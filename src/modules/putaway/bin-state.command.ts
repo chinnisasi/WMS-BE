@@ -111,7 +111,7 @@ export class BinStateCommand {
             'validation-failed',
             400,
             'System bins can never be blocked',
-            `Bin "${row.code}" is a system bin (Receiving/QC-hold) — blocking it is refused.`,
+            `Bin "${row.code}" is a system bin (Receiving/QC-hold/In-Transit/Returns/Damaged) — blocking it is refused.`,
           );
         }
         // A retired bin is operationally gone — nothing left to block or

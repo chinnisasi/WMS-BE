@@ -11,7 +11,7 @@ import { windDownBlockerInTx, type WindDownBlocker } from '../../shared/primitiv
  *
  * - `stock` — the aggregate stock read: the client's SKUs with a non-zero
  *   balance in ANY bin of any warehouse — the Receiving, QC-HOLD,
- *   IN-TRANSIT and RETURNS system bins included (they are bins); `count` is
+ *   IN-TRANSIT, RETURNS and DAMAGED system bins included (they are bins); `count` is
  *   the number of those SKUs, `codes` the first five SKU codes.
  * - `pending-adjustments` — stock adjustments awaiting a decision
  *   (`ADJUSTMENT_PENDING_OPEN_STATUSES`).

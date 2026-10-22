@@ -306,19 +306,46 @@ export const RETURNS_BIN_TYPE = 'staging';
 export const RETURNS_BIN_CAPACITY = 1_000_000 * QUANTITY_SCALE;
 
 /**
- * Story 13-2 (review) — the zone and bin codes reserved for the system
- * RETURNS pair. A user zone or bin coded `RETURNS` is refused at CREATE
- * (409 `reserved-location-code`), so nothing can occupy the code before the
- * warehouse's first return receipt ensures it. A collision created before
- * this rule still answers `returns-bin-conflict` at receipt.
+ * Story 2-4a — the system DAMAGED bin: every warehouse owns at most one,
+ * lazily ensured by the first receipt that carries damaged units — the
+ * RETURNS ensure's twin (zone + bin code `DAMAGED`, `system_owned`,
+ * `staging`, the 1M sentinel). Damaged units arrive straight into it
+ * (`grn.damaged`) and sit on-hand but NOT SELLABLE: inventory's
+ * `damagedUnits` subtracts it from ATP (code + system-owned identity), so
+ * reservations, channel publish and replenishment never see them. They leave
+ * only by a write-off — a NEGATIVE stock adjustment (decision 3; a 400
+ * `damaged-bin-write-off-only` refuses anything else). Count, transfer,
+ * merge, pick, replan and putaway already exclude system-owned bins; the QC
+ * hold origin refuses it by code.
  */
+export const DAMAGED_ZONE_CODE = 'DAMAGED';
+export const DAMAGED_BIN_CODE = 'DAMAGED';
+export const DAMAGED_BIN_TYPE = 'staging';
+/** Effectively unbounded: booking damaged arrivals is never capacity-gated (milli-units). */
+export const DAMAGED_BIN_CAPACITY = 1_000_000 * QUANTITY_SCALE;
+
+/**
+ * The zone and bin codes reserved for system pairs that are ensured lazily
+ * and never adopt a user's location: RETURNS (story 13-2) and DAMAGED
+ * (story 2-4a). A user zone or bin with one of these codes is refused at
+ * CREATE (409 `reserved-location-code`), so nothing can occupy the code
+ * before the warehouse's first return receipt or damaged receipt ensures it.
+ * A collision created before the rule still answers `returns-bin-conflict` /
+ * `damaged-bin-conflict` at the ensure.
+ */
+export const RESERVED_LOCATION_CODES: Readonly<Record<string, string>> = {
+  [RETURNS_BIN_CODE]: 'returns',
+  [DAMAGED_BIN_CODE]: 'damaged',
+};
+
 export function assertNotReservedLocationCode(code: string, what: 'zone' | 'bin'): void {
-  if (code === RETURNS_ZONE_CODE || code === RETURNS_BIN_CODE) {
+  const system = Object.prototype.hasOwnProperty.call(RESERVED_LOCATION_CODES, code) ? RESERVED_LOCATION_CODES[code] : undefined;
+  if (system !== undefined) {
     throw new ProblemException(
       'reserved-location-code',
       409,
       'Location code is reserved',
-      `${what === 'zone' ? 'Zone' : 'Bin'} code "${code}" is reserved for the system returns ${what} — choose another code.`,
+      `${what === 'zone' ? 'Zone' : 'Bin'} code "${code}" is reserved for the system ${system} ${what} — choose another code.`,
       { code },
     );
   }
@@ -332,6 +359,25 @@ export function returnsBinConflict(warehouseId: string, what: 'zone' | 'bin'): P
     `A user ${what} named RETURNS exists`,
     `Warehouse "${warehouseId}" already holds a user ${what} coded "RETURNS" — the system returns bin cannot be ensured. Rename or retire that ${what}, then receive the return again.`,
     { warehouseId },
+  );
+}
+
+/**
+ * 409 `damaged-bin-conflict` — a user zone or bin occupies the `DAMAGED`
+ * code. DEFENSIVE ONLY (code review CR1): migration 0087 re-coded every
+ * pre-rule user location coded DAMAGED and create reserves the code, so this
+ * is unreachable short of a direct database write. A collision cannot be
+ * cleared from the product (codes cannot be renamed; a retired bin keeps its
+ * code; zones cannot be retired), so the detail names the location for an
+ * administrator to re-code, never a retire.
+ */
+export function damagedBinConflict(warehouseId: string, what: 'zone' | 'bin', locationId: string): ProblemException {
+  return new ProblemException(
+    'damaged-bin-conflict',
+    409,
+    `A user ${what} named DAMAGED exists`,
+    `Warehouse "${warehouseId}" holds a user ${what} (id "${locationId}") coded "DAMAGED", the code reserved for the system damaged ${what} — damaged units cannot be booked until an administrator re-codes it (migration 0087 re-codes such locations). Nothing was recorded.`,
+    { warehouseId, locationId },
   );
 }
 
@@ -352,16 +398,72 @@ export async function ensureReturnsBinInTx(
   tenantId: string,
   warehouseId: string,
 ): Promise<ReceivingBinRef> {
+  return ensureReservedSystemBinInTx(tx, tenantId, warehouseId, {
+    zoneCode: RETURNS_ZONE_CODE,
+    binCode: RETURNS_BIN_CODE,
+    zoneName: 'Returns',
+    capacity: RETURNS_BIN_CAPACITY,
+    type: RETURNS_BIN_TYPE,
+    conflict: (id, what) => returnsBinConflict(id, what),
+  });
+}
+
+/**
+ * `ensureDamagedBinInTx` — story 2-4a: the RETURNS ensure, for the DAMAGED
+ * pair (the same tightening — a user ZONE or BIN coded `DAMAGED` is a 409
+ * `damaged-bin-conflict`, never adopted). Called by a receipt only when one
+ * of its settling lines carries damage, so a warehouse with a pre-rule
+ * collision still receives good-only deliveries.
+ */
+export async function ensureDamagedBinInTx(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+): Promise<ReceivingBinRef> {
+  return ensureReservedSystemBinInTx(tx, tenantId, warehouseId, {
+    zoneCode: DAMAGED_ZONE_CODE,
+    binCode: DAMAGED_BIN_CODE,
+    zoneName: 'Damaged',
+    capacity: DAMAGED_BIN_CAPACITY,
+    type: DAMAGED_BIN_TYPE,
+    conflict: damagedBinConflict,
+  });
+}
+
+/**
+ * The shared body of the reserved system-bin ensures (RETURNS, DAMAGED) —
+ * extracted unchanged from story 13-2's `ensureReturnsBinInTx`. Zones carry
+ * no system flag, so the system zone is recognised by what the ensure itself
+ * creates: this call inserted it, or it already held the system-owned bin
+ * before this call (written in the same transaction as the zone by whichever
+ * first call created it — a concurrent loser's zone insert waits on the
+ * winner's uncommitted row and then finds both). A pre-existing zone that did
+ * not already hold the system bin is a user's zone: 409. A user BIN with the
+ * code anywhere in the warehouse is the IN-TRANSIT precedent's 409.
+ */
+async function ensureReservedSystemBinInTx(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  pair: {
+    readonly zoneCode: string;
+    readonly binCode: string;
+    readonly zoneName: string;
+    readonly capacity: number;
+    readonly type: string;
+    readonly conflict: (warehouseId: string, what: 'zone' | 'bin', locationId: string) => ProblemException;
+  },
+): Promise<ReceivingBinRef> {
   // The bin first: once ensured it is the identity, whatever its zone is
-  // called now (a renamed system zone must not breed a stray RETURNS zone and
-  // a wrong zoneId). A user bin holding the code is the 409.
+  // called now (a renamed system zone must not breed a stray zone and a
+  // wrong zoneId). A user bin holding the code is the 409.
   const existing = await tx
     .select({ id: bins.id, zoneId: bins.zoneId, systemOwned: bins.systemOwned })
     .from(bins)
-    .where(and(eq(bins.tenantId, tenantId), eq(bins.warehouseId, warehouseId), eq(bins.code, RETURNS_BIN_CODE)))
+    .where(and(eq(bins.tenantId, tenantId), eq(bins.warehouseId, warehouseId), eq(bins.code, pair.binCode)))
     .limit(1);
   if (existing[0] !== undefined) {
-    if (!existing[0].systemOwned) throw returnsBinConflict(warehouseId, 'bin');
+    if (!existing[0].systemOwned) throw pair.conflict(warehouseId, 'bin', existing[0].id);
     return { zoneId: existing[0].zoneId, binId: existing[0].id };
   }
   const insertedZone = await tx
@@ -370,21 +472,21 @@ export async function ensureReturnsBinInTx(
       id: uuidv7(),
       tenantId,
       warehouseId,
-      code: RETURNS_ZONE_CODE,
-      name: 'Returns',
+      code: pair.zoneCode,
+      name: pair.zoneName,
     })
     .onConflictDoNothing({ target: [zones.warehouseId, zones.code] })
     .returning({ id: zones.id });
   const zoneRows = await tx
     .select({ id: zones.id })
     .from(zones)
-    .where(and(eq(zones.tenantId, tenantId), eq(zones.warehouseId, warehouseId), eq(zones.code, RETURNS_ZONE_CODE)))
+    .where(and(eq(zones.tenantId, tenantId), eq(zones.warehouseId, warehouseId), eq(zones.code, pair.zoneCode)))
     .limit(1);
   const zone = zoneRows[0];
   if (zone === undefined) {
     // Unreachable short of an RLS/scope bug — fail loudly rather than
     // guess an id.
-    throw new Error(`returns zone missing after ensure: ${tenantId}/${warehouseId}`);
+    throw new Error(`${pair.zoneCode} zone missing after ensure: ${tenantId}/${warehouseId}`);
   }
 
   const insertedBin = await tx
@@ -394,9 +496,9 @@ export async function ensureReturnsBinInTx(
       tenantId,
       warehouseId,
       zoneId: zone.id,
-      code: RETURNS_BIN_CODE,
-      capacity: RETURNS_BIN_CAPACITY,
-      type: RETURNS_BIN_TYPE,
+      code: pair.binCode,
+      capacity: pair.capacity,
+      type: pair.type,
       systemOwned: true,
     })
     .onConflictDoNothing({ target: [bins.warehouseId, bins.code] })
@@ -404,24 +506,25 @@ export async function ensureReturnsBinInTx(
   const binRows = await tx
     .select({ id: bins.id, zoneId: bins.zoneId, systemOwned: bins.systemOwned })
     .from(bins)
-    .where(and(eq(bins.tenantId, tenantId), eq(bins.warehouseId, warehouseId), eq(bins.code, RETURNS_BIN_CODE)))
+    .where(and(eq(bins.tenantId, tenantId), eq(bins.warehouseId, warehouseId), eq(bins.code, pair.binCode)))
     .limit(1);
   const bin = binRows[0];
   if (bin === undefined) {
-    throw new Error(`returns bin missing after ensure: ${tenantId}/${warehouseId}`);
+    throw new Error(`${pair.binCode} bin missing after ensure: ${tenantId}/${warehouseId}`);
   }
-  // The identity that feeds `returnsAwaitingUnits` is code + system-owned: a
-  // user-created bin named `RETURNS` is not the returns bin — adopting it
-  // would park returned units where the ATP hook counts zero, i.e. sellable.
+  // The identity that feeds the ATP hook (`returnsAwaitingUnits`,
+  // `damagedUnits`) is code + system-owned: a user-created bin with the code
+  // is not the system bin — adopting it would park units where the ATP hook
+  // counts zero, i.e. sellable.
   if (!bin.systemOwned) {
-    throw returnsBinConflict(warehouseId, 'bin');
+    throw pair.conflict(warehouseId, 'bin', bin.id);
   }
   // A zone this call did not create must ALREADY have held the system bin
-  // (written with it by the receipt that created it) — a pre-existing zone
-  // into which this call just inserted the bin is a user's zone named
-  // RETURNS, never adopted (the throw rolls the insert back).
+  // (written with it by the call that created it) — a pre-existing zone
+  // into which this call just inserted the bin is a user's zone with the
+  // code, never adopted (the throw rolls the insert back).
   if (insertedZone.length === 0 && (insertedBin.length > 0 || bin.zoneId !== zone.id)) {
-    throw returnsBinConflict(warehouseId, 'zone');
+    throw pair.conflict(warehouseId, 'zone', zone.id);
   }
   return { zoneId: zone.id, binId: bin.id };
 }

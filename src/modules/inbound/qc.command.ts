@@ -18,7 +18,7 @@ import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
-import { ensureQcHoldBinInTx, QC_HOLD_BIN_CODE, RETURNS_BIN_CODE } from '../tenancy/receiving-bin';
+import { DAMAGED_BIN_CODE, ensureQcHoldBinInTx, QC_HOLD_BIN_CODE, RETURNS_BIN_CODE } from '../tenancy/receiving-bin';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
 import { assertPermission, assertSecureBinAuthority } from '../tenancy/permissions';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
@@ -403,6 +403,15 @@ export class QcCommand {
     if (originBin.systemOwned && originBin.code === RETURNS_BIN_CODE) {
       throw qcValidation(
         'The system RETURNS bin cannot be a hold origin — its contents are returned units awaiting disposition.',
+      );
+    }
+    // Story 2-4a: nor can the system DAMAGED bin — its contents are units
+    // received damaged (already outside ATP) that leave only by a write-off;
+    // a hold drawing them out would put unsellable units back on a release
+    // path to a sellable bin.
+    if (originBin.systemOwned && originBin.code === DAMAGED_BIN_CODE) {
+      throw qcValidation(
+        'The system DAMAGED bin cannot be a hold origin — its contents are units received damaged, which leave only by a write-off.',
       );
     }
     // ── story 12-3: the secure-bin authority gate (FR-42) — on the locked

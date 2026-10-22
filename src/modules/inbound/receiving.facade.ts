@@ -10,6 +10,7 @@ import {
   overReceipts,
   purchaseOrderLines,
   purchaseOrders,
+  skus as skusTable,
 } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import { skuOfClient } from '../../shared/db/client-filter';
@@ -37,6 +38,7 @@ import { OPEN_ASN_STATUSES, asnLineSnapshot, type AsnLineSnapshot } from './asn.
 import { partnerNamesInTx, type VendorSnapshotV1 } from '../partners/partners.facade';
 import { gateInLabelsInTx, openGateInsInTx, type OpenGateInView } from './gate-in.read';
 import { gateInClock } from './gate-in.command';
+import { DAMAGE_REASON_CODES, SHORT_REASON_CODES } from './receipt-condition';
 
 /** One GRN header row of the GRN-list read (line counts + unit sums ride along). */
 export interface GoodsReceiptEntry {
@@ -63,6 +65,30 @@ export interface GoodsReceiptEntry {
   readonly lineCount: number;
   readonly totalUnits: number;
   readonly appliedUnits: number;
+  /** Story 2-4a — damaged units across the lines (base units; 0 when none). */
+  readonly damagedUnits: number;
+  /** Story 2-4a — short units across the lines (base units; 0 when none). */
+  readonly shortUnits: number;
+}
+
+/**
+ * Story 2-4a — one line of a GRN as the web's expandable row reads it: the
+ * SKU and batch named, the good units and what applied, and the line's
+ * condition (each damaged / short key present only when > 0). Base units.
+ */
+export interface GoodsReceiptLineEntry {
+  readonly id: string;
+  readonly skuId: string;
+  readonly skuCode: string;
+  readonly skuName: string;
+  readonly batchId: string | null;
+  readonly batchCode: string | null;
+  readonly qty: number;
+  readonly appliedQty: number;
+  readonly damagedQty?: number;
+  readonly damageReasonCode?: string;
+  readonly shortQty?: number;
+  readonly shortReasonCode?: string;
 }
 
 export interface ListGoodsReceiptsQuery {
@@ -206,6 +232,9 @@ export interface CatalogSnapshot {
   }[];
   /** Story 2-3a (additive): the open gate-ins the dock unloads and receives against (decision 15). */
   readonly openGateIns: readonly OpenGateInView[];
+  /** Story 2-4a (additive): the damage and short reason vocabularies — the device's gate on its controls. */
+  readonly receiptDamageReasons: readonly string[];
+  readonly receiptShortReasons: readonly string[];
 }
 
 export const DEFAULT_RECEIVING_PAGE_SIZE = 50;
@@ -378,7 +407,7 @@ export class ReceivingFacade {
       const ids = rows.map((row) => row.id);
       const aggregates =
         ids.length === 0
-          ? new Map<string, { lineCount: number; totalUnits: number; appliedUnits: number }>()
+          ? new Map<string, { lineCount: number; totalUnits: string; appliedUnits: string; damagedUnits: string; shortUnits: string }>()
           : new Map(
               (
                 await tx
@@ -389,6 +418,9 @@ export class ReceivingFacade {
                     // overflows int4, and that must not brick the list read.
                     totalUnits: sql<string>`coalesce(sum(${goodsReceiptLines.qty}), 0)::bigint`,
                     appliedUnits: sql<string>`coalesce(sum(${goodsReceiptLines.appliedQty}), 0)::bigint`,
+                    // Story 2-4a — the condition sums, in this same second query.
+                    damagedUnits: sql<string>`coalesce(sum(${goodsReceiptLines.damagedQty}), 0)::bigint`,
+                    shortUnits: sql<string>`coalesce(sum(${goodsReceiptLines.shortQty}), 0)::bigint`,
                   })
                   .from(goodsReceiptLines)
                   .where(inArray(goodsReceiptLines.grnId, ids))
@@ -399,6 +431,8 @@ export class ReceivingFacade {
                   lineCount: row.lineCount,
                   totalUnits: row.totalUnits,
                   appliedUnits: row.appliedUnits,
+                  damagedUnits: row.damagedUnits,
+                  shortUnits: row.shortUnits,
                 },
               ]),
             );
@@ -429,12 +463,77 @@ export class ReceivingFacade {
         // domain's milli-units.
         totalUnits: fromMilli(Number(aggregates.get(row.id)?.totalUnits ?? 0)),
         appliedUnits: fromMilli(Number(aggregates.get(row.id)?.appliedUnits ?? 0)),
+        damagedUnits: fromMilli(Number(aggregates.get(row.id)?.damagedUnits ?? 0)),
+        shortUnits: fromMilli(Number(aggregates.get(row.id)?.shortUnits ?? 0)),
         occurredAt: canonicalInstant(row.occurredAt),
         recordedAt: canonicalInstant(row.recordedAt),
         createdAt: canonicalInstant(row.createdAt),
         };
       });
       return fullPrecisionPage(rows, items, pageSize);
+    });
+  }
+
+  /**
+   * Story 2-4a — one GRN's lines (the web's expandable GRN row), in receipt
+   * order: SKU code and name, batch code, good and applied units, and the
+   * damaged and short fields (each present only when > 0). Any staff role —
+   * a read, never capability-gated. An unknown or another tenant's GRN is a
+   * 404.
+   */
+  async listGoodsReceiptLines(tenantId: string, grnId: string): Promise<GoodsReceiptLineEntry[]> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const header = await tx
+        .select({ id: goodsReceiptNotes.id })
+        .from(goodsReceiptNotes)
+        .where(and(eq(goodsReceiptNotes.tenantId, tenantId), eq(goodsReceiptNotes.id, grnId)))
+        .limit(1);
+      if (header[0] === undefined) {
+        throw new ProblemException(
+          'not-found',
+          404,
+          'Goods receipt not found',
+          `No goods receipt with id "${grnId}" exists in this tenant.`,
+        );
+      }
+      const rows = await tx
+        .select({
+          id: goodsReceiptLines.id,
+          skuId: goodsReceiptLines.skuId,
+          skuCode: skusTable.code,
+          skuName: skusTable.name,
+          batchId: goodsReceiptLines.batchId,
+          qty: goodsReceiptLines.qty,
+          appliedQty: goodsReceiptLines.appliedQty,
+          damagedQty: goodsReceiptLines.damagedQty,
+          damageReasonCode: goodsReceiptLines.damageReasonCode,
+          shortQty: goodsReceiptLines.shortQty,
+          shortReasonCode: goodsReceiptLines.shortReasonCode,
+        })
+        .from(goodsReceiptLines)
+        .innerJoin(skusTable, and(eq(skusTable.tenantId, goodsReceiptLines.tenantId), eq(skusTable.id, goodsReceiptLines.skuId)))
+        .where(and(eq(goodsReceiptLines.tenantId, tenantId), eq(goodsReceiptLines.grnId, grnId)))
+        .orderBy(goodsReceiptLines.createdAt, goodsReceiptLines.id);
+      const batchCodes = await this.catalog.batchCodesByIdsInTx(
+        tx,
+        tenantId,
+        [...new Set(rows.map((row) => row.batchId).filter((id): id is string => id !== null))],
+      );
+      return rows.map((row) => ({
+        id: row.id,
+        skuId: row.skuId,
+        skuCode: row.skuCode,
+        skuName: row.skuName,
+        batchId: row.batchId,
+        batchCode: row.batchId === null ? null : (batchCodes.get(row.batchId) ?? null),
+        // Read model — base units at the edge (story 10.1).
+        qty: fromMilli(row.qty),
+        appliedQty: fromMilli(row.appliedQty),
+        ...(row.damagedQty > 0 ? { damagedQty: fromMilli(row.damagedQty) } : {}),
+        ...(row.damagedQty > 0 && row.damageReasonCode !== null ? { damageReasonCode: row.damageReasonCode } : {}),
+        ...(row.shortQty > 0 ? { shortQty: fromMilli(row.shortQty) } : {}),
+        ...(row.shortQty > 0 && row.shortReasonCode !== null ? { shortReasonCode: row.shortReasonCode } : {}),
+      }));
     });
   }
 
@@ -648,6 +747,9 @@ export class ReceivingFacade {
         bins: binSummaries,
         putawayTasks: putawayTasks.map((task) => ({ ...task })),
         openGateIns,
+        // Story 2-4a — the vocabularies; their presence is the device's gate.
+        receiptDamageReasons: [...DAMAGE_REASON_CODES],
+        receiptShortReasons: [...SHORT_REASON_CODES],
       };
     });
   }

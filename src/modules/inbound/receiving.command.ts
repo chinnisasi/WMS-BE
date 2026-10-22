@@ -51,7 +51,8 @@ import { ProblemException, isUniqueViolationOn } from '../../shared/problem-deta
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertDeviceOperatorInTx } from '../tenancy/device-operator';
-import { ensureReceivingBinInTx } from '../tenancy/receiving-bin';
+import { ensureDamagedBinInTx, ensureReceivingBinInTx } from '../tenancy/receiving-bin';
+import { isDamageReasonCode, isShortReasonCode, lineConditionFields, DAMAGE_REASON_CODES, SHORT_REASON_CODES } from './receipt-condition';
 import { assertWarehouseInTenant, getMemberRoleIn, getWarehouseCodeInTx } from '../tenancy/tenancy.service';
 import { assertPermission } from '../tenancy/permissions';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
@@ -122,7 +123,33 @@ export interface GrnLineInput {
    * quantity `6` and six weights of ~18,400 g each.
    */
   readonly weightsGrams: readonly number[] | null;
+  /**
+   * Story 2-4a — units that arrived DAMAGED (base UoM on the way in,
+   * milli-units once converted). Optional on the wire AND on a stored older
+   * payload, normalised to `damagedQty ?? 0`; hashed only when > 0. Booked
+   * into the warehouse's system DAMAGED bin (`grn.damaged`), never crediting
+   * the PO or ASN line. `qty` stays the GOOD units only.
+   */
+  readonly damagedQty?: number | null | undefined;
+  /** Story 2-4a — required when `damagedQty > 0`, refused otherwise (`DAMAGE_REASON_CODES`). */
+  readonly damageReasonCode?: string | null | undefined;
+  /**
+   * Story 2-4a — units the supplier's invoice or challan listed that never
+   * arrived. RECORDED ONLY (no stock, no document effect); normalised to
+   * `shortQty ?? 0`, hashed only when > 0.
+   */
+  readonly shortQty?: number | null | undefined;
+  /** Story 2-4a — required when `shortQty > 0`, refused otherwise (`SHORT_REASON_CODES`). */
+  readonly shortReasonCode?: string | null | undefined;
 }
+
+/** Story 2-4a — a GRN line's input after normalisation: every condition field present. */
+type NormalisedGrnLineInput = GrnLineInput & {
+  readonly damagedQty: number;
+  readonly damageReasonCode: string | null;
+  readonly shortQty: number;
+  readonly shortReasonCode: string | null;
+};
 
 export interface SubmitGoodsReceiptCommand {
   readonly tenantId: string;
@@ -220,6 +247,16 @@ export interface GoodsReceiptLineSnapshot {
    * receipt under the default policy is byte-identical.
    */
   readonly toleranceQty?: number;
+  /**
+   * Story 2-4a — the line's condition, each key present only when its
+   * quantity is > 0 (a line without damage or short is byte-identical to
+   * its pre-2-4a shape): the damaged units booked into DAMAGED and why, the
+   * units short against the supplier's document and why.
+   */
+  readonly damagedQty?: number;
+  readonly damageReasonCode?: string;
+  readonly shortQty?: number;
+  readonly shortReasonCode?: string;
   /**
    * Story 10.3: the handling units this line produced, in creation order —
    * present only on a catch-weight line. These ids are what a unit label is
@@ -349,6 +386,15 @@ export interface RejectedGrnLine {
    * date, and which holder — the client brand or the site — lacks it.
    */
   readonly missing?: readonly MissingLicence[];
+  /**
+   * Story 2-4a — the refused line's condition, each present only when > 0
+   * (base units, as sent): a refused line goes to review WHOLE, damaged and
+   * short parts included (decision 6), so the entry carries them.
+   */
+  readonly damagedQty?: number;
+  readonly damageReasonCode?: string;
+  readonly shortQty?: number;
+  readonly shortReasonCode?: string;
 }
 
 /**
@@ -670,6 +716,13 @@ export class ReceivingCommand {
         // physical act), the order here is the order the operator weighed the
         // cases in, and unit i of the line IS weight i.
         weightsGrams: line.weightsGrams ?? undefined,
+        // ── story 2-4a: ADDITIVE, the same rule — each only when > 0 ─────
+        // After `weightsGrams`, at fixed positions. A quantity of 0 (or an
+        // absent key) hashes as absent, so every queued pre-2-4a op — and
+        // every line without damage or short — hashes byte for byte as
+        // before (golden in `test/receipt-condition.spec.ts`); a reason is
+        // hashed only beside its quantity (a reason with 0 is a 400 below).
+        ...conditionHashFields(line),
       })),
     });
 
@@ -693,7 +746,7 @@ export class ReceivingCommand {
     // Story 2-3a — the named gate-in, normalised (the replay rebuild passes a
     // stored payload raw: an absent key is null, never `undefined` — D16).
     const requestedGateInId = command.gateInId ?? null;
-    const inputLines: readonly GrnLineInput[] = command.lines.map((line) => ({
+    const inputLines: readonly NormalisedGrnLineInput[] = command.lines.map((line) => ({
       ...line,
       poLineId: line.poLineId ?? null,
       asnLineId: line.asnLineId ?? null,
@@ -701,6 +754,12 @@ export class ReceivingCommand {
       mfgDate: line.mfgDate ?? null,
       expiryDate: line.expiryDate ?? null,
       weightsGrams: line.weightsGrams ?? null,
+      // Story 2-4a — an older payload (a queued op, a review row's stored
+      // lines re-applied) carries none of the four: absent means 0 / null.
+      damagedQty: line.damagedQty ?? 0,
+      damageReasonCode: line.damageReasonCode ?? null,
+      shortQty: line.shortQty ?? 0,
+      shortReasonCode: line.shortReasonCode ?? null,
     }));
     assertWeightShape(inputLines);
 
@@ -750,14 +809,18 @@ export class ReceivingCommand {
         // Whether the SKU's own unit may express this many decimals is asked
         // below, once `loadSkus` has read the units, and therefore behind the
         // replay lookup above.
-        if (!(line.qty > 0)) {
-          throw grnValidation(`Line quantity must be a positive quantity (got ${String(line.qty)}).`);
+        // Story 2-4a: `qty` is the GOOD units and may be 0 (an all-damaged
+        // line) — the line as a whole must carry arrivals (below).
+        if (typeof line.qty !== 'number' || !Number.isFinite(line.qty) || !(line.qty >= 0)) {
+          throw grnValidation(`Line quantity must be a non-negative quantity (got ${String(line.qty)}).`);
         }
         if (line.qty > fromMilli(MAX_GRN_LINE_QTY)) {
           throw grnValidation(
             `Line quantity must be at most ${fromMilli(MAX_GRN_LINE_QTY)} (got ${String(line.qty)}).`,
           );
         }
+        // ── story 2-4a: the condition fields' shape ─────────────────────
+        assertLineConditionShape(line);
         if (line.mfgDate !== null) {
           assertUtc(line.mfgDate, 'mfgDate');
         }
@@ -806,6 +869,22 @@ export class ReceivingCommand {
         command.tenantId,
         inputLines.map((line) => line.skuId),
       );
+      // ── story 2-4a (decision 9): no damage on a serial-tracked or
+      // catch-weight line ──────────────────────────────────────────────
+      // Over ALL lines, right after the SKUs are read and BEFORE the refusal
+      // split — a whole-op 400 whatever else the line would meet: serial
+      // damage could never be written off (`grn.damaged` has no serial arm),
+      // and a catch-weight unit has no weight capture on the damaged path.
+      // The workaround (PENDING): receive as good, then write off.
+      for (const line of inputLines) {
+        if (line.damagedQty <= 0) continue;
+        const sku = skuById.get(line.skuId)!;
+        if (sku.serialTracked || sku.catchWeightTracked) {
+          throw grnValidation(
+            `SKU "${sku.code}" is ${sku.serialTracked ? 'serial-tracked' : 'catch-weight tracked'} — damaged units cannot be received on its lines. Receive them as good, then write them off.`,
+          );
+        }
+      }
 
       // ── story 1-1: a BLIND receipt that names its client ────────────────
       // The client must exist (404; story 1-2a: any status — see below). A line
@@ -942,11 +1021,14 @@ export class ReceivingCommand {
       // Behind the replay lookup and with each line's unit in hand. Below
       // this point every quantity is milli-units; `command.lines` is not read
       // for a quantity again.
-      const convertedLines: readonly GrnLineInput[] = receivableInput.map((line) => {
+      const convertedLines: readonly NormalisedGrnLineInput[] = receivableInput.map((line) => {
         const uom = skuById.get(line.skuId)!.uom;
         return {
           ...line,
           qty: assertRecordableQuantity(line.qty, 'qty', uom, uomPrecision(uom)),
+          // Story 2-4a — both condition quantities beside `qty`, the same rule.
+          damagedQty: assertRecordableQuantity(line.damagedQty, 'damagedQty', uom, uomPrecision(uom)),
+          shortQty: assertRecordableQuantity(line.shortQty, 'shortQty', uom, uomPrecision(uom)),
         };
       });
 
@@ -1016,7 +1098,7 @@ export class ReceivingCommand {
       // The request index of each line that settles from here on, aligned with `lines`.
       const settlingIndexes =
         licenceRefusedIndexes.size === 0 ? receivableIndexes : receivableIndexes.filter((index) => !licenceRefusedIndexes.has(index));
-      const lines: readonly GrnLineInput[] =
+      const lines: readonly NormalisedGrnLineInput[] =
         licenceRefusedIndexes.size === 0
           ? convertedLines
           : convertedLines.filter((_, receivableIndex) => !licenceRefusedIndexes.has(receivableIndexes[receivableIndex]!));
@@ -1300,7 +1382,7 @@ export class ReceivingCommand {
       const asnLineById = new Map(asnLineRows.map((line) => [line.id, line]));
 
       interface SettledLine {
-        readonly input: GrnLineInput;
+        readonly input: NormalisedGrnLineInput;
         readonly lineId: string;
         /** The document line actually credited — null on a blind or unmatched line. */
         readonly poLineId: string | null;
@@ -1361,15 +1443,20 @@ export class ReceivingCommand {
             asnLineId: asn !== null ? documentLineId : null,
             applied: 0,
           });
-          overReceiptRequests.push({
-            grnLineId: lineId,
-            poId: po?.id ?? null,
-            poLineId: po !== null ? documentLineId : null,
-            asnId: asn?.id ?? null,
-            asnLineId: asn !== null ? documentLineId : null,
-            skuId: input.skuId,
-            excessQty: input.qty,
-          });
+          // Story 2-4a (R1): an all-damaged line (qty 0) pends nothing — an
+          // `excess_qty 0` row would fail its CHECK (a 500); its damaged
+          // units book into DAMAGED below, independent of this arm.
+          if (input.qty > 0) {
+            overReceiptRequests.push({
+              grnLineId: lineId,
+              poId: po?.id ?? null,
+              poLineId: po !== null ? documentLineId : null,
+              asnId: asn?.id ?? null,
+              asnLineId: asn !== null ? documentLineId : null,
+              skuId: input.skuId,
+              excessQty: input.qty,
+            });
+          }
         };
         const requested = po !== null ? input.poLineId : (input.asnLineId ?? null);
         if (terminal) {
@@ -1413,7 +1500,9 @@ export class ReceivingCommand {
           // Story 21-6 — UNMATCHED (the old no-`poLineId` arm, now named):
           // applied in full, no line credited, no ceiling, no over-receipt.
           settled.push({ ...base, lineId: uuidv7(), poLineId: null, asnLineId: null, applied: input.qty });
-          unmatched.push({ index, reason: 'no-line-reference' });
+          // Story 2-4a (R2): an all-damaged line booked nothing good — the
+          // device must not print "booked without crediting".
+          if (input.qty > 0) unmatched.push({ index, reason: 'no-line-reference' });
           continue;
         }
         const documentLine =
@@ -1426,6 +1515,9 @@ export class ReceivingCommand {
             qty: fromMilli(input.qty),
             code: po !== null ? 'po-line-not-found' : 'asn-line-not-found',
             reason: `No line with id "${reference}" exists on ${documentLabel}.`,
+            // Story 2-4a (R3): the line is rejected WHOLE — its damaged units
+            // are not booked either; the entry carries them (base units).
+            ...lineConditionFields({ ...input, damagedQty: fromMilli(input.damagedQty), shortQty: fromMilli(input.shortQty) }),
           });
           continue;
         }
@@ -1433,7 +1525,7 @@ export class ReceivingCommand {
           // Story 21-6 — the scanned goods are not what the referenced line
           // announced: book them (they arrived) without crediting the line.
           settled.push({ ...base, lineId: uuidv7(), poLineId: null, asnLineId: null, applied: input.qty });
-          unmatched.push({ index, reason: 'line-sku-mismatch' });
+          if (input.qty > 0) unmatched.push({ index, reason: 'line-sku-mismatch' });
           continue;
         }
         if (po !== null) {
@@ -1451,6 +1543,7 @@ export class ReceivingCommand {
               qty: fromMilli(input.qty),
               code: 'po-line-not-open',
               reason: `Purchase order line "${reference}" is ${poLine.status} — it cannot receive.`,
+              ...lineConditionFields({ ...input, damagedQty: fromMilli(input.damagedQty), shortQty: fromMilli(input.shortQty) }),
             });
             continue;
           }
@@ -1495,6 +1588,16 @@ export class ReceivingCommand {
         }
       }
 
+      // ── story 2-4a: the DAMAGED bin, only when a SETTLED line carries
+      // damage — after the fold, so a damaged line rejected as
+      // `po-line-not-found` / `asn-line-not-found` / `po-line-not-open`
+      // (whose damaged units are not booked) never ensures it. A good-only
+      // receipt never touches it (`damaged-bin-conflict` — defensive since
+      // 0087 re-coded pre-rule collisions — can only arise here).
+      const damagedBin = settled.some((entry) => entry.input.damagedQty > 0)
+        ? await ensureDamagedBinInTx(tx, command.tenantId, command.warehouseId)
+        : null;
+
       // An all-rejected receipt (every line named an unknown or non-open
       // line of an OPEN document — a stale cache) settles nothing and still
       // records. A terminal document's lines never reject (story 21-9).
@@ -1511,6 +1614,11 @@ export class ReceivingCommand {
             qty: entry.input.qty,
             appliedQty: entry.applied,
             toleranceQty: entry.toleranceQty,
+            // Story 2-4a — the line's condition (milli-units; reasons null at 0).
+            damagedQty: entry.input.damagedQty,
+            damageReasonCode: entry.input.damagedQty > 0 ? entry.input.damageReasonCode : null,
+            shortQty: entry.input.shortQty,
+            shortReasonCode: entry.input.shortQty > 0 ? entry.input.shortReasonCode : null,
           })),
         );
       }
@@ -1610,6 +1718,38 @@ export class ReceivingCommand {
           }),
         };
         await this.inventory.appendLedgerEventInTx(tx, movement);
+      }
+
+      // ── story 2-4a: the damaged units → the system DAMAGED bin ──────────
+      // One `grn.damaged` intake per settled line with damage, INDEPENDENT of
+      // what the good units did (applied, pended on a terminal document,
+      // re-targeted, unmatched): damaged units never credit a document line
+      // and never pend. The reference names the header's document (never a
+      // line) plus the GRN line. Unheld (QC on receipt holds `applied` only),
+      // no handling units (catch-weight damage is refused above).
+      for (const entry of settled) {
+        if (entry.input.damagedQty <= 0) {
+          continue;
+        }
+        await this.inventory.appendLedgerEventInTx(tx, {
+          tenantId: command.tenantId,
+          warehouseId: command.warehouseId,
+          type: 'grn.damaged',
+          skuId: entry.input.skuId,
+          quantityDelta: signedQuantity(entry.input.damagedQty),
+          fromBinId: null,
+          toBinId: damagedBin!.binId,
+          batchRef: entry.batchId,
+          serialRef: null,
+          actorUserId: command.operatorUserId,
+          occurredAt,
+          recordedAt,
+          referenceDoc: grnReferenceDoc(
+            grnId,
+            { poId: po?.id ?? null, poLineId: null, asnId, asnLineId: null },
+            entry.lineId,
+          ),
+        });
       }
 
       // ── story 1-2b: QC on receipt ───────────────────────────────────────
@@ -1757,7 +1897,8 @@ export class ReceivingCommand {
       let inactiveSkuReviewOpId: string | null = null;
       const inactiveBooked = settled.filter(
         (entry) =>
-          entry.applied > 0 &&
+          // Story 2-4a (R12): a damaged-only line booked units too.
+          (entry.applied > 0 || entry.input.damagedQty > 0) &&
           entry.poLineId === null &&
           entry.asnLineId === null &&
           skuById.get(entry.input.skuId)!.status !== 'active',
@@ -1781,7 +1922,14 @@ export class ReceivingCommand {
             // Base units, as booked.
             lines: inactiveBooked.map((entry) => {
               const sku = skuById.get(entry.input.skuId)!;
-              return { skuId: sku.id, skuCode: sku.code, qty: fromMilli(entry.applied), uom: sku.uom };
+              return {
+                skuId: sku.id,
+                skuCode: sku.code,
+                qty: fromMilli(entry.applied),
+                uom: sku.uom,
+                // Story 2-4a — the damaged units it booked into DAMAGED, when any.
+                ...(entry.input.damagedQty > 0 ? { damagedQty: fromMilli(entry.input.damagedQty) } : {}),
+              };
             }),
           },
           occurredAt,
@@ -1834,6 +1982,12 @@ export class ReceivingCommand {
             excessQty: fromMilli(entry.input.qty - entry.applied),
             // Story 1-2b: present only when a tolerance booked excess.
             ...(entry.toleranceQty > 0 ? { toleranceQty: fromMilli(entry.toleranceQty) } : {}),
+            // Story 2-4a: present only when > 0 (base units).
+            ...lineConditionFields({
+              ...entry.input,
+              damagedQty: fromMilli(entry.input.damagedQty),
+              shortQty: fromMilli(entry.input.shortQty),
+            }),
             // Story 10.3: present only on a catch-weight line, so a
             // non-catch-weight GRN's snapshot is byte-identical to its
             // pre-10.3 shape (`JSON.stringify` drops absent keys).
@@ -2649,6 +2803,11 @@ export class ReceivingCommand {
       // A tracked line WITHOUT a batch code is not judged here: it reaches
       // `ensureBatchIdentity`'s 400 ("its lines need a batch code") as before.
       if (out.has(index) || !tracked(line) || line.batchCode === null) continue;
+      // Story 2-4a (decision 6): an ALL-DAMAGED line (no good units) is not
+      // judged for remaining life or a missing expiry — nothing sellable
+      // books; its units go to DAMAGED. The data-integrity rules (1)–(3)
+      // above, the licence and the client rules still apply to it.
+      if (line.qty === 0) continue;
       const policy = args.policyOfSku(line.skuId);
       if (!policy.expiryRequired) continue;
       const key = batchKey(line);
@@ -2697,6 +2856,7 @@ export class ReceivingCommand {
           reason: licenceRefusalReason(sku.code, missing, entry.siteCode ?? ''),
           index: entry.index,
           missing: missing.map((item) => ({ need: item.need, holder: item.holder, ...(entry.siteCode === undefined ? {} : { siteCode: entry.siteCode }) })),
+          ...lineConditionFields(line),
         };
       }
       if (EXPIRY_REFUSAL_CODES.has(code)) {
@@ -2711,12 +2871,14 @@ export class ReceivingCommand {
           batchCode: line.batchCode,
           expiryDate: entry.expiryDate ?? null,
           ...(entry.minShelfLifeDays === undefined ? {} : { minShelfLifeDays: entry.minShelfLifeDays }),
+          ...lineConditionFields(line),
         };
       }
       return {
         poLineId: null,
         skuId: line.skuId,
         qty: line.qty,
+        ...lineConditionFields(line),
         code,
         reason:
           code === 'client-departed'
@@ -2835,6 +2997,8 @@ export class ReceivingCommand {
             ...(line.expiryDate === null || line.expiryDate === undefined ? {} : { expiryDate: line.expiryDate }),
             qty: line.qty,
             ...(line.weightsGrams === null ? {} : { weightsGrams: [...line.weightsGrams] }),
+            // Story 2-4a — the line's condition, only when > 0 (base units).
+            ...lineConditionFields(line),
           })),
           refusals: linesRefused.map(refusalEntry),
         },
@@ -2888,6 +3052,8 @@ export class ReceivingCommand {
             expiryDate: line.expiryDate ?? null,
             qty: line.qty,
             ...(line.weightsGrams === null ? {} : { weightsGrams: [...line.weightsGrams] }),
+            // Story 2-4a — only when > 0, so Apply re-sends them (a pre-2-4a row is byte-identical).
+            ...lineConditionFields(line),
           })),
           refusals: shelfLifeRefused.map(refusalEntry),
         },
@@ -2950,6 +3116,8 @@ export class ReceivingCommand {
             ...(line.expiryDate === null || line.expiryDate === undefined ? {} : { expiryDate: line.expiryDate }),
             qty: line.qty,
             ...(line.weightsGrams === null ? {} : { weightsGrams: [...line.weightsGrams] }),
+            // Story 2-4a — only when > 0, so Apply re-sends them (a pre-2-4a row is byte-identical).
+            ...lineConditionFields(line),
           })),
           refusals: licenceRefused.map(refusalEntry),
           // D1 — no loop: a row raised during a re-run under a shelf-life
@@ -3161,6 +3329,79 @@ function grnValidation(detail: string): ProblemException {
 }
 
 /**
+ * Story 2-4a — the condition fields' hash keys, after `weightsGrams`: each
+ * only when its quantity is > 0 (a 0 or absent quantity hashes as absent, so
+ * one physical act has one hash), the reason only beside its quantity. Over
+ * the line AS RECEIVED (base units, never normalised — the hash is the
+ * cross-version contract).
+ */
+function conditionHashFields(line: GrnLineInput): {
+  damagedQty?: number;
+  damageReasonCode?: string | null;
+  shortQty?: number;
+  shortReasonCode?: string | null;
+} {
+  const damaged = typeof line.damagedQty === 'number' && line.damagedQty > 0;
+  const short = typeof line.shortQty === 'number' && line.shortQty > 0;
+  return {
+    ...(damaged ? { damagedQty: line.damagedQty!, damageReasonCode: line.damageReasonCode ?? null } : {}),
+    ...(short ? { shortQty: line.shortQty!, shortReasonCode: line.shortReasonCode ?? null } : {}),
+  };
+}
+
+/**
+ * Story 2-4a — the condition fields' SHAPE, per (normalised) line, behind the
+ * replay lookup beside `qty`'s own checks (the matrix's "bad shape" row —
+ * every one a whole-op 400 `validation-failed`): each quantity a finite
+ * number ≥ 0 and ≤ the line maximum; a reason exactly when its quantity is
+ * > 0, from its closed vocabulary; and the line carries arrivals —
+ * `qty + damagedQty > 0` (a short with nothing received is not recordable).
+ */
+function assertLineConditionShape(line: NormalisedGrnLineInput): void {
+  const max = fromMilli(MAX_GRN_LINE_QTY);
+  for (const [field, value] of [
+    ['damagedQty', line.damagedQty],
+    ['shortQty', line.shortQty],
+  ] as const) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      throw grnValidation(`${field} must be a non-negative quantity (got ${String(value)}).`);
+    }
+    if (value > max) {
+      throw grnValidation(`${field} must be at most ${max} (got ${String(value)}).`);
+    }
+  }
+  if (line.damagedQty > 0) {
+    if (line.damageReasonCode === null) {
+      throw grnValidation(`A line with damaged units needs a damageReasonCode from ${JSON.stringify(DAMAGE_REASON_CODES)}.`);
+    }
+    if (!isDamageReasonCode(line.damageReasonCode)) {
+      throw grnValidation(
+        `damageReasonCode must be one of ${JSON.stringify(DAMAGE_REASON_CODES)} (got ${JSON.stringify(line.damageReasonCode)}).`,
+      );
+    }
+  } else if (line.damageReasonCode !== null) {
+    throw grnValidation('damageReasonCode is given only beside damagedQty > 0.');
+  }
+  if (line.shortQty > 0) {
+    if (line.shortReasonCode === null) {
+      throw grnValidation(`A line with short units needs a shortReasonCode from ${JSON.stringify(SHORT_REASON_CODES)}.`);
+    }
+    if (!isShortReasonCode(line.shortReasonCode)) {
+      throw grnValidation(
+        `shortReasonCode must be one of ${JSON.stringify(SHORT_REASON_CODES)} (got ${JSON.stringify(line.shortReasonCode)}).`,
+      );
+    }
+  } else if (line.shortReasonCode !== null) {
+    throw grnValidation('shortReasonCode is given only beside shortQty > 0.');
+  }
+  if (!(line.qty + line.damagedQty > 0)) {
+    throw grnValidation(
+      'A line needs units that arrived — good (qty) or damaged (damagedQty) above 0. A short against a line with no arrivals is not recordable.',
+    );
+  }
+}
+
+/**
  * Story 10.3 — the catch-weight SHAPE checks, answerable without a database
  * row and therefore run ABOVE the transaction (`IMPLEMENTATION-GUIDE.md` §1,
  * tier 1): each declared weight's own bounds, and the one-weight-per-unit
@@ -3258,6 +3499,12 @@ export function grnReferenceDoc(
     readonly asnId: string | null;
     readonly asnLineId: string | null;
   },
+  /**
+   * Story 2-4a — the GRN line, passed ONLY by the `grn.damaged` intake and
+   * appended last; omitted otherwise, so every `grn.received` event (submit
+   * and approve) keeps its canonical bytes.
+   */
+  grnLineId?: string,
 ): {
   kind: 'grn-receipt';
   grnId: string;
@@ -3265,6 +3512,7 @@ export function grnReferenceDoc(
   poLineId?: string;
   asnId?: string;
   asnLineId?: string;
+  grnLineId?: string;
 } {
   return {
     kind: 'grn-receipt',
@@ -3273,6 +3521,7 @@ export function grnReferenceDoc(
     ...(refs.poLineId === null ? {} : { poLineId: refs.poLineId }),
     ...(refs.asnId === null ? {} : { asnId: refs.asnId }),
     ...(refs.asnLineId === null ? {} : { asnLineId: refs.asnLineId }),
+    ...(grnLineId === undefined ? {} : { grnLineId }),
   };
 }
 

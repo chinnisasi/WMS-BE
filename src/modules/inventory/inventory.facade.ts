@@ -2333,7 +2333,7 @@ export class InventoryFacade {
         'validation-failed',
         400,
         'Bin is a system bin',
-        `Bin "${bin.code}" is a system bin (Receiving/QC-hold/In-Transit) — transfer intake lands in storage bins only.`,
+        `Bin "${bin.code}" is a system bin (Receiving/QC-hold/In-Transit/Returns/Damaged) — transfer intake lands in storage bins only.`,
       );
     }
     if (bin.retiredAt !== null) {

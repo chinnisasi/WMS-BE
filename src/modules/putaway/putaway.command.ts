@@ -568,7 +568,7 @@ export class PutawayCommand {
       }
       if (targetBin.systemOwned) {
         throw putawayValidation(
-          `Bin "${targetBin.code}" is a system bin (Receiving/QC-hold) — placements land in storage bins only.`,
+          `Bin "${targetBin.code}" is a system bin (Receiving/QC-hold/In-Transit/Returns/Damaged) — placements land in storage bins only.`,
         );
       }
       if (targetBin.retiredAt !== null) {

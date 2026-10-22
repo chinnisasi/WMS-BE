@@ -96,7 +96,7 @@ export class ZoneCommand {
         // write (spec 1.3 Design Notes). RLS already scopes to the tenant;
         // this catches a foreign/nonexistent warehouse as 404.
         await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
-        // Story 13-2: `RETURNS` is the system returns zone's code.
+        // Story 13-2: `RETURNS` is the system returns zone's code; story 2-4a: `DAMAGED` the damaged zone's.
         assertNotReservedLocationCode(command.code, 'zone');
 
         let zone: ZoneSnapshot['zone'];

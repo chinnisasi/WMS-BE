@@ -34,6 +34,7 @@ import {
   MAX_HANDLING_UNITS_PER_REQUEST,
 } from '../catalog/handling-unit';
 import { MAX_HANDLING_UNITS_PER_GRN_LINE, REJECTED_GRN_LINE_CODES, UNMATCHED_LINE_REASONS } from './receiving.command';
+import { DAMAGE_REASON_CODES, SHORT_REASON_CODES } from './receipt-condition';
 // Story 3.5 (additive): the snapshot's putaway decision fields reuse the
 // putaway module's DTOs (one shape on every surface).
 import { PutawayBinDto, PutawayTaskDto } from '../putaway/putaway.dto';
@@ -116,15 +117,69 @@ export class GrnLineInputDto {
   expiryDate?: string | null;
 
   @ApiProperty({
-    description: `Physically received quantity. ${QUANTITY_FIELD_DESCRIPTION}`,
-    minimum: 0.001,
+    description: `The GOOD units received (story 2-4a — damaged units go in damagedQty, never here; 0 on an all-damaged line, but every line needs qty + damagedQty > 0). ${QUANTITY_FIELD_DESCRIPTION}`,
+    minimum: 0,
     maximum: MAX_QUANTITY_BASE,
   })
   @Type(() => Number)
   @IsNumber({ allowNaN: false, allowInfinity: false })
-  @Min(0.001)
+  @Min(0)
   @Max(MAX_QUANTITY_BASE)
   qty!: number;
+
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    minimum: 0,
+    maximum: MAX_QUANTITY_BASE,
+    description:
+      'Story 2-4a — units that arrived DAMAGED, booked into the warehouse\'s system DAMAGED bin (not sellable) and never crediting the PO or ASN line. Needs damageReasonCode when > 0. Refused (400) on a serial-tracked or catch-weight SKU. Omit (or 0) when none',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(0)
+  @Max(MAX_QUANTITY_BASE)
+  damagedQty?: number | null;
+
+  @ApiProperty({
+    required: false,
+    type: String,
+    nullable: true,
+    enum: [...DAMAGE_REASON_CODES, null],
+    description: 'Story 2-4a — why the damaged units are damaged; given exactly when damagedQty > 0',
+  })
+  @IsOptional()
+  @IsIn(DAMAGE_REASON_CODES as unknown as string[])
+  damageReasonCode?: string | null;
+
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    minimum: 0,
+    maximum: MAX_QUANTITY_BASE,
+    description:
+      "Story 2-4a — units the supplier's invoice or challan listed that never arrived, typed at the dock. Recorded on the line only — no stock and no effect on the PO or ASN. Needs shortReasonCode when > 0. Omit (or 0) when none",
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(0)
+  @Max(MAX_QUANTITY_BASE)
+  shortQty?: number | null;
+
+  @ApiProperty({
+    required: false,
+    type: String,
+    nullable: true,
+    enum: [...SHORT_REASON_CODES, null],
+    description: 'Story 2-4a — why the units are short; given exactly when shortQty > 0',
+  })
+  @IsOptional()
+  @IsIn(SHORT_REASON_CODES as unknown as string[])
+  shortReasonCode?: string | null;
 
   @ApiProperty({
     required: false,
@@ -252,9 +307,9 @@ export class GrnLineDto {
   @ApiProperty({ type: String, nullable: true })
   batchCode!: string | null;
 
-  // The schema floor matches the receipt validator (@Min(0.001)): physical
-  // truth is fractional since story 10-1, so a sub-1 line quantity is real.
-  @ApiProperty({ description: 'Physical truth: everything that arrived', minimum: 0.001 })
+  // Story 2-4a: the GOOD units, 0 on an all-damaged line (the floor follows
+  // the receipt validator, @Min(0)).
+  @ApiProperty({ description: 'The good units that arrived (story 2-4a — damaged units are damagedQty; 0 on an all-damaged line)', minimum: 0 })
   qty!: number;
 
   @ApiProperty({ description: 'The within-open portion applied immediately — 0 on every line of a late receipt (story 21-9)', minimum: 0 })
@@ -270,6 +325,18 @@ export class GrnLineDto {
       "Story 1-2b — the part of appliedQty past the open quantity that booked at once within the client's receiving tolerance (no over-receipt). Present only when > 0",
   })
   toleranceQty?: number;
+
+  @ApiProperty({ required: false, minimum: 0, description: 'Story 2-4a — the units that arrived damaged, booked into the system DAMAGED bin (not sellable). Present only when > 0' })
+  damagedQty?: number;
+
+  @ApiProperty({ required: false, enum: [...DAMAGE_REASON_CODES], description: 'Story 2-4a — why; present only beside damagedQty' })
+  damageReasonCode?: string;
+
+  @ApiProperty({ required: false, minimum: 0, description: "Story 2-4a — the units short against the supplier's document (recorded only). Present only when > 0" })
+  shortQty?: number;
+
+  @ApiProperty({ required: false, enum: [...SHORT_REASON_CODES], description: 'Story 2-4a — why; present only beside shortQty' })
+  shortReasonCode?: string;
 
   @ApiProperty({
     required: false,
@@ -303,8 +370,20 @@ export class RejectedGrnLineDto {
   @ApiProperty({ format: 'uuid' })
   skuId!: string;
 
-  @ApiProperty({ minimum: 0.001 })
+  @ApiProperty({ minimum: 0, description: 'The line\'s good units, as sent (story 2-4a — 0 on an all-damaged line)' })
   qty!: number;
+
+  @ApiProperty({ required: false, minimum: 0, description: 'Story 2-4a — the refused line\'s damaged units, as sent (not booked — the line went to review whole). Present only when > 0' })
+  damagedQty?: number;
+
+  @ApiProperty({ required: false, enum: [...DAMAGE_REASON_CODES], description: 'Story 2-4a — present only beside damagedQty' })
+  damageReasonCode?: string;
+
+  @ApiProperty({ required: false, minimum: 0, description: 'Story 2-4a — the refused line\'s short units, as sent. Present only when > 0' })
+  shortQty?: number;
+
+  @ApiProperty({ required: false, enum: [...SHORT_REASON_CODES], description: 'Story 2-4a — present only beside shortQty' })
+  shortReasonCode?: string;
 
   @ApiProperty({
     enum: [...REJECTED_GRN_LINE_CODES],
@@ -585,11 +664,17 @@ export class GoodsReceiptEntryDto {
   @ApiProperty({ description: 'Received (sku, batch) lines' })
   lineCount!: number;
 
-  @ApiProperty({ description: 'Physical units across all lines' })
+  @ApiProperty({ description: 'The good units across all lines (story 2-4a — damaged units are damagedUnits)' })
   totalUnits!: number;
 
   @ApiProperty({ description: 'Units applied immediately (the excess pends)' })
   appliedUnits!: number;
+
+  @ApiProperty({ minimum: 0, description: 'Story 2-4a — the damaged units across all lines (booked into the system DAMAGED bin); 0 when none' })
+  damagedUnits!: number;
+
+  @ApiProperty({ minimum: 0, description: "Story 2-4a — the units short against the supplier's documents across all lines (recorded only); 0 when none" })
+  shortUnits!: number;
 
   @ApiProperty({ description: 'Row creation time (the keyset cursor field), ISO-8601 UTC' })
   createdAt!: string;
@@ -651,6 +736,51 @@ export class GoodsReceiptListQuery {
   @Min(1)
   @Max(200)
   limit?: number;
+}
+
+/** Story 2-4a — one GRN line of the web's expandable GRN row (base units). */
+export class GoodsReceiptLineEntryDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty()
+  skuName!: string;
+
+  @ApiProperty({ format: 'uuid', type: String, nullable: true })
+  batchId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  batchCode!: string | null;
+
+  @ApiProperty({ minimum: 0, description: 'The good units (0 on an all-damaged line)' })
+  qty!: number;
+
+  @ApiProperty({ minimum: 0, description: 'The good units applied at once (the rest pended as an over-receipt)' })
+  appliedQty!: number;
+
+  @ApiProperty({ required: false, minimum: 0, description: 'The damaged units, booked into the system DAMAGED bin — present only when > 0' })
+  damagedQty?: number;
+
+  @ApiProperty({ required: false, enum: [...DAMAGE_REASON_CODES], description: 'Present only beside damagedQty' })
+  damageReasonCode?: string;
+
+  @ApiProperty({ required: false, minimum: 0, description: "The units short against the supplier's document (recorded only) — present only when > 0" })
+  shortQty?: number;
+
+  @ApiProperty({ required: false, enum: [...SHORT_REASON_CODES], description: 'Present only beside shortQty' })
+  shortReasonCode?: string;
+}
+
+/** Story 2-4a — GET …/receiving/goods-receipts/{grnId}/lines response. */
+export class GoodsReceiptLinesResponse {
+  @ApiProperty({ type: [GoodsReceiptLineEntryDto], description: 'The GRN\'s lines, in receipt order' })
+  items!: GoodsReceiptLineEntryDto[];
 }
 
 export class GoodsReceiptListResponse {
@@ -1315,4 +1445,19 @@ export class CatalogSnapshotResponse {
       'Story 2-3a (additive): the warehouse\'s open gate-ins — not gated out, gated in within the last 7 days, at most 200, newest first (decision 15). The dock records their unload and receives against them. An older server omits it',
   })
   openGateIns!: readonly CatalogOpenGateInDto[];
+
+  @ApiProperty({
+    enum: [...DAMAGE_REASON_CODES],
+    isArray: true,
+    description:
+      'Story 2-4a (additive): the damage reason vocabulary — the handheld shows its Damaged control only when the snapshot carries it (an older server omits it), and refuses to confirm a draft holding damage against a snapshot without it',
+  })
+  receiptDamageReasons!: readonly string[];
+
+  @ApiProperty({
+    enum: [...SHORT_REASON_CODES],
+    isArray: true,
+    description: 'Story 2-4a (additive): the short reason vocabulary — the Short control\'s gate, as receiptDamageReasons',
+  })
+  receiptShortReasons!: readonly string[];
 }

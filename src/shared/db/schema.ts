@@ -2539,10 +2539,17 @@ export type GateInDocumentRow = typeof gateInDocuments.$inferSelect;
  * Ops Manager decides. `po_line_id` is null on blind lines; `batch_id` is the
  * catalog-owned batch identity (`batches.id` — created through
  * `CatalogFacade.ensureBatches`, never a direct write; null on non-batch-
- * tracked SKUs). Quantities are positive / non-negative integers in base UoM
- * (DB CHECKs in 0013).
+ * tracked SKUs). Quantities are milli-units (story 10.1).
  *
- * RLS policy + quantity CHECKs live **only in the migration SQL** (0013).
+ * Story 2-4a: `qty` is the GOOD units only (it may be 0 — an all-damaged
+ * line); `damaged_qty` arrived damaged (booked into the system DAMAGED bin,
+ * never crediting a document line) with its `damage_reason_code`, and
+ * `short_qty` is recorded only (the supplier's invoice listed more than
+ * arrived) with its `short_reason_code`. A line always carries arrivals:
+ * `qty + damaged_qty > 0`.
+ *
+ * RLS policy + quantity CHECKs live **only in the migration SQL** (0013,
+ * 0026, 0087).
  */
 export const goodsReceiptLines = pgTable(
   'goods_receipt_lines',
@@ -2567,6 +2574,21 @@ export const goodsReceiptLines = pgTable(
      * 0 ≤ tolerance_qty ≤ applied_qty (CHECK in migration 0078 only).
      */
     toleranceQty: bigint('tolerance_qty', { mode: 'number' }).notNull().default(0),
+    /**
+     * Story 2-4a — units that arrived DAMAGED (milli-units): booked into the
+     * warehouse's system DAMAGED bin (`grn.damaged`), outside ATP, never
+     * crediting the PO or ASN line. 0 with a null reason, or > 0 with a
+     * reason from `DAMAGE_REASON_CODES` (pairing CHECK in 0087 only).
+     */
+    damagedQty: bigint('damaged_qty', { mode: 'number' }).notNull().default(0),
+    damageReasonCode: text('damage_reason_code'),
+    /**
+     * Story 2-4a — units the supplier's invoice or challan listed that never
+     * arrived (milli-units): RECORDED ONLY — no stock, no document effect.
+     * 0 with a null reason, or > 0 with a reason from `SHORT_REASON_CODES`.
+     */
+    shortQty: bigint('short_qty', { mode: 'number' }).notNull().default(0),
+    shortReasonCode: text('short_reason_code'),
     ...tenantTimestamps,
   },
   (table) => [

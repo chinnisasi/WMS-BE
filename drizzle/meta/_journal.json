@@ -610,6 +610,13 @@
       "when": 1792559427861,
       "tag": "0086_gate_ins",
       "breakpoints": true
+    },
+    {
+      "idx": 87,
+      "version": "7",
+      "when": 1792604928128,
+      "tag": "0087_receipt_line_condition",
+      "breakpoints": true
     }
   ]
 }

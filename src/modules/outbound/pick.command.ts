@@ -755,7 +755,7 @@ export class PickCommandService {
       }
       if (drawBin.systemOwned) {
         throw pickValidation(
-          `Bin "${drawBin.code}" is a system bin (Receiving/QC-hold) — picks draw from storage bins only.`,
+          `Bin "${drawBin.code}" is a system bin (Receiving/QC-hold/In-Transit/Returns/Damaged) — picks draw from storage bins only.`,
         );
       }
       if (drawBin.retiredAt !== null) {

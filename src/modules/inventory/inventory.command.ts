@@ -26,7 +26,7 @@ import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
-import { IN_TRANSIT_BIN_CODE, QC_HOLD_BIN_CODE, RETURNS_BIN_CODE } from '../tenancy/receiving-bin';
+import { DAMAGED_BIN_CODE, IN_TRANSIT_BIN_CODE, QC_HOLD_BIN_CODE, RETURNS_BIN_CODE } from '../tenancy/receiving-bin';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { uomPrecision } from '../catalog/uom';
 import { LedgerService } from './ledger.service';
@@ -707,7 +707,23 @@ export class StockAdjustmentCommand {
     // Integrity-only reads: a missing scope is 404 before any write
     // (the bin row is not used beyond existence; the SKU row carries the
     // unit the delta is measured in).
-    await this.assertBinInWarehouse(tx, command);
+    const bin = await this.assertBinInWarehouse(tx, command);
+    // ── story 2-4a: the system DAMAGED bin is WRITE-OFF ONLY (decision 3) ─
+    // Damaged receipt units leave DAMAGED by a negative adjustment (the
+    // write-off) and by nothing else; an adjustment INTO it (a positive
+    // delta) would book unsellable stock with no receipt behind it. Here —
+    // inside the guard set — because this method runs before the pend
+    // branch (an over-threshold write-off still pends) AND again at the
+    // pend's approval, so a positive pend raised before this rule is refused
+    // when an owner approves it. The sign is the request's, in base units.
+    if (bin.systemOwned && bin.code === DAMAGED_BIN_CODE && !(command.quantityDelta < 0)) {
+      throw new ProblemException(
+        'damaged-bin-write-off-only',
+        400,
+        'The system DAMAGED bin only takes a write-off',
+        `The system DAMAGED bin holds units received damaged — they leave only by a write-off (a negative adjustment); an adjustment of ${String(command.quantityDelta)} into it is refused.`,
+      );
+    }
     const sku = await this.assertSkuInTenant(tx, command);
     // Story 1-2a decision 7 — stock that turns up for a DEPARTED client is
     // refused (409 `client-departed`) until an owner reactivates it: a
@@ -921,7 +937,7 @@ export class StockAdjustmentCommand {
   private async assertBinInWarehouse(
     tx: TenantTx,
     command: AdjustStockCommand,
-  ): Promise<{ id: string; code: string }> {
+  ): Promise<{ id: string; code: string; systemOwned: boolean }> {
     const rows = await tx
       .select({ id: bins.id, code: bins.code, systemOwned: bins.systemOwned, retiredAt: bins.retiredAt })
       .from(bins)
