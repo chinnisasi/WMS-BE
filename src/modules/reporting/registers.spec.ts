@@ -15,6 +15,7 @@ describe('referenceSummary (story 5-3a)', () => {
     [{ kind: 'qc-hold', holdId: 'h1' }, 'QC hold h1'],
     [{ kind: 'putaway', grnId: GRN, grnLineId: 'l1' }, 'putaway GRN GRN-0042'],
     [{ kind: 'bin-merge', mergeId: 'm1' }, 'bin merge m1'],
+    [{ kind: 'bin-move', moveId: 'mv1', reasonCode: 'consolidate' }, 'bin move mv1'],
     [{ kind: 'pick', picklistId: 'pl', picklistLineId: 'pll', waveId: 'w', orderId: 'o1', orderLineId: 'ol' }, 'pick order o1'],
     [{ kind: 'pick', picklistId: 'pl', picklistLineId: 'pll', waveId: 'w', orderId: 'o1', orderLineId: 'ol', shortPick: true }, 'pick order o1 (short)'],
     [{ kind: 'pack', orderId: 'o1', orderLineId: 'ol', packedQty: 1 }, 'pack order o1'],
@@ -30,7 +31,7 @@ describe('referenceSummary (story 5-3a)', () => {
   });
 
   it('covers every kind of the union', () => {
-    expect(new Set(cases.map(([doc]) => doc.kind)).size).toBe(11);
+    expect(new Set(cases.map(([doc]) => doc.kind)).size).toBe(12);
   });
 
   it('a kind this build does not know prints its kind; a non-object prints unknown', () => {
