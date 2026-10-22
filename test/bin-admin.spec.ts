@@ -204,6 +204,8 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
     if (createdTenantIds.length === 0) return;
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
+      await sql.unsafe('DELETE FROM qc_inspection_lines WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
+      await sql.unsafe('DELETE FROM qc_inspections WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM qc_holds WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM goods_receipt_lines WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM goods_receipt_notes WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);

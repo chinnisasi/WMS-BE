@@ -226,6 +226,8 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'goods_receipt.shelf_life_waived', targetType: 'goods_receipt' },
   { action: 'qc_hold.receipt_placed', targetType: 'goods_receipt' },
   { action: 'qc_hold.receipt_released', targetType: 'goods_receipt' },
+  // Story 2-8a — the QC inspection outcome closes one hold (`QcCommand.inspectHold`).
+  { action: 'qc_hold.inspected', targetType: 'qc_hold' },
   // Story 1-3 — the business partner master (`PartnersCommand`). The Story
   // 3.1 `vendor.created` audit action left the registry with it (the outbox
   // event of that name stays).

@@ -34,6 +34,7 @@ import {
   approvedExcessByLine,
   binCandidatesInTx,
   dedicatedClientLabelsInTx,
+  failedReceiptQtyByLine,
   openReceiptHoldQtyByLine,
   pickPutawayCandidate,
   putawayRationale,
@@ -303,7 +304,11 @@ export class PutawayFacade {
     // held line therefore shows no task while an earlier unheld line of the
     // same (sku, batch) keeps its own.
     const receiptHeld = openReceiptHoldQtyByLine(tx, tenantId, warehouseId);
-    const putawayQty = sql<string>`(${goodsReceiptLines.appliedQty} + coalesce(${approvedExcess.excessQty}, 0) - coalesce(${receiptHeld.heldQty}, 0))::bigint`;
+    // Story 2-8a (§7f amended): minus the units that FAILED an inspection of
+    // the line's receipt hold — they went to DAMAGED. Passed units returned
+    // to Receiving and stay work.
+    const receiptFailed = failedReceiptQtyByLine(tx, tenantId, warehouseId);
+    const putawayQty = sql<string>`(${goodsReceiptLines.appliedQty} + coalesce(${approvedExcess.excessQty}, 0) - coalesce(${receiptHeld.heldQty}, 0) - coalesce(${receiptFailed.failedQty}, 0))::bigint`;
     const lineRows = (
       await tx
         .select({
@@ -319,6 +324,7 @@ export class PutawayFacade {
         .innerJoin(goodsReceiptNotes, eq(goodsReceiptNotes.id, goodsReceiptLines.grnId))
         .leftJoin(approvedExcess, eq(approvedExcess.grnLineId, goodsReceiptLines.id))
         .leftJoin(receiptHeld, eq(receiptHeld.grnLineId, goodsReceiptLines.id))
+        .leftJoin(receiptFailed, eq(receiptFailed.grnLineId, goodsReceiptLines.id))
         .where(
           and(
             eq(goodsReceiptNotes.tenantId, tenantId),

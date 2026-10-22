@@ -647,6 +647,8 @@ describe('story 21-4: metering and storage snapshots', () => {
         'grn.damaged': ['to'],
         // Story 3-1 — the bin-to-bin move: a relocation, both bins on one event (meters 0).
         'stock.moved': ['both'],
+        // Story 2-8a — a QC fail: QC-HOLD → DAMAGED on one event (a relocation, meters 0, as qc.held does).
+        'qc.failed': ['both'],
       };
 
       it('every registered type is classified, and each arm folds as the replay rule says', async () => {

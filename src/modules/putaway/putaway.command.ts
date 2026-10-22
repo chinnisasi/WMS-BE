@@ -15,6 +15,8 @@ import {
   overReceipts,
   putawayPlacements,
   qcHolds,
+  qcInspectionLines,
+  qcInspections,
   serials,
   skus,
   stockOnHand,
@@ -369,14 +371,19 @@ export class PutawayCommand {
       // (`PutawayFacade.getPutawayTasksInTx`) derives work by the same rule.
       // Story 1-2b (§7f amended): minus the units still on an open receipt
       // QC hold of the line — they sit in the QC-HOLD bin, not Receiving.
+      // Story 2-8a (§7f amended): minus the units that FAILED an inspection
+      // of the line's receipt hold — they went to DAMAGED, not Receiving.
       const heldQty = await openReceiptHoldQtyOfLineInTx(tx, command.tenantId, command.grnLineId);
+      const failedQty = await failedReceiptQtyOfLineInTx(tx, command.tenantId, command.grnLineId);
       const putawayQty =
-        line.appliedQty + (await approvedExcessOfLineInTx(tx, command.tenantId, command.grnLineId)) - heldQty;
+        line.appliedQty + (await approvedExcessOfLineInTx(tx, command.tenantId, command.grnLineId)) - heldQty - failedQty;
       if (putawayQty <= 0) {
         throw putawayValidation(
           heldQty > 0
             ? `GRN line "${command.grnLineId}" is on a QC-on-receipt hold — release the hold before placing its units.`
-            : `GRN line "${command.grnLineId}" applied 0 units and has no approved over-receipt — nothing was put into the Receiving bin to place.`,
+            : failedQty > 0
+              ? `GRN line "${command.grnLineId}" failed its QC inspection — its failed units are in the DAMAGED bin, not Receiving, so nothing is left to place.`
+              : `GRN line "${command.grnLineId}" applied 0 units and has no approved over-receipt — nothing was put into the Receiving bin to place.`,
         );
       }
       const skuRows = await tx
@@ -1983,6 +1990,68 @@ export async function openReceiptHoldQtyOfLineInTx(tx: TenantTx, tenantId: strin
       ),
     );
   return Number(rows[0]?.heldQty ?? 0);
+}
+
+/**
+ * Story 2-8a — the units of each GRN line that FAILED an inspection of its
+ * receipt hold, milli-units: Σ `failed` rows of each INSPECTED `receipt`
+ * hold's inspection, grouped by the hold's GRN line (from `qc_inspection_lines`
+ * through `qc_inspections.hold_id` → `qc_holds.grn_line_id`). Failed units
+ * went QC-HOLD → DAMAGED, never back to Receiving, so they are not putaway
+ * work — the third term of §7f: applied + approved excess − open-held −
+ * failed. Passed units returned to Receiving and stay work (as on a release).
+ */
+export function failedReceiptQtyByLine(tx: TenantTx, tenantId: string, warehouseId: string) {
+  return tx
+    .select({
+      grnLineId: qcHolds.grnLineId,
+      failedQty: sql<string>`sum(${qcInspectionLines.quantity})::bigint`.as('receipt_failed_qty'),
+    })
+    .from(qcHolds)
+    .innerJoin(qcInspections, and(eq(qcInspections.tenantId, qcHolds.tenantId), eq(qcInspections.holdId, qcHolds.id)))
+    .innerJoin(
+      qcInspectionLines,
+      and(
+        eq(qcInspectionLines.tenantId, qcInspections.tenantId),
+        eq(qcInspectionLines.inspectionId, qcInspections.id),
+        eq(qcInspectionLines.outcome, 'failed'),
+      ),
+    )
+    .where(
+      and(
+        eq(qcHolds.tenantId, tenantId),
+        eq(qcHolds.warehouseId, warehouseId),
+        eq(qcHolds.kind, 'receipt'),
+        eq(qcHolds.status, 'inspected'),
+      ),
+    )
+    .groupBy(qcHolds.grnLineId)
+    .as('receipt_failed');
+}
+
+/** Story 2-8a — the failed-at-inspection units of ONE GRN line, milli-units (0 when none) — the placement's half. */
+export async function failedReceiptQtyOfLineInTx(tx: TenantTx, tenantId: string, grnLineId: string): Promise<number> {
+  const rows = await tx
+    .select({ failedQty: sql<string | null>`sum(${qcInspectionLines.quantity})::bigint` })
+    .from(qcHolds)
+    .innerJoin(qcInspections, and(eq(qcInspections.tenantId, qcHolds.tenantId), eq(qcInspections.holdId, qcHolds.id)))
+    .innerJoin(
+      qcInspectionLines,
+      and(
+        eq(qcInspectionLines.tenantId, qcInspections.tenantId),
+        eq(qcInspectionLines.inspectionId, qcInspections.id),
+        eq(qcInspectionLines.outcome, 'failed'),
+      ),
+    )
+    .where(
+      and(
+        eq(qcHolds.tenantId, tenantId),
+        eq(qcHolds.grnLineId, grnLineId),
+        eq(qcHolds.kind, 'receipt'),
+        eq(qcHolds.status, 'inspected'),
+      ),
+    );
+  return Number(rows[0]?.failedQty ?? 0);
 }
 
 /**

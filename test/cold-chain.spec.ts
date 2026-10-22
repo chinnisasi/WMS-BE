@@ -235,6 +235,8 @@ describe('cold-chain trace: the FR-45 reconstruction read (e2e, story 12-6)', ()
       await cleaner.unsafe('set session_replication_role = DEFAULT');
       for (const table of [
         'reservations',
+        'qc_inspection_lines',
+        'qc_inspections',
         'qc_holds',
         'temperature_excursions',
         'serials',

@@ -841,7 +841,7 @@ export class StockAdjustmentCommand {
         'damaged-bin-write-off-only',
         400,
         'The system DAMAGED bin only takes a write-off',
-        `The system DAMAGED bin holds units received damaged — they leave only by a write-off (a negative adjustment); an adjustment of ${String(command.quantityDelta)} into it is refused.`,
+        `The system DAMAGED bin holds units received damaged or failed at QC — they leave only by a write-off (a negative adjustment); an adjustment of ${String(command.quantityDelta)} into it is refused.`,
       );
     }
     const sku = await this.assertSkuInTenant(tx, command);
