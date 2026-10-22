@@ -139,7 +139,7 @@ export class PortalController {
   @Get(':tenantId/portal/orders')
   @UseGuards(PortalSessionGuard)
   @ApiBearerAuth()
-  @ApiOperation({ summary: "This client's orders, newest first (keyset), optionally one status" })
+  @ApiOperation({ summary: "This client's orders, newest first (keyset), optionally one status; story 4-1b: `reference` finds one by your order number or the channel's reference (exact)" })
   @ApiOkResponse({ type: PortalOrderPageResponse })
   @ApiResponse({ status: 400, ...problemJsonResponse(PORTAL_PAGE_400) })
   @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
@@ -154,6 +154,7 @@ export class PortalController {
     const page = await this.outbound.portalOrders(tenantId, session.clientId, {
       ...pageQuery(query),
       ...(query.status === undefined ? {} : { status: query.status }),
+      ...(query.reference === undefined ? {} : { reference: query.reference }),
     });
     return { items: [...page.items], nextCursor: page.nextCursor };
   }
@@ -176,7 +177,7 @@ export class PortalController {
   @ApiResponse({
     status: 400,
     ...problemJsonResponse(
-      'Missing (idempotency-key-required) or malformed (idempotency-key-invalid) Idempotency-Key; an invalid body — a clientId or a ratePaise, no lines or more than 200, an incomplete ship-to address, a malformed consignee GSTIN or legal name, or a quantity finer than its unit (validation-failed)',
+      'Missing (idempotency-key-required) or malformed (idempotency-key-invalid) Idempotency-Key; an invalid body — a clientId or a ratePaise, no lines or more than 200, an incomplete ship-to address, a malformed consignee GSTIN or legal name, a quantity finer than its unit, or an order number that is not 1–64 printable ASCII characters (validation-failed)',
     ),
   })
   @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
@@ -191,7 +192,7 @@ export class PortalController {
   @ApiResponse({
     status: 409,
     ...problemJsonResponse(
-      'Not enough stock at the warehouse for a line — nothing was placed (order-backorder-rejected, extensions.skuCodes naming the short SKUs); a licence for one of the products is not on file with the warehouse (licence-not-covered); a SKU was deactivated while the order was placed — refused even when its stock covered the line, the portal never sells down (sku-inactive); a SKU became a kit or left this client while the order was placed (order-catalog-changed); or a concurrent idempotent request (conflict)',
+      'Not enough stock at the warehouse for a line — nothing was placed (order-backorder-rejected, extensions.skuCodes naming the short SKUs); a licence for one of the products is not on file with the warehouse (licence-not-covered); a SKU was deactivated while the order was placed — refused even when its stock covered the line, the portal never sells down (sku-inactive); a SKU became a kit or left this client while the order was placed (order-catalog-changed); story 4-1b: the order number is already used by another of this client\'s orders (a cancelled order frees its number) — nothing was placed (duplicate-client-order-ref); or a concurrent idempotent request (conflict)',
     ),
   })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
@@ -219,10 +220,20 @@ export class PortalController {
         destination: dto.destination,
         ...(dto.consigneeGstin === undefined ? {} : { consigneeGstin: dto.consigneeGstin }),
         ...(dto.consigneeLegalName === undefined ? {} : { consigneeLegalName: dto.consigneeLegalName }),
+        // Story 4-1b: VERBATIM — the command normalizes and refuses it.
+        ...(dto.clientOrderRef === undefined ? {} : { clientOrderRef: dto.clientOrderRef }),
       },
       key,
     );
-    return { orderId: placed.orderId, warehouseName: placed.warehouseName, lineCount: placed.lineCount, placedAt: placed.placedAt };
+    // Story 4-1b: a replay stored before 4-1b carries no `clientOrderRef` —
+    // it stays absent (never invented), and a reader treats absent as null.
+    return {
+      orderId: placed.orderId,
+      warehouseName: placed.warehouseName,
+      lineCount: placed.lineCount,
+      placedAt: placed.placedAt,
+      ...(placed.clientOrderRef === undefined ? {} : { clientOrderRef: placed.clientOrderRef }),
+    };
   }
 
   @Get(':tenantId/portal/orders/:orderId')

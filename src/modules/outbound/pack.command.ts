@@ -175,6 +175,11 @@ export interface PackSnapshot {
     readonly source: OrderSource;
     readonly integrationId: string | null;
     readonly externalEventId: string | null;
+    /**
+     * Story 4-1b — the client's own order number; null when none. Optional: a
+     * snapshot stored before 4-1b lacks it (a reader treats absent as null).
+     */
+    readonly clientOrderRef?: string | null;
     readonly packedBy: string;
     readonly packedAt: string;
     readonly weightGrams: number | null;
@@ -768,6 +773,7 @@ export class PackCommandService {
           source: order.source as OrderSource,
           integrationId: order.integrationId,
           externalEventId: order.externalEventId,
+          clientOrderRef: order.clientOrderRef,
           packedBy: command.actorUserId,
           packedAt: canonicalInstant(packedAt),
           weightGrams,

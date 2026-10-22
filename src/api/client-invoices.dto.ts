@@ -241,8 +241,11 @@ export class OrderRefDto {
   @ApiProperty({ type: String, nullable: true, example: 'manual', description: '`manual` or the channel the order came from; null only when the order row is missing' })
   source!: string | null;
 
-  @ApiProperty({ type: String, nullable: true, description: "The channel's event id (the web labels it \"Channel ref\"); null on a manual order — there is no order number yet" })
+  @ApiProperty({ type: String, nullable: true, description: "The channel's event id (the web labels it \"Channel ref\"); null on a manual order" })
   externalEventId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, maxLength: 64, pattern: '^[!-~]([ -~]{0,62}[!-~])?$', description: "Story 4-1b — the client's own order number; null when none (or when the order row is missing)" })
+  clientOrderRef!: string | null;
 
   @ApiProperty({ format: 'uuid' })
   orderId!: string;

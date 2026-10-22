@@ -18,13 +18,14 @@ import {
 } from 'class-validator';
 import { PORTAL_PAGE_DEFAULT_LIMIT, PORTAL_PAGE_MAX_LIMIT } from '../shared/primitives/portal-page';
 import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../shared/primitives/quantity';
-import { MAX_CONSIGNEE_LEGAL_NAME_LENGTH, ORDER_SOURCES, ORDER_STATUSES, type OrderStatus } from '../modules/outbound/order.command';
+import { CLIENT_ORDER_REF_RE, MAX_CLIENT_ORDER_REF_LENGTH, MAX_CONSIGNEE_LEGAL_NAME_LENGTH, ORDER_SOURCES, ORDER_STATUSES, type OrderStatus } from '../modules/outbound/order.command';
 import { ASN_STATUSES, MAX_ASN_CODE_LENGTH, MAX_ASN_LINES, type AsnStatus } from '../modules/inbound/asn.command';
 import { PO_STATUSES, type PoStatus } from '../modules/inbound/po.command';
 import { CHARGE_CODES, RATE_BASES } from '../modules/billing/rate-cards';
 import { AddressDto, SessionClientResponse, USER_STATUSES } from '../modules/tenancy/tenancy.dto';
 import { GSTIN_RE, gstinDtoTransform } from '../shared/primitives/gstin';
 import { MAX_ORDER_LINES } from '../modules/outbound/outbound.dto';
+import { MAX_EXTERNAL_ID_LENGTH } from '../shared/primitives/ids';
 
 /** Story 4-1a — the portal order's line ceiling IS the staff order's (`CreateOrderDto`), never a copy. */
 const MAX_PORTAL_ORDER_LINES = MAX_ORDER_LINES;
@@ -62,6 +63,23 @@ export class PortalOrdersQuery extends PortalPageQuery {
   @IsOptional()
   @IsIn([...ORDER_STATUSES])
   status?: OrderStatus;
+
+  @ApiProperty({
+    required: false,
+    maxLength: MAX_EXTERNAL_ID_LENGTH,
+    description:
+      "Story 4-1b — an EXACT, case-sensitive match on your order number (any status, cancelled included) or the sales channel's order reference. Trimmed; blank is no search; over 200 characters is 400. Only your own orders are ever searched",
+  })
+  // Trimmed; a blank search reads as no search (one transform).
+  @Transform(({ value }: { value: unknown }) => {
+    if (typeof value !== 'string') return value;
+    const trimmed = value.trim();
+    return trimmed === '' ? undefined : trimmed;
+  })
+  @IsOptional()
+  @IsString()
+  @Length(1, MAX_EXTERNAL_ID_LENGTH)
+  reference?: string;
 }
 
 export class PortalAsnsQuery extends PortalPageQuery {
@@ -155,6 +173,15 @@ export class PortalOrderRowDto {
 
   @ApiProperty({ type: String, nullable: true, description: "The sales channel's own order reference; null for a manual order" })
   externalRef!: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    maxLength: MAX_CLIENT_ORDER_REF_LENGTH,
+    pattern: CLIENT_ORDER_REF_RE.source,
+    description: 'Story 4-1b — your own order number, as given when the order was placed; null when none was given',
+  })
+  clientOrderRef!: string | null;
 
   @ApiProperty()
   warehouseName!: string;
@@ -406,6 +433,19 @@ export class PortalCreateOrderDto {
   // counted in code points after the trim, by the command, behind its replay
   // lookup — a UTF-16 @MaxLength here would refuse names the command accepts.
   consigneeLegalName?: string;
+
+  @ApiProperty({
+    required: false,
+    maxLength: MAX_CLIENT_ORDER_REF_LENGTH,
+    pattern: CLIENT_ORDER_REF_RE.source,
+    description:
+      'Story 4-1b — your own order number (optional). Trimmed (the pattern is the trimmed value\'s); blank reads as absent. 1–64 printable ASCII characters (400 validation-failed otherwise); must not be already used by another of your orders (409 duplicate-client-order-ref — a cancelled order frees its number).',
+  })
+  @IsOptional()
+  @IsString()
+  // No DTO shape check (the 8-1d rule): the command normalizes and refuses
+  // behind its replay lookup.
+  clientOrderRef?: string;
 }
 
 /** `POST portal/orders` 201 — the placed order, an exact key allowlist (and the stored replay). */
@@ -421,6 +461,16 @@ export class PortalPlacedOrderResponse {
 
   @ApiProperty({ format: 'date-time', description: 'When the order was placed' })
   placedAt!: string;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    maxLength: MAX_CLIENT_ORDER_REF_LENGTH,
+    pattern: CLIENT_ORDER_REF_RE.source,
+    description: 'Story 4-1b — your order number as stored (trimmed); null when none was given. Absent only on a replay of an order placed before 4-1b — read absent as null',
+  })
+  clientOrderRef?: string | null;
 }
 
 /** One option of the announce form's SKU picker (portal vocabulary, as on `portal/stock`). */

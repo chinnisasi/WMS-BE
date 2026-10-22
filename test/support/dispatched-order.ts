@@ -60,13 +60,14 @@ function now(): string {
  * sit in a bin the wave plan can draw from (the calling suite seeds it).
  */
 export function dispatchedOrderFixtures(context: () => DispatchedOrderContext) {
-  async function createOrder(lines: { skuId: string; quantity: number }[], wh?: string): Promise<string> {
+  /** `extra` adds body fields (story 4-1b: a `clientOrderRef`). */
+  async function createOrder(lines: { skuId: string; quantity: number }[], wh?: string, extra: Record<string, unknown> = {}): Promise<string> {
     const ctx = context();
     const res = await request(ctx.app.getHttpServer())
       .post(`${API}/${ctx.tenantId}/outbound/orders`)
       .set('Authorization', `Bearer ${ctx.opsToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ warehouseId: wh ?? ctx.warehouseId, lines, destination: testAddress() })
+      .send({ warehouseId: wh ?? ctx.warehouseId, lines, destination: testAddress(), ...extra })
       .expect(201);
     return res.body.order.id as string;
   }
@@ -74,9 +75,10 @@ export function dispatchedOrderFixtures(context: () => DispatchedOrderContext) {
   /** A released single-order wave over a fresh order of `lines`, and its one picklist. */
   async function releasedWave(
     lines: { skuId: string; quantity: number }[],
+    orderExtra: Record<string, unknown> = {},
   ): Promise<{ waveId: string; orderId: string; picklist: Picklist }> {
     const ctx = context();
-    const orderId = await createOrder(lines);
+    const orderId = await createOrder(lines, undefined, orderExtra);
     const policyId = (
       await request(ctx.app.getHttpServer())
         .post(`${API}/${ctx.tenantId}/outbound/wave-policies`)
@@ -141,20 +143,22 @@ export function dispatchedOrderFixtures(context: () => DispatchedOrderContext) {
     // Story 13-2: a catch-weight line's scan names the cases it packs.
     scanned: { skuId: string; qty: number; handlingUnitIds?: string[] }[],
     dispatchBody: Record<string, unknown> = {},
-  ): Promise<void> {
+  ): Promise<{ pack: Record<string, unknown>; dispatch: Record<string, unknown> }> {
     const ctx = context();
-    await request(ctx.app.getHttpServer())
+    const packed = await request(ctx.app.getHttpServer())
       .post(`${API}/${ctx.tenantId}/outbound/orders/${orderId}/pack`)
       .set('Authorization', `Bearer ${ctx.opsToken}`)
       .set(KEY_HEADER, ulid())
       .send({ scanned })
       .expect(201);
-    await request(ctx.app.getHttpServer())
+    const dispatched = await request(ctx.app.getHttpServer())
       .post(`${API}/${ctx.tenantId}/outbound/orders/${orderId}/dispatch`)
       .set('Authorization', `Bearer ${ctx.opsToken}`)
       .set(KEY_HEADER, ulid())
       .send(dispatchBody)
       .expect(201);
+    // Story 4-1b — the two responses, so a suite can read their order fields.
+    return { pack: packed.body.pack as Record<string, unknown>, dispatch: dispatched.body.dispatch as Record<string, unknown> };
   }
 
   /**

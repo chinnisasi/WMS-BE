@@ -434,4 +434,34 @@ describe('issuance-gate parity: GSTIN prefix at entry and the buyer legal name (
     expect(conflict.status).toBe(422);
     expect(conflict.body.code).toBe('order-source-conflict');
   });
+
+  // ── story 4-1b: the client order number (the same conditional-key rule) ──
+
+  it('golden (4-1b): a client order number joins the staff payload hash ONLY when present, normalized, right after the legal name; blank is absent', async () => {
+    const linesJson = `[{"skuId":"${skuId}","quantity":2,"ratePaise":12500}]`;
+    const head = `{"tenantId":"${tenantId}","warehouseId":"${warehouseId}","source":"manual","integrationId":null,"externalEventId":null,"destination":${DESTINATION_JSON},"consigneeGstin":"${gstinWith('29')}"`;
+    // With a legal name AND a ref: the ref follows the name.
+    const namedKey = ulid();
+    const named = await postOrder(
+      orderBody({ consigneeGstin: gstinWith('29'), consigneeLegalName: 'Mysore Spices Pvt Ltd', clientOrderRef: `  GOLD-${namedKey.slice(-6)} ` }),
+      namedKey,
+    ).expect(201);
+    expect(named.body.order.clientOrderRef).toBe(`GOLD-${namedKey.slice(-6)}`);
+    expect((await storedHashes(named.body.order.id as string, namedKey)).payloadHash).toBe(
+      sha256(`${head},"consigneeLegalName":"Mysore Spices Pvt Ltd","clientOrderRef":"GOLD-${namedKey.slice(-6)}","lines":${linesJson}}`),
+    );
+    // A ref without a legal name: right after the GSTIN, where the name would be.
+    const plainKey = ulid();
+    const plain = await postOrder(orderBody({ consigneeGstin: gstinWith('29'), clientOrderRef: `GOLD-${plainKey.slice(-6)}` }), plainKey).expect(201);
+    const plainHashes = await storedHashes(plain.body.order.id as string, plainKey);
+    expect(plainHashes.sourcePayloadHash).toBeNull();
+    expect(plainHashes.payloadHash).toBe(sha256(`${head},"clientOrderRef":"GOLD-${plainKey.slice(-6)}","lines":${linesJson}}`));
+    // Blank and spaces-only are ABSENT — the pre-4-1b bytes exactly (no key at all), and the column stays null.
+    for (const blank of ['', '   ']) {
+      const key = ulid();
+      const created = await postOrder(orderBody({ consigneeGstin: gstinWith('29'), clientOrderRef: blank }), key).expect(201);
+      expect(created.body.order.clientOrderRef).toBeNull();
+      expect((await storedHashes(created.body.order.id as string, key)).payloadHash).toBe(sha256(`${head},"lines":${linesJson}}`));
+    }
+  });
 });

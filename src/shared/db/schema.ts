@@ -2943,6 +2943,15 @@ export const orders = pgTable(
      * Written by the create command only; read by invoicing as the buyer.
      */
     consigneeLegalName: text('consignee_legal_name'),
+    /**
+     * Story 4-1b — the client's OWN order number (optional): 1–64 printable
+     * ASCII characters, no space first or last (the CHECK
+     * `orders_client_order_ref_shape_check`, migration 0088, hand-written).
+     * Unique per client among LIVE orders (`orders_client_order_ref_live_unique`
+     * — a cancelled order frees its number). Written by the staff and portal
+     * create only (never on an ingested order, never amended).
+     */
+    clientOrderRef: text('client_order_ref'),
     ...tenantTimestamps,
   },
   (table) => [
@@ -2969,6 +2978,23 @@ export const orders = pgTable(
     uniqueIndex('orders_source_event_unique')
       .on(table.tenantId, table.integrationId, table.externalEventId)
       .where(sql`integration_id is not null and external_event_id is not null`),
+    // Story 4-1b (0088) — a client order number is unique per client among
+    // its live orders (a cancelled order frees it). The ref leads, so the
+    // same index serves the duplicate check and the `reference` search's
+    // live arm (which states both predicates).
+    uniqueIndex('orders_client_order_ref_live_unique')
+      .on(table.tenantId, table.clientOrderRef, table.clientId)
+      .where(sql`client_order_ref is not null and status <> 'cancelled'`),
+    // Story 4-1b (0088, code review BH5) — the `reference` search's
+    // client-number arm, ANY status (the unique index above leaves cancelled
+    // orders out, so a cancelled order would be unfindable by its number).
+    index('orders_client_order_ref_idx')
+      .on(table.tenantId, table.clientOrderRef, table.clientId)
+      .where(sql`client_order_ref is not null`),
+    // Story 4-1b (0088) — the `reference` search's channel arm.
+    index('orders_external_event_client_idx')
+      .on(table.tenantId, table.externalEventId, table.clientId)
+      .where(sql`external_event_id is not null`),
   ],
 );
 
@@ -5675,7 +5701,9 @@ export type PushDeliveryRow = typeof pushDeliveries.$inferSelect;
  * DISPATCHED order for return (returns module, module-exclusive writes —
  * pinned by `test/architecture.spec.ts`). `client_id` and `warehouse_id` are
  * the order's (an order's client cannot drift from its SKUs', §7b);
- * `order_reference` snapshots the order's `external_event_id` at create;
+ * `order_reference` snapshots the order's reference at create — story 4-1b:
+ * `coalesce(client_order_ref, external_event_id)` (before 4-1b the channel
+ * reference only; no backfill), null when it has neither;
  * `order_dispatched_at` is the earliest `dispatch.dispatched` event of the
  * order. `code` (`RMA-0001`) is server-allocated, unique per tenant;
  * `external_reference` is a channel's or customer's RMA number, deliberately

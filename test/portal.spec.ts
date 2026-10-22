@@ -868,6 +868,8 @@ describe('client portal (e2e, story 21-7)', () => {
         status: 'accepted',
         source: 'manual',
         externalRef: null,
+        // Story 4-1b — the client's own order number joins the exact key allowlist (null when none).
+        clientOrderRef: null,
         warehouseName: 'Portal Main',
         destinationName: 'Priya Sharma',
         destinationCity: 'Bengaluru',
@@ -889,6 +891,8 @@ describe('client portal (e2e, story 21-7)', () => {
         status: 'accepted',
         source: 'manual',
         externalRef: null,
+        // Story 4-1b — the client's own order number joins the exact key allowlist (null when none).
+        clientOrderRef: null,
         warehouseName: 'Portal Main',
         destinationName: 'Priya Sharma',
         destinationCity: 'Bengaluru',
