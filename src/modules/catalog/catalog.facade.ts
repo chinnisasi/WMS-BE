@@ -261,7 +261,8 @@ export interface SkuSummary {
   /**
    * Story 3-1 — the SKU is a kit (it has a composition). A kit holds no
    * stock, so the handheld refuses a move of it offline instead of queueing
-   * one the server would refuse (`kit-cannot-hold-stock`).
+   * one the server would refuse (`kit-cannot-hold-stock`). Story 3-5a: the
+   * count screen refuses a FOUND kit offline the same way.
    */
   readonly isKit: boolean;
 }

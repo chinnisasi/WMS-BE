@@ -179,7 +179,7 @@ export interface CatalogSnapshot {
       readonly subsidiaryClasses: readonly string[];
       readonly packingGroup: string | null;
     } | null;
-    /** Story 3-1: a kit holds no stock — the handheld refuses a move of it offline. Ninth mirror. */
+    /** Story 3-1: a kit holds no stock — the handheld refuses a move of it offline (3-5a: and a found kit in a count). Ninth mirror. */
     readonly isKit: boolean;
   }[];
   readonly openPurchaseOrders: readonly {

@@ -86,7 +86,9 @@ function cutoffInstantMs(payload: Payload): number | null {
  * Events → kind / tab:
  *  - `wave.released` → new-work · Pick (the wave's warehouse);
  *  - `count.created` with origin `on_demand` or `recount` → new-work · Count
- *    (a SCHEDULED count is never pushed — one tick can create dozens);
+ *    (a SCHEDULED count is never pushed — one tick can create dozens; nor is
+ *    a BULK on-demand create, story 3-5a — its payload carries `bulk: true`
+ *    and one request can create hundreds; a summary push is PENDING);
  *  - `transfer.outbound-confirmed` → new-work · Transfer (the DESTINATION
  *    warehouse — the inbound side's new work);
  *  - the three approval raises (`APPROVAL_PUSH_SOURCES`) → approval · All;
@@ -170,6 +172,8 @@ export class PushEnqueueHandler implements OnModuleInit {
       case PUSH_COUNT_CREATED_EVENT:
         // Scheduled counts are never pushed; an unknown origin is not either.
         if (payload.origin !== 'on_demand' && payload.origin !== 'recount') return null;
+        // Story 3-5a — nor a bulk on-demand create (one request, many tasks).
+        if (payload.bulk === true) return null;
         return newWork('Count', uuidField(payload, 'warehouseId'));
       case PUSH_TRANSFER_CONFIRMED_EVENT:
         return newWork('Transfer', uuidField(payload, 'destWarehouseId'));

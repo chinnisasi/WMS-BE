@@ -169,6 +169,10 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'count.created', targetType: 'count_task' },
   { action: 'count.submitted', targetType: 'count_task' },
   { action: 'count_policy.updated', targetType: 'warehouse' },
+  // Story 3-5a — a class unscheduled (`CountService.deleteCountPolicy`). The
+  // bulk create writes one `count.created` per created task under one key;
+  // an all-skipped bulk create is a declared no-op (`counts.createBulk:all-skipped`).
+  { action: 'count_policy.removed', targetType: 'warehouse' },
   { action: 'device.enrolled', targetType: 'device' },
   // Story 9-3b — the export request (tenancy's `AuditExportCommand`).
   { action: 'audit_export.requested', targetType: 'audit_export' },

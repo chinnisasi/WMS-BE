@@ -344,7 +344,12 @@ describe('mobile pushes (e2e, story 9-2b)', () => {
       for (const origin of ['on_demand', 'scheduled', 'recount']) {
         expect(count).toContain(`origin: '${origin}'`);
       }
-      expect(count.match(/type: 'count\.created'/g)).toHaveLength(4);
+      // Story 3-5a — five emitters: the single create, the bulk create, the
+      // scheduler and the two recount mints; the bulk one alone marks its
+      // payload `bulk: true` (the field the enqueue skips on).
+      expect(count.match(/type: 'count\.created'/g)).toHaveLength(5);
+      expect(count.match(/bulk: true,/g)).toHaveLength(1);
+      expect(count).toMatch(/type: 'count\.created',[\s\S]{0,300}origin: 'on_demand',[\s\S]{0,300}bulk: true,/);
       const transfer = readFileSync(join(SRC, 'modules', 'movements', 'transfer.command.ts'), 'utf8');
       expect(transfer).toMatch(/type: 'transfer\.outbound-confirmed',[\s\S]{0,200}destWarehouseId: order\.destWarehouseId/);
       // The approval raises are the 9-2 sources' own raise events (reused, never re-derived).
@@ -535,6 +540,20 @@ describe('mobile pushes (e2e, story 9-2b)', () => {
       recorder.recorded.length = 0;
       expect((await app.get(NotificationsFacade).sendDuePushes(t.tenantId)).claimed).toBe(0);
       expect(recorder.recorded).toHaveLength(0);
+    });
+
+    it('counts: a BULK on-demand create (story 3-5a, `bulk: true`) queues nothing; the same payload without the flag does', async () => {
+      const bulk: string[] = [];
+      for (let i = 0; i < 12; i += 1) {
+        bulk.push(await emit(t.tenantId, 'count.created', { taskId: uuidv7(), binId: uuidv7(), warehouseId: t.whB, origin: 'on_demand', bulk: true }));
+      }
+      // The control: a flag that is not exactly `true` is not a bulk create.
+      const control = await emit(t.tenantId, 'count.created', { taskId: uuidv7(), binId: uuidv7(), warehouseId: t.whB, origin: 'on_demand', bulk: 'yes' });
+      await drainAll();
+      const all = await deliveries(t.tenantId);
+      expect(all.filter((r) => bulk.includes(r.event_id))).toEqual([]);
+      expect((await deliveries(t.tenantId, control)).length).toBeGreaterThan(0);
+      await sql`delete from push_deliveries where tenant_id = ${t.tenantId}`;
     });
 
     it('counts: on-demand and recount queue new-work · Count; a scheduled count tick (30 tasks) queues nothing', async () => {

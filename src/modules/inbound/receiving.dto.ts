@@ -1280,7 +1280,8 @@ export class CatalogTransferTaskDto {
 
 /**
  * One line of the device snapshot's Count inbox task (story 5-3, additive)
- * — the FROZEN expectation the operator counts against.
+ * — the SKU to count. Story 3-5a made the count blind: the frozen
+ * expectation stays on the server (the web task detail shows it).
  */
 export class CatalogCountTaskLineDto {
   @ApiProperty({ format: 'uuid' })
@@ -1292,8 +1293,7 @@ export class CatalogCountTaskLineDto {
   @ApiProperty({ type: String, nullable: true })
   skuName!: string | null;
 
-  @ApiProperty({ description: `The expectation frozen at task start. ${QUANTITY_FIELD_DESCRIPTION}`, minimum: 0 })
-  expectedQuantity!: number;
+  // Story 3-5a — the count is BLIND: no expected quantity reaches a device.
 }
 
 /** One stored count task of the device snapshot (story 5-3, additive) — the Count inbox task. */
@@ -1316,14 +1316,14 @@ export class CatalogCountTaskDto {
   @ApiProperty({
     type: Number,
     nullable: true,
-    description: 'The bin state epoch FROZEN at task start — the submit quotes it back for the equality compare',
+    description: 'The bin state epoch FROZEN at task start — informational: the submit reads the epoch from the task row for the equality compare, never from the device',
   })
   binStateEpoch!: number | null;
 
   @ApiProperty({ description: 'When the task was created (ISO-8601 UTC)' })
   createdAt!: string;
 
-  @ApiProperty({ type: [CatalogCountTaskLineDto], description: 'The FROZEN expectations — every line must be counted at submit' })
+  @ApiProperty({ type: [CatalogCountTaskLineDto], description: 'The SKUs the task lists (blind — no expected quantity); every line must be counted at submit, and SKUs found in the bin may be added' })
   lines!: readonly CatalogCountTaskLineDto[];
 }
 

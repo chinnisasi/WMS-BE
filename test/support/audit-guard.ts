@@ -105,6 +105,17 @@ export const AUDIT_NO_OP_ARMS = {
    */
   'gateIns.unload:already-recorded': (snapshot: unknown) =>
     isRecord(snapshot) && sameKeys(snapshot, ['applied', 'gateIn']) && snapshot.applied === false && isRecord(snapshot.gateIn),
+  /**
+   * Story 3-5a — `CountService.createCountsBulk` that created nothing: every
+   * bin had an open task (or was a listed system/retired bin), or the zone
+   * held no countable bin. The key is stored with `{ created: [], skipped }`.
+   */
+  'counts.createBulk:all-skipped': (snapshot: unknown) =>
+    isRecord(snapshot) &&
+    sameKeys(snapshot, ['created', 'skipped']) &&
+    Array.isArray(snapshot.created) &&
+    snapshot.created.length === 0 &&
+    Array.isArray(snapshot.skipped),
   /** Story 6-1b — `SecondFactorCommand.reset` of a user with no two-factor sign-in and no enrolment code. */
   'users.resetSecondFactor:not-enrolled': (snapshot: unknown) =>
     isRecord(snapshot) &&
