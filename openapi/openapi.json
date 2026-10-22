@@ -1164,6 +1164,121 @@
         ]
       }
     },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/bins/labels": {
+      "post": {
+        "description": "labels.execute (owner, ops manager, operator). Send `binIds` (1–1000 distinct bins of this warehouse) or `zoneId` (the zone's non-retired, non-system bins; more than 1000 is refused). Labels come out sorted by bin code (numeric collation, ties by code then id). Each label carries the code in large text, a Code 128 (start B) of exactly the code, `<ZONE> - <WAREHOUSE>`, and a small line with the storage class when not ambient and the dedicated client's code. `layout=label` prints one label per page / per ^XA…^XZ at `size` 4x2 (default) or 2x1 in; `layout=a4` (PDF only) prints 24 per A4 sheet (3 × 8 cells of 70 × 36 mm). The listing refusals carry `binCodes` (the first 50 offenders). The `Content-Disposition` filename (`bin-labels-<WH>-<YYYYMMDD>.<ext>`, the IST date) is not readable cross-origin — a client builds the same name itself.",
+        "operationId": "TenancyController_printBinLabels",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BinLabelsRequestDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The labels: ZPL as `text/plain; charset=us-ascii`, or a PDF",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid body (validation-failed): both or neither of binIds/zoneId, more than 1000 or duplicate ids, size with the a4 layout, the a4 layout with zpl, or a malformed warehouseId",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks labels.execute (role-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse, zone or a listed bin is not in this tenant and warehouse (not-found), or the zone has no printable bin (no-bins-to-print)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A listed bin is retired (bin-retired) or a system bin (bin-not-printable); a code is not barcodable — non-ASCII, a control character, a leading or trailing space (bin-code-not-barcodable); a code too long for the size or A4 cell at a 2-dot bar (bin-code-too-long-for-label) — each with `binCodes`; or the zone has more than 1000 printable bins (too-many-labels, with `count`)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Prints bin labels: ZPL (Zebra, 203 dpi) or PDF, the barcode a Code 128 of exactly the bin code",
+        "tags": [
+          "tenancy"
+        ]
+      }
+    },
     "/tenants/{tenantId}/warehouses/{warehouseId}/bins/{binId}": {
       "patch": {
         "operationId": "TenancyController_setBinBlocked",
@@ -30807,6 +30922,56 @@
         "required": [
           "items",
           "nextCursor"
+        ]
+      },
+      "BinLabelsRequestDto": {
+        "type": "object",
+        "properties": {
+          "binIds": {
+            "minItems": 1,
+            "maxItems": 1000,
+            "uniqueItems": true,
+            "description": "The bins to print (distinct ids of this warehouse). Send this or `zoneId`, never both.",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "zoneId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Print every printable bin of this zone (retired and system bins are skipped). Send this or `binIds`, never both."
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "zpl",
+              "pdf"
+            ],
+            "description": "`zpl` (Zebra thermal, 203 dpi) or `pdf`"
+          },
+          "layout": {
+            "type": "string",
+            "enum": [
+              "label",
+              "a4"
+            ],
+            "default": "label",
+            "description": "`label` — one label per page or per ^XA…^XZ (default); `a4` — a 3 × 8 sheet of 70 × 36 mm cells (PDF only)"
+          },
+          "size": {
+            "type": "string",
+            "enum": [
+              "4x2",
+              "2x1"
+            ],
+            "default": "4x2",
+            "description": "The label size in inches (`label` layout only; sending it with `a4` is a 400)"
+          }
+        },
+        "required": [
+          "format"
         ]
       },
       "PatchBinDto": {

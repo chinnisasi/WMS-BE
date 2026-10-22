@@ -9,6 +9,7 @@ import {
   ApiOkResponse,
   ApiOperation,
   ApiParam,
+  ApiProduces,
   ApiProperty,
   ApiResponse,
   ApiTags,
@@ -20,6 +21,12 @@ import { ProblemException } from '../../shared/problem-details/problem.exception
 import { CurrentSession } from './tenant-session.guard';
 import { TenantSessionGuard } from './tenant-session.guard';
 import type { TenantSession } from './jwt-session';
+import type { Response } from 'express';
+import { UUID_RE } from '../../shared/primitives/ids';
+import { DEFAULT_LABEL_SIZE } from '../../shared/labels/layout';
+// Value import: Nest DI needs the runtime class token (same bend as below).
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { BinLabelsService } from './bin-labels';
 import { IdempotencyKey, parseRequiredIdempotencyKey } from './idempotency-guard';
 import { clientIpOf } from './auth-attempts';
 import {
@@ -80,6 +87,7 @@ import {
   WarehouseListResponse,
   WarehouseResponse,
   BinGridResponse,
+  BinLabelsRequestDto,
   BinListResponse,
   BinMergeResponse,
   BinResponse,
@@ -132,6 +140,7 @@ export class TenancyController {
     private readonly binCommand: BinCommand,
     private readonly binStateCommand: BinStateCommand,
     private readonly tenancyService: TenancyService,
+    private readonly binLabels: BinLabelsService,
   ) {}
 
   @Post()
@@ -554,6 +563,98 @@ export class TenancyController {
       query.limit === undefined ? undefined : query.limit,
     );
     return { items: [...page.items], nextCursor: page.nextCursor };
+  }
+
+  /**
+   * Story 2-10a — bin labels as a file download (ZPL or PDF). Declared BEFORE
+   * the `bins/:binId` routes (IMPLEMENTATION-GUIDE §6 route order) so the
+   * literal `labels` segment is never read as a bin id. The §6 binary
+   * pattern: every refusal is thrown before the first header, so it stays
+   * problem+json; then the headers and `res.end(buffer)` (no ETag). A read —
+   * no idempotency key, no audit row.
+   */
+  @Post(':tenantId/warehouses/:warehouseId/bins/labels')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Prints bin labels: ZPL (Zebra, 203 dpi) or PDF, the barcode a Code 128 of exactly the bin code',
+    description:
+      'labels.execute (owner, ops manager, operator). Send `binIds` (1–1000 distinct bins of this warehouse) or `zoneId` (the zone\'s non-retired, non-system bins; more than 1000 is refused). ' +
+      'Labels come out sorted by bin code (numeric collation, ties by code then id). Each label carries the code in large text, a Code 128 (start B) of exactly the code, `<ZONE> - <WAREHOUSE>`, and a small line with the storage class when not ambient and the dedicated client\'s code. ' +
+      '`layout=label` prints one label per page / per ^XA…^XZ at `size` 4x2 (default) or 2x1 in; `layout=a4` (PDF only) prints 24 per A4 sheet (3 × 8 cells of 70 × 36 mm). ' +
+      'The listing refusals carry `binCodes` (the first 50 offenders). The `Content-Disposition` filename (`bin-labels-<WH>-<YYYYMMDD>.<ext>`, the IST date) is not readable cross-origin — a client builds the same name itself.',
+  })
+  @ApiBody({ type: BinLabelsRequestDto })
+  @ApiProduces('text/plain', 'application/pdf')
+  @ApiResponse({
+    status: 200,
+    description: 'The labels: ZPL as `text/plain; charset=us-ascii`, or a PDF',
+    content: {
+      'text/plain': { schema: { type: 'string', format: 'binary' } },
+      'application/pdf': { schema: { type: 'string', format: 'binary' } },
+    },
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Invalid body (validation-failed): both or neither of binIds/zoneId, more than 1000 or duplicate ids, size with the a4 layout, the a4 layout with zpl, or a malformed warehouseId') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), the caller lacks labels.execute (role-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse, zone or a listed bin is not in this tenant and warehouse (not-found), or the zone has no printable bin (no-bins-to-print)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('A listed bin is retired (bin-retired) or a system bin (bin-not-printable); a code is not barcodable — non-ASCII, a control character, a leading or trailing space (bin-code-not-barcodable); a code too long for the size or A4 cell at a 2-dot bar (bin-code-too-long-for-label) — each with `binCodes`; or the zone has more than 1000 printable bins (too-many-labels, with `count`)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  async printBinLabels(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: BinLabelsRequestDto,
+    @Res() res: Response,
+  ): Promise<void> {
+    assertOwnTenant(session, tenantId);
+    // Authority before every body and path 400 (the DTO's own shape checks
+    // run earlier, in the ValidationPipe): a role without labels.execute
+    // learns nothing from its body.
+    await this.binLabels.assertCanPrint(tenantId, session.userId);
+    if (!UUID_RE.test(warehouseId)) {
+      throw new ProblemException('validation-failed', 400, 'Malformed warehouseId', `warehouseId must be a uuid (got "${warehouseId}").`);
+    }
+    // `@IsOptional` lets null through: null counts as absent.
+    const binIds = dto.binIds ?? undefined;
+    const zoneId = dto.zoneId ?? undefined;
+    if ((binIds === undefined) === (zoneId === undefined)) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'Send binIds or zoneId',
+        'Send exactly one of `binIds` (the bins to print) or `zoneId` (every printable bin of a zone).',
+      );
+    }
+    // Uuids are case-insensitive: two spellings of one id are a duplicate.
+    const lowerIds = binIds?.map((id) => id.toLowerCase());
+    if (lowerIds !== undefined && new Set(lowerIds).size !== lowerIds.length) {
+      throw new ProblemException('validation-failed', 400, 'Duplicate bin ids', 'binIds lists the same bin more than once (uuids compare case-insensitively).');
+    }
+    const layout = dto.layout ?? 'label';
+    if (layout === 'a4' && dto.size !== undefined) {
+      throw new ProblemException('validation-failed', 400, 'size does not apply to a4', 'The A4 sheet has fixed 70 × 36 mm cells — omit `size` with `layout: a4`.');
+    }
+    if (layout === 'a4' && dto.format !== 'pdf') {
+      throw new ProblemException('validation-failed', 400, 'a4 is PDF only', 'The A4 sheet layout is a PDF — send `format: pdf`, or `layout: label` for ZPL.');
+    }
+    const file = await this.binLabels.render({
+      tenantId,
+      actorUserId: session.userId,
+      warehouseId,
+      binIds: lowerIds,
+      zoneId,
+      format: dto.format,
+      layout,
+      size: dto.size ?? DEFAULT_LABEL_SIZE,
+    });
+    res.status(200);
+    res.setHeader('Content-Type', file.contentType);
+    res.setHeader('Content-Length', String(file.body.length));
+    res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(file.body);
   }
 
   @Patch(':tenantId/warehouses/:warehouseId/bins/:binId')

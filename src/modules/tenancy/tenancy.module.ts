@@ -11,6 +11,7 @@ import { AuditExportCommand } from './audit-export.command';
 import { AuditExportRunner } from './audit-export.runner';
 import { AUDIT_EXPORT_STORE, PostgresAuditExportStore } from './audit-export.store';
 import { BinCommand } from './bin.command';
+import { BinLabelsService } from './bin-labels';
 import { DeviceSessionGuard } from './device-session.guard';
 import { EnrollmentCommand } from './enrollment.command';
 import { RegistrationCommand } from './registration.command';
@@ -73,6 +74,8 @@ import { ZoneCommand } from './zone.command';
     WarehouseCommand,
     ZoneCommand,
     BinCommand,
+    // Story 2-10a — bin labels (a read: ZPL / PDF rendering).
+    BinLabelsService,
     UsersCommand,
     EnrollmentCommand,
     SyncReportCommand,

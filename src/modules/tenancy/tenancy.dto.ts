@@ -21,6 +21,21 @@ import { GSTIN_RE, gstinDtoTransform } from '../../shared/primitives/gstin';
 import type { AddressSnapshot } from '../../shared/primitives/address';
 import { Transform, Type } from 'class-transformer';
 import {
+  DEFAULT_LABEL_SIZE,
+  LABEL_FORMATS,
+  MAX_LABELS_PER_PRINT,
+  LABEL_LAYOUTS,
+  LABEL_SIZES,
+  type LabelFormat,
+  type LabelLayout,
+  type LabelSize,
+} from '../../shared/labels/layout';
+
+import {
+  ArrayMaxSize,
+  ArrayMinSize,
+  ArrayUnique,
+  IsArray,
   IsBoolean,
   IsEmail,
   IsIn,
@@ -1212,4 +1227,61 @@ export class SetupChecklistStepResponse {
 export class SetupChecklistResponse {
   @ApiProperty({ type: [SetupChecklistStepResponse] })
   steps!: SetupChecklistStepResponse[];
+}
+/**
+ * Story 2-10a — `POST …/warehouses/{w}/bins/labels`. Exactly one of `binIds`
+ * (1–1000 distinct bin ids of this warehouse) or `zoneId` (the zone's
+ * non-retired, non-system bins); `size` only with the `label` layout; `a4`
+ * only with `pdf` — the cross-field rules are 400s in the controller.
+ */
+export class BinLabelsRequestDto {
+  @ApiProperty({
+    required: false,
+    type: [String],
+    format: 'uuid',
+    minItems: 1,
+    maxItems: MAX_LABELS_PER_PRINT,
+    uniqueItems: true,
+    description: 'The bins to print (distinct ids of this warehouse). Send this or `zoneId`, never both.',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(MAX_LABELS_PER_PRINT)
+  @ArrayUnique()
+  @IsUUID('all', { each: true })
+  binIds?: string[];
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: "Print every printable bin of this zone (retired and system bins are skipped). Send this or `binIds`, never both.",
+  })
+  @IsOptional()
+  @IsUUID('all')
+  zoneId?: string;
+
+  @ApiProperty({ enum: [...LABEL_FORMATS], description: '`zpl` (Zebra thermal, 203 dpi) or `pdf`' })
+  @IsIn([...LABEL_FORMATS])
+  format!: LabelFormat;
+
+  @ApiProperty({
+    required: false,
+    enum: [...LABEL_LAYOUTS],
+    default: 'label',
+    description: '`label` — one label per page or per ^XA…^XZ (default); `a4` — a 3 × 8 sheet of 70 × 36 mm cells (PDF only)',
+  })
+  @IsOptional()
+  @IsIn([...LABEL_LAYOUTS])
+  layout?: LabelLayout;
+
+  @ApiProperty({
+    required: false,
+    enum: [...LABEL_SIZES],
+    default: DEFAULT_LABEL_SIZE,
+    description: 'The label size in inches (`label` layout only; sending it with `a4` is a 400)',
+  })
+  @IsOptional()
+  @IsIn([...LABEL_SIZES])
+  size?: LabelSize;
 }
