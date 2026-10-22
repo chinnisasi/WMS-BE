@@ -1,4 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
+import { EMAIL_STATUSES, type EmailStatus } from '../mail/mail.facade';
 import { MAX_QUANTITY_BASE } from '../../shared/primitives/quantity';
 // Story 12-1: the storage-class vocabulary — the DTO mirror of the shared
 // primitive's tuple (the three-layer pattern: TS tuple / DB CHECK / @IsIn).
@@ -325,6 +326,21 @@ export class UserResponse {
   secondFactorResetPending?: boolean;
 }
 
+/** Story 5-1a — the invite email a command queued (`pending`, or `skipped`). */
+export class InviteEmailStatusResponse {
+  @ApiProperty({ enum: EMAIL_STATUSES, example: 'pending' })
+  status!: EmailStatus;
+}
+
+/** Story 5-1a — the latest invite email of an invited user, on the users list. */
+export class InviteEmailListStatusResponse {
+  @ApiProperty({ enum: EMAIL_STATUSES, example: 'sent' })
+  status!: EmailStatus;
+
+  @ApiProperty({ example: '2026-10-23T05:30:00.000Z', description: 'When the status last changed' })
+  updatedAt!: string;
+}
+
 /** Story 6-1a — deactivate / reactivate. A reactivated never-accepted invitee carries a fresh invite token. */
 export class UserStatusResponse {
   @ApiProperty({ type: UserResponse })
@@ -335,6 +351,23 @@ export class UserStatusResponse {
 
   @ApiProperty({ required: false })
   inviteExpiresAt?: string;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    description:
+      'Story 5-1a — beside `inviteToken` only: the accept link (built from the server’s WEB_BASE_URL; the emailed link is the same). Null when the server has no base URL configured — build it from the web origin',
+  })
+  inviteUrl?: string | null;
+
+  @ApiProperty({
+    type: InviteEmailStatusResponse,
+    nullable: true,
+    required: false,
+    description: 'Story 5-1a — beside `inviteToken` only: the reissued invite’s email. Null on a replay of a response stored before 5-1a',
+  })
+  inviteEmail?: InviteEmailStatusResponse | null;
 }
 
 export class InviteUserDto {
@@ -376,9 +409,21 @@ export class AcceptInviteDto {
   password!: string;
 }
 
+/** Story 5-1a — a users-list row: the user, plus (owner only) its latest invite email. */
+export class UserListItemResponse extends UserResponse {
+  @ApiProperty({
+    type: InviteEmailListStatusResponse,
+    nullable: true,
+    required: false,
+    description:
+      'Story 5-1a — for an `invited` user, the latest invite email’s status (null: none — invited before email existed; null for every other status). Present only when the caller holds users.invite',
+  })
+  inviteEmail?: InviteEmailListStatusResponse | null;
+}
+
 export class UserListResponse {
-  @ApiProperty({ type: [UserResponse] })
-  items!: UserResponse[];
+  @ApiProperty({ type: [UserListItemResponse] })
+  items!: UserListItemResponse[];
 
   @ApiProperty({ type: String, nullable: true, description: 'Opaque keyset cursor' })
   nextCursor!: string | null;
@@ -393,6 +438,21 @@ export class InviteUserResponse {
 
   @ApiProperty({ example: '2026-09-15T00:00:00.000Z', description: 'One-time link expiry (7 days)' })
   inviteExpiresAt!: string;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description:
+      'Story 5-1a — the accept link, built from the server’s WEB_BASE_URL (the emailed link is the same string). Null when the server has no base URL configured — build it from the web origin',
+  })
+  inviteUrl!: string | null;
+
+  @ApiProperty({
+    type: InviteEmailStatusResponse,
+    nullable: true,
+    description: 'Story 5-1a — the invite email this request queued: `pending`, or `skipped` (email off, or outside the allowlist). Null on a replay of a response stored before 5-1a',
+  })
+  inviteEmail!: InviteEmailStatusResponse | null;
 }
 
 export class AcceptInviteResponse {

@@ -5697,6 +5697,47 @@ export const pushDeliveries = pgTable(
 export type PushDeliveryRow = typeof pushDeliveries.$inferSelect;
 
 /**
+ * Story 5-1a — the email queue (mail module, module-exclusive writes). One
+ * row per message a committed business transaction wants sent, written IN
+ * that transaction (`queueEmailInTx` — never the outbox, whose payloads are
+ * plain jsonb): a rolled-back command queues nothing, a replay queues
+ * nothing. No body is stored — only the code-defined `template` and its
+ * `params`; a secret needed only at send time (an invite's raw token) is
+ * `sealed_secret` (AES-GCM, AAD `tenant_id:id`, `EMAIL_SEAL_KEY`) and wiped
+ * on every final status. The sender worker claims due rows (`sending`,
+ * committed before the provider call) — at-most-once: a stale `sending` row
+ * is `failed`, never re-sent. `user_id` is the user the message concerns
+ * (the users list reads the latest invite per user). The vocabulary CHECKs,
+ * the wipe CHECK and RLS live only in `drizzle/0089_email_messages.sql`.
+ */
+export const emailMessages = pgTable(
+  'email_messages',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    userId: uuid('user_id'),
+    template: text('template').notNull(),
+    toEmail: text('to_email').notNull(),
+    params: jsonb('params').notNull(),
+    sealedSecret: text('sealed_secret'),
+    status: text('status').notNull(),
+    attempts: integer('attempts').notNull().default(0),
+    nextAttemptAt: timestamp('next_attempt_at', { withTimezone: true, mode: 'string' }).notNull(),
+    providerMessageId: text('provider_message_id'),
+    errorCode: text('error_code'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    index('email_messages_tenant_status_next_attempt_idx').on(table.tenantId, table.status, table.nextAttemptAt),
+    index('email_messages_tenant_user_created_idx').on(table.tenantId, table.userId, table.createdAt.desc()),
+  ],
+);
+
+export type EmailMessageRow = typeof emailMessages.$inferSelect;
+
+/**
  * Story 13-1 — a return authorization (RMA): an operator authorizes part of a
  * DISPATCHED order for return (returns module, module-exclusive writes —
  * pinned by `test/architecture.spec.ts`). `client_id` and `warehouse_id` are

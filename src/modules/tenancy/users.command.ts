@@ -3,7 +3,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { AUTH_DATABASE, DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { auditEvents, devices, idempotencyKeys, users } from '../../shared/db/schema';
+import { auditEvents, devices, idempotencyKeys, tenants, users } from '../../shared/db/schema';
 import type { UserRole, UserStatus } from '../../shared/db/schema';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
@@ -15,7 +15,15 @@ import { idempotencyKeyReuse } from './registration.command';
 import { assertPermission } from './permissions';
 import { getMemberRoleIn } from './tenancy.service';
 import { DUMMY_HASH, hashPassword } from './passwords';
-import { shareLockClientInTx } from '../clients/clients.facade';
+import { getClientInTx, shareLockClientInTx } from '../clients/clients.facade';
+import {
+  cancelUserEmailsInTx,
+  inviteAcceptUrl,
+  latestUserEmailsInTx,
+  queueEmailInTx,
+  type EmailStatus,
+} from '../mail/mail.facade';
+import { ROLE_CAPABILITIES } from './permissions';
 import { emailDigest, signInLockedUntil } from './auth-attempts';
 import { revokeSessionsInTx } from './sessions';
 import { clearOpenChallengesInTx, clearSecondFactorLockInTx } from './second-factor';
@@ -37,7 +45,8 @@ export type UserAction =
   | 'user.accepted'
   | 'user.deactivated'
   | 'user.reactivated'
-  | 'user.unlocked';
+  | 'user.unlocked'
+  | 'user.invite_resent';
 
 /** The user shape every users response carries — never password material. */
 export interface UserView {
@@ -61,6 +70,22 @@ export interface UserView {
   readonly secondFactorEnabled?: boolean;
   /** Story 6-1b (amendment) — a reset's enrolment code is outstanding and 2FA is not set up again. List only. */
   readonly secondFactorResetPending?: boolean;
+  /**
+   * Story 5-1a — the latest invite email's status for an `invited` user;
+   * list only, and only for a caller holding `users.invite` (absent
+   * otherwise). Null when the user has no invite email (invited before 5-1a).
+   */
+  readonly inviteEmail?: { readonly status: EmailStatus; readonly updatedAt: string } | null;
+}
+
+/**
+ * Story 5-1a — the invite email a command queued, as its response reports it
+ * (`pending`, or `skipped`). Stored in the snapshot, so a replay re-serves
+ * the status the command saw; a snapshot stored before 5-1a has none and
+ * replays it as `null`.
+ */
+export interface InviteEmailState {
+  readonly status: EmailStatus;
 }
 
 export interface UserStatusInput {
@@ -74,6 +99,14 @@ export interface UserStatusSnapshot {
   readonly user: UserView;
   readonly inviteToken?: string;
   readonly inviteExpiresAt?: string;
+  /** Story 5-1a — present beside `inviteToken` (the reissued invite's email). */
+  readonly inviteEmail?: InviteEmailState | null;
+}
+
+/** The deactivate / reactivate response: the snapshot plus (beside a token) the accept link. */
+export interface UserStatusResult extends UserStatusSnapshot {
+  /** Story 5-1a — beside `inviteToken` only: the accept link built from `WEB_BASE_URL` (null when unset). */
+  readonly inviteUrl?: string | null;
 }
 
 export interface InviteUserInput {
@@ -95,6 +128,55 @@ export interface InviteUserSnapshot {
   readonly user: UserView;
   readonly inviteToken: string;
   readonly inviteExpiresAt: string;
+  /** Story 5-1a — the invite email this command queued; absent from a pre-5-1a snapshot. */
+  readonly inviteEmail?: InviteEmailState | null;
+}
+
+/**
+ * Story 5-1a — the invite / resend response: the snapshot, plus the accept
+ * link built from `WEB_BASE_URL` (the emailed link and the copy link are the
+ * same string; null when no base URL is configured — the web then builds it
+ * from its own origin). The link is derived on every answer, never stored.
+ */
+export interface InviteUserResult extends InviteUserSnapshot {
+  readonly inviteUrl: string | null;
+  readonly inviteEmail: InviteEmailState | null;
+}
+
+function inviteResult(tenantId: string, snapshot: InviteUserSnapshot): InviteUserResult {
+  return {
+    ...snapshot,
+    user: normaliseUserView(snapshot.user),
+    inviteEmail: snapshot.inviteEmail ?? null,
+    inviteUrl: inviteAcceptUrl(tenantId, snapshot.inviteToken),
+  };
+}
+
+function statusResult(tenantId: string, snapshot: UserStatusSnapshot): UserStatusResult {
+  if (snapshot.inviteToken === undefined) return snapshot;
+  return {
+    ...snapshot,
+    inviteEmail: snapshot.inviteEmail ?? null,
+    inviteUrl: inviteAcceptUrl(tenantId, snapshot.inviteToken),
+  };
+}
+
+function clientNotActive(code: string, status: string): ProblemException {
+  return new ProblemException(
+    'client-not-active',
+    409,
+    'Client is not active',
+    `Client ${code} is ${status} — portal users are invited only for an active client.`,
+  );
+}
+
+function userNotInvited(email: string, status: string): ProblemException {
+  return new ProblemException(
+    'user-not-invited',
+    409,
+    'Not an open invitation',
+    `${email} is ${status} — only an invited user who has not accepted can be sent a new invitation.`,
+  );
 }
 
 export interface SetUserRoleInput {
@@ -188,7 +270,7 @@ export class UsersCommand {
     @Inject(OUTBOX_SINK) private readonly outbox: OutboxSink,
   ) {}
 
-  async invite(command: InviteUserInput, idempotencyKey: string): Promise<InviteUserSnapshot> {
+  async invite(command: InviteUserInput, idempotencyKey: string): Promise<InviteUserResult> {
     const email = command.email.trim().toLowerCase();
     const clientId = command.clientId ?? null;
     // Story 21-7 — request SHAPE (no DB row needed, so above the
@@ -231,8 +313,7 @@ export class UsersCommand {
         if (existing[0].payloadHash !== payloadHash) {
           throw idempotencyKeyReuse();
         }
-        const stored = existing[0].responseSnapshot as InviteUserSnapshot;
-        return { ...stored, user: normaliseUserView(stored.user) };
+        return existing[0].responseSnapshot as InviteUserSnapshot;
       }
 
       // Story 21-7 — the client checks, BEHIND the replay lookup (a committed
@@ -240,10 +321,12 @@ export class UsersCommand {
       // the client must be this tenant's (read by tenant AND id → 404), a
       // client brand rather than the tenant's own `self` (400), and active
       // (409 `client-not-active`, the 21-3 type).
+      let clientName: string | null = null;
       if (clientId !== null) {
         // Story 21-10 — FOR SHARE, so a suspend cannot commit between this
         // read and the invite insert.
         const client = await shareLockClientInTx(tx, command.tenantId, clientId);
+        clientName = client.name;
         if (client.systemOwned) {
           throw clientRoleShapeRefused(
             "A client-portal user belongs to a client brand — the tenant's own company is not one.",
@@ -305,6 +388,17 @@ export class UsersCommand {
         throw err;
       }
 
+      // Story 5-1a — the invite email, queued IN this transaction (a
+      // rolled-back invite queues nothing; a replay returned above).
+      const inviteEmail = await queueInviteEmailInTx(tx, {
+        tenantId: command.tenantId,
+        actorUserId: command.actorUserId,
+        user,
+        rawToken,
+        expiresAt: inviteExpiresAt,
+        clientName,
+      });
+
       await insertAuditRow(tx, {
         tenantId: command.tenantId,
         actorUserId: command.actorUserId,
@@ -318,6 +412,7 @@ export class UsersCommand {
         user,
         inviteToken: rawToken,
         inviteExpiresAt,
+        inviteEmail,
       };
       // In-transaction outbox append (AD-7, story outbox-relay) — replaces
       // the old post-commit publish, and closes retro item 3: an idempotent
@@ -352,7 +447,7 @@ export class UsersCommand {
       return body;
     });
 
-    return snapshot;
+    return inviteResult(command.tenantId, snapshot);
   }
 
   async setUserRole(command: SetUserRoleInput, idempotencyKey: string): Promise<UserView> {
@@ -606,6 +701,9 @@ export class UsersCommand {
         throw inviteInvalid();
       }
       const updated = updatedRows[0]!;
+      // Story 5-1a — the token is spent: a still-queued invite email would
+      // deliver a dead link.
+      await cancelUserEmailsInTx(tx, invite.tenantId, updated.id, 'user-invite', 'accepted');
 
       await insertAuditRow(tx, {
         tenantId: invite.tenantId,
@@ -675,13 +773,13 @@ export class UsersCommand {
   async setUserStatus(
     command: UserStatusInput & { readonly arm: 'deactivate' | 'reactivate' },
     idempotencyKey: string,
-  ): Promise<UserStatusSnapshot> {
+  ): Promise<UserStatusResult> {
     const payloadHash = hashCommandPayload({
       arm: command.arm,
       tenantId: command.tenantId,
       targetUserId: command.targetUserId,
     });
-    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+    const snapshot = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
       assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'users.role_change');
       const replayed = await replayUserKey(tx, command.tenantId, idempotencyKey, payloadHash);
       if (replayed !== null) return replayed as UserStatusSnapshot;
@@ -738,6 +836,8 @@ export class UsersCommand {
             .where(eq(users.id, target.id))
             .returning();
           await revokeSessionsInTx(tx, command.tenantId, { userId: target.id }, 'deactivated');
+          // Story 5-1a — the cancelled invite's queued email goes with it.
+          await cancelUserEmailsInTx(tx, command.tenantId, target.id, 'user-invite', 'deactivated');
           // Story 6-1b — and any sign-in in progress.
           await clearOpenChallengesInTx(tx, command.tenantId, target.id);
           await tx
@@ -764,6 +864,12 @@ export class UsersCommand {
         body = { user: toUserView(target) };
       } else {
         const restore = target.statusBeforeDeactivation === 'invited' ? 'invited' : 'active';
+        // Story 5-1a — a reissued portal invite needs an active client (the
+        // invite's and the resend's own gate), FOR SHARE.
+        if (restore === 'invited' && target.clientId !== null) {
+          const client = await shareLockClientInTx(tx, command.tenantId, target.clientId);
+          if (client.status !== 'active') throw clientNotActive(client.code, client.status);
+        }
         const rawToken = restore === 'invited' ? generateInviteToken() : null;
         const expiresAt = rawToken === null ? null : new Date(Date.now() + INVITE_TTL_MS).toISOString();
         const updated = await tx
@@ -776,6 +882,13 @@ export class UsersCommand {
           })
           .where(eq(users.id, target.id))
           .returning();
+        const reactivated = toUserView(updated[0]!);
+        // Story 5-1a — a reissued invite is emailed like a new one; any
+        // older live invite email carries a dead token and is cancelled.
+        const inviteEmail =
+          rawToken === null
+            ? null
+            : await this.reissueInviteEmailInTx(tx, command, reactivated, rawToken, expiresAt!, target.clientId);
         await insertAuditRow(tx, {
           tenantId: command.tenantId,
           actorUserId: command.actorUserId,
@@ -786,11 +899,99 @@ export class UsersCommand {
         });
         body =
           rawToken === null
-            ? { user: toUserView(updated[0]!) }
-            : { user: toUserView(updated[0]!), inviteToken: rawToken, inviteExpiresAt: expiresAt! };
+            ? { user: reactivated }
+            : { user: reactivated, inviteToken: rawToken, inviteExpiresAt: expiresAt!, inviteEmail };
       }
       await storeUserKey(tx, command.tenantId, idempotencyKey, payloadHash, body);
       return body;
+    });
+    return statusResult(command.tenantId, snapshot);
+  }
+
+  /**
+   * Story 5-1a — resend an invitation (`users.invite`, owner): for a user
+   * still `invited`, mint a FRESH token (the old link dies — its hash is
+   * replaced), push the expiry out 7 days, cancel every older live invite
+   * email and queue a new one. Keyed (`arm: 'resend-invite'` in the hash —
+   * the deactivate / reactivate / unlock keys never replay it) and audited
+   * `user.invite_resent`. Skeleton order: authority → replay → lock the
+   * target (404) → replay again → the status guard (409 `user-not-invited`)
+   * → a portal user's client must still be active (409 `client-not-active`).
+   * The response carries the new token and link, like the invite's — the
+   * snapshot stores the raw token, as the invite's does (PENDING: redact).
+   */
+  async resendInvite(command: UserStatusInput, idempotencyKey: string): Promise<InviteUserResult> {
+    const payloadHash = hashCommandPayload({
+      arm: 'resend-invite',
+      tenantId: command.tenantId,
+      targetUserId: command.targetUserId,
+    });
+    const snapshot = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'users.invite');
+      const replayed = await replayInviteKey(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) return replayed;
+
+      const targetRows = await tx
+        .select()
+        .from(users)
+        .where(and(eq(users.id, command.targetUserId), eq(users.tenantId, command.tenantId)))
+        .for('update')
+        .limit(1);
+      const target = targetRows[0];
+      if (!target) throw userNotFound();
+      const again = await replayInviteKey(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (again !== null) return again;
+
+      if (target.status !== 'invited') throw userNotInvited(target.email, target.status);
+      if (target.clientId !== null) {
+        // The invite's own gate: a portal user is (re)invited only for an
+        // active client — FOR SHARE, so a suspend cannot commit between.
+        const client = await shareLockClientInTx(tx, command.tenantId, target.clientId);
+        if (client.status !== 'active') throw clientNotActive(client.code, client.status);
+      }
+
+      const rawToken = generateInviteToken();
+      const inviteExpiresAt = new Date(Date.now() + INVITE_TTL_MS).toISOString();
+      const updated = await tx
+        .update(users)
+        .set({ inviteTokenHash: hashInviteToken(rawToken), inviteExpiresAt, updatedAt: nowIso() })
+        .where(and(eq(users.id, target.id), eq(users.status, 'invited')))
+        .returning();
+      const user = toUserView(updated[0]!);
+      const inviteEmail = await this.reissueInviteEmailInTx(tx, command, user, rawToken, inviteExpiresAt, target.clientId);
+      await insertAuditRow(tx, {
+        tenantId: command.tenantId,
+        actorUserId: command.actorUserId,
+        action: 'user.invite_resent',
+        targetType: 'user',
+        targetId: target.id,
+        reference: idempotencyKey,
+      });
+      const body: InviteUserSnapshot = { user, inviteToken: rawToken, inviteExpiresAt, inviteEmail };
+      await storeUserKey(tx, command.tenantId, idempotencyKey, payloadHash, body);
+      return body;
+    });
+    return inviteResult(command.tenantId, snapshot);
+  }
+
+  /** Story 5-1a — a reissued token: cancel the user's older live invite emails, queue the new one. */
+  private async reissueInviteEmailInTx(
+    tx: TenantTx,
+    command: UserStatusInput,
+    user: UserView,
+    rawToken: string,
+    expiresAt: string,
+    clientId: string | null,
+  ): Promise<InviteEmailState> {
+    await cancelUserEmailsInTx(tx, command.tenantId, user.id, 'user-invite', 'superseded');
+    const clientName = clientId === null ? null : (await getClientInTx(tx, command.tenantId, clientId)).name;
+    return queueInviteEmailInTx(tx, {
+      tenantId: command.tenantId,
+      actorUserId: command.actorUserId,
+      user,
+      rawToken,
+      expiresAt,
+      clientName,
     });
   }
 
@@ -840,15 +1041,17 @@ export class UsersCommand {
     tenantId: string,
     cursor?: string,
     limit: number = DEFAULT_USER_PAGE_SIZE,
+    /** Story 5-1a — the caller; `inviteEmail` is filled only when it holds `users.invite`. */
+    actorUserId?: string,
   ): Promise<Page<UserView>> {
     const pageSize = Math.min(
       Math.max(Math.trunc(limit) || DEFAULT_USER_PAGE_SIZE, 1),
       MAX_USER_PAGE_SIZE,
     );
     const before = cursor === undefined ? undefined : decodeCursorSafe(cursor);
-    const rows = await withTenantTransaction(this.db, tenantId, (tx) => {
+    const { rows, inviteEmails } = await withTenantTransaction(this.db, tenantId, async (tx) => {
       const scope = eq(users.tenantId, tenantId);
-      return tx
+      const found = await tx
         .select()
         .from(users)
         .where(
@@ -861,6 +1064,24 @@ export class UsersCommand {
         )
         .orderBy(desc(users.createdAt), desc(users.id))
         .limit(pageSize + 1);
+      // Story 5-1a — the invite email's status, for the owner only (W10):
+      // it is the inviter's follow-up, and it would tell anyone else who has
+      // been invited and whether the mail went out. A non-member or an
+      // inactive caller reads none.
+      let emails: Map<string, { status: EmailStatus; updatedAt: string }> | null = null;
+      if (actorUserId !== undefined) {
+        const actor = await tx
+          .select({ role: users.role, status: users.status })
+          .from(users)
+          .where(and(eq(users.id, actorUserId), eq(users.tenantId, tenantId)))
+          .limit(1);
+        const caller = actor[0];
+        if (caller !== undefined && caller.status === 'active' && ROLE_CAPABILITIES[caller.role].has('users.invite')) {
+          const invited = found.slice(0, pageSize).filter((row) => row.status === 'invited').map((row) => row.id);
+          emails = await latestUserEmailsInTx(tx, tenantId, invited, 'user-invite');
+        }
+      }
+      return { rows: found, inviteEmails: emails };
     });
     const page = buildPage(rows, pageSize);
     // Story 6-1a — the Team card's Unlock reads `lockedUntil`; story 6-1b —
@@ -873,6 +1094,9 @@ export class UsersCommand {
         lockedUntil: laterLock(locks.get(row.email) ?? null, secondFactorLockOf(row.mfaLockedUntil, now)),
         secondFactorEnabled: row.mfaEnabledAt !== null,
         secondFactorResetPending: row.mfaEnrolCodeHash !== null && row.mfaEnabledAt === null,
+        ...(inviteEmails === null
+          ? {}
+          : { inviteEmail: row.status === 'invited' ? (inviteEmails.get(row.id) ?? null) : null }),
       })),
       nextCursor: page.nextCursor,
     };
@@ -1032,4 +1256,67 @@ async function storeUserKey(
     }
     throw err;
   }
+}
+
+/** Story 5-1a — the replay of an invite-shaped snapshot (resend): `null` when the key is new. */
+async function replayInviteKey(
+  tx: TenantTx,
+  tenantId: string,
+  idempotencyKey: string,
+  payloadHash: string,
+): Promise<InviteUserSnapshot | null> {
+  const existing = await tx
+    .select()
+    .from(idempotencyKeys)
+    .where(and(eq(idempotencyKeys.tenantId, tenantId), eq(idempotencyKeys.key, idempotencyKey)))
+    .limit(1);
+  if (!existing[0]) return null;
+  if (existing[0].payloadHash !== payloadHash) throw idempotencyKeyReuse();
+  return existing[0].responseSnapshot as InviteUserSnapshot;
+}
+
+/**
+ * Story 5-1a — queue the invite email for `user` in the caller's
+ * transaction. The names it carries are read HERE, in the command's
+ * transaction (decision 6, B10): the tenant's name (a tenancy-local read)
+ * and the inviting owner's email (the Reply-To); the client's name comes
+ * from the caller (`LockedClientFacts.name`, or the client read on a
+ * reissue). The raw token is the message's SEALED secret — never a param.
+ */
+async function queueInviteEmailInTx(
+  tx: TenantTx,
+  input: {
+    readonly tenantId: string;
+    readonly actorUserId: string;
+    readonly user: Pick<UserView, 'id' | 'email' | 'role'>;
+    readonly rawToken: string;
+    readonly expiresAt: string;
+    readonly clientName: string | null;
+  },
+): Promise<InviteEmailState> {
+  const tenantRows = await tx
+    .select({ name: tenants.name })
+    .from(tenants)
+    .where(eq(tenants.id, input.tenantId))
+    .limit(1);
+  const inviterRows = await tx
+    .select({ email: users.email })
+    .from(users)
+    .where(and(eq(users.id, input.actorUserId), eq(users.tenantId, input.tenantId)))
+    .limit(1);
+  const queued = await queueEmailInTx(tx, {
+    tenantId: input.tenantId,
+    template: 'user-invite',
+    to: input.user.email,
+    params: {
+      tenantName: tenantRows[0]?.name ?? 'Your team',
+      inviterEmail: inviterRows[0]?.email ?? null,
+      role: input.user.role,
+      clientName: input.clientName,
+      expiresAt: input.expiresAt,
+    },
+    secret: input.rawToken,
+    sourceRef: { userId: input.user.id },
+  });
+  return { status: queued.status };
 }

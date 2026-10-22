@@ -3122,31 +3122,49 @@ describe('architecture: no suite deletes the audit guard\'s evidence before the 
   });
 });
 
-describe('architecture: the second factor’s key material has one home (story 6-1b)', () => {
+describe('architecture: the second factor’s key material has one home (story 6-1b; story 5-1a extracted seal.ts)', () => {
   const tenancyRoot = join(SRC_ROOT, 'modules', 'tenancy');
   const SECRETS_OWNER = join(tenancyRoot, 'second-factor-secrets.ts');
+  const SEAL = join(SRC_ROOT, 'shared', 'crypto', 'seal.ts');
   const ENVELOPE_IMPORT = /from\s+['"][^'"]*crypto\/envelope['"]/;
+  /** A direct env read of the key (`process.env.X`, `env.X`, `process.env['X']`). */
+  const DIRECT_READ = /\benv(?:\.|\[\s*['"`])MFA_ENCRYPTION_KEY/;
+  /** The key's NAME as a string literal — what a keyring passes to seal.ts (backticks are prose in comments). */
+  const NAMED = /['"]MFA_ENCRYPTION_KEY(?:_PREVIOUS)?['"]/;
 
-  it('MFA_ENCRYPTION_KEY (and its _PREVIOUS) is read only in second-factor-secrets.ts', () => {
-    const offenders = files
-      .filter((file) => file.path !== SECRETS_OWNER && /process\.env\.MFA_ENCRYPTION_KEY/.test(file.source))
-      .map((file) => file.path);
-    expect(offenders).toEqual([]);
-    // Meaningful: the owner really reads both.
+  it('MFA_ENCRYPTION_KEY is named only in second-factor-secrets.ts and read only through seal.ts', () => {
+    expect(DIRECT_READ.test("process.env.MFA_ENCRYPTION_KEY")).toBe(true);
+    expect(NAMED.test("env: 'MFA_ENCRYPTION_KEY',")).toBe(true);
+    // Production source only: a unit spec beside the code may set the key for its own run.
+    const source = files.filter((file) => !file.path.endsWith('.spec.ts'));
+    expect(source.filter((file) => DIRECT_READ.test(file.source)).map((file) => file.path)).toEqual([]);
+    expect(source.filter((file) => NAMED.test(file.source)).map((file) => file.path)).toEqual([SECRETS_OWNER]);
+    // Meaningful: the owner names its keyring and seals through seal.ts,
+    // which reads the env by the keyring's name (and `_PREVIOUS`).
     const owner = readFileSync(SECRETS_OWNER, 'utf8');
-    expect(owner).toContain('process.env.MFA_ENCRYPTION_KEY');
-    expect(owner).toContain('process.env.MFA_ENCRYPTION_KEY_PREVIOUS');
+    expect(owner).toContain("env: 'MFA_ENCRYPTION_KEY'");
+    expect(owner).toMatch(/from '\.\.\/\.\.\/shared\/crypto\/seal'/);
+    const seal = readFileSync(SEAL, 'utf8');
+    expect(seal).toContain('process.env[keyring.env]');
+    expect(seal).toContain('process.env[previousName(keyring)]');
   });
 
-  it('tenancy’s envelope importers are only enrollment.command.ts (and second-factor-secrets.ts, which does its own GCM)', () => {
+  it('seal.ts is the only dynamic env reader of a keyring, and names no key itself', () => {
+    const DYNAMIC_KEYRING_READ = /process\.env\[\s*(?:keyring\.env|previousName\()/;
+    expect(files.filter((file) => DYNAMIC_KEYRING_READ.test(file.source)).map((file) => file.path)).toEqual([SEAL]);
+    const seal = readFileSync(SEAL, 'utf8');
+    expect(/['"](?:MFA_ENCRYPTION_KEY|EMAIL_SEAL_KEY)/.test(seal)).toBe(false);
+  });
+
+  it('tenancy’s envelope importers are only enrollment.command.ts — the 2FA secrets seal with their own AAD through seal.ts', () => {
     const importers = files
       .filter((file) => file.path.startsWith(tenancyRoot) && ENVELOPE_IMPORT.test(file.source))
       .map((file) => file.path.slice(tenancyRoot.length + 1))
       .sort();
-    for (const importer of importers) expect(['enrollment.command.ts', 'second-factor-secrets.ts']).toContain(importer);
-    expect(importers).toContain('enrollment.command.ts');
+    expect(importers).toEqual(['enrollment.command.ts']);
     // The 2FA secrets never go through the device envelope (whose seal/open default to the device key).
-    expect(readFileSync(SECRETS_OWNER, 'utf8')).toContain("cipher.setAAD(");
+    expect(ENVELOPE_IMPORT.test(readFileSync(SEAL, 'utf8'))).toBe(false);
+    expect(readFileSync(SEAL, 'utf8')).toContain('cipher.setAAD(');
   });
 
   it('the app refuses to boot without the key: main.ts runs the check before createApp', () => {
@@ -3154,6 +3172,85 @@ describe('architecture: the second factor’s key material has one home (story 6
     const check = main.indexOf('assertSecondFactorKeyConfigured()');
     expect(check).toBeGreaterThan(-1);
     expect(check).toBeLessThan(main.indexOf('await createApp('));
+  });
+});
+
+describe('architecture: the mail module (story 5-1a)', () => {
+  const mailRoot = join(SRC_ROOT, 'modules', 'mail');
+  const MAIL_SECRETS = join(mailRoot, 'mail-secrets.ts');
+  const mailFiles = files.filter((file) => file.path.startsWith(mailRoot));
+  const RAW_WRITE = /\b(insert into|update|delete from)\s+email_messages\b/i;
+
+  it('the detectors bite (the test is meaningful)', () => {
+    expect(mailFiles.length).toBeGreaterThanOrEqual(7);
+    expect(drizzleWriteOn('emailMessages').test(readFileSync(join(mailRoot, 'mail.facade.ts'), 'utf8'))).toBe(true);
+    expect(drizzleWriteOn('emailMessages').test(readFileSync(join(mailRoot, 'mail.sender.ts'), 'utf8'))).toBe(true);
+    expect(RAW_WRITE.test(readFileSync(join(mailRoot, 'mail.sender.ts'), 'utf8'))).toBe(true); // the purge
+    expect(RAW_WRITE.test('delete from email_messages where')).toBe(true);
+  });
+
+  it('email_messages is written only in src/modules/mail', () => {
+    const offenders = files
+      .filter((file) => !file.path.startsWith(mailRoot))
+      .filter((file) => drizzleWriteOn('emailMessages').test(file.source) || RAW_WRITE.test(file.source))
+      .map((file) => file.path);
+    expect(offenders).toEqual([]);
+  });
+
+  it('other modules import only mail.facade (the shells may also wire mail.module; main.ts runs the boot check)', () => {
+    const IMPORT = /from\s+['"]([^'"]*(?:modules\/mail|\.\.\/mail)\/[^'"]+)['"]/g;
+    const offenders: string[] = [];
+    let facadeImporters = 0;
+    for (const file of files.filter((f) => !f.path.startsWith(mailRoot))) {
+      for (const match of file.source.matchAll(IMPORT)) {
+        const target = match[1]!;
+        if (/\/mail\/mail\.facade$/.test(target)) {
+          facadeImporters += 1;
+          continue;
+        }
+        const shell =
+          file.path === join(SRC_ROOT, 'app.module.ts') || file.path === join(SRC_ROOT, 'jobs', 'jobs.module.ts');
+        if (shell && /\/mail\/mail\.module$/.test(target)) continue;
+        if (file.path === join(SRC_ROOT, 'main.ts') && /\/mail\/mail\.config$/.test(target)) continue;
+        offenders.push(`${file.path}: ${target}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+    // Meaningful: tenancy's users command and the DTOs do import the facade.
+    expect(facadeImporters).toBeGreaterThanOrEqual(3);
+  });
+
+  it('the mail module imports nothing from tenancy', () => {
+    const offenders = mailFiles
+      .filter((file) => /from\s+['"][^'"]*(?:modules\/tenancy|\.\.\/tenancy)\//.test(file.source))
+      .map((file) => file.path);
+    expect(offenders).toEqual([]);
+  });
+
+  it('EMAIL_SEAL_KEY is named only in mail-secrets.ts and read only through seal.ts', () => {
+    const DIRECT_READ = /\benv(?:\.|\[\s*['"`])EMAIL_SEAL_KEY/;
+    const NAMED = /['"]EMAIL_SEAL_KEY(?:_PREVIOUS)?['"]/;
+    // Production source only: the gateway's unit spec sets the key for its own boot-check cases.
+    const source = files.filter((file) => !file.path.endsWith('.spec.ts'));
+    expect(source.filter((file) => DIRECT_READ.test(file.source)).map((file) => file.path)).toEqual([]);
+    expect(source.filter((file) => NAMED.test(file.source)).map((file) => file.path)).toEqual([MAIL_SECRETS]);
+    expect(readFileSync(MAIL_SECRETS, 'utf8')).toContain("env: 'EMAIL_SEAL_KEY'");
+  });
+
+  it('the boot check runs in main.ts before createApp, beside the second factor’s', () => {
+    const main = readFileSync(join(SRC_ROOT, 'main.ts'), 'utf8');
+    const check = main.indexOf('assertMailConfigured()');
+    expect(check).toBeGreaterThan(-1);
+    expect(check).toBeLessThan(main.indexOf('await createApp('));
+  });
+
+  it('only the sender holds the gateway — the queue writer makes no network call', () => {
+    const GATEWAY = /EMAIL_GATEWAY|EmailGateway\b|client-sesv2/;
+    expect(GATEWAY.test(readFileSync(join(mailRoot, 'mail.sender.ts'), 'utf8'))).toBe(true);
+    const facade = readFileSync(join(mailRoot, 'mail.facade.ts'), 'utf8');
+    const queueWriter = facade.slice(facade.indexOf('export async function queueEmailInTx'), facade.indexOf('export async function cancelUserEmailsInTx'));
+    expect(queueWriter.length).toBeGreaterThan(100);
+    expect(GATEWAY.test(queueWriter)).toBe(false);
   });
 });
 

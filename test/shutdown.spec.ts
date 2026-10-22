@@ -318,6 +318,8 @@ describe('graceful shutdown (story 6-2a)', () => {
         'REPLENISHMENT_SCHEDULER_POLL_MS', 'CHANNELS_SYNC_POLL_MS', 'STORAGE_SNAPSHOT_POLL_MS', 'PUSH_SENDER_POLL_MS',
         'WAVE_CUTOFF_SWEEP_POLL_MS', 'AUDIT_EXPORT_POLL_MS', 'LEDGER_INTEGRITY_POLL_MS', 'SESSION_PURGE_POLL_MS',
         'LICENCE_EXPIRY_POLL_MS',
+        // Story 5-1a — the email sender.
+        'EMAIL_SEND_POLL_MS',
       ];
       for (const name of POLLS) process.env[name] = '20';
       let app: INestApplication;
@@ -329,7 +331,7 @@ describe('graceful shutdown (story 6-2a)', () => {
       const workerClasses = (Reflect.getMetadata('providers', JobsModule) as (new (...args: never[]) => unknown)[]).filter(
         (provider) => typeof provider === 'function' && /Worker$|Reaper$/.test(provider.name),
       );
-      expect(workerClasses).toHaveLength(13);
+      expect(workerClasses).toHaveLength(14); // 5-1a added EmailSenderWorker
       type Worker = { tick: () => Promise<unknown>; beforeApplicationShutdown: () => Promise<void> };
       const rows = workerClasses.map((cls) => {
         const worker = app.get(cls) as unknown as Worker;

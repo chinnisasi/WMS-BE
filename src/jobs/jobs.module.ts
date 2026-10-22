@@ -28,6 +28,14 @@ import { purgeEndedSessions } from '../modules/tenancy/sessions';
 import { purgeAuthCounters } from '../modules/tenancy/auth-attempts';
 import { purgeSecondFactorState } from '../modules/tenancy/second-factor';
 import { ComplianceModule } from '../modules/compliance/compliance.module';
+import { MailModule } from '../modules/mail/mail.module';
+import {
+  EMAIL_FINAL_STATUSES,
+  EMAIL_PENDING_EXPIRY_MS,
+  EMAIL_RETENTION_DAYS,
+  EMAIL_SENDING_STALE_MS,
+  MailFacade,
+} from '../modules/mail/mail.facade';
 import { LicenceFacade } from '../modules/compliance/licence.facade';
 import { licenceToday } from '../modules/compliance/licence.command';
 import { LICENCE_WARNING_LEAD_DAYS } from '../shared/primitives/licence';
@@ -1233,6 +1241,132 @@ export class PushSenderWorker implements OnApplicationBootstrap, BeforeApplicati
   }
 }
 
+/** `EMAIL_SEND_POLL_MS` (story 5-1a): the email sender's poll; unset/`0` = OFF. */
+export function parseEmailSendPollMs(raw: string | undefined): number {
+  return parsePollMs('EMAIL_SEND_POLL_MS', raw);
+}
+
+/**
+ * Story 5-1a — the email sender worker (the `PushSenderWorker` shape). Each
+ * tick finds the tenants with mail work cross-tenant on the read-only
+ * BYPASSRLS `AUTH_DATABASE` — a due `pending` row, a `pending` row past the
+ * 24-hour expiry, a `sending` row past the 10-minute stale bound, or a final
+ * row past the 90-day retention (its own arm, so an idle tenant is purged
+ * too) — and calls `MailFacade.sendDue(tenantId, remaining)` once per
+ * tenant, where `remaining` is what is left of `EMAIL_MAX_PER_TICK` this
+ * tick (the SES send rate is per account, not per tenant; the walk starts
+ * one tenant later each tick, so no backlog starves the others). A failing tenant
+ * is logged and retried next tick; config faults are logged ONCE per tick,
+ * by code. Env-gated OFF when `EMAIL_SEND_POLL_MS` is unset/`0`;
+ * single-flight; `unref`'d timer; the 6-2a shutdown drain. Two instances are
+ * safe: the claim is `FOR UPDATE SKIP LOCKED` and commits `sending` before
+ * the send.
+ */
+@Injectable()
+export class EmailSenderWorker implements OnApplicationBootstrap, BeforeApplicationShutdown, OnApplicationShutdown {
+  private readonly logger = new Logger('EmailSenderWorker');
+  private readonly pollMs: number;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private running = false;
+  /** Ticks run so far — rotates where each tick's tenant walk starts. */
+  private tickCount = 0;
+  private readonly ticks = new InFlightTick();
+
+  constructor(
+    @Inject(AUTH_DATABASE) private readonly authDb: Database,
+    @Inject(MailFacade) private readonly mail: MailFacade,
+  ) {
+    this.pollMs = parseEmailSendPollMs(process.env.EMAIL_SEND_POLL_MS);
+  }
+
+  onApplicationBootstrap(): void {
+    if (this.pollMs === 0) {
+      return; // env-gated off
+    }
+    this.logger.log(`Email sender worker started (poll every ${this.pollMs}ms)`);
+    this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
+    this.timer.unref?.();
+  }
+
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (!(await this.ticks.settle())) {
+      this.logger.warn('A tick was still running at the shutdown drain deadline');
+    }
+  }
+
+  onApplicationShutdown(): void {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  /** One cycle; returns the tenants it drove (the plumbing test reads it). */
+  async tick(): Promise<string[]> {
+    if (this.running) {
+      return []; // shed: one cycle at a time in this process
+    }
+    this.running = true;
+    try {
+      // The bounds are the sender's own constants — a hardcoded interval
+      // here would drift from the sweeps it gates.
+      const finals = sql.join(EMAIL_FINAL_STATUSES.map((status) => sql`${status}`), sql`, `);
+      const tenants = (await this.authDb.execute(sql`
+        select distinct tenant_id as "tenantId"
+        from email_messages
+        where (status = 'pending' and next_attempt_at <= now())
+           or (status = 'pending' and created_at < now() - make_interval(secs => ${EMAIL_PENDING_EXPIRY_MS / 1000}::double precision))
+           or (status = 'sending' and updated_at < now() - make_interval(secs => ${EMAIL_SENDING_STALE_MS / 1000}::double precision))
+           or (status in (${finals}) and updated_at < now() - make_interval(days => ${EMAIL_RETENTION_DAYS}))
+        order by tenant_id asc
+      `)) as unknown as { tenantId: string }[];
+      let remaining = this.mail.maxPerTick();
+      const driven: string[] = [];
+      const configCodes = new Set<string>();
+      // Code review — the shared budget would let the first tenant's backlog
+      // starve the rest every tick: the walk starts one tenant later each
+      // tick (wrapping), and still visits every tenant for its sweeps.
+      const start = tenants.length === 0 ? 0 : this.tickCount % tenants.length;
+      this.tickCount += 1;
+      const rotated = [...tenants.slice(start), ...tenants.slice(0, start)];
+      for (const { tenantId } of rotated) {
+        try {
+          // Every tenant is still visited once the budget is spent: its
+          // sweeps (stale, expiry, purge) run with a zero send limit.
+          const summary = await this.mail.sendDue(tenantId, remaining);
+          remaining = Math.max(0, remaining - summary.attempted);
+          for (const code of summary.configCodes) configCodes.add(code);
+          driven.push(tenantId);
+        } catch (error) {
+          this.logger.error(
+            `Email sender could not send for tenant ${tenantId} — retried next tick: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      if (configCodes.size > 0) {
+        // ONCE per tick, across every tenant: the deployment is wrong
+        // (credentials, a paused account, an unverified identity or sandbox
+        // recipient). Codes only — never a provider message.
+        this.logger.error(
+          `email provider refused on configuration (${[...configCodes].sort().join(', ')}) — check EMAIL_FROM, the SES identity, ` +
+            'IAM and the account status; rows retried without spending an attempt, expired after 24 hours',
+        );
+      }
+      return driven;
+    } catch (error) {
+      this.logger.error(`Email sender cycle failed: ${error instanceof Error ? error.message : String(error)}`);
+      return [];
+    } finally {
+      this.running = false;
+    }
+  }
+}
+
 /**
  * Story 9-2b — the wave cutoff sweep worker. Each tick finds the tenants with
  * a PLANNED wave under a policy that has a cutoff (cross-tenant, read-only,
@@ -1798,6 +1932,8 @@ export class LicenceExpiryWorker implements OnApplicationBootstrap, BeforeApplic
     TenancyModule,
     // Story 1-6c — the licence expiry sweep (compliance).
     ComplianceModule,
+    // Story 5-1a — the email sender (mail).
+    MailModule,
   ],
   providers: [
     OutboxRelayWorker,
@@ -1821,6 +1957,8 @@ export class LicenceExpiryWorker implements OnApplicationBootstrap, BeforeApplic
     SessionPurgeWorker,
     // Story 1-6c — the licence expiry sweep (env-gated OFF by default).
     LicenceExpiryWorker,
+    // Story 5-1a — the email sender (env-gated OFF by default).
+    EmailSenderWorker,
   ],
   exports: [],
 })

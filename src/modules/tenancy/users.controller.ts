@@ -99,7 +99,11 @@ export class UsersController {
   @HttpCode(HttpStatus.CREATED)
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
-  @ApiOperation({ summary: 'Invites a user (Owner only) — returns the one-time invite token' })
+  @ApiOperation({
+    summary: 'Invites a user (Owner only) — returns the one-time invite token and accept link, and queues the invite email',
+    description:
+      'Story 5-1a: the invite email is queued in the same transaction (`inviteEmail.status` `pending`, or `skipped` when the email provider is off or the address is outside the allowlist); `inviteUrl` is the accept link the email carries.',
+  })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiResponse({ status: HttpStatus.CREATED, type: InviteUserResponse })
   @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, invalid body, a client invite without clientId / a staff invite with one, or the tenant\u2019s own client (story 21-7)') })
@@ -149,6 +153,7 @@ export class UsersController {
       tenantId,
       query.cursor,
       query.limit === undefined ? undefined : query.limit,
+      session.userId,
     );
     return { items: page.items.map((user) => ({ ...user })), nextCursor: page.nextCursor };
   }
@@ -241,6 +246,36 @@ export class UsersController {
       { tenantId, actorUserId: session.userId, targetUserId: userId, arm: 'reactivate' },
       key,
     );
+  }
+
+  @Post(':tenantId/users/:userId/resend-invite')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Story 5-1a — sends an invited user a NEW invitation (users.invite, Owner): a fresh one-time token (the old link stops working), a new 7-day expiry, and a new invite email (older queued ones are cancelled). Keyed; audited user.invite_resent',
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: InviteUserResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or malformed userId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks users.invite (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('User does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The user is not invited — already active, or deactivated (user-not-invited); a portal user whose client is not active (client-not-active); or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'userId', format: 'uuid' })
+  async resendInvite(
+    @Param('tenantId') tenantId: string,
+    @Param('userId') userId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<InviteUserResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUserIdParam(userId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const result = await this.usersCommand.resendInvite({ tenantId, actorUserId: session.userId, targetUserId: userId }, key);
+    return { ...result, user: { ...result.user } };
   }
 
   @Post(':tenantId/users/:userId/unlock')
