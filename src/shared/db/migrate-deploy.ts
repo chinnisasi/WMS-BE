@@ -60,6 +60,8 @@ import { drizzle } from 'drizzle-orm/postgres-js';
 import { migrate } from 'drizzle-orm/postgres-js/migrator';
 import { readMigrationFiles } from 'drizzle-orm/migrator';
 import postgres from 'postgres';
+import { ConfigRefusal, EXIT_CONFIG_REFUSAL } from '../lifecycle/process-role';
+import { postgresTlsOptions } from './pg-tls';
 
 export const DEFAULT_LARGE_TABLE_ROWS = 100_000;
 export const DEFAULT_LARGE_TABLE_BYTES = 64 * 1024 * 1024;
@@ -759,6 +761,8 @@ export async function migrateDeploy(options: MigrateDeployOptions): Promise<Migr
   const advisoryWaitMs = options.advisoryWaitMs ?? envInt('MIGRATE_ADVISORY_WAIT_MS', DEFAULT_ADVISORY_WAIT_MS);
 
   const sql = postgres(options.url, {
+    // Story 6-2c (decision 11): TLS through the one helper.
+    ...postgresTlsOptions(options.url, process.env, 'migrate'),
     max: 3,
     onnotice: () => undefined,
     connection: {
@@ -861,6 +865,16 @@ async function main(): Promise<void> {
   if (!url) {
     console.error('DATABASE_URL is required (the migrating owner)');
     process.exit(1);
+  }
+  // Story 6-2c (A4): the TLS configuration is judged before connecting (exit 78).
+  try {
+    postgresTlsOptions(url, process.env, 'migrate');
+  } catch (err) {
+    if (err instanceof ConfigRefusal) {
+      console.error(`Refusing to migrate: ${err.message}`);
+      process.exit(EXIT_CONFIG_REFUSAL);
+    }
+    throw err;
   }
   let args: CliArgs;
   try {

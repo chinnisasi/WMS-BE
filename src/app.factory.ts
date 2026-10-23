@@ -1,9 +1,14 @@
+import type { Server } from 'node:http';
 import type { INestApplication} from '@nestjs/common';
 import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 import { OpenApiDocumentHolder } from './api/openapi-document.holder';
+
+import { parsePort as parsePortFromEnv } from './shared/lifecycle/process-role';
+
+export { parsePort } from './shared/lifecycle/process-role';
 
 export const API_PREFIX = 'api/v1';
 
@@ -18,17 +23,46 @@ export const API_PREFIX = 'api/v1';
 export const SHUTDOWN_HTTP_OPTIONS = { forceCloseConnections: true, return503OnClosing: true } as const;
 
 /**
+ * Story 6-2c (decision 2) — the keep-alive edge. The ALB keeps an idle
+ * connection to a target for 60 s; a target that closes it sooner (Node and
+ * Bun default to 5 s) races the ALB, which can send a request on a socket the
+ * API has just closed — an intermittent 502. The API therefore keeps idle
+ * sockets for 65 s, above the ALB's idle timeout (the invariant: ALB
+ * `idle_timeout` ≤ 65 − 5 — #219's 60 s is the boundary). Constants, not env vars: they are tied to the
+ * ALB's value, and `runtime-contract.json` carries them for the IaC's test.
+ *
+ * `headersTimeout` must exceed `keepAliveTimeout` under Node (jest runs on
+ * Node). Bun accepts it but does not enforce it (its own ~12 s idle timer
+ * bounds an incomplete header block) — set for parity.
+ */
+export const HTTP_KEEP_ALIVE_TIMEOUT_MS = 65_000;
+export const HTTP_HEADERS_TIMEOUT_MS = 66_000;
+
+/**
  * Builds the configured application: global prefix, validation, problem-details
  * filter (via SharedModule), and the versioned OpenAPI document.
  *
- * `withListener` is false for tests and the OpenAPI export script.
+ * `withListener` is false for tests, the OpenAPI export script and the
+ * worker role (story 6-2c: the worker initialises the app without an API
+ * listener; `main.ts`).
  */
 export async function createApp(withListener = false): Promise<INestApplication> {
   // Story 7.2 (RD-5): `rawBody: true` buffers every JSON request a second
   // time (req.rawBody) so the channel webhook signatures can be verified
   // over the EXACT bytes the provider signed — a re-serialized body would
   // not re-hash. Deliberately accepted app-wide cost (the spec's record).
-  const app = await NestFactory.create(AppModule, { logger: ['error', 'warn', 'log'], rawBody: true, ...SHUTDOWN_HTTP_OPTIONS });
+  // Story 6-2c (A18): `abortOnError: false` — a provider's construction error
+  // (a bad *_POLL_MS → ConfigRefusal) reaches main.ts, which maps it to its
+  // exit code, instead of Nest's own process.exit(1).
+  const app = await NestFactory.create(AppModule, {
+    logger: ['error', 'warn', 'log'],
+    rawBody: true,
+    abortOnError: false,
+    ...SHUTDOWN_HTTP_OPTIONS,
+  });
+  const httpServer = app.getHttpServer() as Server;
+  httpServer.keepAliveTimeout = HTTP_KEEP_ALIVE_TIMEOUT_MS;
+  httpServer.headersTimeout = HTTP_HEADERS_TIMEOUT_MS;
 
   // CORS: the web client runs on its own origin (dev: localhost:3001) and
   // talks to this API cross-origin with a bearer token — an allow-list, not a
@@ -76,15 +110,8 @@ export async function createApp(withListener = false): Promise<INestApplication>
   );
 
   if (withListener) {
-    await app.listen(parsePort(process.env.PORT));
+    await app.listen(parsePortFromEnv(process.env.PORT));
   }
   return app;
 }
 
-export function parsePort(raw: string | undefined): number {
-  const port = Number(raw ?? 3000);
-  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
-    throw new Error(`Invalid PORT "${raw ?? ''}" — must be an integer between 1 and 65535`);
-  }
-  return port;
-}

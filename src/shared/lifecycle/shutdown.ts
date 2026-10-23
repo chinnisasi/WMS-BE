@@ -1,3 +1,13 @@
+import {
+  DEFAULT_NO_PROGRESS_MS,
+  heartbeatClock,
+  noProgressBound,
+  registerJobHeartbeat,
+  type JobHeartbeat,
+  type WorkerJob,
+} from './worker-heartbeat';
+import { EXIT_DRAIN_TIMEOUT } from './process-role';
+
 /**
  * Story 6-2a — graceful shutdown (amendment A1).
  *
@@ -20,7 +30,9 @@
  *                     `end({timeout})`; `ValkeyClient`: `quit`)
  *
  * The whole sequence is bounded by `armForceExit`: a 25 s unref'd timer
- * armed on the first signal, under the orchestrator's 30 s stop timeout.
+ * armed on the first signal, under the orchestrator's 30 s stop timeout —
+ * exit **75** (story 6-2c, A18: the drain-timeout code, distinct from a
+ * crash's 1 and a config refusal's 78).
  */
 
 /** The force-exit bound, armed on the first shutdown signal (A1). */
@@ -80,16 +92,56 @@ export async function settleBefore(work: Promise<unknown>, deadline: number): Pr
 export class InFlightTick {
   private current: Promise<unknown> | undefined;
   private stopped = false;
+  /** Story 6-2c (A3): this job's heartbeat, once `track` registered it. */
+  private heartbeat: JobHeartbeat | undefined;
+
+  /**
+   * Story 6-2c (A3) — registers this job for `/health/worker`. Called by an
+   * ENABLED worker after its env gate; `noProgressMs` defaults to the job's
+   * entry in `DEFAULT_NO_PROGRESS_MS`, raised by `WORKER_HEARTBEAT_STALE_MS`.
+   */
+  track(job: WorkerJob, pollMs: number, noProgressMs: number = DEFAULT_NO_PROGRESS_MS[job]): void {
+    this.heartbeat = registerJobHeartbeat(job, pollMs, noProgressBound(noProgressMs));
+  }
+
+  /**
+   * Story 6-2c (A3) — the running tick made progress (one unit of its loop: a
+   * scope, a tenant, a connection). A no-op when the job is not tracked (a
+   * test driving `tick()` directly) or no tick is in flight.
+   */
+  beat(): void {
+    const heartbeat = this.heartbeat;
+    if (heartbeat !== undefined && heartbeat.inFlight) heartbeat.lastProgressAt = heartbeatClock.now();
+  }
 
   /** Starts `run` unless a tracked tick is still in flight or shutdown began. */
   start(run: () => Promise<unknown>): void {
     if (this.stopped || this.current !== undefined) return;
-    const tick = run()
+    const heartbeat = this.heartbeat;
+    if (heartbeat !== undefined) {
+      const now = heartbeatClock.now();
+      heartbeat.inFlight = true;
+      heartbeat.lastStartedAt = now;
+      heartbeat.lastProgressAt = now;
+    }
+    let tick: Promise<unknown>;
+    try {
+      tick = run();
+    } catch (error) {
+      tick = Promise.reject(error);
+    }
+    const tracked = tick
       .catch(() => undefined)
       .finally(() => {
-        if (this.current === tick) this.current = undefined;
+        if (heartbeat !== undefined) {
+          const settledAt = heartbeatClock.now();
+          heartbeat.inFlight = false;
+          heartbeat.lastSettledAt = settledAt;
+          heartbeat.lastProgressAt = settledAt;
+        }
+        if (this.current === tracked) this.current = undefined;
       });
-    this.current = tick;
+    this.current = tracked;
   }
 
   /** True while a tracked tick runs. */
@@ -111,7 +163,8 @@ export class InFlightTick {
 
 /**
  * Arms the force exit on the first SIGTERM / SIGINT: if the graceful
- * sequence has not ended the process within `ms`, exit 1 (a hung pool, a
+ * sequence has not ended the process within `ms`, exit 75 (story 6-2c, A18 —
+ * was 1; a hung pool, a
  * request that ignores its socket being destroyed). The timer is unref'd, so
  * it never itself holds the process open.
  *
@@ -136,8 +189,8 @@ export function armForceExit(
     if (timer !== undefined) return; // a repeated signal: the sequence is already running
     shutdownDrainDeadline(Date.now());
     timer = setTimeout(() => {
-      console.error(`Graceful shutdown (${signal}) did not finish within ${ms}ms — forcing exit`);
-      exit(1);
+      console.error(`Graceful shutdown (${signal}) did not finish within ${ms}ms — forcing exit ${EXIT_DRAIN_TIMEOUT}`);
+      exit(EXIT_DRAIN_TIMEOUT);
     }, ms);
     timer.unref?.();
   };

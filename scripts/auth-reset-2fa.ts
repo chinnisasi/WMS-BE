@@ -25,7 +25,7 @@ if (email === undefined || !email.includes('@')) {
   process.exit(2);
 }
 const db = createDatabase();
-const authDb = createDatabase(process.env.DATABASE_AUTH_URL || requiredDbUrl());
+const authDb = createDatabase(process.env.DATABASE_AUTH_URL || requiredDbUrl(), 'auth');
 const account = (
   await authDb
     .select({ id: users.id, tenantId: users.tenantId, clientId: users.clientId })

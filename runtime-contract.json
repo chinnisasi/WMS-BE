@@ -1,0 +1,6 @@
+{
+  "httpKeepAliveTimeoutMs": 65000,
+  "httpHeadersTimeoutMs": 66000,
+  "shutdownForceExitMs": 25000,
+  "shutdownDrainMs": 20000
+}

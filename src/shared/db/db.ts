@@ -1,6 +1,7 @@
 import { drizzle, type PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import * as schema from './schema';
+import { postgresTlsOptions } from './pg-tls';
 
 export type Database = PostgresJsDatabase<typeof schema>;
 
@@ -8,8 +9,9 @@ export type Database = PostgresJsDatabase<typeof schema>;
  * Single shared Drizzle client. DATABASE_URL is required in every environment;
  * migrations and the app talk to Postgres over UTC-session connections.
  */
-export function createDatabase(url: string = requiredDbUrl()): Database {
-  const client = postgres(url, { max: 10 });
+export function createDatabase(url: string = requiredDbUrl(), pool = 'app'): Database {
+  // Story 6-2c (decision 11): every pool's TLS goes through the one helper.
+  const client = postgres(url, { max: 10, ...postgresTlsOptions(url, process.env, pool) });
   return drizzle(client, { schema });
 }
 
@@ -47,7 +49,7 @@ export function createLazyAuthDatabase(): Database {
           'works where the DATABASE_URL role itself is superuser (dev/CI).',
       );
     }
-    return createDatabase(authUrl || requiredDbUrl());
+    return createDatabase(authUrl || requiredDbUrl(), 'auth');
   });
 }
 
