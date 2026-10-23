@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
+import type { OrderPriority, OrderType } from './order-urgency';
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
@@ -180,6 +181,15 @@ export interface PackSnapshot {
      * snapshot stored before 4-1b lacks it (a reader treats absent as null).
      */
     readonly clientOrderRef?: string | null;
+    /**
+     * Story 4-2a — the packing slip's order fields (read through: order
+     * fields never change, decision 6). Optional: a slip stored before 4-2a
+     * lacks them; a reader treats absent as null and shows "—".
+     */
+    readonly orderType?: OrderType | null;
+    readonly priority?: OrderPriority | null;
+    readonly shipByDate?: string | null;
+    readonly codAmountPaise?: number | null;
     readonly packedBy: string;
     readonly packedAt: string;
     readonly weightGrams: number | null;
@@ -774,6 +784,11 @@ export class PackCommandService {
           integrationId: order.integrationId,
           externalEventId: order.externalEventId,
           clientOrderRef: order.clientOrderRef,
+          // Story 4-2a — the slip carries the amount to collect and the type.
+          orderType: order.orderType as OrderType | null,
+          priority: order.priority as OrderPriority,
+          shipByDate: order.shipByDate,
+          codAmountPaise: order.codAmountPaise,
           packedBy: command.actorUserId,
           packedAt: canonicalInstant(packedAt),
           weightGrams,

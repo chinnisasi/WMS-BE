@@ -40,3 +40,24 @@ export function divideRoundHalfUp(numerator: bigint, denominator: bigint): bigin
   const remainder = numerator - quotient * denominator;
   return remainder * 2n >= denominator ? quotient + 1n : quotient;
 }
+
+/**
+ * Story 4-2a — the cash-on-delivery ceiling: ₹1 crore in paise. One copy for
+ * the order command's COD check, the `orders_cod_amount_paise_check` CHECK
+ * (migration 0093, pinned by test/order-fields.spec.ts) and the channel parse
+ * arms (Shopify's `total_outstanding`), which may not import outbound.
+ */
+export const MAX_COD_AMOUNT_PAISE = 1_000_000_000;
+
+/**
+ * Story 4-2a — a channel's decimal rupee string (`^\d{1,8}(\.\d{1,2})?$`,
+ * e.g. Shopify's `total_outstanding: "1499.00"`) as integer paise, by integer
+ * arithmetic (never a float). Null for any other shape.
+ */
+export function decimalRupeesToPaise(text: string): number | null {
+  const match = /^(\d{1,8})(?:\.(\d{1,2}))?$/.exec(text);
+  if (match === null) return null;
+  const whole = Number.parseInt(match[1]!, 10);
+  const fraction = Number.parseInt((match[2] ?? '').padEnd(2, '0'), 10);
+  return whole * 100 + fraction;
+}

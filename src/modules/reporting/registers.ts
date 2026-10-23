@@ -2,7 +2,7 @@ import type { TenantTx } from '../../shared/db/tenant-scope';
 import { rearmTxDeadline } from '../../shared/db/tx-deadline';
 import type { ExportCell, ExportColumn } from '../../shared/export/cells';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
-import { istDateOf } from '../../shared/primitives/time';
+import { istDateOf, istMidnightOf } from '../../shared/primitives/time';
 import { getClientsInTx } from '../clients/clients.facade';
 import type { CatalogFacade } from '../catalog/catalog.facade';
 import type { InboundFacade } from '../inbound/inbound.facade';
@@ -271,6 +271,14 @@ const OUTBOUND_COLUMNS: readonly ExportColumn[] = [
   // Story 4-1b — the client's own order number (blank when none), appended
   // LAST so every existing column keeps its position for file consumers.
   text('client_order_ref'),
+  // Story 4-2a (A20) — the order header fields, appended at the END (every
+  // earlier position unchanged). ORDER-level: each is repeated on every line
+  // of a multi-line order — `cod_amount_paise` (integer paise, blank when
+  // prepaid) is the order's amount once, never a per-line figure to sum.
+  text('order_type'),
+  text('priority'),
+  date('ship_by_date'),
+  number('cod_amount_paise'),
 ];
 
 const outboundRegister: RegisterDefinition = {
@@ -309,6 +317,12 @@ const outboundRegister: RegisterDefinition = {
         at(dispatch?.dispatchedAt ?? null),
         ...carrierPair(dispatch, row),
         row.clientOrderRef,
+        row.orderType,
+        row.priority,
+        // An IST calendar date — the date cell prints the IST date of its
+        // instant, so the IST midnight that begins it.
+        row.shipByDate === null ? null : new Date(istMidnightOf(row.shipByDate)),
+        row.codAmountPaise,
       ];
     });
   },

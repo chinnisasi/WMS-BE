@@ -170,6 +170,16 @@ export class ChannelsIngestCommand {
       connectionId,
       parsed.orderRef,
     );
+    // Story 4-2a (A6) — COD drift: the channel's COD is NOT in the dedup
+    // fingerprint, so a delivery for a known order resolves to it whatever
+    // its COD says now. A changed amount is logged (ids and amounts only —
+    // never the payload); consuming `orders/updated` is PENDING.
+    const parsedCod = parsed.codAmountPaise ?? null;
+    if (prior !== null && parsedCod !== prior.codAmountPaise) {
+      this.logger.warn(
+        `COD drift on channel redelivery — connection ${connectionId}, order ${prior.id}: stored codAmountPaise ${String(prior.codAmountPaise)}, delivered ${String(parsedCod)}; the order keeps its stored amount.`,
+      );
+    }
 
     // Story 21-2b: an order is for ONE client, derived from its SKUs. A
     // FIRST delivery whose mapped SKUs span clients is a mapping problem the
@@ -217,6 +227,9 @@ export class ChannelsIngestCommand {
       integrationId: connectionId,
       externalEventId: parsed.orderRef,
       ...(parsed.destination === undefined ? {} : { destination: parsed.destination }),
+      // Story 4-2a — the channel's COD amount (absent/null = prepaid). Not in
+      // the channel dedup fingerprint; the order command validates it.
+      ...(parsedCod === null ? {} : { codAmountPaise: parsedCod }),
       lines,
       // RD-3: the connection's policy rides the command (default 'accept').
       ...(connection.backorderPolicy === 'reject' ? { backorderPolicy: 'reject' } : {}),

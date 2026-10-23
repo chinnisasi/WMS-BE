@@ -5,7 +5,12 @@ import type { Database } from '../../shared/db/db';
 import { orderLines, orders, skus, warehouses } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
-import { CarriersFacade, rateThroughAdapter } from '../carriers/carriers.facade';
+import {
+  CarriersFacade,
+  carrierCodUnsupported,
+  carrierSupportsCod,
+  rateThroughAdapter,
+} from '../carriers/carriers.facade';
 import type {
   CarrierConnectionView,
   CarrierRateRequest,
@@ -140,6 +145,8 @@ export class RateService {
           status: orders.status,
           warehouseId: orders.warehouseId,
           destinationPincode: orders.destinationPincode,
+          // Story 4-2a — the COD amount (the request field and the A18 refusal).
+          codAmountPaise: orders.codAmountPaise,
         })
         .from(orders)
         .where(and(eq(orders.tenantId, tenantId), eq(orders.id, orderId)))
@@ -238,6 +245,20 @@ export class RateService {
       // ── per live connection: open the credential in-tx, call the glue ───
       const items: RateItem[] = [];
       for (const connection of connections) {
+        // Story 4-2a (A18) — a COD order on a carrier that cannot collect is
+        // that connection's REFUSED item (the label command's 409 code),
+        // before its credential opens. The read is live per request (no cache,
+        // no fingerprint), so nothing else changes.
+        if (order.codAmountPaise !== null && !carrierSupportsCod(connection.carrierCode)) {
+          items.push({
+            connectionId: connection.id,
+            carrierCode: connection.carrierCode,
+            carrierName: connection.carrierName,
+            quote: null,
+            refusal: refusalOf(carrierCodUnsupported(connection.carrierCode, connection.carrierName)),
+          });
+          continue;
+        }
         const credential = await this.carriers.openCredentialForAdapterUseInTx(
           tx,
           tenantId,
@@ -248,6 +269,7 @@ export class RateService {
           originPincode: originRows[0]?.originPincode ?? null,
           destinationPincode: order.destinationPincode,
           weightGrams,
+          codAmountPaise: order.codAmountPaise,
         };
         try {
           const quote = await rateThroughAdapter(connection.carrierCode, credential, request);

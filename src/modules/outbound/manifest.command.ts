@@ -1,8 +1,8 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, eq, inArray } from 'drizzle-orm';
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { auditEvents, idempotencyKeys, manifests, shipments } from '../../shared/db/schema';
+import { auditEvents, idempotencyKeys, manifests, orders, shipments } from '../../shared/db/schema';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { canonicalInstant, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
@@ -58,6 +58,15 @@ export interface ManifestSnapshot {
     readonly carrierCode: string;
     readonly shipmentCount: number;
     readonly shipmentIds: readonly string[];
+    /**
+     * Story 4-2a (A17) — the courier's cash hand-over figure: how many member
+     * shipments are COD and the total to collect, integer paise, computed in
+     * the create transaction over the member shipments' orders and FROZEN
+     * here (one shipment per order for life; no void, no manifest mutation).
+     * Optional: a manifest stored before 4-2a lacks them (read absent as 0).
+     */
+    readonly codShipmentCount?: number;
+    readonly codTotalPaise?: number;
     readonly createdBy: string;
     readonly createdAt: string;
     readonly updatedAt: string;
@@ -214,6 +223,21 @@ export class ManifestCommandService {
         );
       }
 
+      // ── story 4-2a (A17): the COD hand-over figure, in THIS transaction ───
+      // Over the member shipments' orders (order COD never changes, so the
+      // list read's live computation agrees). `::bigint` sums come back as
+      // strings (IMPLEMENTATION-GUIDE §2) — coerced at the boundary.
+      const cod = codTotalsOf(
+        await tx
+          .select({
+            codShipmentCount: sql<number>`count(${orders.codAmountPaise})::int`,
+            codTotalPaise: sql<string>`coalesce(sum(${orders.codAmountPaise}), 0)::bigint`,
+          })
+          .from(shipments)
+          .innerJoin(orders, and(eq(orders.id, shipments.orderId), eq(orders.tenantId, shipments.tenantId)))
+          .where(and(eq(shipments.tenantId, command.tenantId), inArray(shipments.id, shipmentIds))),
+      );
+
       const snapshot: ManifestSnapshot = {
         manifest: {
           id: manifestId,
@@ -223,6 +247,8 @@ export class ManifestCommandService {
           carrierCode: first.carrierCode,
           shipmentCount: shipmentIds.length,
           shipmentIds,
+          codShipmentCount: cod.codShipmentCount,
+          codTotalPaise: cod.codTotalPaise,
           createdBy: command.actorUserId,
           createdAt: canonicalInstant(createdAt),
           updatedAt: canonicalInstant(createdAt),
@@ -358,4 +384,19 @@ function manifestValidation(detail: string): ProblemException {
 
 function manifestConflict(title: string, detail: string): ProblemException {
   return new ProblemException('conflict', 409, title, detail);
+}
+
+/**
+ * Story 4-2a (A17) — one aggregate row of `count(cod)::int` /
+ * `coalesce(sum(cod), 0)::bigint` → numbers (a manifest with no COD reads
+ * 0 / 0). Shared with the list read so the two cannot disagree on shape.
+ */
+export function codTotalsOf(
+  rows: readonly { readonly codShipmentCount: number | string; readonly codTotalPaise: number | string }[],
+): { codShipmentCount: number; codTotalPaise: number } {
+  const row = rows[0];
+  return {
+    codShipmentCount: row === undefined ? 0 : Number(row.codShipmentCount),
+    codTotalPaise: row === undefined ? 0 : Number(row.codTotalPaise),
+  };
 }

@@ -875,6 +875,13 @@ describe('client portal (e2e, story 21-7)', () => {
         externalRef: null,
         // Story 4-1b — the client's own order number joins the exact key allowlist (null when none).
         clientOrderRef: null,
+        // Story 4-2a — the four order header fields join the exact key
+        // allowlist, extended deliberately (the order was placed with none:
+        // the derived b2c, the default normal, no ship-by, prepaid).
+        orderType: 'b2c',
+        priority: 'normal',
+        shipByDate: null,
+        codAmountPaise: null,
         warehouseName: 'Portal Main',
         destinationName: 'Priya Sharma',
         destinationCity: 'Bengaluru',
@@ -898,6 +905,13 @@ describe('client portal (e2e, story 21-7)', () => {
         externalRef: null,
         // Story 4-1b — the client's own order number joins the exact key allowlist (null when none).
         clientOrderRef: null,
+        // Story 4-2a — the four order header fields join the exact key
+        // allowlist, extended deliberately (the order was placed with none:
+        // the derived b2c, the default normal, no ship-by, prepaid).
+        orderType: 'b2c',
+        priority: 'normal',
+        shipByDate: null,
+        codAmountPaise: null,
         warehouseName: 'Portal Main',
         destinationName: 'Priya Sharma',
         destinationCity: 'Bengaluru',

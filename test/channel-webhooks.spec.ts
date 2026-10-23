@@ -526,6 +526,51 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
     );
   });
 
+  // ── story 4-2a: COD on the ingest (A4–A7) ──────────────────────────────────
+
+  function codBody(orderRef: number, extra: Record<string, unknown>): string {
+    return JSON.stringify({
+      ...(JSON.parse(orderBody(orderRef, [{ sku: 'WH-A', quantity: 1 }])) as Record<string, unknown>),
+      payment_gateway_names: ['Cash on Delivery (COD)'],
+      financial_status: 'pending',
+      currency: 'INR',
+      total_outstanding: '1499.00',
+      ...extra,
+    });
+  }
+
+  it('story 4-2a: a Shopify COD delivery creates a COD order — b2c, normal, 149900 paise', async () => {
+    const res = await postOrder(connId, codBody(9_000_000_042_001, {})).expect(200);
+    expect(res.body.outcome).toBe('accepted');
+    const order = await outbound.findOrderByChannelRef(tenantId, connId, '9000000042001');
+    expect(order).toMatchObject({ codAmountPaise: 149900, orderType: 'b2c', priority: 'normal', shipByDate: null });
+  });
+
+  it('story 4-2a (A6): a redelivery with a DIFFERENT COD resolves to the original order, which keeps its amount (warn logged)', async () => {
+    const res = await postOrder(connId, codBody(9_000_000_042_001, { total_outstanding: '999.00' })).expect(200);
+    expect(res.body.outcome).toBe('replayed');
+    expect(await declareChannelNoOps(tenantId, res.body.orderId as string, 'orders.createOrder:channel-redelivery')).toBe(1);
+    expect((await outbound.findOrderByChannelRef(tenantId, connId, '9000000042001'))!.codAmountPaise).toBe(149900);
+  });
+
+  it('story 4-2a (A5): a COD body whose amount cannot be read is the same 400, metered cod-amount-unmappable — no order', async () => {
+    for (const [ref, extra] of [
+      [9_000_000_042_002, { total_outstanding: 'abc' }],
+      [9_000_000_042_003, { currency: 'USD' }],
+      [9_000_000_042_004, { financial_status: 'authorized' }],
+    ] as const) {
+      const res = await postOrder(connId, codBody(ref, extra)).expect(400);
+      expect(res.body.code).toBe('validation-failed');
+      expect(await outbound.findOrderByChannelRef(tenantId, connId, String(ref))).toBeNull();
+      const rows = await meterRows(connId);
+      expect(rows.at(-1)).toMatchObject({
+        kind: 'order-ingest',
+        status: 'validation-failed',
+        error: 'cod-amount-unmappable — the COD amount to collect could not be read (currency, status or total_outstanding)',
+      });
+    }
+  });
+
   it('concurrent same-deliveries resolve to ONE order — both answer it', async () => {
     const bodyText = orderBody(9_000_000_010_002, [{ sku: 'WH-A', quantity: 1 }]);
     const [first, second] = await Promise.all([postOrder(connId, bodyText), postOrder(connId, bodyText)]);

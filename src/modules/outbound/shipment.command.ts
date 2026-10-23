@@ -13,7 +13,12 @@ import { getMemberRoleIn } from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
-import { CarriersFacade, labelThroughAdapter } from '../carriers/carriers.facade';
+import {
+  CarriersFacade,
+  carrierCodUnsupported,
+  carrierSupportsCod,
+  labelThroughAdapter,
+} from '../carriers/carriers.facade';
 import type { CarrierLabelRequest } from '../carriers/carriers.facade';
 import { MAX_DIMENSION_MM, MAX_WEIGHT_GRAMS } from './pack.command';
 import type { PackDimensionsInput } from './pack.command';
@@ -82,6 +87,13 @@ export interface ShipmentSnapshot {
     readonly labelledBy: string;
     readonly labelledAt: string;
     readonly manifestId: string | null;
+    /**
+     * Story 4-2a — the cash the courier collects for this order, integer
+     * paise; null for prepaid. One shipment per order for life (the guard
+     * below), so COD rides exactly one label. Optional: a label stored before
+     * 4-2a lacks it (read absent as null).
+     */
+    readonly codAmountPaise?: number | null;
   };
 }
 
@@ -230,6 +242,13 @@ export class ShipmentCommandService {
         );
       }
 
+      // ── story 4-2a (A18): a COD order needs a COD-capable carrier ─────────
+      // After the connection resolves (a foreign connection is still the
+      // 404) and BEFORE the credential opens or any adapter is called.
+      if (order.codAmountPaise !== null && !carrierSupportsCod(connection.carrierCode)) {
+        throw carrierCodUnsupported(connection.carrierCode, connection.carrierName);
+      }
+
       // ── the credential, in-tx (503 arms; never persisted, never logged) ─
       const credential = await this.carriers.openCredentialForAdapterUseInTx(
         tx,
@@ -244,6 +263,9 @@ export class ShipmentCommandService {
         orderRef: order.id,
         weightGrams,
         dimensions: dimensionsMm === null ? null : dimensionsMm,
+        // Story 4-2a — the amount to collect rides to the adapter (the
+        // sandbox ignores it; a real adapter must send it).
+        codAmountPaise: order.codAmountPaise,
       };
       const label = await labelThroughAdapter(connection.carrierCode, credential, request);
 
@@ -301,6 +323,7 @@ export class ShipmentCommandService {
           labelledBy: command.actorUserId,
           labelledAt: canonicalInstant(labelledAt),
           manifestId: null,
+          codAmountPaise: order.codAmountPaise,
         },
       };
 

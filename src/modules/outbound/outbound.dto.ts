@@ -23,7 +23,14 @@ import {
 import { ApiProperty, OmitType } from '@nestjs/swagger';
 import { BooleanFlag, IsInstant } from '../../shared/primitives/instant-range';
 import { PACK_FAILURE_ENTRIES } from '../../shared/db/schema';
-import { CLIENT_ORDER_REF_RE, MAX_CLIENT_ORDER_REF_LENGTH, ORDER_SOURCES, ORDER_STATUSES } from './order.command';
+import {
+  CLIENT_ORDER_REF_RE,
+  MAX_CLIENT_ORDER_REF_LENGTH,
+  MAX_SHIP_BY_DAYS_AHEAD,
+  ORDER_SOURCES,
+  ORDER_STATUSES,
+} from './order.command';
+import { MAX_COD_AMOUNT_PAISE, ORDER_PRIORITIES, ORDER_TYPES } from './order-urgency';
 import { MAX_EXTERNAL_ID_LENGTH } from '../../shared/primitives/ids';
 import { AddressDto } from '../tenancy/tenancy.dto';
 import { SHORT_PICK_REASON_CODES } from './pick.command';
@@ -43,6 +50,19 @@ import {
   WAVE_GROUPINGS,
   WAVE_STATUSES,
 } from './wave.command';
+
+// ── story 4-2a: the order header fields on the wire ─────────────────────────
+// One description per field, shared by every DTO that carries them. The
+// nullable `orderType` lists `null` in its enum (IMPLEMENTATION-GUIDE §4, 8-2b).
+
+export const ORDER_TYPE_DOC =
+  "Story 4-2a — the order type: 'b2b' or 'b2c' (operational only — tax treatment stays GSTIN-driven). Null on an order created before 4-2a.";
+export const ORDER_PRIORITY_DOC =
+  "Story 4-2a — the order priority: 'normal', 'high' or 'urgent' (every order created before 4-2a reads 'normal').";
+export const SHIP_BY_DATE_DOC =
+  'Story 4-2a — the ship-by date, an IST calendar date YYYY-MM-DD ("ship by the end of that IST day"); null when none.';
+export const COD_AMOUNT_DOC =
+  'Story 4-2a — the cash to collect on delivery, integer paise; null means prepaid (nothing to collect).';
 
 /** Trim at the validation boundary (the tenancy DTO pattern). */
 function Trim() {
@@ -179,6 +199,55 @@ export class CreateOrderDto {
   // No DTO shape check (IMPLEMENTATION-GUIDE §4, the 8-1d rule): the command
   // normalizes and refuses behind its replay lookup.
   clientOrderRef?: string;
+
+  // ── story 4-2a: the order header fields (all optional, create-only) ──────
+  // Type checks only (A11): the global pipe converts nothing, so a string
+  // stays a string; every VALUE check (the vocabularies, the type ↔ GSTIN
+  // contradiction, the ship-by shape and bounds, the COD range) is the
+  // command's, behind its replay lookup — a refused value answers 400
+  // `validation-failed` there. Trimmed by the command; blank reads as absent.
+  // Each joins the idempotency hash only when sent, AS SENT (an explicit
+  // 'normal' hashes differently from an omitted priority).
+
+  @ApiProperty({
+    required: false,
+    enum: [...ORDER_TYPES, null],
+    description:
+      "Story 4-2a — 'b2b' or 'b2c'. Omitted: derived — b2b with a consigneeGstin, else b2c. An explicit b2c beside a consigneeGstin is 400 (a GST-registered buyer is a business); b2b without one is allowed. Manual orders only (400 on source 'ingested').",
+  })
+  @IsOptional()
+  @IsString()
+  orderType?: string;
+
+  @ApiProperty({
+    required: false,
+    enum: [...ORDER_PRIORITIES],
+    description:
+      "Story 4-2a — 'normal' (the default when omitted), 'high' or 'urgent'. Wave planning takes due and urgent orders first. Manual orders only.",
+  })
+  @IsOptional()
+  @IsString()
+  priority?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'date',
+    description: `Story 4-2a — ship by the end of this IST day, YYYY-MM-DD; from today (IST) to ${MAX_SHIP_BY_DAYS_AHEAD} days ahead, else 400. Manual orders only.`,
+  })
+  @IsOptional()
+  @IsString()
+  shipByDate?: string;
+
+  @ApiProperty({
+    required: false,
+    type: 'integer',
+    minimum: 1,
+    maximum: MAX_COD_AMOUNT_PAISE,
+    description:
+      'Story 4-2a — cash on delivery: the amount the courier collects, integer paise (1 to 1,000,000,000 — ₹1 crore). Omit it for a prepaid order. A string, a fraction or a value out of range is 400.',
+  })
+  @IsOptional()
+  codAmountPaise?: number;
 }
 
 /** POST /tenants/{tenantId}/outbound/orders/{orderId}/cancel body — none. */
@@ -264,6 +333,41 @@ export class OrderDto {
       "Story 4-1b — the client's own order number (null when none was given). Absent only on a replayed response stored before 4-1b — read absent as null",
   })
   clientOrderRef?: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    enum: [...ORDER_TYPES, null],
+    description: `${ORDER_TYPE_DOC} Absent only on a replayed response stored before 4-2a — read absent as null.`,
+  })
+  orderType?: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    enum: [...ORDER_PRIORITIES, null],
+    description: `${ORDER_PRIORITY_DOC} Absent only on a replayed response stored before 4-2a — read absent as null.`,
+  })
+  priority?: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    format: 'date',
+    description: `${SHIP_BY_DATE_DOC} Absent only on a replayed response stored before 4-2a — read absent as null.`,
+  })
+  shipByDate?: string | null;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    required: false,
+    description: `${COD_AMOUNT_DOC} Absent only on a replayed response stored before 4-2a — read absent as null.`,
+  })
+  codAmountPaise?: number | null;
 
   @ApiProperty({
     type: AddressDto,
@@ -426,6 +530,37 @@ export class OrderEntryDto {
     description: "Story 4-1b — the client's own order number; null when none was given (a live read — always present)",
   })
   clientOrderRef!: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    enum: [...ORDER_TYPES, null],
+    description: `${ORDER_TYPE_DOC}`,
+  })
+  orderType!: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    enum: [...ORDER_PRIORITIES, null],
+    description: `${ORDER_PRIORITY_DOC}`,
+  })
+  priority!: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    format: 'date',
+    description: `${SHIP_BY_DATE_DOC}`,
+  })
+  shipByDate!: string | null;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    description: `${COD_AMOUNT_DOC}`,
+  })
+  codAmountPaise!: number | null;
 
   @ApiProperty({
     type: AddressDto,
@@ -692,6 +827,26 @@ export class PicklistDto {
 
   @ApiProperty({ description: 'Distinct bin stops on this walk — the "steps" of the batching guarantee' })
   stopCount!: number;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    enum: [...ORDER_PRIORITIES, null],
+    description:
+      "Story 4-2a — the most urgent priority among the orders of this picklist's non-cancelled lines. Absent only on a replayed wave stored before 4-2a — read absent as null.",
+  })
+  priority?: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    format: 'date',
+    description:
+      "Story 4-2a — the earliest ship-by date (IST, YYYY-MM-DD) among the orders of this picklist's non-cancelled lines; null when none has one. Absent only on a replayed wave stored before 4-2a — read absent as null.",
+  })
+  shipByDate?: string | null;
 
   @ApiProperty({ description: 'ISO-8601 UTC creation time' })
   createdAt!: string;
@@ -1102,6 +1257,21 @@ export class PickTaskDto {
       'Story 11.7: the parent kit SKU\'s code when this task\'s order line is a kit component (order_lines.parent_line_id), null on an ordinary line. Display-only — the device renders "from kit {code}" in the task header; no pick logic reads kit-ness.',
   })
   kitParentSkuCode!: string | null;
+
+
+  @ApiProperty({
+    enum: [...ORDER_PRIORITIES],
+    description: "Story 4-2a — the task's order priority (display: the stop's chip). The walk stays in bin order.",
+  })
+  orderPriority!: string;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    format: 'date',
+    description: "Story 4-2a — the task's order ship-by date (IST, YYYY-MM-DD); null when none.",
+  })
+  orderShipByDate!: string | null;
 }
 
 // ── Packing (Story 4.5) ─────────────────────────────────────────────────────
@@ -1280,6 +1450,41 @@ export class PackDto {
   })
   clientOrderRef?: string | null;
 
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    enum: [...ORDER_TYPES, null],
+    description: `${ORDER_TYPE_DOC} Absent only on a replayed response stored before 4-2a — read absent as null.`,
+  })
+  orderType?: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    enum: [...ORDER_PRIORITIES, null],
+    description: `${ORDER_PRIORITY_DOC} Absent only on a replayed response stored before 4-2a — read absent as null.`,
+  })
+  priority?: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    format: 'date',
+    description: `${SHIP_BY_DATE_DOC} Absent only on a replayed response stored before 4-2a — read absent as null.`,
+  })
+  shipByDate?: string | null;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    required: false,
+    description: `${COD_AMOUNT_DOC} Absent only on a replayed response stored before 4-2a — read absent as null.`,
+  })
+  codAmountPaise?: number | null;
+
   @ApiProperty({ format: 'uuid', description: 'The operator who packed it' })
   packedBy!: string;
 
@@ -1425,6 +1630,23 @@ export class DispatchDto {
   })
   clientOrderRef?: string | null;
 
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    enum: [...ORDER_TYPES, null],
+    description: `${ORDER_TYPE_DOC} Absent only on a replayed response stored before 4-2a — read absent as null.`,
+  })
+  orderType?: string | null;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    required: false,
+    description: `${COD_AMOUNT_DOC} Absent only on a replayed response stored before 4-2a — read absent as null.`,
+  })
+  codAmountPaise?: number | null;
+
   @ApiProperty({ format: 'uuid', description: 'The operator who dispatched it' })
   dispatchedBy!: string;
 
@@ -1547,6 +1769,14 @@ export class ShipmentDto {
 
   @ApiProperty({ type: String, nullable: true, description: 'The manifest the shipment closed onto; null while labelled' })
   manifestId!: string | null;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    required: false,
+    description: `${COD_AMOUNT_DOC} Absent only on a replayed response stored before 4-2a — read absent as null.`,
+  })
+  codAmountPaise?: number | null;
 }
 
 export class ShipmentResponse {
@@ -1603,6 +1833,22 @@ export class ManifestDto {
       'The closed shipment ids — carried by the CREATE response only (the idempotency snapshot); list rows are header rows (the shipments point back through their manifestId)',
   })
   shipmentIds?: readonly string[];
+
+  @ApiProperty({
+    type: Number,
+    required: false,
+    description:
+      "Story 4-2a — how many of the manifest's shipments are cash on delivery (the courier's hand-over count); frozen in the create snapshot, computed the same way on a list row. Absent only on a replayed create stored before 4-2a — read absent as 0.",
+  })
+  codShipmentCount?: number;
+
+  @ApiProperty({
+    type: Number,
+    required: false,
+    description:
+      "Story 4-2a — the cash the courier collects across the manifest's COD shipments, integer paise (0 when none). Frozen in the create snapshot; a list row computes the same (order COD never changes). Absent only on a replayed create stored before 4-2a — read absent as 0.",
+  })
+  codTotalPaise?: number;
 
   @ApiProperty({ format: 'uuid', description: 'The operator who created it' })
   createdBy!: string;

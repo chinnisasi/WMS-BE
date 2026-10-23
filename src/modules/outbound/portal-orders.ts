@@ -6,6 +6,7 @@ import { fromMilli } from '../../shared/primitives/quantity';
 import { canonicalInstant } from '../../shared/primitives/time';
 import type { OrderSource, OrderStatus } from './order.command';
 import { orderReferenceMatch } from './order-reference';
+import type { OrderPriority, OrderType } from './order-urgency';
 
 /**
  * Story 21-7 — the client portal's order reads. ONE client's orders, never
@@ -26,6 +27,15 @@ export interface PortalOrderRow {
    * composes the label `clientOrderRef ?? externalRef ?? …`.
    */
   readonly clientOrderRef: string | null;
+  /**
+   * Story 4-2a — the order header fields (raw). `orderType` is null on an
+   * order created before 4-2a; `priority` reads `normal`; `codAmountPaise`
+   * null means prepaid. The web composes the chips and the payment line.
+   */
+  readonly orderType: OrderType | null;
+  readonly priority: OrderPriority;
+  readonly shipByDate: string | null;
+  readonly codAmountPaise: number | null;
   readonly warehouseName: string;
   readonly destinationName: string | null;
   readonly destinationCity: string | null;
@@ -55,6 +65,10 @@ interface OrderHeaderRow {
   source: string;
   externalRef: string | null;
   clientOrderRef: string | null;
+  orderType: string | null;
+  priority: string;
+  shipByDate: string | null;
+  codAmountPaise: string | number | null;
   warehouseName: string;
   destinationName: string | null;
   destinationCity: string | null;
@@ -68,6 +82,10 @@ function headerSelect(tenantId: string): ReturnType<typeof sql> {
   return sql`
     select o.id, o.status, o.source, o.external_event_id as "externalRef",
            o.client_order_ref as "clientOrderRef",
+           o.order_type as "orderType",
+           o.priority as "priority",
+           o.ship_by_date::text as "shipByDate",
+           o.cod_amount_paise as "codAmountPaise",
            w.name as "warehouseName",
            o.destination_contact_name as "destinationName",
            o.destination_city as "destinationCity",
@@ -88,6 +106,11 @@ function toRow(row: OrderHeaderRow): PortalOrderRow {
     source: row.source as OrderSource,
     externalRef: row.externalRef,
     clientOrderRef: row.clientOrderRef,
+    orderType: row.orderType as OrderType | null,
+    priority: row.priority as OrderPriority,
+    shipByDate: row.shipByDate,
+    // bigint over raw SQL is a string (IMPLEMENTATION-GUIDE §2).
+    codAmountPaise: row.codAmountPaise === null ? null : Number(row.codAmountPaise),
     warehouseName: row.warehouseName,
     destinationName: row.destinationName,
     destinationCity: row.destinationCity,

@@ -46,6 +46,17 @@ export interface OutboundRegisterRow {
   readonly channelOrderRef: string | null;
   /** Story 4-1b — the client's own order number; null when none. */
   readonly clientOrderRef: string | null;
+  /**
+   * Story 4-2a (A20) — the order header fields, ORDER-level values repeated
+   * on every line of the order (a two-line COD order prints its COD twice —
+   * never sum the column per line). `orderType` null on a pre-4-2a order;
+   * `shipByDate` an IST date `YYYY-MM-DD`; `codAmountPaise` integer paise,
+   * null for prepaid.
+   */
+  readonly orderType: string | null;
+  readonly priority: string;
+  readonly shipByDate: string | null;
+  readonly codAmountPaise: number | null;
   readonly clientId: string;
   readonly consigneeLegalName: string | null;
   readonly consigneeGstin: string | null;
@@ -100,6 +111,8 @@ export async function outboundRegisterInTx(
       select o.id::text as "orderId", ${iso(sql`o.created_at`)} as "createdAt", o.status as "status", o.source as "source",
              case when o.source = 'ingested' then o.external_event_id end as "channelOrderRef",
              o.client_order_ref as "clientOrderRef",
+             o.order_type as "orderType", o.priority as "priority", o.ship_by_date::text as "shipByDate",
+             o.cod_amount_paise::text as "codAmountPaise",
              o.client_id::text as "clientId", o.consignee_legal_name as "consigneeLegalName", o.consignee_gstin as "consigneeGstin",
              o.destination_city as "destinationCity", o.destination_state as "destinationState", o.destination_pincode as "destinationPincode",
              ol.id::text as "lineId", k.id::text as "skuId", k.code as "skuCode", k.name as "skuName", k.uom as "uom",
@@ -120,10 +133,18 @@ export async function outboundRegisterInTx(
         and ol.order_id = any(${sql.param(orders.map((order) => order.id))}::uuid[])
       order by o.created_at, o.id, ol.created_at, ol.id
       limit ${limit - out.length + 1}::int
-    `)) as unknown as (Omit<OutboundRegisterRow, 'quantity'> & { quantity: string })[];
+    `)) as unknown as (Omit<OutboundRegisterRow, 'quantity' | 'codAmountPaise'> & {
+      quantity: string;
+      codAmountPaise: string | null;
+    })[];
     for (const row of lines) {
       if (out.length >= limit) break;
-      out.push({ ...row, quantity: fromMilli(Number(row.quantity)) });
+      out.push({
+        ...row,
+        quantity: fromMilli(Number(row.quantity)),
+        // bigint over raw SQL is text (IMPLEMENTATION-GUIDE §2), coerced here.
+        codAmountPaise: row.codAmountPaise === null ? null : Number(row.codAmountPaise),
+      });
     }
     if (orders.length < pageSize) break;
     const last = orders.at(-1)!;

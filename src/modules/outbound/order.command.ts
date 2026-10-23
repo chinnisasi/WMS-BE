@@ -13,7 +13,14 @@ import {
 } from '../../shared/db/schema';
 import type { Order, OrderLine, SkuStatus } from '../../shared/db/schema';
 import { MAX_EXTERNAL_ID_LENGTH, UUID_RE, uuidv7 } from '../../shared/primitives/ids';
-import { canonicalInstant, nowIso } from '../../shared/primitives/time';
+import { addIsoDays, canonicalInstant, isIsoDate, nowIso } from '../../shared/primitives/time';
+import {
+  MAX_COD_AMOUNT_PAISE,
+  ORDER_PRIORITIES,
+  ORDER_TYPES,
+  type OrderPriority,
+  type OrderType,
+} from './order-urgency';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
@@ -244,6 +251,17 @@ export interface CreateOrderCommand {
    * client among live orders (409 `duplicate-client-order-ref`). Create-only.
    */
   readonly clientOrderRef?: string | undefined;
+  /**
+   * Story 4-2a — the order header fields (all optional, create-only). Each is
+   * normalized before the hash (a string trimmed; `undefined`, `null` and a
+   * blank string read as ABSENT) and joins the payload hash only when sent,
+   * as sent; the value checks run behind the replay lookup (`assertOrderFields`).
+   * An ingested order may carry `codAmountPaise` only (A3).
+   */
+  readonly orderType?: unknown;
+  readonly priority?: unknown;
+  readonly shipByDate?: unknown;
+  readonly codAmountPaise?: unknown;
   /** Channel arms — required together when `source: 'ingested'`, else absent. */
   readonly integrationId?: string | undefined;
   readonly externalEventId?: string | undefined;
@@ -277,6 +295,11 @@ export interface PlacePortalOrderCommand {
   readonly consigneeLegalName?: string | undefined;
   /** Story 4-1b — the client's own order number (the staff create's rules; the portal's 409 copy). */
   readonly clientOrderRef?: string | undefined;
+  /** Story 4-2a — the order header fields (the staff create's rules; portal `urgent` refused, A12). */
+  readonly orderType?: unknown;
+  readonly priority?: unknown;
+  readonly shipByDate?: unknown;
+  readonly codAmountPaise?: unknown;
 }
 
 /**
@@ -298,6 +321,14 @@ export interface PortalPlacedOrder {
    * treats absent as null).
    */
   readonly clientOrderRef?: string | null;
+  /**
+   * Story 4-2a — the order header fields as stored (A1). Optional: a response
+   * stored before 4-2a lacks them (a reader treats absent as null).
+   */
+  readonly orderType?: OrderType | null;
+  readonly priority?: OrderPriority | null;
+  readonly shipByDate?: string | null;
+  readonly codAmountPaise?: number | null;
 }
 
 export interface CancelOrderCommand {
@@ -363,6 +394,15 @@ export interface OrderSnapshot {
      * idempotent replay) does not carry it — a reader treats absent as null.
      */
     readonly clientOrderRef?: string | null;
+    /**
+     * Story 4-2a — the order header fields. Optional on the interface (A1): a
+     * snapshot stored before 4-2a lacks them; a reader treats absent as null.
+     * `orderType` is null on a pre-4-2a order row; `priority` reads `normal`.
+     */
+    readonly orderType?: OrderType | null;
+    readonly priority?: OrderPriority | null;
+    readonly shipByDate?: string | null;
+    readonly codAmountPaise?: number | null;
     /** Where the shipment goes (story 11-1); null on a pre-11.1 order row. */
     readonly destination: AddressSnapshot | null;
     /**
@@ -451,6 +491,18 @@ export class OrderCommandService {
         'clientOrderRef is a manual order\'s field — a channel order is named by its externalEventId.',
       );
     }
+    // Story 4-2a (A3) — a channel order never carries the manual fields (type,
+    // priority, ship-by); its COD comes from the channel. 400, beside 4-1b's
+    // refusal (normalized first: a blank value reads as absent).
+    const orderFields = normalizeOrderFields(command);
+    if (
+      command.source === 'ingested' &&
+      (orderFields.orderType !== null || orderFields.priority !== null || orderFields.shipByDate !== null)
+    ) {
+      throw validationFailed(
+        'orderType, priority and shipByDate are a manual order\'s fields — a channel order carries only its cash-on-delivery amount.',
+      );
+    }
     const integrationId = command.source === 'ingested' ? (command.integrationId ?? null) : null;
     const externalEventId =
       command.source === 'ingested' ? (command.externalEventId ?? null) : null;
@@ -522,6 +574,16 @@ export class OrderCommandService {
             lines: command.lines.map(lineFingerprint),
           })
         : null;
+    //
+    // ── story 4-2a: the order fields join the payload hash ONLY WHEN SENT ──
+    // The 8-1d conditional-key rule (IMPLEMENTATION-GUIDE §4): each field
+    // normalized first (a string trimmed, blank = absent), then spread in AS
+    // SENT — never the derived default — at fixed positions right after
+    // `clientOrderRef`: orderType, priority, shipByDate, codAmountPaise. An
+    // order without them hashes byte-identically to the pre-4-2a build (the
+    // existing goldens); an explicit `priority: 'normal'` hashes differently
+    // from an omitted one (pinned). NEVER in the channel `sourcePayloadHash`:
+    // a redelivery spanning the deploy must still resolve to its order.
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       warehouseId: command.warehouseId,
@@ -532,6 +594,7 @@ export class OrderCommandService {
       consigneeGstin,
       ...legalNameFingerprint,
       ...clientOrderRefFingerprint,
+      ...orderFieldsFingerprint(orderFields),
       lines: command.lines.map(lineFingerprint),
     });
 
@@ -578,7 +641,17 @@ export class OrderCommandService {
     return this.placeOrder(
       command,
       idempotencyKey,
-      { integrationId, externalEventId, consigneeGstin, consigneeLegalName, clientOrderRef, sourcePayloadHash, payloadHash },
+      {
+        integrationId,
+        externalEventId,
+        consigneeGstin,
+        consigneeLegalName,
+        clientOrderRef,
+        orderFields,
+        licenceDate,
+        sourcePayloadHash,
+        payloadHash,
+      },
       staff,
     );
   }
@@ -636,6 +709,7 @@ export class OrderCommandService {
     const consigneeGstin = normalizeGstinInput(command.consigneeGstin);
     const consigneeLegalName = normalizeConsigneeLegalName(command.consigneeLegalName);
     const clientOrderRef = normalizeClientOrderRef(command.clientOrderRef);
+    const orderFields = normalizeOrderFields(command);
     // The portal fingerprint: `surface` FIRST (an identical payload must never
     // replay the operator surface's snapshot under a shared key), then the
     // session's client; the legal name only when present, at the 8-1d
@@ -651,6 +725,8 @@ export class OrderCommandService {
       consigneeGstin,
       ...(consigneeLegalName === null ? {} : { consigneeLegalName }),
       ...(clientOrderRef === null ? {} : { clientOrderRef }),
+      // Story 4-2a — the order fields, only when sent, at the staff positions.
+      ...orderFieldsFingerprint(orderFields),
       lines,
     });
 
@@ -723,6 +799,11 @@ export class OrderCommandService {
         lineCount: snapshot.order.lines.filter((line) => line.parentLineId === null).length,
         placedAt: snapshot.order.createdAt,
         clientOrderRef: snapshot.order.clientOrderRef ?? null,
+        // Story 4-2a — the four fields as stored (the exact key allowlist grows by four).
+        orderType: snapshot.order.orderType ?? null,
+        priority: snapshot.order.priority ?? null,
+        shipByDate: snapshot.order.shipByDate ?? null,
+        codAmountPaise: snapshot.order.codAmountPaise ?? null,
       }),
     };
 
@@ -740,7 +821,17 @@ export class OrderCommandService {
         backorderPolicy: 'reject',
       },
       idempotencyKey,
-      { integrationId: null, externalEventId: null, consigneeGstin, consigneeLegalName, clientOrderRef, sourcePayloadHash: null, payloadHash },
+      {
+        integrationId: null,
+        externalEventId: null,
+        consigneeGstin,
+        consigneeLegalName,
+        clientOrderRef,
+        orderFields,
+        licenceDate,
+        sourcePayloadHash: null,
+        payloadHash,
+      },
       portal,
     );
   }
@@ -963,6 +1054,16 @@ export class OrderCommandService {
       if (clientOrderRef !== null) {
         assertClientOrderRefShape(clientOrderRef);
       }
+      // Story 4-2a — the order fields' value checks, behind the replay lookup
+      // (A11): the vocabularies, the type ↔ GSTIN contradiction, the ship-by
+      // shape and its bounds against the ONE IST date the create captured
+      // (A13 — a replay tomorrow of today's order replays above, never
+      // refused), the COD amount's type and range. Then the derived defaults.
+      const fields = assertOrderFields(hashes.orderFields, {
+        surface: surface.kind,
+        consigneeGstin,
+        todayIst: hashes.licenceDate,
+      });
       // Story 11-1: the destination is validated HERE, behind the replay
       // lookup — the command is the boundary (the Epic 7 adapter path bypasses
       // the DTO's @ValidateNested), and a refusal must never answer 400 to an
@@ -1138,6 +1239,7 @@ export class OrderCommandService {
       return {
         replayed: false,
         destination,
+        fields,
         lines: linesWithRates,
         explosions,
         clientId,
@@ -1354,6 +1456,13 @@ export class OrderCommandService {
             // Story 4-1b: the client's own order number (normalized and
             // shape-checked in phase 1; null when none was given).
             clientOrderRef,
+            // Story 4-2a: the order header fields as phase 1 validated and
+            // derived them (the type derived from the GSTIN when not sent,
+            // priority `normal` when not sent).
+            orderType: preflight.fields.orderType,
+            priority: preflight.fields.priority,
+            shipByDate: preflight.fields.shipByDate,
+            codAmountPaise: preflight.fields.codAmountPaise,
           });
         } catch (err) {
           // Story 4-1b — a concurrent order of the same client took the number
@@ -2084,6 +2193,11 @@ export class OrderCommandService {
         externalEventId: order.externalEventId,
         // Story 4-1b: the client's own order number (null when none).
         clientOrderRef: order.clientOrderRef,
+        // Story 4-2a: the order header fields (orderType null on a pre-4-2a row).
+        orderType: order.orderType as OrderType | null,
+        priority: order.priority as OrderPriority,
+        shipByDate: order.shipByDate,
+        codAmountPaise: order.codAmountPaise,
         // Story 11-1: the destination echoes from the flat columns; a
         // pre-11.1 row (all null) reads back `destination: null`.
         destination: addressFromColumns({
@@ -2293,6 +2407,10 @@ interface OrderHashStage {
   readonly consigneeLegalName: string | null;
   /** Story 4-1b — normalized (trim, blank = absent); the shape refusal and the duplicate check are phase 1's. */
   readonly clientOrderRef: string | null;
+  /** Story 4-2a — normalized (a string trimmed, blank = absent); the value checks are phase 1's. */
+  readonly orderFields: NormalizedOrderFields;
+  /** Story 4-2a (A13) — the ONE IST date the create captured (`licenceToday()`), the ship-by bound's today. */
+  readonly licenceDate: string;
   readonly sourcePayloadHash: string | null;
   readonly payloadHash: string;
 }
@@ -2354,6 +2472,8 @@ interface OrderSurface<R> {
 interface PreflightAccepted {
   readonly replayed: false;
   readonly destination: AddressInput;
+  /** Story 4-2a — the validated, derived order header fields. */
+  readonly fields: ValidatedOrderFields;
   /** Milli-units, each with its validated rate (story 8-1). */
   readonly lines: readonly OrderLineInput[];
   readonly explosions: Map<number, readonly KitCompositionLine[]>;
@@ -2466,6 +2586,129 @@ function explodeKitLine(
 
 function validationFailed(detail: string): ProblemException {
   return new ProblemException('validation-failed', 400, 'Order validation failed', detail);
+}
+
+// ── story 4-2a: the order header fields ───────────────────────────────────────
+
+/** How far ahead a manual order's ship-by date may be (inclusive), in IST days. */
+export const MAX_SHIP_BY_DAYS_AHEAD = 365;
+
+/**
+ * Story 4-2a — the four fields as normalized before the hash: a string is
+ * trimmed, and `undefined`, `null` and a blank string read as ABSENT (null).
+ * Any other value is kept AS SENT (so it hashes as sent) and refused behind
+ * the replay lookup — `assertOrderFields`.
+ */
+export interface NormalizedOrderFields {
+  readonly orderType: unknown;
+  readonly priority: unknown;
+  readonly shipByDate: unknown;
+  readonly codAmountPaise: unknown;
+}
+
+/** The fields as phase 1 validated and derived them — what the insert writes. */
+export interface ValidatedOrderFields {
+  readonly orderType: OrderType;
+  readonly priority: OrderPriority;
+  readonly shipByDate: string | null;
+  readonly codAmountPaise: number | null;
+}
+
+function normalizeOrderFieldValue(raw: unknown): unknown {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw === 'string') {
+    const value = raw.trim();
+    return value === '' ? null : value;
+  }
+  return raw;
+}
+
+/** Story 4-2a — the lenient pre-hash normal form (never throws). */
+export function normalizeOrderFields(input: {
+  readonly orderType?: unknown;
+  readonly priority?: unknown;
+  readonly shipByDate?: unknown;
+  readonly codAmountPaise?: unknown;
+}): NormalizedOrderFields {
+  return {
+    orderType: normalizeOrderFieldValue(input.orderType),
+    priority: normalizeOrderFieldValue(input.priority),
+    shipByDate: normalizeOrderFieldValue(input.shipByDate),
+    codAmountPaise: normalizeOrderFieldValue(input.codAmountPaise),
+  };
+}
+
+/**
+ * Story 4-2a (decision 7) — the fields' contribution to the payload hash:
+ * each key ONLY when sent, as sent (never a derived default), at fixed
+ * positions in this order. Spread right after `clientOrderRef`.
+ */
+export function orderFieldsFingerprint(fields: NormalizedOrderFields): Record<string, unknown> {
+  return {
+    ...(fields.orderType === null ? {} : { orderType: fields.orderType }),
+    ...(fields.priority === null ? {} : { priority: fields.priority }),
+    ...(fields.shipByDate === null ? {} : { shipByDate: fields.shipByDate }),
+    ...(fields.codAmountPaise === null ? {} : { codAmountPaise: fields.codAmountPaise }),
+  };
+}
+
+/**
+ * Story 4-2a — the value checks (400 `validation-failed`), behind the replay
+ * lookup, then the derived defaults. The command is the boundary: a non-HTTP
+ * caller (the channel ingest) bypasses the DTO, and the DTO checks types only.
+ */
+export function assertOrderFields(
+  fields: NormalizedOrderFields,
+  context: { readonly surface: 'staff' | 'portal'; readonly consigneeGstin: string | null; readonly todayIst: string },
+): ValidatedOrderFields {
+  const { orderType, priority, shipByDate, codAmountPaise } = fields;
+  if (orderType !== null && !(typeof orderType === 'string' && (ORDER_TYPES as readonly string[]).includes(orderType))) {
+    throw validationFailed(`orderType must be one of ${JSON.stringify(ORDER_TYPES)} (got ${JSON.stringify(orderType)}).`);
+  }
+  // Decision 4 (A7): only an EXPLICIT b2c contradicts a GSTIN — a derived type never refuses.
+  if (orderType === 'b2c' && context.consigneeGstin !== null) {
+    throw validationFailed(
+      'orderType b2c contradicts the consignee GSTIN — a GST-registered buyer is a business: send b2b, or leave orderType out.',
+    );
+  }
+  if (priority !== null && !(typeof priority === 'string' && (ORDER_PRIORITIES as readonly string[]).includes(priority))) {
+    throw validationFailed(`priority must be one of ${JSON.stringify(ORDER_PRIORITIES)} (got ${JSON.stringify(priority)}).`);
+  }
+  // A12 — urgent is the warehouse's call; a portal client may ask for high.
+  if (context.surface === 'portal' && priority === 'urgent') {
+    throw validationFailed('Urgent priority is set by the warehouse — choose Normal or High.');
+  }
+  if (shipByDate !== null) {
+    if (typeof shipByDate !== 'string' || !isIsoDate(shipByDate)) {
+      throw validationFailed(
+        `shipByDate must be a calendar date YYYY-MM-DD (an IST day, not a time; got ${JSON.stringify(shipByDate)}).`,
+      );
+    }
+    const latest = addIsoDays(context.todayIst, MAX_SHIP_BY_DAYS_AHEAD);
+    if (shipByDate < context.todayIst || shipByDate > latest) {
+      throw validationFailed(
+        `shipByDate must fall from today (${context.todayIst}, IST) to ${latest} — ${MAX_SHIP_BY_DAYS_AHEAD} days ahead (got ${shipByDate}).`,
+      );
+    }
+  }
+  if (codAmountPaise !== null) {
+    if (
+      typeof codAmountPaise !== 'number' ||
+      !Number.isSafeInteger(codAmountPaise) ||
+      codAmountPaise < 1 ||
+      codAmountPaise > MAX_COD_AMOUNT_PAISE
+    ) {
+      throw validationFailed(
+        `codAmountPaise is the cash to collect in whole paise, a number from 1 to ${MAX_COD_AMOUNT_PAISE} (₹1 crore) — leave it out for a prepaid order (got ${JSON.stringify(codAmountPaise)}).`,
+      );
+    }
+  }
+  return {
+    orderType: (orderType as OrderType | null) ?? (context.consigneeGstin !== null ? 'b2b' : 'b2c'),
+    priority: (priority as OrderPriority | null) ?? 'normal',
+    shipByDate: shipByDate as string | null,
+    codAmountPaise: codAmountPaise as number | null,
+  };
 }
 
 /**

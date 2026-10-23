@@ -110,6 +110,20 @@ export function carrierTransportUnconfigured(carrierCode: string): ProblemExcept
 }
 
 /**
+ * Story 4-2a (A18) — 409 `carrier-cod-unsupported`: a cash-on-delivery order
+ * on a carrier that has not declared it can collect COD. Nothing is written
+ * and no adapter is called; the label read's rate item carries the same code.
+ */
+export function carrierCodUnsupported(carrierCode: string, carrierName: string): ProblemException {
+  return new ProblemException(
+    'carrier-cod-unsupported',
+    409,
+    'Carrier cannot collect cash on delivery',
+    `${carrierName} (${carrierCode}) cannot collect cash on delivery on this deployment — label this cash-on-delivery order with a carrier that can.`,
+  );
+}
+
+/**
  * 503 `carrier-encryption-unavailable` — the deployment has no (or a too
  * short) `CARRIER_ENCRYPTION_KEY`. Mirrors 3.2's
  * `device-encryption-unavailable`: a raw throw from inside the transaction

@@ -1208,6 +1208,27 @@ export class CatalogPackTaskDto {
       'Story 10.3: the SKU is handled by unit — the bench must scan each case\'s handling-unit label (count == pickedQty), never a typed quantity.',
   })
   catchWeightTracked!: boolean;
+  @ApiProperty({
+    enum: ['normal', 'high', 'urgent'],
+    description:
+      "Story 4-2a — the order's priority (order-level, repeated on each of its SKU rows): the pack card's chip. Pack tasks arrive by the urgency key (due first, priority, ship-by, then oldest).",
+  })
+  orderPriority!: string;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    format: 'date',
+    description: "Story 4-2a — the order's ship-by date (IST, YYYY-MM-DD); null when none.",
+  })
+  orderShipByDate!: string | null;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    description: "Story 4-2a — the cash to collect on delivery for this order, integer paise; null means prepaid.",
+  })
+  codAmountPaise!: number | null;
 }
 
 /** One active handling unit of the device snapshot (story 10.7, additive). */

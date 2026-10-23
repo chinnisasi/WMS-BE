@@ -18,6 +18,7 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 import { DEFAULT_CHANNEL_HTTP_TIMEOUT_MS, parseChannelHttpTimeoutMs } from '../src/modules/channels/channel-http';
 import type { ChannelHttpResponse } from '../src/modules/channels/channel-http';
 import { channelHttpRequest } from '../src/modules/channels/channel-http';
+import { isShopifyCodGateway, shopifyCodAmountPaise, shopifyParseOrder } from '../src/modules/channels/channel-shopify-port';
 import {
   ChannelItemsUnresolvedError,
 } from '../src/modules/channels/channel-availability-port';
@@ -756,5 +757,59 @@ describe('CHANNEL_HTTP_TIMEOUT_MS: the poll-gate parse conventions (RD-6)', () =
     } finally {
       hung.close();
     }
+  });
+});
+
+// ── story 4-2a (A4): Shopify COD, fail closed ─────────────────────────────────
+describe('shopify COD parse (story 4-2a, A4)', () => {
+  const base = {
+    id: 5_500_000_000_001,
+    shipping_address: { name: 'Ravi', phone: '9876543210', address1: 'Plot 12', city: 'Hyderabad', province: 'Telangana', zip: '500081' },
+    line_items: [{ sku: 'SKU-1', quantity: 1 }],
+  };
+  const cod = (extra: Record<string, unknown>) => ({
+    ...base,
+    payment_gateway_names: ['Cash on Delivery (COD)'],
+    financial_status: 'pending',
+    currency: 'INR',
+    total_outstanding: '1499.00',
+    ...extra,
+  });
+
+  it('Shopify COD: a COD gateway, pending, INR, total_outstanding "1499.00" → 149900 paise', () => {
+    expect(shopifyParseOrder(cod({}))).toMatchObject({ orderRef: '5500000000001', codAmountPaise: 149900 });
+    expect(shopifyCodAmountPaise(cod({ financial_status: 'partially_paid', total_outstanding: '0.5' }))).toBe(50);
+    expect(shopifyCodAmountPaise(cod({ total_outstanding: '12' }))).toBe(1200);
+  });
+
+  it('gateway spellings: cash_on_delivery and COD-India are COD; a non-COD gateway is prepaid whatever the status', () => {
+    for (const name of ['cash_on_delivery', 'COD-India', 'Cash on Delivery (COD)', 'cod']) expect(isShopifyCodGateway(name)).toBe(true);
+    for (const name of ['shopify_payments', 'Razorpay', 'codex pay', 'manual']) expect(isShopifyCodGateway(name)).toBe(false);
+    expect(shopifyParseOrder({ ...base, payment_gateway_names: ['razorpay'], financial_status: 'pending', total_outstanding: 'abc' })).toMatchObject({ codAmountPaise: null });
+    expect(shopifyParseOrder(base)).toMatchObject({ codAmountPaise: null });
+  });
+
+  it('status arms: paid, refunded, partially_refunded → prepaid; authorized, voided, missing → unmappable', () => {
+    for (const status of ['paid', 'refunded', 'partially_refunded']) expect(shopifyCodAmountPaise(cod({ financial_status: status }))).toBeNull();
+    for (const status of ['authorized', 'voided', undefined, 7]) {
+      expect(shopifyParseOrder(cod({ financial_status: status }))).toEqual({ refused: 'cod-amount-unmappable' });
+    }
+  });
+
+  it('bad amounts and a non-INR shop currency are unmappable — never prepaid', () => {
+    for (const total_outstanding of ['abc', undefined, '0.00', '0', 1499, '1499.001', '-5', '123456789.00', '1,499.00']) {
+      expect(shopifyParseOrder(cod({ total_outstanding }))).toEqual({ refused: 'cod-amount-unmappable' });
+    }
+    expect(shopifyParseOrder(cod({ currency: 'USD' }))).toEqual({ refused: 'cod-amount-unmappable' });
+    // The shop currency decides, never the presentment currency.
+    expect(shopifyParseOrder(cod({ presentment_currency: 'USD' }))).toMatchObject({ codAmountPaise: 149900 });
+    // The ceiling: ₹1 crore is the cap; 99,999,999.99 is above it.
+    expect(shopifyCodAmountPaise(cod({ total_outstanding: '10000000.00' }))).toBe(1_000_000_000);
+    expect(shopifyCodAmountPaise(cod({ total_outstanding: '10000000.01' }))).toBe('unmappable');
+  });
+
+  it('Shopify B2B (A7): a company block maps nothing — no type is parsed (PENDING)', () => {
+    const parsed = shopifyParseOrder({ ...base, company: { id: 1, location_id: 2 } });
+    expect(parsed).toEqual({ orderRef: '5500000000001', destination: expect.any(Object), lines: [{ externalRef: 'SKU-1', quantity: 1 }], codAmountPaise: null });
   });
 });

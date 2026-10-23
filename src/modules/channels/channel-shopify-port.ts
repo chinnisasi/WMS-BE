@@ -28,9 +28,15 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { fromMilli } from '../../shared/primitives/quantity';
 import { MAX_EXTERNAL_ID_LENGTH } from '../../shared/primitives/ids';
+import { MAX_COD_AMOUNT_PAISE, decimalRupeesToPaise } from '../../shared/primitives/money';
 import { ChannelHttpError, channelHttpRequest } from './channel-http';
 import { ChannelItemsUnresolvedError } from './channel-availability-port';
-import type { ParsedChannelCancellation, ParsedChannelLine, ParsedChannelOrder } from './channel-registry';
+import type {
+  ParsedChannelCancellation,
+  ParsedChannelLine,
+  ParsedChannelOrder,
+  ParsedChannelRefusal,
+} from './channel-registry';
 import type { ChannelCredential } from './channel-credentials';
 import type { AddressInput } from '../../shared/primitives/address';
 import type {
@@ -466,7 +472,51 @@ function parseShippingAddress(raw: unknown): AddressInput | undefined | null {
   return destination.line2 === undefined ? destination : { ...destination, line2: destination.line2 };
 }
 
-export function shopifyParseOrder(body: Record<string, unknown>): ParsedChannelOrder | null {
+/**
+ * Story 4-2a (A4) — a Shopify payment gateway names cash on delivery. Each
+ * entry is normalized first (`_` and `-` become spaces, the case is folded),
+ * so "Cash on Delivery (COD)", "cash_on_delivery" and "COD-India" all match.
+ */
+const COD_GATEWAY_RE = /cash on delivery|\bcod\b/;
+
+export function isShopifyCodGateway(name: string): boolean {
+  return COD_GATEWAY_RE.test(name.replace(/[_-]/g, ' ').toLowerCase());
+}
+
+/** `financial_status` with a COD gateway: still to collect, or settled (prepaid). */
+const COD_OUTSTANDING_STATUSES: readonly string[] = ['pending', 'partially_paid'];
+const COD_SETTLED_STATUSES: readonly string[] = ['paid', 'refunded', 'partially_refunded'];
+
+/**
+ * Story 4-2a (A4) — Shopify's COD amount, FAIL CLOSED:
+ *   - no COD gateway → prepaid (`null`), whatever the status;
+ *   - a COD gateway and `financial_status` `paid` / `refunded` /
+ *     `partially_refunded` → prepaid (nothing left to collect);
+ *   - a COD gateway and `pending` / `partially_paid` → COD, the amount
+ *     `total_outstanding` (a decimal string `^\d{1,8}(\.\d{1,2})?$`, in the
+ *     SHOP currency `currency` — never `presentment_currency` — which must be
+ *     INR), converted to paise by integer arithmetic, 1..₹1 crore;
+ *   - anything else with a COD gateway (another status, another currency, an
+ *     amount that fails) → `'unmappable'`: the order is refused (metered
+ *     `cod-amount-unmappable`), never ingested as a prepaid order.
+ */
+export function shopifyCodAmountPaise(body: Record<string, unknown>): number | null | 'unmappable' {
+  const gateways = body['payment_gateway_names'];
+  const cod =
+    Array.isArray(gateways) && gateways.some((name) => typeof name === 'string' && isShopifyCodGateway(name));
+  if (!cod) return null;
+  const status = body['financial_status'];
+  if (typeof status === 'string' && COD_SETTLED_STATUSES.includes(status)) return null;
+  if (typeof status !== 'string' || !COD_OUTSTANDING_STATUSES.includes(status)) return 'unmappable';
+  if (body['currency'] !== 'INR') return 'unmappable';
+  const outstanding = body['total_outstanding'];
+  if (typeof outstanding !== 'string') return 'unmappable';
+  const amount = decimalRupeesToPaise(outstanding);
+  if (amount === null || amount < 1 || amount > MAX_COD_AMOUNT_PAISE) return 'unmappable';
+  return amount;
+}
+
+export function shopifyParseOrder(body: Record<string, unknown>): ParsedChannelOrder | ParsedChannelRefusal | null {
   const orderRef = parseOrderRef(body);
   if (orderRef === null) {
     return null;
@@ -505,7 +555,13 @@ export function shopifyParseOrder(body: Record<string, unknown>): ParsedChannelO
   if (lines.length === 0) {
     return null;
   }
-  return { orderRef, destination, lines };
+  // Story 4-2a (A4/A5) — the COD amount, fail closed: a COD body whose amount
+  // cannot be read is refused by name, never ingested as prepaid.
+  const codAmountPaise = shopifyCodAmountPaise(body);
+  if (codAmountPaise === 'unmappable') {
+    return { refused: 'cod-amount-unmappable' };
+  }
+  return { orderRef, destination, lines, codAmountPaise };
 }
 
 export function shopifyParseCancellation(body: Record<string, unknown>): ParsedChannelCancellation | null {

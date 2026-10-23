@@ -45,6 +45,13 @@ export interface CarrierLabelRequest {
   readonly dimensions:
     | { readonly lengthMm: number; readonly widthMm: number; readonly heightMm: number }
     | null;
+  /**
+   * Story 4-2a — the cash the courier collects, integer paise; null for a
+   * prepaid order. The sandbox arm ignores it — it never joins the sandbox
+   * canonical string (A19: the tracking number and the label goldens stay
+   * unchanged); a real adapter (4-6d) MUST send it.
+   */
+  readonly codAmountPaise: number | null;
 }
 
 /** What a label arm answers: the adapter-issued identity of the shipment. */
@@ -130,6 +137,11 @@ export interface CarrierRateRequest {
    * consumed outside that guard).
    */
   readonly weightGrams: number | null;
+  /**
+   * Story 4-2a — the order's COD amount, integer paise; null for prepaid. The
+   * sandbox arm ignores it; a real adapter must price the COD service on it.
+   */
+  readonly codAmountPaise: number | null;
 }
 
 /**

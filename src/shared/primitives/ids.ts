@@ -7,25 +7,46 @@
  */
 
 // UUIDv7: 48-bit big-endian unix ms in the first 6 bytes, ver 7 / variant bits.
+//
+// Story 4-2a (A2) — MONOTONIC within a process. `lastMs` is the millisecond
+// the last id EMBEDDED, `lastRaw` the clock reading it was minted at. When the
+// 12-bit sequence wraps inside one millisecond the embedded clock is bumped
+// past it, and that bump is CARRIED (`lastMs`): every later id minted while
+// the clock still reads at or before the bumped millisecond continues the
+// sequence from it, so an id never goes back in time. (Before 4-2a the bump
+// was never stored — the next id in the same millisecond embedded the old one
+// again and sorted before the bumped id.) An explicit `now` before the last
+// clock reading (a test minting an id "two hours ago") is not part of the
+// sequence: it embeds exactly that instant with a fresh random sequence.
 let lastMs = 0;
+let lastRaw = 0;
 let seq = 0;
 
 export function uuidv7(now: number = Date.now()): string {
-  // 12-bit sequence guard for ids generated within the same millisecond.
-  if (now === lastMs) {
-    seq = (seq + 1) & 0x0fff;
-    if (seq === 0) now += 1; // sequence exhausted — bump the clock
-  } else {
+  if (now > lastMs) {
     lastMs = now;
+    lastRaw = now;
     seq = Math.floor(Math.random() * 0x0fff);
+  } else if (now >= lastRaw) {
+    // The same millisecond (or one the carried bump already covers): continue
+    // the 12-bit sequence; a wrap moves the embedded clock forward one ms.
+    lastRaw = now;
+    seq = (seq + 1) & 0x0fff;
+    if (seq === 0) lastMs += 1;
+    now = lastMs;
+  } else {
+    return build(now, Math.floor(Math.random() * 0x0fff));
   }
+  return build(now, seq);
+}
 
+function build(now: number, sequence: number): string {
   const bytes = new Uint8Array(16);
   const view = new DataView(bytes.buffer);
   view.setUint32(0, Math.floor(now / 2 ** 16));
   view.setUint16(4, now & 0xffff);
-  view.setUint8(6, 0x70 | (seq >> 8)); // version 7 + top 4 seq bits
-  view.setUint8(7, seq & 0xff);
+  view.setUint8(6, 0x70 | (sequence >> 8)); // version 7 + top 4 seq bits
+  view.setUint8(7, sequence & 0xff);
   crypto.getRandomValues(bytes.subarray(8, 16));
   bytes[8]! = (bytes[8]! & 0x3f) | 0x80; // variant 10xx
 

@@ -555,7 +555,18 @@ describe('client order number (e2e, story 4-1b)', () => {
   describe('the portal', () => {
     it('ACME places " SO-7 ": stored "SO-7"; the placed response and its list row carry it', async () => {
       const res = await place(orderBody('A-1', { clientOrderRef: ' SO-7 ' })).expect(201);
-      expect(res.body).toEqual({ orderId: expect.any(String), warehouseName: 'Main', lineCount: 1, placedAt: expect.any(String), clientOrderRef: 'SO-7' });
+      // (Story 4-2a added the four order header fields, deliberately.)
+      expect(res.body).toEqual({
+        orderId: expect.any(String),
+        warehouseName: 'Main',
+        lineCount: 1,
+        placedAt: expect.any(String),
+        clientOrderRef: 'SO-7',
+        orderType: 'b2c',
+        priority: 'normal',
+        shipByDate: null,
+        codAmountPaise: null,
+      });
       expect((await sql`select client_order_ref from orders where id = ${res.body.orderId as string}`)[0]!.client_order_ref).toBe('SO-7');
       const row = (await portalSearch('')).find((o) => o.id === res.body.orderId);
       expect(row).toMatchObject({ clientOrderRef: 'SO-7', externalRef: null });

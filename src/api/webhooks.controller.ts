@@ -15,7 +15,7 @@ import { problemJsonResponse } from '../shared/problem-details/problem-details.o
 import { ProblemException } from '../shared/problem-details/problem.exception';
 import { UUID_RE } from '../shared/primitives/ids';
 import { ChannelsFacade } from '../modules/channels/channels.facade';
-import { channelAdapter } from '../modules/channels/channel-registry';
+import { channelAdapter, isParsedChannelRefusal } from '../modules/channels/channel-registry';
 import type {
   ChannelAdapter,
   ChannelWebhookEndpoint,
@@ -105,6 +105,12 @@ export class WebhooksController {
     const parsed = verified.adapter.webhook!.parseOrder(verified.body);
     if (parsed === null) {
       await this.channels.recordIngestParseRefused(tenantId, connectionId);
+      throw webhookValidationFailed();
+    }
+    // Story 4-2a (A5) — a named parse refusal (a COD body whose amount cannot
+    // be read): metered by its reason, answered with the same 400.
+    if (isParsedChannelRefusal(parsed)) {
+      await this.channels.recordIngestParseRefused(tenantId, connectionId, parsed.refused);
       throw webhookValidationFailed();
     }
     const result = await this.channels.ingestOrderDelivery({

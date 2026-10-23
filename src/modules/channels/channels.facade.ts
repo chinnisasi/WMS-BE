@@ -11,7 +11,7 @@ import { getMemberRoleIn } from '../tenancy/tenancy.service';
 import { channelConnectionNotFound } from './channels.errors';
 import { ChannelsCommandService } from './channels.command';
 import { ChannelsIngestCommand } from './channels.ingest.command';
-import type { ParsedChannelCancellation, ParsedChannelOrder } from './channel-registry';
+import type { ParsedChannelCancellation, ParsedChannelOrder, ParsedChannelRefusal } from './channel-registry';
 import type {
   ConnectChannelCommand,
   RotateChannelCredentialCommand,
@@ -208,12 +208,19 @@ export class ChannelsFacade {
     return this.publish.recordIngestVerificationRefused(tenantId, connectionId);
   }
 
-  /** The parse-arm refusal's meter (a VERIFIED body with no mappable shape). */
-  recordIngestParseRefused(tenantId: string, connectionId: string): Promise<void> {
+  /**
+   * The parse-arm refusal's meter (a VERIFIED body with no mappable shape).
+   * Story 4-2a (A5) — a named `reason` meters its own sentence under the same
+   * `validation-failed` status (the HTTP answer is the same 400).
+   */
+  recordIngestParseRefused(tenantId: string, connectionId: string, reason?: ParsedChannelRefusal['refused']): Promise<void> {
     return this.publish.recordIngestOutcome(tenantId, connectionId, {
       status: 'validation-failed',
       latencyMs: 0,
-      error: 'the payload carries no mappable shape for the endpoint',
+      error:
+        reason === 'cod-amount-unmappable'
+          ? 'cod-amount-unmappable — the COD amount to collect could not be read (currency, status or total_outstanding)'
+          : 'the payload carries no mappable shape for the endpoint',
     });
   }
 

@@ -15,6 +15,7 @@ import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
+import { istDateOf } from '../src/shared/primitives/time';
 
 // Story 4-1a — portal order entry: a client user places an outbound order for
 // its OWN active SKUs (`POST portal/orders`, the client taken from the
@@ -315,7 +316,19 @@ describe('portal order entry (e2e, story 4-1a)', () => {
       const orderId = res.body.orderId as string;
       // Exact keys — no reservation, rate, phone, status or line detail.
       // (Story 4-1b added `clientOrderRef`, null when none was given.)
-      expect(res.body).toEqual({ orderId, warehouseName: 'Main', lineCount: 2, placedAt: expect.any(String), clientOrderRef: null });
+      // (Story 4-2a added the four order header fields — the derived type,
+      // the default priority, no ship-by, prepaid — deliberately.)
+      expect(res.body).toEqual({
+        orderId,
+        warehouseName: 'Main',
+        lineCount: 2,
+        placedAt: expect.any(String),
+        clientOrderRef: null,
+        orderType: 'b2c',
+        priority: 'normal',
+        shipByDate: null,
+        codAmountPaise: null,
+      });
       expect(res.body.placedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
 
       // The staff view: an ordinary manual order of ACME, fully reserved.
@@ -544,6 +557,30 @@ describe('portal order entry (e2e, story 4-1a)', () => {
       expect(hashOf.get(blankKey)).toBe(sha256(`${head},"consigneeGstin":null,${line}`));
     });
 
+    it('golden (4-2a): the portal hash carries the order fields ONLY when sent, as sent, right after the client order number; urgent is refused', async () => {
+      const line = `"lines":[{"skuId":"${sku.get('A-1')!}","quantity":1}]}`;
+      const head = `{"surface":"portal","tenantId":"${tenantId}","clientId":"${clientA}","warehouseId":"${whMain}","destination":${DESTINATION_JSON}`;
+      const today = istDateOf(new Date(licenceClock.now()).toISOString());
+      const fullKey = ulid();
+      const ref = `PF-${fullKey.slice(-8)}`;
+      const placed = await place(
+        body([{ skuId: sku.get('A-1')!, quantity: 1 }], { clientOrderRef: ref, orderType: 'b2c', priority: 'high', shipByDate: today, codAmountPaise: 149900 }),
+        portalA.token,
+        fullKey,
+      ).expect(201);
+      expect(placed.body).toMatchObject({ orderType: 'b2c', priority: 'high', shipByDate: today, codAmountPaise: 149900 });
+      const plainKey = ulid();
+      await place(body([{ skuId: sku.get('A-1')!, quantity: 1 }], { priority: 'normal' }), portalA.token, plainKey).expect(201);
+      const rows = await sql`select key, payload_hash from idempotency_keys where tenant_id = ${tenantId} and key in (${fullKey}, ${plainKey})`;
+      const hashOf = new Map(rows.map((row) => [row.key as string, row.payload_hash as string]));
+      expect(hashOf.get(fullKey)).toBe(
+        sha256(`${head},"consigneeGstin":null,"clientOrderRef":"${ref}","orderType":"b2c","priority":"high","shipByDate":"${today}","codAmountPaise":149900,${line}`),
+      );
+      expect(hashOf.get(plainKey)).toBe(sha256(`${head},"consigneeGstin":null,"priority":"normal",${line}`));
+      const urgent = await place(body([{ skuId: sku.get('A-1')!, quantity: 1 }], { priority: 'urgent' }), portalA.token).expect(400);
+      expect(urgent.body.detail).toBe('Urgent priority is set by the warehouse — choose Normal or High.');
+    });
+
     it('the staff create hash and response are UNCHANGED by 4-1a (pinned golden)', async () => {
       const key = ulid();
       const res = await staffCreate(body([{ skuId: sku.get('A-1')!, quantity: 2 }]), key).expect(201);
@@ -555,7 +592,9 @@ describe('portal order entry (e2e, story 4-1a)', () => {
       );
       expect(Object.keys(res.body)).toEqual(['order']);
       // The response keys 4-1a left unchanged — plus story 4-1b's deliberate
-      // `clientOrderRef` (null when none), right after `externalEventId`.
+      // `clientOrderRef` (null when none), right after `externalEventId`, and
+      // story 4-2a's four order header fields right after it (the HASH above
+      // is byte-identical: none of the four was sent).
       expect(Object.keys(res.body.order as Record<string, unknown>)).toEqual([
         'id',
         'tenantId',
@@ -565,6 +604,10 @@ describe('portal order entry (e2e, story 4-1a)', () => {
         'integrationId',
         'externalEventId',
         'clientOrderRef',
+        'orderType',
+        'priority',
+        'shipByDate',
+        'codAmountPaise',
         'destination',
         'clientId',
         'createdAt',

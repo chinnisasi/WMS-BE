@@ -18,13 +18,20 @@ import {
 } from 'class-validator';
 import { PORTAL_PAGE_DEFAULT_LIMIT, PORTAL_PAGE_MAX_LIMIT } from '../shared/primitives/portal-page';
 import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../shared/primitives/quantity';
-import { CLIENT_ORDER_REF_RE, MAX_CLIENT_ORDER_REF_LENGTH, MAX_CONSIGNEE_LEGAL_NAME_LENGTH, ORDER_SOURCES, ORDER_STATUSES, type OrderStatus } from '../modules/outbound/order.command';
+import { CLIENT_ORDER_REF_RE, MAX_CLIENT_ORDER_REF_LENGTH, MAX_CONSIGNEE_LEGAL_NAME_LENGTH, MAX_SHIP_BY_DAYS_AHEAD, ORDER_SOURCES, ORDER_STATUSES, type OrderStatus } from '../modules/outbound/order.command';
+import { MAX_COD_AMOUNT_PAISE, ORDER_PRIORITIES, ORDER_TYPES } from '../modules/outbound/order-urgency';
 import { ASN_STATUSES, MAX_ASN_CODE_LENGTH, MAX_ASN_LINES, type AsnStatus } from '../modules/inbound/asn.command';
 import { PO_STATUSES, type PoStatus } from '../modules/inbound/po.command';
 import { CHARGE_CODES, RATE_BASES } from '../modules/billing/rate-cards';
 import { AddressDto, SessionClientResponse, USER_STATUSES } from '../modules/tenancy/tenancy.dto';
 import { GSTIN_RE, gstinDtoTransform } from '../shared/primitives/gstin';
-import { MAX_ORDER_LINES } from '../modules/outbound/outbound.dto';
+import {
+  COD_AMOUNT_DOC,
+  MAX_ORDER_LINES,
+  ORDER_PRIORITY_DOC,
+  ORDER_TYPE_DOC,
+  SHIP_BY_DATE_DOC,
+} from '../modules/outbound/outbound.dto';
 import { MAX_EXTERNAL_ID_LENGTH } from '../shared/primitives/ids';
 
 /** Story 4-1a — the portal order's line ceiling IS the staff order's (`CreateOrderDto`), never a copy. */
@@ -182,6 +189,18 @@ export class PortalOrderRowDto {
     description: 'Story 4-1b — your own order number, as given when the order was placed; null when none was given',
   })
   clientOrderRef!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, enum: [...ORDER_TYPES, null], description: ORDER_TYPE_DOC })
+  orderType!: string | null;
+
+  @ApiProperty({ enum: [...ORDER_PRIORITIES], description: ORDER_PRIORITY_DOC })
+  priority!: string;
+
+  @ApiProperty({ type: String, nullable: true, format: 'date', description: SHIP_BY_DATE_DOC })
+  shipByDate!: string | null;
+
+  @ApiProperty({ type: Number, nullable: true, description: COD_AMOUNT_DOC })
+  codAmountPaise!: number | null;
 
   @ApiProperty()
   warehouseName!: string;
@@ -446,6 +465,47 @@ export class PortalCreateOrderDto {
   // No DTO shape check (the 8-1d rule): the command normalizes and refuses
   // behind its replay lookup.
   clientOrderRef?: string;
+
+  // ── story 4-2a: the order header fields — type checks only (A11); the
+  // command checks every value behind its replay lookup (400 validation-failed).
+
+  @ApiProperty({
+    required: false,
+    enum: [...ORDER_TYPES, null],
+    description:
+      "Story 4-2a — 'b2b' or 'b2c' (optional). Omitted: b2b when a consigneeGstin is given, else b2c. b2c beside a consigneeGstin is 400.",
+  })
+  @IsOptional()
+  @IsString()
+  orderType?: string;
+
+  @ApiProperty({
+    required: false,
+    enum: ['normal', 'high'],
+    description: "Story 4-2a — 'normal' (the default) or 'high'. 'urgent' is set by the warehouse only (400 here).",
+  })
+  @IsOptional()
+  @IsString()
+  priority?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'date',
+    description: `Story 4-2a — ship by the end of this IST day, YYYY-MM-DD, from today (IST) to ${MAX_SHIP_BY_DAYS_AHEAD} days ahead (optional).`,
+  })
+  @IsOptional()
+  @IsString()
+  shipByDate?: string;
+
+  @ApiProperty({
+    required: false,
+    type: 'integer',
+    minimum: 1,
+    maximum: MAX_COD_AMOUNT_PAISE,
+    description: 'Story 4-2a — cash on delivery: the amount to collect, integer paise (1 to 1,000,000,000). Omit it for a prepaid order.',
+  })
+  @IsOptional()
+  codAmountPaise?: number;
 }
 
 /** `POST portal/orders` 201 — the placed order, an exact key allowlist (and the stored replay). */
@@ -471,6 +531,41 @@ export class PortalPlacedOrderResponse {
     description: 'Story 4-1b — your order number as stored (trimmed); null when none was given. Absent only on a replay of an order placed before 4-1b — read absent as null',
   })
   clientOrderRef?: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    enum: [...ORDER_TYPES, null],
+    description: `${ORDER_TYPE_DOC} Absent only on a replay of an order placed before 4-2a — read absent as null.`,
+  })
+  orderType?: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    enum: [...ORDER_PRIORITIES, null],
+    description: `${ORDER_PRIORITY_DOC} Absent only on a replay of an order placed before 4-2a — read absent as null.`,
+  })
+  priority?: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    format: 'date',
+    description: `${SHIP_BY_DATE_DOC} Absent only on a replay of an order placed before 4-2a — read absent as null.`,
+  })
+  shipByDate?: string | null;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    required: false,
+    description: `${COD_AMOUNT_DOC} Absent only on a replay of an order placed before 4-2a — read absent as null.`,
+  })
+  codAmountPaise?: number | null;
 }
 
 /** One option of the announce form's SKU picker (portal vocabulary, as on `portal/stock`). */
