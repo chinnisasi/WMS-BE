@@ -46,6 +46,7 @@ import type {
   WindowFilter,
 } from './fact-lists';
 import type { PicklistLineStatus } from './wave.command';
+import { orderUrgencyOrderBy, type OrderPriority, type OrderType } from './order-urgency';
 
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
@@ -117,6 +118,16 @@ export interface OrderEntry {
   readonly externalEventId: string | null;
   /** Story 4-1b — the client's own order number; null when none. */
   readonly clientOrderRef: string | null;
+  /**
+   * Story 4-2a — the order header fields (a live read: always present).
+   * `orderType` is null on a pre-4-2a order; `priority` reads `normal`.
+   * `findOrderByChannelRef` carries `codAmountPaise` for the ingest's COD
+   * drift check (A6).
+   */
+  readonly orderType: OrderType | null;
+  readonly priority: OrderPriority;
+  readonly shipByDate: string | null;
+  readonly codAmountPaise: number | null;
   /** Where the shipment goes (story 11-1); null on a pre-11.1 order row. */
   readonly destination: AddressSnapshot | null;
   /** Story 21-2b — the client the order is for (derived from its SKUs). */
@@ -208,6 +219,14 @@ export interface PackTask {
    * case's label and the count must equal `pickedQty`, never a typed quantity.
    */
   readonly catchWeightTracked: boolean;
+  /**
+   * Story 4-2a — the order's priority, ship-by date and COD amount (the pack
+   * card's chips and "COD ₹x"; the bench's "collect" banner). Order-level,
+   * repeated on each of the order's SKU rows.
+   */
+  readonly orderPriority: OrderPriority;
+  readonly orderShipByDate: string | null;
+  readonly codAmountPaise: number | null;
 }
 
 /**
@@ -379,13 +398,19 @@ export interface ManifestEntry {
   readonly carrierConnectionId: string;
   readonly carrierCode: string;
   readonly shipmentCount: number;
+  /** Story 4-2a (A17) — computed live, the same figure the create froze. */
+  readonly codShipmentCount: number;
+  readonly codTotalPaise: number;
   readonly createdBy: string;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
 
 /** The row → view mapping the read-back and the snapshot share (4.6c). */
-function toShipmentView(row: typeof shipments.$inferSelect): ShipmentSnapshot['shipment'] {
+function toShipmentView(
+  row: typeof shipments.$inferSelect,
+  codAmountPaise: number | null,
+): ShipmentSnapshot['shipment'] {
   return {
     id: row.id,
     orderId: row.orderId,
@@ -405,6 +430,8 @@ function toShipmentView(row: typeof shipments.$inferSelect): ShipmentSnapshot['s
     labelledBy: row.labelledBy,
     labelledAt: canonicalInstant(row.labelledAt),
     manifestId: row.manifestId,
+    // Story 4-2a — the order's COD (immutable, so the read agrees with the label).
+    codAmountPaise,
   };
 }
 
@@ -464,15 +491,16 @@ export class OutboundFacade {
   async getShipmentForOrder(tenantId: string, orderId: string): Promise<ShipmentSnapshot['shipment'] | null> {
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       const rows = await tx
-        .select()
+        .select({ shipment: shipments, codAmountPaise: orders.codAmountPaise })
         .from(shipments)
+        .leftJoin(orders, and(eq(orders.id, shipments.orderId), eq(orders.tenantId, shipments.tenantId)))
         .where(and(eq(shipments.tenantId, tenantId), eq(shipments.orderId, orderId)))
         .limit(1);
       const row = rows[0];
       if (row === undefined) {
         return null;
       }
-      return toShipmentView(row);
+      return toShipmentView(row.shipment, row.codAmountPaise ?? null);
     });
   }
 
@@ -527,6 +555,10 @@ export class OutboundFacade {
           integrationId: orders.integrationId,
           externalEventId: orders.externalEventId,
           clientOrderRef: orders.clientOrderRef,
+          orderType: orders.orderType,
+          priority: orders.priority,
+          shipByDate: orders.shipByDate,
+          codAmountPaise: orders.codAmountPaise,
           clientId: orders.clientId,
           createdAt: orders.createdAt,
           updatedAt: orders.updatedAt,
@@ -553,6 +585,10 @@ export class OutboundFacade {
         integrationId: row.integrationId,
         externalEventId: row.externalEventId,
         clientOrderRef: row.clientOrderRef,
+        orderType: row.orderType as OrderType | null,
+        priority: row.priority as OrderPriority,
+        shipByDate: row.shipByDate,
+        codAmountPaise: row.codAmountPaise,
         destination: null,
         clientId: row.clientId,
         createdAt: canonicalInstant(row.createdAt),
@@ -771,6 +807,10 @@ export class OutboundFacade {
           integrationId: orders.integrationId,
           externalEventId: orders.externalEventId,
           clientOrderRef: orders.clientOrderRef,
+          orderType: orders.orderType,
+          priority: orders.priority,
+          shipByDate: orders.shipByDate,
+          codAmountPaise: orders.codAmountPaise,
           // Story 11-1: the list row carries the destination (city + pincode
           // are what the dispatch surface shows first); pre-11.1 rows null.
           destinationContactName: orders.destinationContactName,
@@ -820,6 +860,10 @@ export class OutboundFacade {
         integrationId: row.integrationId,
         externalEventId: row.externalEventId,
         clientOrderRef: row.clientOrderRef,
+        orderType: row.orderType as OrderType | null,
+        priority: row.priority as OrderPriority,
+        shipByDate: row.shipByDate,
+        codAmountPaise: row.codAmountPaise,
         destination: addressFromColumns({
           contactName: row.destinationContactName,
           phone: row.destinationPhone,
@@ -1047,6 +1091,13 @@ export class OutboundFacade {
           carrierConnectionId: manifests.carrierConnectionId,
           carrierCode: manifests.carrierCode,
           shipmentCount: manifests.shipmentCount,
+          // Story 4-2a (A17) — the member orders' COD, live (order COD is
+          // immutable, so this equals the create's frozen figure). Table-
+          // qualified by hand (Gotcha 9: drizzle renders a selected column
+          // bare, and a bare name in a correlated subquery binds the INNER
+          // from-list).
+          codShipmentCount: sql<number>`(select count(o.cod_amount_paise)::int from shipments sh join orders o on o.id = sh.order_id and o.tenant_id = sh.tenant_id where sh.tenant_id = manifests.tenant_id and sh.manifest_id = manifests.id)`,
+          codTotalPaise: sql<string>`(select coalesce(sum(o.cod_amount_paise), 0)::bigint from shipments sh join orders o on o.id = sh.order_id and o.tenant_id = sh.tenant_id where sh.tenant_id = manifests.tenant_id and sh.manifest_id = manifests.id)`,
           createdBy: manifests.createdBy,
           createdAt: manifests.createdAt,
           updatedAt: manifests.updatedAt,
@@ -1074,6 +1125,8 @@ export class OutboundFacade {
         .limit(pageSize + 1);
       const items = rows.map((row) => ({
         ...row,
+        codShipmentCount: Number(row.codShipmentCount),
+        codTotalPaise: Number(row.codTotalPaise),
         createdAt: canonicalInstant(row.createdAt),
         updatedAt: canonicalInstant(row.updatedAt),
       }));
@@ -1172,8 +1225,9 @@ export class OutboundFacade {
     tx: TenantTx,
     tenantId: string,
     warehouseId: string,
+    todayIst: string,
   ): Promise<PickTask[]> {
-    return this.pickCommand.getPickTasksInTx(tx, tenantId, warehouseId);
+    return this.pickCommand.getPickTasksInTx(tx, tenantId, warehouseId, todayIst);
   }
 
   /**
@@ -1183,9 +1237,9 @@ export class OutboundFacade {
    * the shell composes the two facades sequentially rather than nesting, so
    * neither read can queue behind the other.
    */
-  async getPickTasks(tenantId: string, warehouseId: string): Promise<PickTask[]> {
+  async getPickTasks(tenantId: string, warehouseId: string, todayIst: string): Promise<PickTask[]> {
     return withTenantTransaction(this.db, tenantId, (tx) =>
-      this.getPickTasksInTx(tx, tenantId, warehouseId),
+      this.getPickTasksInTx(tx, tenantId, warehouseId, todayIst),
     );
   }
 
@@ -1223,6 +1277,7 @@ export class OutboundFacade {
     tx: TenantTx,
     tenantId: string,
     warehouseId: string,
+    todayIst: string,
   ): Promise<PackWorkRead> {
     // The packable predicate: `picks` joined to its order (which carries the
     // warehouse scope and the accepted status), with the line-status arms as
@@ -1233,6 +1288,9 @@ export class OutboundFacade {
       .select({
         orderId: picks.orderId,
         orderCreatedAt: orders.createdAt,
+        orderPriority: orders.priority,
+        orderShipByDate: orders.shipByDate,
+        codAmountPaise: orders.codAmountPaise,
         skuId: picks.skuId,
         skuCode: skus.code,
         skuName: skus.name,
@@ -1258,7 +1316,20 @@ export class OutboundFacade {
       // Primary key columns ride the group by so Postgres's functional
       // dependency admits the other selected columns without listing them.
       .groupBy(picks.orderId, orders.id, picks.skuId, skus.id)
-      .orderBy(asc(orders.createdAt), asc(orders.id), asc(skus.code), asc(picks.skuId))
+      // Story 4-2a (A16) — the urgency key first (on the snapshot's IST date),
+      // then the old order: each order's rows stay contiguous (orders.id ends
+      // the key), so the whole-order truncation below never cuts an urgent
+      // order before a routine one.
+      .orderBy(
+        orderUrgencyOrderBy(todayIst, {
+          priority: sql`${orders.priority}`,
+          shipByDate: sql`${orders.shipByDate}`,
+          createdAt: sql`${orders.createdAt}`,
+          id: sql`${orders.id}`,
+        }),
+        asc(skus.code),
+        asc(picks.skuId),
+      )
       .limit(MAX_SNAPSHOT_PACK_TASKS + 1);
 
     // Whole-order truncation — `truncateToWholeGroups`, keyed by order. The
@@ -1275,6 +1346,9 @@ export class OutboundFacade {
       // exact-match gate compares against.
       pickedQty: fromMilli(Number(row.pickedQty)),
       catchWeightTracked: row.catchWeightTracked,
+      orderPriority: row.orderPriority as OrderPriority,
+      orderShipByDate: row.orderShipByDate,
+      codAmountPaise: row.codAmountPaise,
     }));
 
     // Active units, id + skuId only (the bench resolves labels, nothing more).
@@ -1303,9 +1377,9 @@ export class OutboundFacade {
    * the shell composes the facades sequentially rather than nesting, so
    * neither read can queue behind the other.
    */
-  async getPackTasks(tenantId: string, warehouseId: string): Promise<PackWorkRead> {
+  async getPackTasks(tenantId: string, warehouseId: string, todayIst: string): Promise<PackWorkRead> {
     return withTenantTransaction(this.db, tenantId, (tx) =>
-      this.getPackTasksInTx(tx, tenantId, warehouseId),
+      this.getPackTasksInTx(tx, tenantId, warehouseId, todayIst),
     );
   }
 

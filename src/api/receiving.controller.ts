@@ -1,6 +1,7 @@
 import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiBody, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
+import { istDateOf } from '../shared/primitives/time';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
 import { ProblemException } from '../shared/problem-details/problem.exception';
 import { TenantSessionGuard, CurrentSession } from '../modules/tenancy/tenant-session.guard';
@@ -218,11 +219,15 @@ export class ReceivingController {
     // Making `InboundModule` import `OutboundModule` instead would pull the
     // entire outbound graph into inbound's initialization for one array.
     const snapshot = await this.receiving.getCatalogSnapshot(tenantId, query.warehouseId);
-    const pickTasks = await this.outbound.getPickTasks(tenantId, query.warehouseId);
+    // Story 4-2a (A16) — the urgency key's "today" is the snapshot's own IST
+    // date (its `generatedAt`), the same date the device judges "Due today"
+    // and "Overdue" against — never the device clock.
+    const todayIst = istDateOf(snapshot.generatedAt);
+    const pickTasks = await this.outbound.getPickTasks(tenantId, query.warehouseId, todayIst);
     // Story 10.7: the pack arm — packable orders' per-SKU picked totals plus
     // the warehouse's active handling units. Same sequential composition: the
     // shell never nests one facade's transaction inside another's.
-    const packWork = await this.outbound.getPackTasks(tenantId, query.warehouseId);
+    const packWork = await this.outbound.getPackTasks(tenantId, query.warehouseId, todayIst);
     // Story 5-1: the Transfer inbox arm — in-transit transfers TO this
     // warehouse, the inbound-confirm tasks. Same sequential composition: the
     // shell never nests one facade's transaction inside another's.

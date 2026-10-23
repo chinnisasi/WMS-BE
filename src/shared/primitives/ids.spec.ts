@@ -27,6 +27,40 @@ describe('ids primitives', () => {
     expect(ids.size).toBe(5000);
   });
 
+  test('story 4-2a (A2): ids stay strictly increasing across a 12-bit sequence wrap in one fixed millisecond', () => {
+    // A millisecond later than any id this process minted, so the sequence
+    // starts here; 4097 ids in it MUST wrap the 12-bit counter at least once.
+    const t = Date.parse('2099-01-01T00:00:00Z');
+    const ids = Array.from({ length: 4097 }, () => uuidv7(t));
+    const embedded = (id: string): number => Number(BigInt(`0x${id.replace(/-/g, '').slice(0, 12)}`));
+    // The ms + version + sequence prefix (the first 16 hex) orders the ids.
+    const prefix = (id: string): bigint => BigInt(`0x${id.replace(/-/g, '').slice(0, 16)}`);
+    for (let i = 1; i < ids.length; i += 1) {
+      expect(prefix(ids[i]!) > prefix(ids[i - 1]!)).toBe(true);
+      expect(ids[i]! > ids[i - 1]!).toBe(true);
+    }
+    // The wrap happened (the clock was bumped) and the bump was carried:
+    // the last id embeds a later millisecond than the first, never an earlier one.
+    expect(embedded(ids[0]!)).toBe(t);
+    expect(embedded(ids[ids.length - 1]!)).toBeGreaterThan(t);
+    // And the next id minted at the same fixed clock reading continues after it.
+    const next = uuidv7(t);
+    expect(prefix(next) > prefix(ids[ids.length - 1]!)).toBe(true);
+  });
+
+  test('story 4-2a: after the clock steps back, ids in that millisecond are monotonic again at once', () => {
+    const prefix = (id: string): bigint => BigInt(`0x${id.replace(/-/g, '').slice(0, 16)}`);
+    const ahead = Date.parse('2099-06-01T00:00:00Z');
+    uuidv7(ahead);
+    // A reading one second earlier (an NTP step back): a fresh sequence there.
+    const back = ahead - 1000;
+    const ids = Array.from({ length: 50 }, () => uuidv7(back));
+    for (let i = 1; i < ids.length; i += 1) expect(prefix(ids[i]!) > prefix(ids[i - 1]!)).toBe(true);
+    // And the real clock (far behind both) is in sequence again too.
+    const real = [uuidv7(), uuidv7(), uuidv7()];
+    expect(real[1]! > real[0]! && real[2]! > real[1]!).toBe(true);
+  });
+
   test('ulid is 26 Crockford base32 chars, time-prefixed and sortable', () => {
     const early = ulid(Date.parse('2026-09-08T00:00:00Z'));
     const late = ulid(Date.parse('2026-09-09T00:00:00Z'));

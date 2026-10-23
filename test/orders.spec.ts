@@ -1,4 +1,5 @@
 import type { INestApplication } from '@nestjs/common';
+import { ORDER_PRIORITIES, ORDER_TYPES } from '../src/modules/outbound/order-urgency';
 import postgres from 'postgres';
 import request from 'supertest';
 import Redis from 'ioredis';
@@ -930,7 +931,7 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
     // live constraint definitions and pins them to the constants.
     const defs = await sql`
       select conname, pg_get_constraintdef(oid) as def from pg_constraint
-      where conname in ('orders_status_check', 'orders_source_check', 'order_lines_status_check')
+      where conname in ('orders_status_check', 'orders_source_check', 'order_lines_status_check', 'orders_order_type_check', 'orders_priority_check')
     `;
     const armsOf = (conname: string): string[] => {
       const row = defs.find((item) => (item as unknown as { conname: string }).conname === conname);
@@ -940,13 +941,17 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
       // `orders_status_check` would have parsed `ready_to_dispatch` as
       // `ready` and this guard would have failed for the wrong reason (or,
       // worse, silently agreed with a TS constant that had drifted).
-      const arms = [...def.matchAll(/'([a-z_]+)'/g)].map((match) => match[1]!);
+      const arms = [...def.matchAll(/'([a-z0-9_]+)'/g)].map((match) => match[1]!);
       expect(arms.length).toBeGreaterThan(0); // every arm is a quoted literal
       return arms.sort();
     };
     expect(armsOf('orders_status_check')).toEqual([...ORDER_STATUSES].sort());
     expect(armsOf('orders_source_check')).toEqual([...ORDER_SOURCES].sort());
     expect(armsOf('order_lines_status_check')).toEqual([...ORDER_LINE_STATUSES].sort());
+    // Story 4-2a — the order header vocabularies (0093, NOT VALID: the quoted
+    // literals parse the same with the suffix).
+    expect(armsOf('orders_order_type_check')).toEqual([...ORDER_TYPES].sort());
+    expect(armsOf('orders_priority_check')).toEqual([...ORDER_PRIORITIES].sort());
   });
 
   it('RLS: orders and order_lines are invisible to another tenant even for a same-session probe', async () => {

@@ -3044,6 +3044,23 @@ export const orders = pgTable(
      * create only (never on an ingested order, never amended).
      */
     clientOrderRef: text('client_order_ref'),
+    /**
+     * Story 4-2a — the order header fields (migration 0093, hand-written
+     * NOT VALID CHECKs). All four are create-only (no amend command exists).
+     * - `order_type`: `b2b` | `b2c` (`ORDER_TYPES`, `order-urgency.ts`); NULL
+     *   only on an order created before 4-2a (every new order stores one —
+     *   derived from the consignee GSTIN when not sent).
+     * - `priority`: `normal` | `high` | `urgent` (`ORDER_PRIORITIES`); the
+     *   column default is `normal`, so a pre-4-2a row reads `normal`.
+     * - `ship_by_date`: an IST calendar date ("ship by the end of that IST
+     *   day"), NULL when none.
+     * - `cod_amount_paise`: the cash to collect on delivery, integer paise
+     *   1..1_000_000_000; NULL means prepaid (nothing to collect).
+     */
+    orderType: text('order_type'),
+    priority: text('priority').notNull().default('normal'),
+    shipByDate: date('ship_by_date', { mode: 'string' }),
+    codAmountPaise: bigint('cod_amount_paise', { mode: 'number' }),
     ...tenantTimestamps,
   },
   (table) => [

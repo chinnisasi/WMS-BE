@@ -25,6 +25,7 @@ describe('registerCarrierAdapter (the import-time guards)', () => {
         label: unconfiguredLabelArm('delhivery'),
         rate: unconfiguredRateArm('delhivery'),
         credentialFields: [field],
+        supportsCod: false,
       }),
     ).toThrow('Carrier adapter already registered: delhivery');
     // The registry is unchanged by the rejected call.
@@ -39,6 +40,7 @@ describe('registerCarrierAdapter (the import-time guards)', () => {
         label: unconfiguredLabelArm('spec-empty'),
         rate: unconfiguredRateArm('spec-empty'),
         credentialFields: [],
+        supportsCod: false,
       }),
     ).toThrow('declares no credential fields');
     expect(isKnownCarrierCode('spec-empty')).toBe(false);
@@ -52,6 +54,7 @@ describe('registerCarrierAdapter (the import-time guards)', () => {
         label: unconfiguredLabelArm('spec-dupe-field'),
         rate: unconfiguredRateArm('spec-dupe-field'),
         credentialFields: [field, { ...field, label: 'Other' }],
+        supportsCod: false,
       }),
     ).toThrow('duplicate field: apiToken');
     expect(isKnownCarrierCode('spec-dupe-field')).toBe(false);
@@ -65,5 +68,13 @@ describe('registerCarrierAdapter (the import-time guards)', () => {
     // Shiprocket is an aggregator and is deliberately out (the OQ1 decision).
     expect(getCarrierAdapter('shiprocket')).toBeUndefined();
     expect(isKnownCarrierCode('shiprocket')).toBe(false);
+  });
+
+  it('story 4-2a (A18): every adapter declares supportsCod — sandbox true, the DIRECT carriers false until their transports land', () => {
+    const declared = Object.fromEntries(listCarrierAdapters().map((adapter) => [adapter.code, adapter.supportsCod]));
+    expect(declared).toEqual({ blue_dart: false, delhivery: false, ecom_express: false, sandbox: true });
+    for (const adapter of listCarrierAdapters()) {
+      expect(typeof adapter.supportsCod).toBe('boolean');
+    }
   });
 });

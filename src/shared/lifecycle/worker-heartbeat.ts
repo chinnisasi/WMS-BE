@@ -34,7 +34,7 @@ export const LOOP_DEAD_SLACK_MS = 60_000;
 /** The smallest `WORKER_HEARTBEAT_STALE_MS` accepted (A3). */
 export const MIN_HEARTBEAT_STALE_MS = 60_000;
 
-/** The thirteen jobs, by the names `/health/worker` reports. */
+/** The fourteen jobs (5-1a added email-sender), by the names `/health/worker` reports. */
 export const WORKER_JOBS = [
   'outbox-relay',
   'reconciliation',

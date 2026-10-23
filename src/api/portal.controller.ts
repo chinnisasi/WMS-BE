@@ -222,6 +222,11 @@ export class PortalController {
         ...(dto.consigneeLegalName === undefined ? {} : { consigneeLegalName: dto.consigneeLegalName }),
         // Story 4-1b: VERBATIM — the command normalizes and refuses it.
         ...(dto.clientOrderRef === undefined ? {} : { clientOrderRef: dto.clientOrderRef }),
+        // Story 4-2a: VERBATIM — the command normalizes and refuses them.
+        ...(dto.orderType === undefined ? {} : { orderType: dto.orderType }),
+        ...(dto.priority === undefined ? {} : { priority: dto.priority }),
+        ...(dto.shipByDate === undefined ? {} : { shipByDate: dto.shipByDate }),
+        ...(dto.codAmountPaise === undefined ? {} : { codAmountPaise: dto.codAmountPaise }),
       },
       key,
     );
@@ -233,6 +238,11 @@ export class PortalController {
       lineCount: placed.lineCount,
       placedAt: placed.placedAt,
       ...(placed.clientOrderRef === undefined ? {} : { clientOrderRef: placed.clientOrderRef }),
+      // Story 4-2a: the same rule — a replay stored before 4-2a carries none.
+      ...(placed.orderType === undefined ? {} : { orderType: placed.orderType }),
+      ...(placed.priority === undefined ? {} : { priority: placed.priority }),
+      ...(placed.shipByDate === undefined ? {} : { shipByDate: placed.shipByDate }),
+      ...(placed.codAmountPaise === undefined ? {} : { codAmountPaise: placed.codAmountPaise }),
     };
   }
 

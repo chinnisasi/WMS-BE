@@ -29,7 +29,7 @@ import {
   ingestLicenceNotCovered,
   ingestSkuInactive,
 } from './channels.errors';
-import type { ParsedChannelCancellation, ParsedChannelOrder } from './channel-registry';
+import type { ParsedChannelCancellation, ParsedChannelOrder, ParsedChannelRefusal } from './channel-registry';
 
 /**
  * The webhook ingest command (story 7.2, RD-1/RD-2/RD-3/RD-8/RD-9): the
@@ -78,8 +78,14 @@ export class ChannelsIngestCommand {
     tenantId: string;
     connectionId: string;
     parsed: ParsedChannelOrder;
+    /**
+     * Story 4-2a (A5) — the parse arm could not read the COD amount
+     * (`parsed` then carries none): a redelivery of a known order resolves
+     * to it; a first delivery is refused, metered by reason and order ref.
+     */
+    codRefusal?: ParsedChannelRefusal['refused'];
   }): Promise<{ outcome: 'accepted' | 'backordered' | 'replayed'; orderId: string }> {
-    const { tenantId, connectionId, parsed } = args;
+    const { tenantId, connectionId, parsed, codRefusal } = args;
     const startedAt = Date.now();
 
     // ── the connection's face + config (RD-4) ─────────────────────────────
@@ -170,6 +176,28 @@ export class ChannelsIngestCommand {
       connectionId,
       parsed.orderRef,
     );
+    // Story 4-2a (A6) — COD drift: the channel's COD is NOT in the dedup
+    // fingerprint, so a delivery for a known order resolves to it whatever
+    // its COD says now. A changed amount is logged (ids and amounts only —
+    // never the payload); consuming `orders/updated` is PENDING.
+    // Story 4-2a (A5) — an unreadable COD refuses a FIRST delivery only
+    // (never ingested as prepaid); a known order resolves as any redelivery.
+    if (codRefusal !== undefined && prior === null) {
+      await this.publish.recordIngestOutcome(tenantId, connectionId, {
+        status: 'validation-failed',
+        latencyMs: Date.now() - startedAt,
+        error: `cod-amount-unmappable — the COD amount to collect could not be read (currency, status or total_outstanding); channel order "${parsed.orderRef.slice(0, 64)}"`,
+      });
+      throw validationFailedIngest(
+        `Channel order "${parsed.orderRef}" is cash on delivery but its amount to collect could not be read (the shop currency must be INR, the financial status pending or partially paid, and total_outstanding a rupee amount from 0.01 to 1,00,00,000) — nothing was written.`,
+      );
+    }
+    const parsedCod = parsed.codAmountPaise ?? null;
+    if (prior !== null && (codRefusal !== undefined || parsedCod !== prior.codAmountPaise)) {
+      this.logger.warn(
+        `COD drift on channel redelivery — connection ${connectionId}, order ${prior.id}: stored codAmountPaise ${String(prior.codAmountPaise)}, delivered ${codRefusal === undefined ? String(parsedCod) : 'an unreadable amount'}; the order keeps its stored amount.`,
+      );
+    }
 
     // Story 21-2b: an order is for ONE client, derived from its SKUs. A
     // FIRST delivery whose mapped SKUs span clients is a mapping problem the
@@ -217,6 +245,9 @@ export class ChannelsIngestCommand {
       integrationId: connectionId,
       externalEventId: parsed.orderRef,
       ...(parsed.destination === undefined ? {} : { destination: parsed.destination }),
+      // Story 4-2a — the channel's COD amount (absent/null = prepaid). Not in
+      // the channel dedup fingerprint; the order command validates it.
+      ...(parsedCod === null ? {} : { codAmountPaise: parsedCod }),
       lines,
       // RD-3: the connection's policy rides the command (default 'accept').
       ...(connection.backorderPolicy === 'reject' ? { backorderPolicy: 'reject' } : {}),

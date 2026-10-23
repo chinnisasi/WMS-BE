@@ -90,7 +90,7 @@ export class OutboundController {
     description:
       'Order accepted with per-line reserved / shortfall quantities (the idempotency snapshot)',
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or invalid body — story 4-1b: a clientOrderRef that is not 1–64 printable ASCII characters, or one on an ingested order (validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or invalid body — story 4-1b: a clientOrderRef that is not 1–64 printable ASCII characters, or one on an ingested order; story 4-2a: an orderType, priority, shipByDate or codAmountPaise out of its vocabulary, shape or range — orderType b2c beside a consigneeGstin, a ship-by before today (IST) or more than 365 days ahead, a COD amount that is not a whole number of paise from 1 to 1,000,000,000 — or orderType/priority/shipByDate on an ingested order (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks orders.manage (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse or a line\'s SKU does not exist in this tenant (not-found)') })
@@ -131,6 +131,12 @@ export class OutboundController {
         // Story 4-1b: the client order number, VERBATIM — the command
         // normalizes it and owns its refusals behind the replay lookup.
         ...(dto.clientOrderRef !== undefined ? { clientOrderRef: dto.clientOrderRef } : {}),
+        // Story 4-2a: the order header fields, VERBATIM — the command
+        // normalizes them and owns every value refusal behind its replay lookup.
+        ...(dto.orderType !== undefined ? { orderType: dto.orderType } : {}),
+        ...(dto.priority !== undefined ? { priority: dto.priority } : {}),
+        ...(dto.shipByDate !== undefined ? { shipByDate: dto.shipByDate } : {}),
+        ...(dto.codAmountPaise !== undefined ? { codAmountPaise: dto.codAmountPaise } : {}),
         lines: dto.lines.map((line) => ({
           skuId: line.skuId,
           quantity: line.quantity,
@@ -326,7 +332,7 @@ export class OutboundController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks labels.execute (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Order, or the carrier connection, does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The order is not packable-state (it does not read ready_to_dispatch — conflict naming the status), or it already has a labelled or manifested shipment (conflict), or a concurrent idempotent request (conflict). Nothing is written') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The order is not packable-state (it does not read ready_to_dispatch — conflict naming the status), or it already has a labelled or manifested shipment (conflict), or a concurrent idempotent request (conflict); story 4-2a: a cash-on-delivery order on a carrier that has not declared it can collect COD — checked before any adapter call (carrier-cod-unsupported). Nothing is written') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiResponse({ status: 501, ...problemJsonResponse('The connection’s carrier has no label transport on this deployment — the DIRECT carriers’ typed, retryable refusal (carrier-transport-unconfigured). Nothing is written') })
   @ApiResponse({ status: 503, ...problemJsonResponse('CARRIER_ENCRYPTION_KEY is missing (carrier-encryption-unavailable) or the stored credential does not open under it (carrier-credential-unreadable — rotate the connection). Nothing is written') })

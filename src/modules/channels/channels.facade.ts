@@ -11,7 +11,7 @@ import { getMemberRoleIn } from '../tenancy/tenancy.service';
 import { channelConnectionNotFound } from './channels.errors';
 import { ChannelsCommandService } from './channels.command';
 import { ChannelsIngestCommand } from './channels.ingest.command';
-import type { ParsedChannelCancellation, ParsedChannelOrder } from './channel-registry';
+import type { ParsedChannelCancellation, ParsedChannelOrder, ParsedChannelRefusal } from './channel-registry';
 import type {
   ConnectChannelCommand,
   RotateChannelCredentialCommand,
@@ -185,6 +185,7 @@ export class ChannelsFacade {
     tenantId: string;
     connectionId: string;
     parsed: ParsedChannelOrder;
+    codRefusal?: ParsedChannelRefusal['refused'];
   }): Promise<{ outcome: 'accepted' | 'backordered' | 'replayed'; orderId: string }> {
     return this.ingest.ingestOrderDelivery(args);
   }

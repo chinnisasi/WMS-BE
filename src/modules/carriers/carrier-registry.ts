@@ -68,6 +68,15 @@ export interface CarrierAdapter {
    * quoted (sandbox) or refused (the DIRECT carriers' same typed 501).
    */
   readonly rate: CarrierRateArm;
+  /**
+   * Story 4-2a (A18) — whether this carrier can collect cash on delivery. A
+   * COD order labelled through a carrier declaring `false` is refused 409
+   * `carrier-cod-unsupported` before any adapter call, and the rate read marks
+   * its item refused with the same code. `sandbox` declares `true`; the DIRECT
+   * carriers declare `false` until their real transports land (their arms are
+   * the typed 501 today) — each transport story declares its own.
+   */
+  readonly supportsCod: boolean;
 }
 
 const REGISTRY = new Map<string, CarrierAdapter>();
@@ -111,6 +120,8 @@ registerCarrierAdapter({
   displayName: 'Delhivery',
   label: unconfiguredLabelArm('delhivery'),
   rate: unconfiguredRateArm('delhivery'),
+  // Story 4-2a (A18) — no COD until this carrier's real transport lands.
+  supportsCod: false,
   credentialFields: [
     {
       name: 'apiToken',
@@ -132,6 +143,8 @@ registerCarrierAdapter({
   displayName: 'Blue Dart',
   label: unconfiguredLabelArm('blue_dart'),
   rate: unconfiguredRateArm('blue_dart'),
+  // Story 4-2a (A18) — no COD until this carrier's real transport lands.
+  supportsCod: false,
   credentialFields: [
     {
       name: 'licenceKey',
@@ -159,6 +172,8 @@ registerCarrierAdapter({
   displayName: 'Ecom Express',
   label: unconfiguredLabelArm('ecom_express'),
   rate: unconfiguredRateArm('ecom_express'),
+  // Story 4-2a (A18) — no COD until this carrier's real transport lands.
+  supportsCod: false,
   credentialFields: [
     {
       name: 'username',
@@ -190,6 +205,8 @@ registerCarrierAdapter({
   displayName: 'Sandbox',
   label: sandboxLabelArm(),
   rate: sandboxRateArm(),
+  // Story 4-2a (A18) — the stand-in collects COD (its arms ignore the amount).
+  supportsCod: true,
   credentialFields: [
     {
       name: 'accountToken',

@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
+import type { OrderType } from './order-urgency';
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
@@ -98,6 +99,12 @@ export interface DispatchSnapshot {
      * snapshot stored before 4-1b lacks it (a reader treats absent as null).
      */
     readonly clientOrderRef?: string | null;
+    /**
+     * Story 4-2a — the dispatch confirmation's "COD ₹x" / "Prepaid" line.
+     * Optional: a snapshot stored before 4-2a lacks them (read absent as null).
+     */
+    readonly orderType?: OrderType | null;
+    readonly codAmountPaise?: number | null;
     readonly dispatchedBy: string;
     readonly dispatchedAt: string;
     readonly carrierName: string | null;
@@ -459,6 +466,9 @@ export class DispatchCommandService {
           integrationId: order.integrationId,
           externalEventId: order.externalEventId,
           clientOrderRef: order.clientOrderRef,
+          // Story 4-2a — the amount the courier collects (read through).
+          orderType: order.orderType as OrderType | null,
+          codAmountPaise: order.codAmountPaise,
           dispatchedBy: command.actorUserId,
           dispatchedAt: canonicalInstant(dispatchedAt),
           // 4.6c: the labelled shipment's carrier/tracking auto-stamp when no

@@ -49,6 +49,7 @@ import {
 } from '../../shared/primitives/storage-class';
 import { ORDER_OWNER_TYPE, ORDER_RESERVATION_TTL_SECONDS } from './order.command';
 import type { OrderStatus } from './order.command';
+import { orderPriorityRankSql, orderUrgencyOrderBy, type OrderPriority } from './order-urgency';
 import { isBatchExpiredAt } from '../../shared/primitives/batch-expiry';
 
 /**
@@ -265,6 +266,13 @@ export interface PickTask {
    * point-in-time, so the parent line the join resolves always exists.
    */
   readonly kitParentSkuCode: string | null;
+  /**
+   * Story 4-2a — the task's ORDER priority and ship-by date (display: the
+   * stop's chip and "Due today" / "Overdue"). The walk stays in bin order;
+   * the device orders whole picklists by urgency (A16).
+   */
+  readonly orderPriority: OrderPriority;
+  readonly orderShipByDate: string | null;
 }
 
 /** The AD-14 taxonomy's two SUCCESS arms, plus "no conflict at all". */
@@ -1640,13 +1648,59 @@ export class PickCommandService {
    * `picklist_lines_pickable_walk_idx` (plus the `picklists` warehouse/status
    * and `waves` status indexes) — this runs inside the device catalog
    * snapshot, so it must not degrade with picking history.
+   *
+   * Story 4-2a (A2) — the order is EXPLICIT, never the picklist id's: the
+   * picklist's urgency key (its most urgent order among its `planned` lines,
+   * one derived row per picklist,
+   * by A8's key on `todayIst` — the snapshot's own IST date), then the
+   * picklist's `created_at`, its id, the walk position and the line id. The
+   * whole-picklist truncation follows that order, so an urgent picklist is
+   * never the one cut.
    */
-  async getPickTasksInTx(tx: TenantTx, tenantId: string, warehouseId: string): Promise<PickTask[]> {
+  async getPickTasksInTx(tx: TenantTx, tenantId: string, warehouseId: string, todayIst: string): Promise<PickTask[]> {
     // Story 11.7: a kit component's task names its parent kit's SKU code, for
     // the task header's "from kit" line. `order_lines` self-joins once — a
     // component line's `parent_line_id` is another row of the same table.
     const parentLines = alias(orderLines, 'parent_order_lines');
     const parentSkus = alias(skus, 'parent_skus');
+    const taskOrders = alias(orders, 'task_orders');
+    // The picklist's most urgent order among its planned lines (A2): ONE
+    // derived row per picklist (`distinct on (picklist_id)`, ordered by A8's
+    // key), joined once — never a subquery re-run per task row. Scoped to
+    // the same ready picklists of this warehouse the outer read walks.
+    const urgencyLines = alias(picklistLines, 'urgency_lines');
+    const urgencyOrders = alias(orders, 'urgency_orders');
+    const urgencyPicklists = alias(picklists, 'urgency_picklists');
+    const picklistUrgency = tx
+      .selectDistinctOn([urgencyLines.picklistId], {
+        picklistId: sql<string>`${urgencyLines.picklistId}`.as('urgency_picklist_id'),
+        due: sql<boolean>`(${urgencyOrders.shipByDate} is not null and ${urgencyOrders.shipByDate} <= ${todayIst}::date)`.as('urgency_due'),
+        rank: sql<number>`${orderPriorityRankSql(sql`${urgencyOrders.priority}`)}`.as('urgency_rank'),
+        shipBy: sql<string | null>`${urgencyOrders.shipByDate}`.as('urgency_ship_by'),
+        orderCreatedAt: sql<string>`${urgencyOrders.createdAt}`.as('urgency_created_at'),
+        orderId: sql<string>`${urgencyOrders.id}`.as('urgency_order_id'),
+      })
+      .from(urgencyLines)
+      .innerJoin(urgencyPicklists, eq(urgencyPicklists.id, urgencyLines.picklistId))
+      .innerJoin(urgencyOrders, and(eq(urgencyOrders.id, urgencyLines.orderId), eq(urgencyOrders.tenantId, urgencyLines.tenantId)))
+      .where(
+        and(
+          eq(urgencyLines.tenantId, tenantId),
+          eq(urgencyPicklists.warehouseId, warehouseId),
+          eq(urgencyPicklists.status, 'ready'),
+          eq(urgencyLines.status, 'planned'),
+        ),
+      )
+      .orderBy(
+        urgencyLines.picklistId,
+        orderUrgencyOrderBy(todayIst, {
+          priority: sql`${urgencyOrders.priority}`,
+          shipByDate: sql`${urgencyOrders.shipByDate}`,
+          createdAt: sql`${urgencyOrders.createdAt}`,
+          id: sql`${urgencyOrders.id}`,
+        }),
+      )
+      .as('picklist_urgency');
     const overRead = await tx
       .select({
         waveId: picklistLines.waveId,
@@ -1664,6 +1718,8 @@ export class PickCommandService {
         sliceSeq: picklistLines.sliceSeq,
         walkSeq: picklistLines.walkSeq,
         kitParentSkuCode: parentSkus.code,
+        orderPriority: taskOrders.priority,
+        orderShipByDate: taskOrders.shipByDate,
       })
       .from(picklistLines)
       .innerJoin(picklists, eq(picklists.id, picklistLines.picklistId))
@@ -1672,6 +1728,8 @@ export class PickCommandService {
       .leftJoin(orderLines, eq(orderLines.id, picklistLines.orderLineId))
       .leftJoin(parentLines, eq(parentLines.id, orderLines.parentLineId))
       .leftJoin(parentSkus, eq(parentSkus.id, parentLines.skuId))
+      .innerJoin(taskOrders, and(eq(taskOrders.id, picklistLines.orderId), eq(taskOrders.tenantId, picklistLines.tenantId)))
+      .leftJoin(picklistUrgency, sql`${picklistUrgency.picklistId} = ${picklistLines.picklistId}`)
       .where(
         and(
           eq(picklistLines.tenantId, tenantId),
@@ -1682,7 +1740,17 @@ export class PickCommandService {
           sql`${picklistLines.binId} is not null`,
         ),
       )
-      .orderBy(asc(picklistLines.picklistId), asc(picklistLines.walkSeq), asc(picklistLines.id))
+      .orderBy(
+        sql`${picklistUrgency.due} desc nulls last`,
+        sql`${picklistUrgency.rank} asc nulls last`,
+        sql`${picklistUrgency.shipBy} asc nulls last`,
+        sql`${picklistUrgency.orderCreatedAt} asc nulls last`,
+        sql`${picklistUrgency.orderId} asc nulls last`,
+        asc(picklists.createdAt),
+        asc(picklistLines.picklistId),
+        asc(picklistLines.walkSeq),
+        asc(picklistLines.id),
+      )
       // One row over the ceiling: reading it is how we learn the result was
       // truncated without a second COUNT query.
       .limit(MAX_SNAPSHOT_PICK_TASKS + 1);
@@ -1742,6 +1810,8 @@ export class PickCommandService {
       stopCount: stops.get(row.picklistId)?.size ?? 0,
       binStateEpoch: binEpochs.get(row.binId!) ?? null,
       kitParentSkuCode: row.kitParentSkuCode,
+      orderPriority: row.orderPriority as OrderPriority,
+      orderShipByDate: row.orderShipByDate,
     }));
   }
 }

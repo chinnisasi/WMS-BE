@@ -801,7 +801,12 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
     await cancelWave(wave.id).expect(200);
   });
 
-  it('generate without an explicit selection sweeps every eligible accepted order, oldest first, capped by the policy — and a claimed order is never swept twice', async () => {
+  // Story 4-2a (A9) — re-pinned as "urgency, then oldest": the sweep now
+  // orders by the urgency key (due first, priority, ship-by, then created_at,
+  // id). This fixture's orders are all `normal` with no ship-by date, so the
+  // key reduces to oldest first and the expectation is unchanged; the urgent
+  // and due arms are pinned in test/order-fields.spec.ts.
+  it('generate without an explicit selection sweeps every eligible accepted order by urgency, then oldest first (all normal here), capped by the policy — and a claimed order is never swept twice', async () => {
     // A warehouse of its own: a sweep with no selection reads EVERY free
     // accepted order in the warehouse, so the other scenarios' leftovers
     // would otherwise decide which two orders the cap takes.
@@ -811,7 +816,8 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
     const first = await createOrder([{ skuId, quantity: 1 }], sweep.warehouseId);
     const second = await createOrder([{ skuId, quantity: 1 }], sweep.warehouseId);
     const third = await createOrder([{ skuId, quantity: 1 }], sweep.warehouseId);
-    // maxOrders 2: the sweep takes the two OLDEST and leaves the third.
+    // maxOrders 2: all three tie on urgency (normal, no ship-by), so the sweep
+    // takes the two OLDEST and leaves the third.
     const policy = await policyId(`Sweep ${ulid().slice(0, 8)}`, 'batch', { maxOrders: 2 }, sweep.warehouseId);
 
     const swept = (await generate({ policyId: policy, warehouseId: sweep.warehouseId }).expect(201)).body.wave as Wave;

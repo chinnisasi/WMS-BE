@@ -15,7 +15,7 @@ import { problemJsonResponse } from '../shared/problem-details/problem-details.o
 import { ProblemException } from '../shared/problem-details/problem.exception';
 import { UUID_RE } from '../shared/primitives/ids';
 import { ChannelsFacade } from '../modules/channels/channels.facade';
-import { channelAdapter } from '../modules/channels/channel-registry';
+import { channelAdapter, isParsedChannelRefusal } from '../modules/channels/channel-registry';
 import type {
   ChannelAdapter,
   ChannelWebhookEndpoint,
@@ -107,10 +107,15 @@ export class WebhooksController {
       await this.channels.recordIngestParseRefused(tenantId, connectionId);
       throw webhookValidationFailed();
     }
+    // Story 4-2a (A5) — a named parse refusal (a COD body whose amount cannot
+    // be read) still reaches the ingest: a redelivery of a known order
+    // resolves to it; a first delivery is refused there (metered, 400).
     const result = await this.channels.ingestOrderDelivery({
       tenantId,
       connectionId,
-      parsed,
+      ...(isParsedChannelRefusal(parsed)
+        ? { parsed: parsed.order, codRefusal: parsed.refused }
+        : { parsed }),
     });
     return { outcome: result.outcome, orderId: result.orderId };
   }

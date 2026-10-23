@@ -298,7 +298,23 @@ describe('operational registers (e2e, story 5-3a)', () => {
 
     // ── outbound: orders by insert, dispatches through the ledger facade ────
     // Story 4-1b — O1 carries ACME's own order number (the register's client_order_ref column).
-    const o1 = await insertOrder('O1', acme, at(2, 10), 'dispatched', { consignee: ['Acme Retail LLP', '29ABCDE1234F1Z5'], clientOrderRef: 'SO-1042' }, [['AC-PL', 2], ['AC-BT', 3]]);
+    // Story 4-2a — and the order header fields: a two-line COD order, so the
+    // register's ORDER-level cod_amount_paise repeats on both lines (A20).
+    const o1 = await insertOrder(
+      'O1',
+      acme,
+      at(2, 10),
+      'dispatched',
+      {
+        consignee: ['Acme Retail LLP', '29ABCDE1234F1Z5'],
+        clientOrderRef: 'SO-1042',
+        orderType: 'b2b',
+        priority: 'high',
+        shipByDate: addIsoDays(D0, 3),
+        codAmountPaise: 149900,
+      },
+      [['AC-PL', 2], ['AC-BT', 3]],
+    );
     // Two dispatches of O1: the FIRST wins (carrier and AWB from its event).
     await dispatch(o1, wh1, at(3, 9), { carrierName: 'BlueDart', trackingNumber: 'BD-111' });
     await dispatch(o1, wh1, at(4, 9), { carrierName: 'Delhivery', trackingNumber: 'DL-999' });
@@ -439,15 +455,26 @@ describe('operational registers (e2e, story 5-3a)', () => {
     clientId: string,
     createdAt: string,
     status: 'accepted' | 'dispatched',
-    extra: { consignee?: [string, string]; externalEventId?: string; clientOrderRef?: string },
+    extra: {
+      consignee?: [string, string];
+      externalEventId?: string;
+      clientOrderRef?: string;
+      // Story 4-2a — the order header fields (the register's four last columns).
+      orderType?: string;
+      priority?: string;
+      shipByDate?: string;
+      codAmountPaise?: number;
+    },
     lines: ([string, number] | [string, number, number])[],
   ): Promise<SeededOrder> {
     const orderId = uuidv7();
     const ingested = extra.externalEventId !== undefined;
     await sql`insert into orders (id, tenant_id, client_id, warehouse_id, status, source, integration_id, external_event_id,
-        consignee_legal_name, consignee_gstin, destination_city, destination_state, destination_pincode, client_order_ref, created_at, updated_at)
+        consignee_legal_name, consignee_gstin, destination_city, destination_state, destination_pincode, client_order_ref,
+        order_type, priority, ship_by_date, cod_amount_paise, created_at, updated_at)
       values (${orderId}, ${tenantId}, ${clientId}, ${wh1}, ${status}, ${ingested ? 'ingested' : 'manual'}, ${ingested ? uuidv7() : null}, ${extra.externalEventId ?? null},
-        ${extra.consignee?.[0] ?? null}, ${extra.consignee?.[1] ?? null}, 'Bengaluru', 'Karnataka', '560001', ${extra.clientOrderRef ?? null}, ${createdAt}, ${createdAt})`;
+        ${extra.consignee?.[0] ?? null}, ${extra.consignee?.[1] ?? null}, 'Bengaluru', 'Karnataka', '560001', ${extra.clientOrderRef ?? null},
+        ${extra.orderType ?? null}, ${extra.priority ?? 'normal'}, ${extra.shipByDate ?? null}, ${extra.codAmountPaise ?? null}, ${createdAt}, ${createdAt})`;
     const seeded: { id: string; skuId: string; qty: number }[] = [];
     for (const [code, qty, parent] of lines) {
       const id = uuidv7();
@@ -540,6 +567,8 @@ describe('operational registers (e2e, story 5-3a)', () => {
         'order_id:text', 'created_ist:instant', 'status:text', 'source:text', 'channel_order_ref:text', 'client_code:text',
         'consignee_legal_name:text', 'consignee_gstin:text', 'destination_city:text', 'destination_state:text', 'destination_pincode:text',
         'sku_code:text', 'sku_name:text', 'kit_of:text', 'uom:text', 'ordered_qty:number', 'first_dispatched_ist:instant', 'carrier:text', 'awb:text', 'client_order_ref:text',
+        // Story 4-2a (A20) — the order header fields, appended at the END.
+        'order_type:text', 'priority:text', 'ship_by_date:date', 'cod_amount_paise:number',
       ],
       ledger: [
         'created_ist:instant', 'recorded_ist:instant', 'occurred_ist:instant', 'type:text', 'sku_code:text', 'client_code:text', 'uom:text',
@@ -684,13 +713,16 @@ describe('operational registers (e2e, story 5-3a)', () => {
     const o5 = order.get('O5')!;
     const first = istWallClock(at(3, 9));
     const accepted = (id: string, when: string, client: string, skuCode: string, name: string, kitOf: string, qty: string) =>
-      [id, istWallClock(when), 'accepted', 'manual', '', client, '', '', 'Bengaluru', 'Karnataka', '560001', skuCode, name, kitOf, 'each', qty, '', '', '', ''];
+      // (Story 4-2a: a legacy-shaped row — no type, priority normal, no ship-by, prepaid.)
+      [id, istWallClock(when), 'accepted', 'manual', '', client, '', '', 'Bengaluru', 'Karnataka', '560001', skuCode, name, kitOf, 'each', qty, '', '', '', '', '', 'normal', '', ''];
     expect(rows).toEqual([
       // Story 4-1b — the client order number is the LAST column.
-      [o1, istWallClock(at(2, 10)), 'dispatched', 'manual', '', 'ACME', 'Acme Retail LLP', '29ABCDE1234F1Z5', 'Bengaluru', 'Karnataka', '560001', 'AC-PL', 'Acme Plain', '', 'each', '2', first, 'BlueDart', 'BD-111', 'SO-1042'],
-      [o1, istWallClock(at(2, 10)), 'dispatched', 'manual', '', 'ACME', 'Acme Retail LLP', '29ABCDE1234F1Z5', 'Bengaluru', 'Karnataka', '560001', 'AC-BT', 'Acme Pills', '', 'each', '3', first, 'BlueDart', 'BD-111', 'SO-1042'],
+      // Story 4-2a (A20) — the four order fields last; the ORDER-level COD
+      // (paise) repeated on BOTH lines of the two-line order.
+      [o1, istWallClock(at(2, 10)), 'dispatched', 'manual', '', 'ACME', 'Acme Retail LLP', '29ABCDE1234F1Z5', 'Bengaluru', 'Karnataka', '560001', 'AC-PL', 'Acme Plain', '', 'each', '2', first, 'BlueDart', 'BD-111', 'SO-1042', 'b2b', 'high', addIsoDays(D0, 3), '149900'],
+      [o1, istWallClock(at(2, 10)), 'dispatched', 'manual', '', 'ACME', 'Acme Retail LLP', '29ABCDE1234F1Z5', 'Bengaluru', 'Karnataka', '560001', 'AC-BT', 'Acme Pills', '', 'each', '3', first, 'BlueDart', 'BD-111', 'SO-1042', 'b2b', 'high', addIsoDays(D0, 3), '149900'],
       // The dispatch event named no carrier: the LATEST shipment's pair (never the older one's).
-      [o2, istWallClock(at(5, 10)), 'dispatched', 'ingested', 'SHOP-1001', 'ACME', '', '', 'Bengaluru', 'Karnataka', '560001', 'AC-PL', 'Acme Plain', '', 'each', '1', istWallClock(at(5, 15)), 'Ekart', 'AWB-22', ''],
+      [o2, istWallClock(at(5, 10)), 'dispatched', 'ingested', 'SHOP-1001', 'ACME', '', '', 'Bengaluru', 'Karnataka', '560001', 'AC-PL', 'Acme Plain', '', 'each', '1', istWallClock(at(5, 15)), 'Ekart', 'AWB-22', '', '', 'normal', '', ''],
       accepted(o3, at(6, 10), 'BETA', 'BE-PL', 'Beta Plain', '', '4'),
       accepted(o5, at(7, 10), 'ACME', 'AC-KIT', 'Acme Kit', '', '1'),
       accepted(o5, at(7, 10), 'ACME', 'AC-PL', 'Acme Plain', 'AC-KIT', '2'),

@@ -20,6 +20,7 @@ import type { CarrierAdapter } from './carrier-registry';
 import { MissingCarrierEncryptionKeyError, openCredential } from './carrier-credentials';
 import type { CarrierCredential } from './carrier-credentials';
 import {
+  carrierCodUnsupported,
   carrierConnectionNotFound,
   carrierCredentialUnreadable,
   carrierEncryptionUnavailable,
@@ -50,6 +51,9 @@ export type {
   CarrierRateResult,
 } from './carrier-label-port';
 
+// Story 4-2a (A18) — the COD refusal, for the label command and the rate read.
+export { carrierCodUnsupported };
+
 export const DEFAULT_CARRIER_PAGE_SIZE = 50;
 
 /**
@@ -70,6 +74,15 @@ export async function labelThroughAdapter(
     throw new Error(`No carrier adapter registered: ${carrierCode}`);
   }
   return adapter.label(credential, request);
+}
+
+/**
+ * Story 4-2a (A18) — whether the carrier behind `carrierCode` can collect
+ * cash on delivery. An unregistered code answers false (fail closed: a COD
+ * order is never handed to a carrier nobody declared COD-capable).
+ */
+export function carrierSupportsCod(carrierCode: string): boolean {
+  return getCarrierAdapter(carrierCode)?.supportsCod === true;
 }
 
 /**

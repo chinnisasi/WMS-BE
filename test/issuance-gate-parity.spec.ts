@@ -14,6 +14,7 @@ import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { noOpIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
+import { licenceClock } from '../src/modules/compliance/licence-enforcement';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -463,5 +464,81 @@ describe('issuance-gate parity: GSTIN prefix at entry and the buyer legal name (
       expect(created.body.order.clientOrderRef).toBeNull();
       expect((await storedHashes(created.body.order.id as string, key)).payloadHash).toBe(sha256(`${head},"lines":${linesJson}}`));
     }
+  });
+
+  // ── story 4-2a: the order header fields (the same conditional-key rule) ──
+
+  it('golden (4-2a): the four order fields join the staff payload hash ONLY when sent, AS SENT, right after clientOrderRef — orderType, priority, shipByDate, codAmountPaise', async () => {
+    const realNow = licenceClock.now;
+    const day = '2026-11-10';
+    const at = Date.parse(`${day}T06:00:00.000Z`);
+    licenceClock.now = () => at;
+    try {
+      const linesJson = `[{"skuId":"${skuId}","quantity":2,"ratePaise":12500}]`;
+      const head = `{"tenantId":"${tenantId}","warehouseId":"${warehouseId}","source":"manual","integrationId":null,"externalEventId":null,"destination":${DESTINATION_JSON},"consigneeGstin":null`;
+      // All four, trimmed strings, after the client order number, in the fixed order.
+      const fullKey = ulid();
+      const ref = `GOLD-${fullKey.slice(-6)}`;
+      const full = await postOrder(
+        orderBody({ clientOrderRef: ref, codAmountPaise: 149900, shipByDate: ` ${day} `, priority: 'urgent', orderType: ' b2c ' }),
+        fullKey,
+      ).expect(201);
+      expect(full.body.order).toMatchObject({ orderType: 'b2c', priority: 'urgent', shipByDate: day, codAmountPaise: 149900 });
+      expect((await storedHashes(full.body.order.id as string, fullKey)).payloadHash).toBe(
+        sha256(`${head},"clientOrderRef":"${ref}","orderType":"b2c","priority":"urgent","shipByDate":"${day}","codAmountPaise":149900,"lines":${linesJson}}`),
+      );
+      // One alone: COD only — no other key appears.
+      const codKey = ulid();
+      const cod = await postOrder(orderBody({ codAmountPaise: 99900 }), codKey).expect(201);
+      expect((await storedHashes(cod.body.order.id as string, codKey)).payloadHash).toBe(sha256(`${head},"codAmountPaise":99900,"lines":${linesJson}}`));
+      // An EXPLICIT default hashes as sent: priority 'normal' differs from an omitted one (stored normal either way).
+      const explicitKey = ulid();
+      const explicit = await postOrder(orderBody({ priority: 'normal' }), explicitKey).expect(201);
+      expect(explicit.body.order.priority).toBe('normal');
+      const explicitHash = (await storedHashes(explicit.body.order.id as string, explicitKey)).payloadHash;
+      expect(explicitHash).toBe(sha256(`${head},"priority":"normal","lines":${linesJson}}`));
+      expect(explicitHash).not.toBe(sha256(`${head},"lines":${linesJson}}`));
+      // The derived type never joins the hash: none sent → the pre-4-2a bytes exactly.
+      const noneKey = ulid();
+      const none = await postOrder(orderBody(), noneKey).expect(201);
+      expect(none.body.order.orderType).toBe('b2c');
+      expect((await storedHashes(none.body.order.id as string, noneKey)).payloadHash).toBe(sha256(`${head},"lines":${linesJson}}`));
+      // Blank is ABSENT: whitespace type, empty ship-by and empty COD hash as omitted.
+      const blankKey = ulid();
+      const blank = await postOrder(orderBody({ orderType: '   ', shipByDate: '', codAmountPaise: '' }), blankKey).expect(201);
+      expect((await storedHashes(blank.body.order.id as string, blankKey)).payloadHash).toBe(sha256(`${head},"lines":${linesJson}}`));
+    } finally {
+      licenceClock.now = realNow;
+    }
+  });
+
+  it('golden (4-2a): an ingested COD order — the COD joins the payload hash but NEVER the channel sourcePayloadHash, so a redelivery across the deploy (and a divergent COD) resolves to the first order', async () => {
+    const integrationId = uuidv7();
+    const externalEventId = `evt-${ulid()}`;
+    const key = ulid();
+    const linesJson = `[{"skuId":"${skuId}","quantity":2,"ratePaise":12500}]`;
+    const body = orderBody({ source: 'ingested', integrationId, externalEventId, codAmountPaise: 149900 });
+    const created = await postOrder(body, key).expect(201);
+    expect(created.body.order).toMatchObject({ codAmountPaise: 149900, orderType: 'b2c', priority: 'normal' });
+    const hashes = await storedHashes(created.body.order.id as string, key);
+    // The pre-4-2a channel fingerprint, byte for byte.
+    expect(hashes.sourcePayloadHash).toBe(sha256(`{"warehouseId":"${warehouseId}","destination":${DESTINATION_JSON},"consigneeGstin":null,"lines":${linesJson}}`));
+    expect(hashes.payloadHash).toBe(
+      sha256(
+        `{"tenantId":"${tenantId}","warehouseId":"${warehouseId}","source":"ingested","integrationId":"${integrationId}","externalEventId":"${externalEventId}","destination":${DESTINATION_JSON},"consigneeGstin":null,"codAmountPaise":149900,"lines":${linesJson}}`,
+      ),
+    );
+    // The same channel event redelivered WITHOUT a COD (a pre-4-2a delivery) — and with another amount — resolves to it.
+    const prepaidRedelivery = await postOrder(
+      orderBody({ source: 'ingested', integrationId, externalEventId }),
+      noOpIdempotencyKey(tenantId, ulid(), 'orders.createOrder:channel-redelivery'),
+    ).expect(201);
+    expect(prepaidRedelivery.body.order.id).toBe(created.body.order.id);
+    expect(prepaidRedelivery.body.order.codAmountPaise).toBe(149900);
+    const drifted = await postOrder(
+      orderBody({ source: 'ingested', integrationId, externalEventId, codAmountPaise: 1 }),
+      noOpIdempotencyKey(tenantId, ulid(), 'orders.createOrder:channel-redelivery'),
+    ).expect(201);
+    expect(drifted.body.order.id).toBe(created.body.order.id);
   });
 });

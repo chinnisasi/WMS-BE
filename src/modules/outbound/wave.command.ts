@@ -29,6 +29,12 @@ import { buildStockPool, pickableBinsInTx } from './replan';
 import { WAVE_CLOCK } from './wave.clock';
 import type { WaveClock } from './wave.clock';
 import { fromMilli } from '../../shared/primitives/quantity';
+import {
+  compareOrderUrgency,
+  foldOrderUrgency,
+  orderUrgencyOrderBy,
+  type OrderPriority,
+} from './order-urgency';
 
 // ── state machines + policy constants (the outbound module exclusively owns
 // the wave/picklist state machines, AD-6 — the additive arms below are the
@@ -230,6 +236,13 @@ export interface PicklistSnapshot {
   readonly status: PicklistStatus;
   /** Distinct bin stops on this picklist's walk (unfulfillable lines are none). */
   readonly stopCount: number;
+  /**
+   * Story 4-2a (A1) — the most urgent priority and the earliest ship-by date
+   * among the orders of the picklist's NON-cancelled lines. Optional: a wave
+   * snapshot stored before 4-2a (a generate or release replay) lacks them.
+   */
+  readonly priority?: OrderPriority | null;
+  readonly shipByDate?: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly lines: readonly PicklistLineSnapshot[];
@@ -564,8 +577,20 @@ export class WaveCommandService {
           );
         }
 
+        // ── story 4-2a (A9): plan in SELECTION order ─────────────────────
+        // `selectOrders` returns the orders by the urgency key; `planSlices`
+        // consumes the stock pool destructively, so the order lines are
+        // planned in that order and the urgent order draws the first-FEFO
+        // stock (an all-normal, no-ship-by selection is oldest first, as
+        // before). Within one order the lines keep their (created_at, id)
+        // order. This replaces the old `orderId` order deliberately.
+        const selectionRank = new Map(selectedOrderIds.map((orderId, index) => [orderId, index]));
+        const planningOrder = [...pickable].sort(
+          (a, b) => selectionRank.get(a.orderId)! - selectionRank.get(b.orderId)!,
+        );
+
         // ── the plan: bin walk (bins.code asc) × FEFO within the bin ──────
-        const slices = await this.planSlices(tx, command, pickable);
+        const slices = await this.planSlices(tx, command, planningOrder);
 
         // ── the writes ────────────────────────────────────────────────────
         const waveId = uuidv7();
@@ -1076,7 +1101,8 @@ export class WaveCommandService {
    * The wave's order selection. An explicit selection earns precise
    * refusals (an unknown order 404s, a non-accepted order and an order
    * already on an open wave are named); an omitted selection sweeps every
-   * eligible accepted order in the warehouse, oldest first.
+   * eligible accepted order in the warehouse. Both return the orders by the
+   * story 4-2a urgency key (due first, priority, ship-by, then oldest).
    *
    * `FOR UPDATE` on the order rows keeps a cancellation from landing
    * between the eligibility read and the plan — the lock is taken in a
@@ -1090,10 +1116,19 @@ export class WaveCommandService {
     selection: readonly string[] | null,
   ): Promise<string[]> {
     const cap = policy.maxOrders ?? DEFAULT_WAVE_MAX_ORDERS;
+    // Story 4-2a (A8) — the urgency key's "today" is the wave's own clock.
+    const todayIst = istDateOf(this.clock.now().toISOString());
 
     if (selection !== null) {
       const rows = await tx
-        .select({ id: orders.id, status: orders.status, warehouseId: orders.warehouseId })
+        .select({
+          id: orders.id,
+          status: orders.status,
+          warehouseId: orders.warehouseId,
+          priority: orders.priority,
+          shipByDate: orders.shipByDate,
+          createdAt: orders.createdAt,
+        })
         .from(orders)
         .where(and(eq(orders.tenantId, command.tenantId), inArray(orders.id, [...selection])))
         .orderBy(asc(orders.createdAt), asc(orders.id))
@@ -1133,33 +1168,75 @@ export class WaveCommandService {
           `Policy "${policy.name}" waves at most ${cap} orders; the selection names ${selection.length}. Narrow the selection or raise the policy's maxOrders.`,
         );
       }
-      // Oldest first — the same order the walk and the picklists are built in.
-      return rows.map((row) => row.id);
+      // Story 4-2a (A8) — the locked read above keeps the (created_at, id)
+      // lock order; the selection is returned by the urgency key, the order
+      // the slices and the picklists are built in.
+      return [...rows].sort((a, b) => compareOrderUrgency(a, b, todayIst)).map((row) => row.id);
     }
 
-    const rows = await tx
-      .select({ id: orders.id })
-      .from(orders)
-      .where(
-        and(
-          eq(orders.tenantId, command.tenantId),
-          eq(orders.warehouseId, command.warehouseId),
-          // Story 4.5 audit: the auto-selection filter is the same allow-list
-          // as the explicit path above — a `ready_to_dispatch` (packed) order
-          // is simply not swept, with no new clause needed.
-          eq(orders.status, 'accepted'),
-          sql`not exists (select 1 from ${picklistLines} pl where pl.tenant_id = ${orders.tenantId} and pl.order_id = ${orders.id} and pl.status <> 'cancelled')`,
-        ),
-      )
-      .orderBy(asc(orders.createdAt), asc(orders.id))
-      .limit(cap)
-      .for('update');
-    if (rows.length === 0) {
-      throw noEligibleOrders(
-        'No accepted order in this warehouse is free to wave — every one is already on an open wave, or none exists.',
+    // ── the sweep (story 4-2a, A8): read by urgency, lock in (created_at, id)
+    // A single `… order by <urgency> limit cap for update` would lock rows in
+    // URGENCY order — not the (created_at, id) order `cancelOrder` and every
+    // other sweep lock them in — and two commands locking overlapping rows in
+    // different orders deadlock. So the sweep is two statements:
+    //   1. an UNLOCKED candidate read by the urgency key, `limit cap * 2`
+    //      (the slack absorbs candidates claimed before the lock);
+    //   2. a LOCKED re-read of exactly those ids in (created_at, id) order,
+    //      re-stating the eligibility predicate (a cancelled or packed
+    //      candidate fails it and is skipped), then a fresh open-claim read
+    //      (READ COMMITTED: a fresh statement sees a concurrent wave that
+    //      committed while this one waited for the lock).
+    // Then the first `cap` still eligible, in urgency order. A candidate lost
+    // in between only makes the wave smaller. When candidates existed but
+    // NONE survived, the candidate read runs once more; still none → the
+    // claim-lost 409 (the winner named, or retry) — never the 422, which
+    // means "nothing to wave".
+    const eligible = and(
+      eq(orders.tenantId, command.tenantId),
+      eq(orders.warehouseId, command.warehouseId),
+      // Story 4.5 audit: the auto-selection filter is the same allow-list
+      // as the explicit path above — a `ready_to_dispatch` (packed) order
+      // is simply not swept, with no new clause needed.
+      eq(orders.status, 'accepted'),
+      sql`not exists (select 1 from ${picklistLines} pl where pl.tenant_id = ${orders.tenantId} and pl.order_id = ${orders.id} and pl.status <> 'cancelled')`,
+    );
+    const urgency = orderUrgencyOrderBy(todayIst, {
+      priority: sql`${orders.priority}`,
+      shipByDate: sql`${orders.shipByDate}`,
+      createdAt: sql`${orders.createdAt}`,
+      id: sql`${orders.id}`,
+    });
+    let lastCandidates: string[] = [];
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const candidates = (
+        await tx.select({ id: orders.id }).from(orders).where(eligible).orderBy(urgency).limit(cap * 2)
+      ).map((row) => row.id);
+      if (candidates.length === 0) {
+        if (attempt === 0) {
+          throw noEligibleOrders(
+            'No accepted order in this warehouse is free to wave — every one is already on an open wave, or none exists.',
+          );
+        }
+        // Every candidate was claimed while this sweep waited — a lost race.
+        throw new WaveClaimLostError(command.tenantId, lastCandidates);
+      }
+      lastCandidates = candidates;
+      const locked = await tx
+        .select({ id: orders.id, priority: orders.priority, shipByDate: orders.shipByDate, createdAt: orders.createdAt })
+        .from(orders)
+        .where(and(eligible, inArray(orders.id, candidates)))
+        .orderBy(asc(orders.createdAt), asc(orders.id))
+        .for('update');
+      const claimedNow = new Set(
+        (await this.openClaims(tx, command.tenantId, locked.map((row) => row.id))).map((claim) => claim.orderId),
       );
+      const kept = locked
+        .filter((row) => !claimedNow.has(row.id))
+        .sort((a, b) => compareOrderUrgency(a, b, todayIst))
+        .slice(0, cap);
+      if (kept.length > 0) return kept.map((row) => row.id);
     }
-    return rows.map((row) => row.id);
+    throw new WaveClaimLostError(command.tenantId, lastCandidates);
   }
 
   /** The open (non-cancelled) wave claims held over a set of orders. */
@@ -1448,6 +1525,20 @@ export class WaveCommandService {
               and(eq(picklistLines.tenantId, wave.tenantId), eq(picklistLines.waveId, wave.id)),
             )
             .orderBy(asc(picklistLines.picklistId), asc(picklistLines.walkSeq), asc(picklistLines.id));
+    // Story 4-2a (A1) — each picklist's urgency: its non-cancelled lines'
+    // orders, folded to the most urgent priority and the earliest ship-by.
+    const lineOrderIds = [
+      ...new Set(lines.filter((line) => line.status !== 'cancelled').map((line) => line.orderId)),
+    ];
+    const urgencyByOrder = new Map(
+      (lineOrderIds.length === 0
+        ? []
+        : await tx
+            .select({ id: orders.id, priority: orders.priority, shipByDate: orders.shipByDate })
+            .from(orders)
+            .where(and(eq(orders.tenantId, wave.tenantId), inArray(orders.id, lineOrderIds)))
+      ).map((row) => [row.id, row]),
+    );
     return {
       wave: {
         id: wave.id,
@@ -1463,6 +1554,7 @@ export class WaveCommandService {
           picklistSnapshot(
             list,
             lines.filter((line) => line.picklistId === list.id),
+            urgencyByOrder,
           ),
         ),
       },
@@ -1493,8 +1585,14 @@ export function policySnapshot(row: WavePolicy): WavePolicySnapshotBody {
 export function picklistSnapshot(
   row: Picklist,
   lines: readonly PicklistLine[],
+  urgencyByOrder: ReadonlyMap<string, { readonly priority: string; readonly shipByDate: string | null }>,
 ): PicklistSnapshot {
   const ordered = [...lines].sort((a, b) => a.walkSeq - b.walkSeq);
+  const urgency = foldOrderUrgency(
+    [...new Set(ordered.filter((line) => line.status !== 'cancelled').map((line) => line.orderId))]
+      .map((orderId) => urgencyByOrder.get(orderId))
+      .filter((fact): fact is { readonly priority: string; readonly shipByDate: string | null } => fact !== undefined),
+  );
   return {
     id: row.id,
     waveId: row.waveId,
@@ -1509,6 +1607,8 @@ export function picklistSnapshot(
         .filter((line) => line.binId !== null && line.status !== 'cancelled')
         .map((line) => line.binId),
     ).size,
+    priority: urgency.priority,
+    shipByDate: urgency.shipByDate,
     createdAt: canonicalInstant(row.createdAt),
     updatedAt: canonicalInstant(row.updatedAt),
     lines: ordered.map(lineSnapshot),

@@ -104,6 +104,34 @@ export interface ParsedChannelOrder {
   /** Unset when the payload carries no address — the command 400s (required at create). */
   readonly destination?: AddressInput | undefined;
   readonly lines: readonly ParsedChannelLine[];
+  /**
+   * Story 4-2a — the cash to collect on delivery, integer paise, when the
+   * channel says the order is COD; absent or null means prepaid. Never part
+   * of the channel dedup fingerprint (`sourcePayloadHash`).
+   */
+  readonly codAmountPaise?: number | null;
+}
+
+/**
+ * Story 4-2a (A5) — a VERIFIED body the parse arm refuses for a named reason
+ * (beside `null`, the generic "no mappable shape"). `cod-amount-unmappable` —
+ * the body says cash on delivery but the amount to collect cannot be read
+ * (currency, status or `total_outstanding`): never ingested as a prepaid
+ * order. It carries the order as parsed WITHOUT its COD, so the ingest can
+ * still resolve a redelivery of an order it already holds (decision 7: a
+ * redelivery always resolves to its order); only a FIRST delivery is refused
+ * — metered by its reason and the channel order ref, answered 400.
+ */
+export interface ParsedChannelRefusal {
+  readonly refused: 'cod-amount-unmappable';
+  readonly order: ParsedChannelOrder;
+}
+
+/** Story 4-2a — narrows a parse result to its refusal arm. */
+export function isParsedChannelRefusal(
+  parsed: ParsedChannelOrder | ParsedChannelRefusal | null,
+): parsed is ParsedChannelRefusal {
+  return parsed !== null && 'refused' in parsed;
 }
 
 /** A `cancellations` endpoint payload, normalized to the order ref alone. */
@@ -128,7 +156,7 @@ export interface ParsedChannelCancellation {
 export interface ChannelWebhookDeclaration {
   readonly topics: Readonly<Record<ChannelWebhookEndpoint, string>>;
   readonly verification: ChannelWebhookVerification;
-  parseOrder(body: Record<string, unknown>): ParsedChannelOrder | null;
+  parseOrder(body: Record<string, unknown>): ParsedChannelOrder | ParsedChannelRefusal | null;
   parseCancellation(body: Record<string, unknown>): ParsedChannelCancellation | null;
 }
 

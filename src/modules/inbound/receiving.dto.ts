@@ -1208,6 +1208,27 @@ export class CatalogPackTaskDto {
       'Story 10.3: the SKU is handled by unit — the bench must scan each case\'s handling-unit label (count == pickedQty), never a typed quantity.',
   })
   catchWeightTracked!: boolean;
+  @ApiProperty({
+    enum: ['normal', 'high', 'urgent'],
+    description:
+      "Story 4-2a — the order's priority (order-level, repeated on each of its SKU rows): the pack card's chip. Pack tasks arrive by the urgency key (due first, priority, ship-by, then oldest).",
+  })
+  orderPriority!: string;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    format: 'date',
+    description: "Story 4-2a — the order's ship-by date (IST, YYYY-MM-DD); null when none.",
+  })
+  orderShipByDate!: string | null;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    description: "Story 4-2a — the cash to collect on delivery for this order, integer paise; null means prepaid.",
+  })
+  codAmountPaise!: number | null;
 }
 
 /** One active handling unit of the device snapshot (story 10.7, additive). */
@@ -1432,7 +1453,7 @@ export class CatalogSnapshotResponse {
   @ApiProperty({ type: [PutawayTaskDto], description: 'Story 3.5 (additive): the derived putaway tasks with the capacity-only suggestions (advisory — the server re-gates at placement)' })
   putawayTasks!: readonly PutawayTaskDto[];
 
-  @ApiProperty({ type: [PickTaskDto], description: 'Story 4.3 (additive): the pick tasks of every ready picklist on a released wave, in walk order (the bin/batch each names is advisory — the server re-derives both at pick time)' })
+  @ApiProperty({ type: [PickTaskDto], description: 'Story 4.3 (additive): the pick tasks of every ready picklist on a released wave — story 4-2a: whole picklists by urgency (the most urgent planned order of each picklist, judged on the snapshot IST date), each in walk order (the bin/batch each names is advisory — the server re-derives both at pick time)' })
   pickTasks!: readonly PickTaskDto[];
 
   @ApiProperty({ type: [CatalogPackTaskDto], description: 'Story 10.7 (additive): the packable orders\' per-SKU picked totals — the dataset the bench pre-verifies its scan against, offline. Mirrors the pack command\'s own verification query (picks grouped by (order, sku)) and its completeness guards (accepted, ≥1 pick line, none planned, not all cancelled)' })
