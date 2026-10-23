@@ -9,16 +9,25 @@ import {
   goodsReceiptNotes,
   idempotencyKeys,
   qcHolds,
+  qcInspectionLines,
+  qcInspections,
   skus,
 } from '../../shared/db/schema';
 import type { UserRole } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
-import { fromMilli, signedQuantity } from '../../shared/primitives/quantity';
+import { assertRecordableQuantity, fromMilli, signedQuantity } from '../../shared/primitives/quantity';
+import { uomPrecision } from '../catalog/uom';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
-import { DAMAGED_BIN_CODE, ensureQcHoldBinInTx, QC_HOLD_BIN_CODE, RETURNS_BIN_CODE } from '../tenancy/receiving-bin';
+import {
+  DAMAGED_BIN_CODE,
+  ensureDamagedBinInTx,
+  ensureQcHoldBinInTx,
+  QC_HOLD_BIN_CODE,
+  RETURNS_BIN_CODE,
+} from '../tenancy/receiving-bin';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
 import { assertPermission, assertSecureBinAuthority } from '../tenancy/permissions';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
@@ -72,6 +81,162 @@ export interface ReleaseQcHoldCommand {
  */
 export const QC_HOLD_KINDS = ['manual', 'receipt'] as const;
 export type QcHoldKind = (typeof QC_HOLD_KINDS)[number];
+
+/**
+ * The hold statuses (`qc_holds.status`, CHECK `qc_holds_status_check`, 0014,
+ * widened by 0091): `open` → `released` (a release) or `inspected` (story
+ * 2-8a — an inspection outcome). Both closed states carry `released_by` /
+ * `released_at`, read as "closed by / at". Pinned against the CHECK by
+ * test/qc-inspection.spec.ts.
+ */
+export const QC_HOLD_STATUSES = ['open', 'released', 'inspected'] as const;
+export type QcHoldStatus = (typeof QC_HOLD_STATUSES)[number];
+
+/**
+ * Story 2-8a — why inspected units failed (`qc_inspection_lines.fail_reason`,
+ * CHECK `qc_inspection_lines_outcome_check`, 0091). `other` needs the note.
+ * Pinned against the CHECK by test/qc-inspection.spec.ts.
+ */
+export const QC_FAIL_REASONS = ['damaged', 'expired', 'contaminated', 'wrong-item', 'spec-failure', 'other'] as const;
+export type QcFailReason = (typeof QC_FAIL_REASONS)[number];
+
+/** Story 2-8a — an inspection line's outcome (`qc_inspection_lines.outcome`). */
+export const QC_INSPECTION_OUTCOMES = ['passed', 'failed'] as const;
+export type QcInspectionOutcome = (typeof QC_INSPECTION_OUTCOMES)[number];
+
+/** Story 2-8a — the outbox event of an inspection (resolves a manual hold's `qc-hold` entry). */
+export const QC_HOLD_INSPECTED_EVENT = 'qc_hold.inspected';
+
+/** Story 2-8a — the inspection note's ceiling (code points, after trimming). */
+export const MAX_INSPECTION_NOTE_LENGTH = 500;
+
+/** Story 2-8a — one held batch arm's outcome as the request sends it (base units). */
+export interface InspectQcHoldLine {
+  /** The arm's batch (null on an untracked SKU's single arm). */
+  readonly batchId: string | null;
+  /** Units that passed — back to the origin bin (Receiving for a receipt hold). */
+  readonly passed: number;
+  /** Units that failed, per reason — into the system DAMAGED bin. */
+  readonly failed: readonly { readonly reason: QcFailReason; readonly quantity: number }[];
+}
+
+/** Story 2-8a — `POST …/qc-holds/:holdId/inspect`. */
+export interface InspectQcHoldCommand {
+  readonly tenantId: string;
+  /** The session user — authority is re-read from the DB at command entry. */
+  readonly actorUserId: string;
+  readonly holdId: string;
+  /** One line per held batch arm, covering exactly the hold's arms. */
+  readonly lines: readonly InspectQcHoldLine[];
+  /** Optional (≤ 500 after trimming, blank = absent); required when a reason is `other`. */
+  readonly note?: string | null | undefined;
+}
+
+/** Story 2-8a — one stored inspection row as every surface returns it (base units). */
+export interface QcInspectionLineSnapshot {
+  readonly batchId: string | null;
+  readonly outcome: QcInspectionOutcome;
+  readonly failReason: QcFailReason | null;
+  readonly quantity: number;
+}
+
+/** Story 2-8a — the inspection that closed a hold. */
+export interface QcInspectionSnapshot {
+  readonly id: string;
+  readonly holdId: string;
+  readonly note: string | null;
+  /** The hold's `released_by` / `released_at` — the single authority for who and when. */
+  readonly inspectedBy: string;
+  readonly inspectedAt: string;
+  /** Σ passed / Σ failed, base units. */
+  readonly passedQuantity: number;
+  readonly failedQuantity: number;
+  /** Ordered: batch (untracked first, then by id), passed before failed, failures by reason. */
+  readonly lines: readonly QcInspectionLineSnapshot[];
+}
+
+/** Story 2-8a — the inspect answer (the idempotency snapshot). */
+export interface InspectQcHoldSnapshot {
+  readonly qcHold: QcHoldSnapshot['qcHold'];
+  readonly inspection: QcInspectionSnapshot;
+}
+
+/** Story 2-8a — batch ids ordered untracked (null) first, then ascending — the one canonical arm order. */
+export function compareBatchIds(a: string | null, b: string | null): number {
+  if (a === b) return 0;
+  if (a === null) return -1;
+  if (b === null) return 1;
+  return a < b ? -1 : 1;
+}
+
+/** Story 2-8a — the canonical order of inspection rows (the snapshot's and the detail read's). */
+export function compareInspectionLines(a: QcInspectionLineSnapshot, b: QcInspectionLineSnapshot): number {
+  const byBatch = compareBatchIds(a.batchId, b.batchId);
+  if (byBatch !== 0) return byBatch;
+  if (a.outcome !== b.outcome) return a.outcome === 'passed' ? -1 : 1;
+  const ra = a.failReason ?? '';
+  const rb = b.failReason ?? '';
+  return ra < rb ? -1 : ra > rb ? 1 : 0;
+}
+
+/**
+ * Story 2-8a — the inspect body's SHAPE rules, above the transaction (guide
+ * §1's first tier: a malformed request answers 400, never a replay): no
+ * duplicate batch, no duplicate reason within a batch, `other` needs the
+ * note, the note ≤ 500 after trimming (blank = absent). Returns the canonical
+ * lines (sorted by batch, untracked first, failures by reason) and the
+ * normalised note — exactly what the fingerprint hashes.
+ */
+export function normaliseInspection(command: Pick<InspectQcHoldCommand, 'lines' | 'note'>): {
+  readonly lines: readonly InspectQcHoldLine[];
+  readonly note: string | null;
+} {
+  const trimmed = command.note === undefined || command.note === null ? '' : command.note.trim();
+  const note = trimmed === '' ? null : trimmed;
+  if (note !== null && [...note].length > MAX_INSPECTION_NOTE_LENGTH) {
+    throw qcValidation(`note is at most ${MAX_INSPECTION_NOTE_LENGTH} characters (got ${[...note].length}).`);
+  }
+  if (command.lines.length === 0) {
+    throw qcValidation('lines must name every held batch arm of the hold (got none).');
+  }
+  const seen = new Set<string>();
+  for (const line of command.lines) {
+    const key = line.batchId ?? 'untracked';
+    if (seen.has(key)) {
+      throw qcValidation(
+        line.batchId === null
+          ? 'lines name the untracked arm (batchId null) twice — one line per held arm.'
+          : `lines name batch "${line.batchId}" twice — one line per held arm.`,
+      );
+    }
+    seen.add(key);
+    const reasons = new Set<string>();
+    for (const failure of line.failed) {
+      if (!(QC_FAIL_REASONS as readonly string[]).includes(failure.reason)) {
+        throw qcValidation(`reason must be one of ${JSON.stringify(QC_FAIL_REASONS)} (got "${String(failure.reason)}").`);
+      }
+      if (reasons.has(failure.reason)) {
+        throw qcValidation(
+          `${line.batchId === null ? 'the untracked arm' : `batch "${line.batchId}"`} names the fail reason "${failure.reason}" twice — give each reason once with its total.`,
+        );
+      }
+      reasons.add(failure.reason);
+      if (failure.reason === 'other' && note === null) {
+        throw qcValidation('a failure with the reason "other" needs a note saying what failed.');
+      }
+    }
+  }
+  const lines = [...command.lines]
+    .map((line) => ({
+      batchId: line.batchId,
+      passed: line.passed,
+      failed: [...line.failed]
+        .map((failure) => ({ reason: failure.reason, quantity: failure.quantity }))
+        .sort((a, b) => (a.reason < b.reason ? -1 : a.reason > b.reason ? 1 : 0)),
+    }))
+    .sort((a, b) => compareBatchIds(a.batchId, b.batchId));
+  return { lines, note };
+}
 
 /**
  * Story 1-2b — the outbox events of QC on receipt: ONE per receipt (or
@@ -129,7 +294,7 @@ export interface QcHoldSnapshot {
     readonly skuId: string;
     readonly binId: string;
     readonly reason: string;
-    readonly status: 'open' | 'released';
+    readonly status: QcHoldStatus;
     readonly heldBy: string;
     readonly heldAt: string;
     readonly releasedBy: string | null;
@@ -220,7 +385,10 @@ export async function openQcHoldsForSkuInTx(
  * the row records the decision, and a release moves exactly the held units
  * back to the hold row's recorded origin bin with `qc.released` events (the
  * same batch arms the hold placed, derived from its own ledger events — no
- * scrap disposition, no partial release, mobile untouched).
+ * partial release, mobile untouched). Story 2-8a adds the disposition: an
+ * INSPECTION closes the hold with, per arm, passed units back to the origin
+ * (`qc.released`) and failed units into the system DAMAGED bin
+ * (`qc.failed`), recording the outcome and fail reasons.
  *
  * Invariant order (the `receiving.command.ts` shape) inside
  * `withTenantTransaction`: authority (fresh DB role read →
@@ -638,10 +806,10 @@ export class QcCommand {
    * `qc-holds/:id/release`: moves the hold's stock back to the hold row's
    * recorded origin bin — exactly the units its own `qc.held` events moved
    * in (same batch arms, replayed from the ledger), never a caller-chosen
-   * bin — and marks the row `released`. A second release is a deterministic
-   * 409; an origin bin that has gone missing mid-hold is a 409 and the hold
-   * stays open (a failed inspection keeps the hold open — no scrap
-   * disposition; Epic 5's adjustment path shrinks quantities).
+   * bin — and marks the row `released`. A second release (or a release of an
+   * inspected hold) is a deterministic 409; an origin bin that has gone
+   * missing mid-hold is a 409 and the hold stays open. A failed inspection is
+   * `inspectHold` (story 2-8a), not a release.
    */
   async releaseHold(command: ReleaseQcHoldCommand, idempotencyKey: string): Promise<QcHoldSnapshot> {
     const payloadHash = hashCommandPayload({
@@ -686,12 +854,7 @@ export class QcCommand {
         );
       }
       if (row.status !== 'open') {
-        throw new ProblemException(
-          'qc-hold-released',
-          409,
-          'QC hold already released',
-          `QC hold "${row.id}" is already released — releases are terminal.`,
-        );
+        throw qcHoldClosed(row.id, row.status);
       }
 
       const snapshot = await this.releaseHoldCoreInTx(tx, row, role, command.actorUserId);
@@ -813,6 +976,332 @@ export class QcCommand {
   }
 
   /**
+   * Story 2-8a — `POST …/qc-holds/:holdId/inspect` (`qc.manage`, keyed): the
+   * inspection outcome closes an OPEN hold in one transaction. For every batch
+   * arm the hold moved, the request gives the passed units and the failed
+   * units per reason, summing exactly to the arm (whole-hold inspection — no
+   * remainder stays held). Passed units go back exactly as a release returns
+   * them (`qc.released`, QC-HOLD → the origin; Receiving for a receipt hold,
+   * where they are putaway work again); failed units relocate QC-HOLD →
+   * DAMAGED (`qc.failed`), where 2-4a's rules apply (ATP-excluded, write-off
+   * only). The hold closes `inspected` (`released_by` / `released_at` = the
+   * inspector, now); the inspection and its lines are stored.
+   *
+   * The skeleton: shape (above the tx) → hash → `qc.manage` → replay → the
+   * hold `FOR UPDATE` (404) → replay again → status (409 `qc-hold-released`)
+   * → the SKU's precision → the held arms match (422
+   * `qc-inspection-mismatch`) → passed > 0: the origin `FOR UPDATE`, gone,
+   * secure gate → the QC-HOLD bin → failed > 0: the DAMAGED bin (409
+   * `damaged-bin-conflict`) → the ledger → the conditional UPDATE → the
+   * inspection rows → outbox `qc_hold.inspected` (and, for a receipt hold,
+   * `qc_hold.receipt_cleared` when its placement has nothing open) → audit
+   * `qc_hold.inspected` → the key LAST. Lock order: hold → origin → (the
+   * system bins are ensured, never locked) → the warehouse advisory inside the
+   * ledger append.
+   */
+  async inspectHold(command: InspectQcHoldCommand, idempotencyKey: string): Promise<InspectQcHoldSnapshot> {
+    // ── shape, above the transaction (400 before any replay) ─────────────
+    const normalised = normaliseInspection(command);
+    // The fingerprint: the hold, the canonical lines with the quantities as
+    // sent (base units) and the normalised note.
+    const payloadHash = hashCommandPayload({
+      tenantId: command.tenantId,
+      holdId: command.holdId,
+      lines: normalised.lines.map((line) => ({
+        batchId: line.batchId,
+        passed: line.passed,
+        failed: line.failed.map((failure) => ({ reason: failure.reason, quantity: failure.quantity })),
+      })),
+      note: normalised.note,
+    });
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      const role = await getMemberRoleIn(tx, command.tenantId, command.actorUserId);
+      assertPermission(role, 'qc.manage');
+
+      const replayed = await this.replayInspection(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) return replayed;
+
+      // ── the hold, locked (a lock helper never checks status — guide §1) ─
+      const rows = await tx
+        .select()
+        .from(qcHolds)
+        .where(and(eq(qcHolds.id, command.holdId), eq(qcHolds.tenantId, command.tenantId)))
+        .limit(1)
+        .for('update');
+      const row = rows[0];
+      if (row === undefined) {
+        throw new ProblemException(
+          'not-found',
+          404,
+          'QC hold not found',
+          `No QC hold with id "${command.holdId}" exists in this tenant.`,
+        );
+      }
+      // A same-key duplicate parked on the lock replays the winner's answer.
+      const replayedUnderLock = await this.replayInspection(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) return replayedUnderLock;
+      if (row.status !== 'open') {
+        throw qcHoldClosed(row.id, row.status);
+      }
+
+      // ── the precision refusal (behind the replay lookup, after the SKU) ─
+      const skuRows = await tx
+        .select({ uom: skus.uom })
+        .from(skus)
+        .where(and(eq(skus.id, row.skuId), eq(skus.tenantId, command.tenantId)))
+        .limit(1);
+      if (skuRows[0] === undefined) {
+        throw notFound('SKU', row.skuId);
+      }
+      const uom = skuRows[0].uom;
+      const precision = uomPrecision(uom);
+      const lines = normalised.lines.map((line, index) => ({
+        batchId: line.batchId,
+        passed: assertRecordableQuantity(line.passed, `lines[${index}].passed`, uom, precision),
+        failed: line.failed.map((failure, at) => ({
+          reason: failure.reason,
+          quantity: assertRecordableQuantity(failure.quantity, `lines[${index}].failed[${at}].quantity`, uom, precision),
+        })),
+      }));
+
+      // ── the held arms are the truth: the lines must cover exactly them ──
+      const heldEvents = await this.inventory.qcHeldArmsInTx(tx, command.tenantId, row.warehouseId, row.id);
+      const held = new Map<string | null, number>();
+      for (const event of heldEvents) {
+        held.set(event.batchRef, (held.get(event.batchRef) ?? 0) + event.quantity);
+      }
+      if (held.size === 0) {
+        // Unreachable short of ledger tampering (the release core's twin).
+        throw new ProblemException(
+          'qc-hold-origin-bin-gone',
+          409,
+          'QC hold has no ledger movements',
+          `QC hold "${row.id}" carries no qc.held movements — the ledger is its movement record; refusing a blind inspection.`,
+        );
+      }
+      const heldText = (): string =>
+        [...held]
+          .sort(([a], [b]) => compareBatchIds(a, b))
+          .map(([batch, qty]) => `${batch === null ? 'the untracked arm' : `batch "${batch}"`} ${fromMilli(qty)} ${uom}`)
+          .join(', ');
+      for (const line of lines) {
+        const arm = held.get(line.batchId);
+        if (arm === undefined) {
+          throw qcInspectionMismatch(
+            `QC hold "${row.id}" holds no ${line.batchId === null ? 'untracked arm' : `batch "${line.batchId}"`} — it holds ${heldText()}. Send one line per held arm.`,
+          );
+        }
+        const total = line.passed + line.failed.reduce((sum, failure) => sum + failure.quantity, 0);
+        if (total !== arm) {
+          throw qcInspectionMismatch(
+            `${line.batchId === null ? 'The untracked arm' : `Batch "${line.batchId}"`} of QC hold "${row.id}" holds ${fromMilli(arm)} ${uom}, but passed + failed is ${fromMilli(total)} — they must add up exactly (it holds ${heldText()}).`,
+          );
+        }
+      }
+      if (lines.length !== held.size) {
+        const named = new Set(lines.map((line) => line.batchId));
+        const missing = [...held.keys()].filter((batch) => !named.has(batch)).sort(compareBatchIds);
+        throw qcInspectionMismatch(
+          `The inspection leaves ${missing.map((batch) => (batch === null ? 'the untracked arm' : `batch "${batch}"`)).join(', ')} of QC hold "${row.id}" out — it holds ${heldText()}. Every held arm needs a line.`,
+        );
+      }
+      const passedTotal = lines.reduce((sum, line) => sum + line.passed, 0);
+      const failedTotal = lines.reduce((sum, line) => sum + line.failed.reduce((s2, failure) => s2 + failure.quantity, 0), 0);
+
+      // ── where the units go: the origin only when something passes ──────
+      if (passedTotal > 0) {
+        await this.lockOriginBinInTx(tx, row, role);
+      }
+      const qcBin = await ensureQcHoldBinInTx(tx, command.tenantId, row.warehouseId);
+      const damagedBin = failedTotal > 0 ? await ensureDamagedBinInTx(tx, command.tenantId, row.warehouseId) : null;
+
+      // ── the ledger: qc.released for passed units, qc.failed for failed ──
+      const inspectionId = uuidv7();
+      const inspectedAt = nowIso();
+      for (const line of lines) {
+        const failed = line.failed.reduce((sum, failure) => sum + failure.quantity, 0);
+        if (line.passed > 0) {
+          await this.inventory.appendLedgerEventInTx(tx, {
+            tenantId: command.tenantId,
+            warehouseId: row.warehouseId,
+            type: 'qc.released',
+            skuId: row.skuId,
+            quantityDelta: signedQuantity(line.passed),
+            fromBinId: qcBin.binId,
+            toBinId: row.binId,
+            batchRef: line.batchId,
+            serialRef: null,
+            actorUserId: command.actorUserId,
+            occurredAt: inspectedAt,
+            recordedAt: inspectedAt,
+            referenceDoc: { kind: 'qc-hold', holdId: row.id, inspectionId },
+          });
+        }
+        if (failed > 0 && damagedBin !== null) {
+          await this.inventory.appendLedgerEventInTx(tx, {
+            tenantId: command.tenantId,
+            warehouseId: row.warehouseId,
+            type: 'qc.failed',
+            skuId: row.skuId,
+            quantityDelta: signedQuantity(failed),
+            fromBinId: qcBin.binId,
+            toBinId: damagedBin.binId,
+            batchRef: line.batchId,
+            serialRef: null,
+            actorUserId: command.actorUserId,
+            occurredAt: inspectedAt,
+            recordedAt: inspectedAt,
+            // `grnLineId` only on a receipt hold — omitted, never null (guide §4).
+            referenceDoc: {
+              kind: 'qc-hold',
+              holdId: row.id,
+              ...(row.grnLineId === null ? {} : { grnLineId: row.grnLineId }),
+              inspectionId,
+            },
+          });
+        }
+      }
+
+      // ── the hold closes (conditional — a terminal transition) ──────────
+      const closed = await tx
+        .update(qcHolds)
+        .set({ status: 'inspected', releasedBy: command.actorUserId, releasedAt: inspectedAt, updatedAt: inspectedAt })
+        .where(and(eq(qcHolds.id, row.id), eq(qcHolds.status, 'open')))
+        .returning({ id: qcHolds.id });
+      if (closed.length === 0) {
+        // Unreachable under the row lock; refuse rather than write a second outcome.
+        throw qcHoldClosed(row.id, 'closed');
+      }
+
+      // ── the inspection record ───────────────────────────────────────────
+      await tx.insert(qcInspections).values({
+        id: inspectionId,
+        tenantId: command.tenantId,
+        holdId: row.id,
+        note: normalised.note,
+        createdAt: inspectedAt,
+        updatedAt: inspectedAt,
+      });
+      const stored: { batchId: string | null; outcome: QcInspectionOutcome; failReason: QcFailReason | null; quantity: number }[] = [];
+      for (const line of lines) {
+        if (line.passed > 0) stored.push({ batchId: line.batchId, outcome: 'passed', failReason: null, quantity: line.passed });
+        for (const failure of line.failed) {
+          stored.push({ batchId: line.batchId, outcome: 'failed', failReason: failure.reason, quantity: failure.quantity });
+        }
+      }
+      await tx.insert(qcInspectionLines).values(
+        stored.map((entry) => ({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          inspectionId,
+          batchId: entry.batchId,
+          outcome: entry.outcome,
+          failReason: entry.failReason,
+          quantity: entry.quantity,
+          createdAt: inspectedAt,
+          updatedAt: inspectedAt,
+        })),
+      );
+
+      const snapshot: InspectQcHoldSnapshot = {
+        qcHold: {
+          id: row.id,
+          tenantId: row.tenantId,
+          warehouseId: row.warehouseId,
+          skuId: row.skuId,
+          binId: row.binId,
+          reason: row.reason,
+          status: 'inspected',
+          heldBy: row.heldBy,
+          heldAt: canonicalInstant(row.heldAt),
+          releasedBy: command.actorUserId,
+          releasedAt: inspectedAt,
+          createdAt: canonicalInstant(row.createdAt),
+          ...(row.kind === 'receipt' && row.grnLineId !== null ? { kind: 'receipt' as const, grnLineId: row.grnLineId } : {}),
+        },
+        inspection: {
+          id: inspectionId,
+          holdId: row.id,
+          note: normalised.note,
+          inspectedBy: command.actorUserId,
+          inspectedAt,
+          passedQuantity: fromMilli(passedTotal),
+          failedQuantity: fromMilli(failedTotal),
+          lines: stored.map((entry) => ({ ...entry, quantity: fromMilli(entry.quantity) })),
+        },
+      };
+
+      // ── outbox (AD-7): totals in base units ─────────────────────────────
+      await this.outbox.append(tx, {
+        messageId: uuidv7(),
+        tenantId: command.tenantId,
+        type: QC_HOLD_INSPECTED_EVENT,
+        occurredAt: inspectedAt,
+        payload: {
+          holdId: row.id,
+          tenantId: command.tenantId,
+          warehouseId: row.warehouseId,
+          skuId: row.skuId,
+          binId: row.binId,
+          reason: row.reason,
+          inspectionId,
+          passedQuantity: fromMilli(passedTotal),
+          failedQuantity: fromMilli(failedTotal),
+          // Every stored row; quantities as base-unit decimal strings (the
+          // outbox's exact-quantity convention — never a float).
+          lines: stored.map((entry) => ({
+            batchId: entry.batchId,
+            outcome: entry.outcome,
+            reason: entry.failReason,
+            quantity: String(fromMilli(entry.quantity)),
+          })),
+          inspectedBy: command.actorUserId,
+          inspectedAt,
+          // A receipt hold raised no `qc-hold` entry: its placement's
+          // `qc-receipt` entry resolves through `qc_hold.receipt_cleared`.
+          ...(row.kind === 'receipt' ? { kind: 'receipt' } : {}),
+        },
+      });
+      if (row.kind === 'receipt') {
+        await this.emitReceiptClearedInTx(tx, command.tenantId, [row]);
+      }
+
+      await tx.insert(auditEvents).values({
+        id: uuidv7(),
+        tenantId: command.tenantId,
+        actorUserId: command.actorUserId,
+        action: 'qc_hold.inspected',
+        targetType: 'qc_hold',
+        targetId: row.id,
+        reference: idempotencyKey,
+        occurredAt: inspectedAt,
+      });
+
+      await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+      return snapshot;
+    });
+  }
+
+  private async replayInspection(
+    tx: TenantTx,
+    tenantId: string,
+    idempotencyKey: string,
+    payloadHash: string,
+  ): Promise<InspectQcHoldSnapshot | null> {
+    const existing = await tx
+      .select()
+      .from(idempotencyKeys)
+      .where(and(eq(idempotencyKeys.tenantId, tenantId), eq(idempotencyKeys.key, idempotencyKey)))
+      .limit(1);
+    if (existing[0] === undefined) return null;
+    if (existing[0].payloadHash !== payloadHash) {
+      throw idempotencyKeyReuse();
+    }
+    return existing[0].responseSnapshot as InspectQcHoldSnapshot;
+  }
+
+  /**
    * The release of ONE open hold row (locked by the caller): the origin-bin
    * checks, the 12-3 secure gate, the hold's own `qc.held` arms replayed
    * back as `qc.released`, the conditional status flip and the per-hold
@@ -827,68 +1316,7 @@ export class QcCommand {
     actorUserId: string,
   ): Promise<QcHoldSnapshot> {
     const command = { tenantId: row.tenantId, actorUserId };
-    // The origin bin must still exist and not be retired (the matrix's
-    // retired/missing arm — a gone bin cannot receive the stock back; the
-    // hold stays open and the decision retried once the bin state is
-    // resolved). Story 3.6: retirement is the one-way state that extends
-    // this check — a retired origin bin is operationally gone even though
-    // its row remains.
-    const originRows = await tx
-      .select({
-        id: bins.id,
-        code: bins.code,
-        retiredAt: bins.retiredAt,
-        // Story 12-3 — the class the secure-origin authority gate rules on.
-        storageClass: bins.storageClass,
-      })
-      .from(bins)
-      .where(
-        and(
-          eq(bins.id, row.binId),
-          eq(bins.tenantId, command.tenantId),
-          eq(bins.warehouseId, row.warehouseId),
-        ),
-      )
-      .limit(1)
-      // Story 1-5b — the origin bin locks before the release writes (closing
-      // PENDING "releaseHold lacks .for('update')"): the bin edit's dedicate
-      // guard locks the same row and then counts the bin's open holds, so a
-      // release and a dedication serialise — one waits, and foreign units
-      // never land in a freshly dedicated bin. Lock order: the hold row(s)
-      // (the caller) → this bin row → the warehouse advisory inside the
-      // ledger append — the canonical bin-row → advisory chain; nothing
-      // locks a bin row and then a hold row.
-      .for('update');
-    const origin = originRows[0];
-    if (origin === undefined) {
-      throw new ProblemException(
-        'qc-hold-origin-bin-gone',
-        409,
-        'Origin bin no longer exists',
-        `The hold's origin bin ("${row.binId}") no longer exists in this warehouse — the held stock cannot return to it. Resolve the bin state first; the hold stays open.`,
-      );
-    }
-    if (origin.retiredAt !== null) {
-      throw new ProblemException(
-        'qc-hold-origin-bin-gone',
-        409,
-        'Origin bin is retired',
-        `The hold's origin bin ("${origin.code}") is retired — the held stock cannot return to a retired bin. Resolve the bin state first; the hold stays open.`,
-      );
-    }
-    // ── story 12-3: the secure-bin authority gate (FR-42) — on the origin
-    // read: released units RETURN to the origin bin, so a SECURE origin
-    // additionally requires `secure.move`, the (role, bin) authority
-    // decided on the row already in hand. (The PENDING `inbound:45`
-    // currency note on this read stands — story 12-3 adds the assert on
-    // the class read here, not the lock.) Non-denying today (the matrix
-    // invariant keeps the subset enforced): `qc.manage` and `secure.move`
-    // are held by exactly the same roles. Non-secure releases are
-    // byte-identical to the pre-12.3 build. A replayed idempotency key
-    // returns the cached success before this gate — the original
-    // authorized execution already decided; that is deliberate
-    // idempotency semantics.
-    assertSecureBinAuthority(role, [origin]);
+    await this.lockOriginBinInTx(tx, row, role);
 
     // The release replays the hold's OWN qc.held arms — a concurrent hold
     // of the same SKU from another origin bin never returns with this one.
@@ -979,6 +1407,84 @@ export class QcCommand {
     return snapshot;
   }
 
+
+  /**
+   * The origin bin of ONE locked hold row, locked `FOR UPDATE`: it must still
+   * exist and not be retired (409 `qc-hold-origin-bin-gone`), and the 12-3
+   * secure gate rules on it. Extracted unchanged from the release core (story
+   * 2-8a) so an inspection that passes units checks its origin the one way;
+   * an all-fail inspection never calls it.
+   */
+  private async lockOriginBinInTx(
+    tx: TenantTx,
+    row: typeof qcHolds.$inferSelect,
+    role: UserRole,
+  ): Promise<void> {
+    const command = { tenantId: row.tenantId };
+    // The origin bin must still exist and not be retired (the matrix's
+    // retired/missing arm — a gone bin cannot receive the stock back; the
+    // hold stays open and the decision retried once the bin state is
+    // resolved). Story 3.6: retirement is the one-way state that extends
+    // this check — a retired origin bin is operationally gone even though
+    // its row remains.
+    const originRows = await tx
+      .select({
+        id: bins.id,
+        code: bins.code,
+        retiredAt: bins.retiredAt,
+        // Story 12-3 — the class the secure-origin authority gate rules on.
+        storageClass: bins.storageClass,
+      })
+      .from(bins)
+      .where(
+        and(
+          eq(bins.id, row.binId),
+          eq(bins.tenantId, command.tenantId),
+          eq(bins.warehouseId, row.warehouseId),
+        ),
+      )
+      .limit(1)
+      // Story 1-5b — the origin bin locks before the release writes (closing
+      // PENDING "releaseHold lacks .for('update')"): the bin edit's dedicate
+      // guard locks the same row and then counts the bin's open holds, so a
+      // release and a dedication serialise — one waits, and foreign units
+      // never land in a freshly dedicated bin. Lock order: the hold row(s)
+      // (the caller) → this bin row → the warehouse advisory inside the
+      // ledger append — the canonical bin-row → advisory chain; nothing
+      // locks a bin row and then a hold row.
+      .for('update');
+    const origin = originRows[0];
+    if (origin === undefined) {
+      throw new ProblemException(
+        'qc-hold-origin-bin-gone',
+        409,
+        'Origin bin no longer exists',
+        `The hold's origin bin ("${row.binId}") no longer exists in this warehouse — the held stock cannot return to it. Resolve the bin state first; the hold stays open.`,
+      );
+    }
+    if (origin.retiredAt !== null) {
+      throw new ProblemException(
+        'qc-hold-origin-bin-gone',
+        409,
+        'Origin bin is retired',
+        `The hold's origin bin ("${origin.code}") is retired — the held stock cannot return to a retired bin. Resolve the bin state first; the hold stays open.`,
+      );
+    }
+    // ── story 12-3: the secure-bin authority gate (FR-42) — on the origin
+    // read: released units RETURN to the origin bin, so a SECURE origin
+    // additionally requires `secure.move`, the (role, bin) authority
+    // decided on the row already in hand. (The PENDING `inbound:45`
+    // currency note on this read stands — story 12-3 adds the assert on
+    // the class read here, not the lock.) Non-denying today (the matrix
+    // invariant keeps the subset enforced): `qc.manage` and `secure.move`
+    // are held by exactly the same roles. Non-secure releases are
+    // byte-identical to the pre-12.3 build. A replayed idempotency key
+    // returns the cached success before this gate — the original
+    // authorized execution already decided; that is deliberate
+    // idempotency semantics.
+    assertSecureBinAuthority(role, [origin]);
+  }
+
   /**
    * Story 1-2b — for each receipt placement the released rows belong to (the
    * GRN, or the approved over-receipt), emit `qc_hold.receipt_cleared` once
@@ -1032,12 +1538,38 @@ export class QcCommand {
         )
         .limit(1);
       if (open[0] !== undefined) continue;
+      // Story 2-8a — the placement resolves `inspected` when ANY of its holds
+      // was inspected (whichever closed last — a release after an inspection
+      // still cleared a placement that had a QC outcome); a placement of only
+      // releases carries no `resolution` key, so its payload keeps the 1-2b bytes.
+      const inspected = await tx
+        .select({ id: qcHolds.id })
+        .from(qcHolds)
+        .innerJoin(goodsReceiptLines, eq(goodsReceiptLines.id, qcHolds.grnLineId))
+        .where(
+          and(
+            eq(qcHolds.tenantId, tenantId),
+            eq(qcHolds.kind, 'receipt'),
+            eq(qcHolds.status, 'inspected'),
+            eq(goodsReceiptLines.grnId, placement.grnId),
+            placement.overReceiptId === null
+              ? isNull(qcHolds.overReceiptId)
+              : eq(qcHolds.overReceiptId, placement.overReceiptId),
+          ),
+        )
+        .limit(1);
+      const resolution = inspected[0] === undefined ? undefined : ('inspected' as const);
       await this.outbox.append(tx, {
         messageId: uuidv7(),
         tenantId,
         type: QC_RECEIPT_CLEARED_EVENT,
         occurredAt: nowIso(),
-        payload: { placementId, grnId: placement.grnId, warehouseId: placement.warehouseId },
+        payload: {
+          placementId,
+          grnId: placement.grnId,
+          warehouseId: placement.warehouseId,
+          ...(resolution === undefined ? {} : { resolution }),
+        },
       });
     }
   }
@@ -1091,6 +1623,24 @@ export class QcCommand {
       throw err;
     }
   }
+}
+
+/**
+ * 409 `qc-hold-released` — the hold is already closed. The code is kept from
+ * story 3.4 (clients branch on it); story 2-8a's wording names both closed
+ * states, since a hold now closes by a release OR an inspection.
+ */
+function qcHoldClosed(holdId: string, status: string): ProblemException {
+  return new ProblemException(
+    'qc-hold-released',
+    409,
+    'QC hold already closed',
+    `QC hold "${holdId}" is already closed (${status}) — a release or an inspection is terminal.`,
+  );
+}
+
+function qcInspectionMismatch(detail: string): ProblemException {
+  return new ProblemException('qc-inspection-mismatch', 422, 'Inspection does not match the held stock', detail);
 }
 
 function qcValidation(detail: string): ProblemException {

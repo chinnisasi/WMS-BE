@@ -32,7 +32,10 @@ import {
 } from '../modules/inbound/receiving.dto';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import {
+  InspectQcHoldDto,
+  InspectQcHoldResponse,
   PlaceQcHoldDto,
+  QcHoldDetailResponse,
   QcHoldListQuery,
   QcHoldListResponse,
   QcHoldResponse,
@@ -534,6 +537,55 @@ export class ReceivingController {
     return { qcHold: { ...snapshot.qcHold } };
   }
 
+  @Post(':tenantId/receiving/qc-holds/:holdId/inspect')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Story 2-8a — records a QC hold's inspection outcome and closes it (qc.manage): per held batch arm, passed units return to the origin bin (qc.released; Receiving for a receipt hold — putaway work again) and failed units move to the system DAMAGED bin (qc.failed — ATP-excluded, write-off only) with a fail reason; the hold closes `inspected`; audited",
+  })
+  @ApiBody({ type: InspectQcHoldDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: InspectQcHoldResponse, description: 'The inspected hold and its inspection (a matching Idempotency-Key replays it)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed holdId or body, a batch named twice, a reason named twice in one batch, `other` without a note, a note over 500 characters, or a quantity finer than the unit allows (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks qc.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No QC hold with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The hold is already closed — released or inspected (qc-hold-released); units pass but the origin bin is gone or retired (qc-hold-origin-bin-gone); a user location occupies the DAMAGED code (damaged-bin-conflict); or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('The lines do not cover exactly the held arms and quantities (qc-inspection-mismatch), or the Idempotency-Key was reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'holdId', format: 'uuid' })
+  async inspectQcHold(
+    @Param('tenantId') tenantId: string,
+    @Param('holdId') holdId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: InspectQcHoldDto,
+  ): Promise<InspectQcHoldResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(holdId, 'holdId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.qc.inspectHold(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        holdId,
+        lines: dto.lines.map((line) => ({
+          batchId: line.batchId,
+          passed: line.passed,
+          failed: line.failed.map((failure) => ({ reason: failure.reason, quantity: failure.quantity })),
+        })),
+        note: dto.note ?? null,
+      },
+      key,
+    );
+    return {
+      qcHold: { ...snapshot.qcHold },
+      inspection: { ...snapshot.inspection, lines: snapshot.inspection.lines.map((line) => ({ ...line })) },
+    };
+  }
+
   @Post(':tenantId/receiving/qc-holds/release-receipt')
   @HttpCode(HttpStatus.OK)
   @UseGuards(TenantSessionGuard)
@@ -571,7 +623,7 @@ export class ReceivingController {
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
   @ApiOperation({
-    summary: 'Lists QC holds (keyset cursor pagination, warehouse- and status-filterable — open to any member)',
+    summary: 'Lists QC holds (keyset cursor pagination, warehouse- and status-filterable — open to any member; story 2-8a: `inspected` and `closed` = released or inspected)',
   })
   @ApiOkResponse({
     type: QcHoldListResponse,
@@ -600,6 +652,38 @@ export class ReceivingController {
       limit: query.limit,
     });
     return { items: page.items, nextCursor: page.nextCursor };
+  }
+
+  @Get(':tenantId/receiving/qc-holds/:holdId')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Story 2-8a — one QC hold: the list row, the batch arms it moved (code, expiry, quantity) and, once inspected, its inspection (open to any member)',
+  })
+  @ApiOkResponse({ type: QcHoldDetailResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed holdId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No QC hold with this id exists in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'holdId', format: 'uuid' })
+  async getQcHold(
+    @Param('tenantId') tenantId: string,
+    @Param('holdId') holdId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<QcHoldDetailResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(holdId, 'holdId');
+    const detail = await this.qc.getQcHold(tenantId, holdId);
+    return {
+      qcHold: detail.qcHold,
+      arms: detail.arms.map((arm) => ({ ...arm })),
+      inspection:
+        detail.inspection === null
+          ? null
+          : { ...detail.inspection, lines: detail.inspection.lines.map((line) => ({ ...line })) },
+    };
   }
 }
 

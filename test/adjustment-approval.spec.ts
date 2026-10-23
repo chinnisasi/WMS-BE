@@ -110,6 +110,8 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
         'wave_policies',
         'order_lines',
         'orders',
+        'qc_inspection_lines',
+        'qc_inspections',
         'qc_holds',
         'handling_units',
         'putaway_placements',

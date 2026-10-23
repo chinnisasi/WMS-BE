@@ -337,6 +337,8 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       // → ledger → projections → spine.
       await cleaner.unsafe('DELETE FROM devices WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('DELETE FROM temperature_excursions WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
+      await cleaner.unsafe('DELETE FROM qc_inspection_lines WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
+      await cleaner.unsafe('DELETE FROM qc_inspections WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('DELETE FROM qc_holds WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('DELETE FROM transfer_order_lines WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('DELETE FROM transfer_orders WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);

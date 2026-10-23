@@ -99,6 +99,19 @@ export type LedgerReferenceDoc =
       readonly kind: 'qc-hold';
       readonly holdId: string;
       readonly fromBinId?: string;
+      /**
+       * Story 2-8a — the GRN line of a RECEIPT hold, on its `qc.failed`
+       * events only (the credited DAMAGED units 2-8b's return to vendor must
+       * tell apart from 2-4a damage). ADDITIVE optional key, omitted when
+       * absent — never `null` — so every earlier event keeps its bytes.
+       */
+      readonly grnLineId?: string;
+      /**
+       * Story 2-8a — the inspection that closed the hold, on the
+       * inspection's `qc.released` (passed units) and `qc.failed` (failed
+       * units) events. Optional, additive and omitted when absent.
+       */
+      readonly inspectionId?: string;
     }
   // Story 3.5 — the putaway arm: every `putaway.placed` movement names the
   // GRN line whose received stock moved from the system Receiving bin, the
@@ -606,6 +619,27 @@ registerLedgerEventType({
   type: 'grn.damaged',
   sinceVersion: 1,
   referenceKinds: ['grn-receipt'],
+  allowsBatchArm: true,
+  allowsSerialArm: false,
+});
+
+/**
+ * Grammar v1, Story 2-8a — the QC inspection's failed units: a RELOCATION
+ * from the warehouse's system QC-hold bin into its system DAMAGED bin on the
+ * same batch arm (`fromBinId` QC-HOLD, `toBinId` DAMAGED, one event per arm
+ * with failed units). The reference is the hold arm (`qc-hold`) with the
+ * `inspectionId` and, for a receipt hold, the `grnLineId` — the failed units
+ * stay credited on their document line (they were received), which is what
+ * tells them apart from 2-4a's `grn.damaged`. In DAMAGED the units fall under
+ * `damagedUnits` (ATP-excluded, write-off only) exactly like 2-4a damage. It
+ * meters 0 (a `both`-shape relocation: storage continues). The batch arm is
+ * OPEN; the serial arm CLOSED (serial-tracked stock is never QC-held).
+ * Registers sinceVersion 1 — no new grammar version.
+ */
+registerLedgerEventType({
+  type: 'qc.failed',
+  sinceVersion: 1,
+  referenceKinds: ['qc-hold'],
   allowsBatchArm: true,
   allowsSerialArm: false,
 });

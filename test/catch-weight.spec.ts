@@ -332,6 +332,8 @@ describe('catch weight and handling units (e2e, story 10.3)', () => {
         'wave_policies',
         'order_lines',
         'orders',
+        'qc_inspection_lines',
+        'qc_inspections',
         'qc_holds',
         'handling_units',
         'over_receipts',

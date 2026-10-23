@@ -72,7 +72,8 @@ export const SOURCE_RESOLUTIONS = {
   'rejected-op': resolvedStates(REJECTED_OP_STATUSES),
   'reorder-breach': ['recovered', 'dismissed', 'actioned', 'policy-removed'],
   'batch-alert': ['resolved', 'dismissed'],
-  'qc-hold': ['released'],
+  // Story 2-8a — or closed by an inspection outcome.
+  'qc-hold': ['released', 'inspected'],
   'channel-sync': ['recovered', 'disconnected'],
   // Story 9-3b — an export's entry stays open until its file expires;
   // downloading does not resolve it (the spec's decision).
@@ -80,8 +81,9 @@ export const SOURCE_RESOLUTIONS = {
   // Story 9-3c — open until an owner acknowledges it; detection never
   // auto-heals, so nothing else resolves it.
   'ledger-chain-break': ['acknowledged'],
-  // Story 1-2b — open until every hold of the placement is released.
-  'qc-receipt': ['released'],
+  // Story 1-2b — open until every hold of the placement is released. Story
+  // 2-8a: `inspected` when the placement's last hold closed by inspection.
+  'qc-receipt': ['released', 'inspected'],
   // Story 1-6c — an edit moved `validUntil` out of the warned state
   // (`renewed`), the licence was withdrawn, or the expired raise superseded
   // the open upcoming entry (`expired`). Pinned to the emitter's
@@ -546,6 +548,13 @@ export const NOTIFICATION_SOURCES: Readonly<Record<NotificationSourceType, Sourc
         // here: ignored, never a tombstone.
         decode: (payload) => (payload.kind === 'receipt' ? 'ignore' : fixedResolve('holdId', 'released')(payload)),
       },
+      {
+        // Story 2-8a — an inspection closes a manual hold too (resolution
+        // `inspected`); a receipt hold's resolves its placement's
+        // `qc-receipt` entry through `qc_hold.receipt_cleared` instead.
+        type: 'qc_hold.inspected',
+        decode: (payload) => (payload.kind === 'receipt' ? 'ignore' : fixedResolve('holdId', 'inspected')(payload)),
+      },
     ],
   },
   'qc-receipt': {
@@ -568,7 +577,16 @@ export const NOTIFICATION_SOURCES: Readonly<Record<NotificationSourceType, Sourc
         }));
       },
     },
-    resolves: [{ type: 'qc_hold.receipt_cleared', decode: fixedResolve('placementId', 'released') }],
+    resolves: [
+      {
+        type: 'qc_hold.receipt_cleared',
+        // Story 2-8a — `resolution: 'inspected'` rides the event only when an
+        // inspection cleared the placement; a release's event carries none
+        // (its 1-2b bytes), so absent reads `released`.
+        decode: (payload) =>
+          fixedResolve('placementId', payload.resolution === 'inspected' ? 'inspected' : 'released')(payload),
+      },
+    ],
   },
   'licence-expiry': {
     // Story 1-6c (compliance's expiry sweep). The entry is the WARNING's own

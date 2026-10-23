@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { bigint, boolean, customType, date, index, integer, jsonb, numeric, pgEnum, pgTable, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { bigint, boolean, customType, date, index, integer, jsonb, numeric, pgEnum, pgTable, primaryKey, text, timestamp, unique, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import { uuidv7 } from '../primitives/ids';
 
 /**
@@ -2748,10 +2748,10 @@ export type AsnLine = typeof asnLines.$inferSelect;
  * when), never a stock write (the stock moves through the ledger: `qc.held`
  * movements into the system QC-hold bin at hold time, `qc.released` back to
  * `bin_id` — the origin captured at hold time, never caller-chosen — at
- * release). `status` is `open → released` (conditional UPDATE — a second
- * decision is a deterministic 409); there is no scrap/reject disposition
- * (a failed inspection keeps the hold open — quantity shrinkage is Epic 5's
- * adjustment path) and no partial release (v1 releases the full held scope).
+ * release). `status` is `open → released | inspected` (conditional UPDATE —
+ * a second decision is a deterministic 409); story 2-8a's inspection is the
+ * disposition (passed units back to the origin, failed units to DAMAGED —
+ * `qc_inspections`); there is no partial release or partial inspection.
  *
  * One open hold per scope: the partial unique index is the DB backstop
  * behind the command's 409 `qc-hold-open` (the `inventory_quarantines`
@@ -2811,6 +2811,66 @@ export const qcHolds = pgTable(
 );
 
 export type QcHold = typeof qcHolds.$inferSelect;
+
+/**
+ * Story 2-8a — the QC inspection outcome: ONE row per hold closed by an
+ * inspection (`qc_holds.status = 'inspected'`, `hold_id` UNIQUE). Who
+ * inspected and when is the hold's `released_by` / `released_at` — the single
+ * authority ("closed by/at"); this row carries no copy. The units moved by the
+ * ledger (`qc.released` for passed units back to the origin, `qc.failed` for
+ * failed units into the system DAMAGED bin); the lines record the outcome.
+ *
+ * RLS policy lives **only in the migration SQL** (0091). No FK (guide §3).
+ */
+export const qcInspections = pgTable(
+  'qc_inspections',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    holdId: uuid('hold_id').notNull(),
+    /** The inspector's note (≤ 500, trimmed; required when a fail reason is `other`). */
+    note: text('note'),
+    ...tenantTimestamps,
+  },
+  (table) => [uniqueIndex('qc_inspections_hold_unique').on(table.tenantId, table.holdId)],
+);
+
+export type QcInspection = typeof qcInspections.$inferSelect;
+
+/**
+ * Story 2-8a — one row per (batch, outcome, fail reason) of an inspection:
+ * `passed` rows carry no reason, `failed` rows one from `QC_FAIL_REASONS`
+ * (mixed reasons in one batch are several rows). `quantity` is milli-units,
+ * > 0. Per batch the rows sum to the hold's held arm — the command enforces
+ * it (422 `qc-inspection-mismatch`). The outcome / reason / quantity CHECKs
+ * live **only in the migration SQL** (0091).
+ */
+export const qcInspectionLines = pgTable(
+  'qc_inspection_lines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    inspectionId: uuid('inspection_id').notNull(),
+    /** The batch arm (null on an untracked SKU's single arm). */
+    batchId: uuid('batch_id'),
+    outcome: text('outcome').notNull(),
+    failReason: text('fail_reason'),
+    /** Milli-units (story 10.1), > 0. */
+    quantity: bigint('quantity', { mode: 'number' }).notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    unique('qc_inspection_lines_outcome_unique')
+      .on(table.inspectionId, table.batchId, table.outcome, table.failReason)
+      .nullsNotDistinct(),
+  ],
+);
+
+export type QcInspectionLine = typeof qcInspectionLines.$inferSelect;
 
 /**
  * Putaway placements (Story 3.5): one row per completed placement — the

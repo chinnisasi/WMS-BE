@@ -173,6 +173,8 @@ describe('QC hold and release (e2e, story 3.4)', () => {
     const cleaner = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       // Children before parents: hold rows → ledger → projections → spine.
+      await cleaner.unsafe('DELETE FROM qc_inspection_lines WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
+      await cleaner.unsafe('DELETE FROM qc_inspections WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('DELETE FROM qc_holds WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('set session_replication_role = replica');
       await cleaner.unsafe('DELETE FROM ledger_events WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);

@@ -522,9 +522,21 @@ export class LedgerReferenceDocDto {
     required: false,
     format: 'uuid',
     description:
-      'The GRN line the movement belongs to: on a `putaway.placed` event the line whose received stock moved; (story 2-4a) on a `grn.damaged` event the line whose damaged units were booked into DAMAGED. Absent on every `grn.received` event',
+      "The GRN line the movement belongs to: on a `putaway.placed` event the line whose received stock moved; (story 2-4a) on a `grn.damaged` event the line whose damaged units were booked into DAMAGED; (story 2-8a) on a `qc.failed` event of a receipt hold the line whose failed units moved to DAMAGED (they stay credited on the line). Absent on every `grn.received` event",
   })
   grnLineId?: string;
+
+  // ── the qc-hold arm (Story 3.4, additive) ─────────────────────────────────
+
+  @ApiProperty({ required: false, format: 'uuid', description: 'The QC hold the movement belongs to (qc-hold arm: qc.held, qc.released, qc.failed)' })
+  holdId?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: 'Story 2-8a — the inspection that closed the hold (qc-hold arm: the inspection\'s qc.released and qc.failed events only)',
+  })
+  inspectionId?: string;
 
   // ── Story 9-3a (additive, omitted when absent) ────────────────────────────
 

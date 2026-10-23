@@ -1031,7 +1031,10 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // neither table has a client; no portal route reads them).
       // Story 5-1a: + email_messages_tenant_isolation (0089, the plain tenant
       // policy — the mail queue is operator-side; no portal route reads it).
-      expect(policies).toHaveLength(122);
+      // Story 2-8a: + qc_inspections_tenant_isolation and
+      // qc_inspection_lines_tenant_isolation (0091, the plain tenant policy —
+      // operator-side, like qc_holds; the portal shows no QC outcome yet).
+      expect(policies).toHaveLength(124);
       const licencePolicy = policies.find((row) => row.policyname === 'licences_tenant_isolation')!;
       expect(licencePolicy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
       expect(licencePolicy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
