@@ -324,6 +324,18 @@ export const CAPABILITIES = [
   // `src/lib/users.ts` (CAPABILITIES — ops_manager is derived there — and the
   // operator grant).
   'stock.move',
+  // Story 3-2b — REQUEST a stock adjustment (decision 1): the holder submits
+  // the same adjustment `stock.adjust` would apply, but it ALWAYS pends for
+  // the owner's approval (`adjustments.approve`, unchanged) whatever its size
+  // — `pend_reason = 'approval-required'`. A holder of `stock.adjust` keeps
+  // the threshold rule; holding neither is 403 as before. Owner (everything),
+  // Ops Manager (listed explicitly — the FE derives ops_manager as "all minus
+  // excluded", A6) and Operator: the floor reports the damaged, missing or
+  // extra unit it finds (the handheld Adjust screen). Operators are never
+  // granted `stock.adjust` itself. A secure, cage or dedicated bin is
+  // contained by the owner's approval for a request-only holder (PENDING).
+  // Mirrored into wms-fe `src/lib/users.ts` (CAPABILITIES + the operator grant).
+  'stock.adjust.request',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -409,6 +421,10 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'gate.manage',
     // Story 3-1 — the bin-to-bin move (owner holds everything).
     'stock.move',
+    // Story 3-2b — the adjustment request (A6: listed so the BE matches the
+    // FE's derived ops_manager set; the manager's own `stock.adjust` still
+    // decides — a holder of both keeps the threshold rule).
+    'stock.adjust.request',
   ]),
   operator: new Set<Capability>([
     'putaway.execute',
@@ -437,6 +453,9 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     // Story 3-1 — the floor moves stock between bins (the handheld's
     // `stock.move`); a secure origin or target still answers the 12-3 gate.
     'stock.move',
+    // Story 3-2b — the floor REQUESTS an adjustment (the handheld Adjust
+    // screen); it always pends for the owner. Never `stock.adjust` itself.
+    'stock.adjust.request',
   ]),
   // Story 8-2b: the accountant's first write — the e-way paperwork (finance
   // work). Story 21-3: the client rate cards (finance work — decision 2,
@@ -486,6 +505,23 @@ export function assertPermission(role: UserRole, capability: Capability): void {
       `Role "${role}" does not include the "${capability}" capability.`,
     );
   }
+}
+
+/**
+ * Story 3-2b — who may submit a stock adjustment, and how (decision 1):
+ * `adjust` — the role holds `stock.adjust` (the threshold rule decides
+ * pend-vs-apply); `request` — it holds only `stock.adjust.request` (every
+ * adjustment pends for the owner). A role holding neither is refused with
+ * `assertPermission`'s own 403 naming `stock.adjust` — the pre-3-2b refusal,
+ * byte-identical. One function, called by the adjustment command and by the
+ * submission's pre-composition check, so the two can never disagree.
+ */
+export function assertAdjustAuthority(role: UserRole): 'adjust' | 'request' {
+  if (ROLE_CAPABILITIES[role].has('stock.adjust')) return 'adjust';
+  if (ROLE_CAPABILITIES[role].has('stock.adjust.request')) return 'request';
+  assertPermission(role, 'stock.adjust');
+  // Unreachable: the assert above threw (the role lacks `stock.adjust`).
+  throw new Error('assertAdjustAuthority: unreachable');
 }
 
 /**

@@ -668,6 +668,8 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
       reasonCode: 'stock-count',
       requestedBy: opsUserId,
       thresholdQuantity: 10,
+      // Story 3-2b — the payload names why it pended (additive).
+      pendReason: 'threshold',
       notifyRole: 'owner',
     });
   });

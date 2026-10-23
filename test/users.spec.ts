@@ -843,6 +843,22 @@ describe('users, roles, and permission gating (e2e)', () => {
         expect(secureMoveHolders).toContain(role);
       }
     }
+    // Story 3-2b (A6) — `stock.adjust.request` is OUTSIDE the cage-capable
+    // set on purpose (the operator holds it), and is contained another way:
+    // a request-only holder's adjustment ALWAYS pends, and only an
+    // `adjustments.approve` holder can post it — so the approvers must be
+    // cage-capable, and every request-only holder must lack `stock.adjust`
+    // (holding both would apply under the threshold, i.e. bypass the cage).
+    const approvers = roles.filter((role) => ROLE_CAPABILITIES[role].has('adjustments.approve'));
+    expect(approvers.length).toBeGreaterThan(0);
+    for (const role of approvers) {
+      expect(secureMoveHolders).toContain(role);
+    }
+    const requestOnly = roles.filter(
+      (role) => ROLE_CAPABILITIES[role].has('stock.adjust.request') && !ROLE_CAPABILITIES[role].has('stock.adjust'),
+    );
+    expect(requestOnly).toEqual(['operator']);
+    expect(secureMoveHolders).not.toContain('operator');
 
     // The decided matrix (2026-09-24), spelled out: owner and ops_manager
     // only — and the floor verbs stay out of the cage. Story 12-5 grows the
@@ -911,7 +927,14 @@ describe('users, roles, and permission gating (e2e)', () => {
     // `client`, and by owner only because owner holds everything (the
     // `asn.announce` precedent); never by ops_manager, operator or
     // accountant (staff key orders via `orders.manage`).
-    expect([...CAPABILITIES]).toHaveLength(48);
+    // Story 3-2b grows it to 49 with `stock.adjust.request` — the operator
+    // REQUESTS an adjustment from the handheld, and it always pends for the
+    // owner: owner (everything), ops_manager (listed — the FE derives it as
+    // "all minus excluded") and operator; never the accountant or a client.
+    // The operator never holds `stock.adjust` itself.
+    expect([...CAPABILITIES]).toHaveLength(49);
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('stock.adjust.request'))).toEqual(['owner', 'ops_manager', 'operator']);
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('stock.adjust'))).toEqual(['owner', 'ops_manager']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('stock.move'))).toEqual(['owner', 'ops_manager', 'operator']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('orders.place'))).toEqual(['owner', 'client']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('gate.manage'))).toEqual(['owner', 'ops_manager', 'operator']);

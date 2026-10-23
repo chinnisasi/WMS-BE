@@ -6469,6 +6469,7 @@
     },
     "/tenants/{tenantId}/inventory/adjustments": {
       "post": {
+        "description": "Accepts EITHER session family on the one route (story 3-2b, the move's precedent): a web session, or a device badge-in session — the handheld's queued `stock.adjust` op (a bare enrollment credential → 401; an op captured by another operator → 409 operator-mismatch; `occurredAt` is required there). A holder of stock.adjust applies under the threshold and pends over it; a holder of only stock.adjust.request (the operator) always pends for the owner (pendReason 'approval-required').",
         "operationId": "InventoryController_adjustStock",
         "parameters": [
           {
@@ -6516,7 +6517,7 @@
             }
           },
           "202": {
-            "description": "Story 5-2: |quantityDelta| exceeds the tenant's policy threshold — the adjustment PENDS (no ledger event, no on-hand change) until an Owner approves or rejects; the body is the pend snapshot with its threshold context",
+            "description": "Story 5-2: |quantityDelta| exceeds the tenant's policy threshold (pendReason 'threshold'), or — story 3-2b — the requester holds only stock.adjust.request (pendReason 'approval-required'): the adjustment PENDS (no ledger event, no on-hand change) until an Owner approves or rejects; the body is the pend snapshot with its threshold context",
             "content": {
               "application/json": {
                 "schema": {
@@ -6526,7 +6527,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, invalid body, or a Story 2.4 batch/serial arm violation (validation-failed): batch/serials on an untracked SKU, a tracked movement missing its arm, malformed batch dates (or expiry preceding mfg), overrideReason on an intake or missing on an override draw, duplicate serials, a quantityDelta that does not equal the serial count, or a reasonCode outside the closed adjustment vocabulary; a retired bin (bin-retired), the system QC-hold or IN-TRANSIT bin (qc-bin-not-adjustable), the system RETURNS bin (returns-bin-not-adjustable), or — story 2-4a — anything but a negative write-off on the system DAMAGED bin (damaged-bin-write-off-only, also at a pend's approval)",
+            "description": "Missing or malformed Idempotency-Key, invalid body, or a Story 2.4 batch/serial arm violation (validation-failed): batch/serials on an untracked SKU, a tracked movement missing its arm, malformed batch dates (or expiry preceding mfg), overrideReason on an intake or missing on an override draw, duplicate serials, a quantityDelta that does not equal the serial count, a reasonCode outside the closed adjustment vocabulary, or — story 3-2b — occurredAt missing on a handheld adjustment; a retired bin (bin-retired), the system QC-hold or IN-TRANSIT bin (qc-bin-not-adjustable), the system RETURNS bin (returns-bin-not-adjustable), or — story 2-4a — anything but a negative write-off on the system DAMAGED bin (damaged-bin-write-off-only, also at a pend's approval)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6536,7 +6537,7 @@
             }
           },
           "401": {
-            "description": "Missing or invalid session token",
+            "description": "Missing or invalid session token of either family, or a device token without a badge-in session (unauthenticated)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6546,7 +6547,7 @@
             }
           },
           "403": {
-            "description": "Session belongs to another tenant (permission-denied), or the caller lacks stock.adjust (role-denied)",
+            "description": "Session belongs to another tenant (permission-denied), an unknown or revoked device (device-revoked), or the caller holds neither stock.adjust nor stock.adjust.request — or replays an applied adjustment without stock.adjust (role-denied)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6566,7 +6567,7 @@
             }
           },
           "409": {
-            "description": "Concurrent request on the same Idempotency-Key (conflict); a kit SKU can never hold stock (kit-cannot-hold-stock, naming it); or a serial-tracked movement scans a serial that already lives in a bin (duplicate-serial, naming it) or draws a serial the ledger last saw in another bin (serial-elsewhere, naming the last-known bin)",
+            "description": "Concurrent request on the same Idempotency-Key (conflict); a kit SKU can never hold stock (kit-cannot-hold-stock, naming it); a serial-tracked movement scans a serial that already lives in a bin (duplicate-serial, naming it) or draws a serial the ledger last saw in another bin (serial-elsewhere, naming the last-known bin); a positive adjustment for a departed client (client-departed); or — story 3-2b — the handheld op was captured by another operator (operator-mismatch)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6588,10 +6589,13 @@
         },
         "security": [
           {
+            "device": []
+          },
+          {
             "bearer": []
           }
         ],
-        "summary": "Records a manual stock adjustment (one ledger event + on-hand projection in one commit; over a tenant approval threshold it PENDS instead — 202)",
+        "summary": "Records a manual stock adjustment (one ledger event + on-hand projection in one commit; over a tenant approval threshold — or, story 3-2b, from a request-only holder — it PENDS instead: 202)",
         "tags": [
           "inventory"
         ]
@@ -34823,7 +34827,8 @@
               "grn.inactive-sku-received",
               "grn.licence-refused",
               "gate-in.unload",
-              "stock.move"
+              "stock.move",
+              "stock.adjust"
             ]
           },
           "classification": {
@@ -34977,7 +34982,8 @@
               "grn.inactive-sku-received",
               "grn.licence-refused",
               "gate-in.unload",
-              "stock.move"
+              "stock.move",
+              "stock.adjust"
             ]
           },
           "classification": {
@@ -35208,7 +35214,7 @@
           },
           "occurredAt": {
             "type": "string",
-            "description": "Business time (ISO-8601 UTC, Z-suffixed); defaults to the commit clock"
+            "description": "Business time (ISO-8601 UTC, Z-suffixed); defaults to the commit clock on the web. Story 3-2b: REQUIRED on a handheld (device session) adjustment — the time the operator confirmed it"
           },
           "batch": {
             "description": "Batch arm (batch-tracked SKUs only): intake identity, or the explicit override draw (with overrideReason)",
@@ -35423,7 +35429,16 @@
           },
           "thresholdQuantityAtRequest": {
             "type": "number",
-            "description": "The policy threshold (base UoM) as it read at request time — frozen context"
+            "nullable": true,
+            "description": "The policy threshold (base UoM) as it read at request time — frozen context. Story 3-2b: null when the tenant had no policy and a request-only holder's adjustment was force-pended (pendReason 'approval-required')"
+          },
+          "pendReason": {
+            "type": "string",
+            "enum": [
+              "threshold",
+              "approval-required"
+            ],
+            "description": "Story 3-2b — why it pended: 'threshold' (|quantityDelta| strictly exceeded the policy threshold) or 'approval-required' (the requester holds only stock.adjust.request — every request pends). Always present on a new 202 and on the queue; a 202 replayed from before 3-2b is served with 'threshold'"
           }
         },
         "required": [
@@ -35598,11 +35613,26 @@
           },
           "thresholdQuantityAtRequest": {
             "type": "number",
-            "description": "The policy threshold (base UoM) as it read at request time — frozen context"
+            "nullable": true,
+            "description": "The policy threshold (base UoM) as it read at request time — frozen context. Story 3-2b: null when the tenant had no policy and a request-only holder's adjustment was force-pended (pendReason 'approval-required')"
+          },
+          "pendReason": {
+            "type": "string",
+            "enum": [
+              "threshold",
+              "approval-required"
+            ],
+            "description": "Story 3-2b — why it pended: 'threshold' (|quantityDelta| strictly exceeded the policy threshold) or 'approval-required' (the requester holds only stock.adjust.request — every request pends). Always present on a new 202 and on the queue; a 202 replayed from before 3-2b is served with 'threshold'"
           },
           "ledgerLinked": {
             "type": "boolean",
             "description": "True only when an approval posted this adjustment from story 9-3a on (the row recorded its first event): its events are listed by `GET …/inventory/events?adjustmentPendingId=`. False while pending, on a reject, and for an approval decided before 9-3a"
+          },
+          "sourceDeviceId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 3-2b — the handheld that submitted the request (null from the web, and on every row raised before 3-2b)"
           }
         },
         "required": [
@@ -35625,7 +35655,8 @@
           "decidedBy",
           "decidedAt",
           "thresholdQuantityAtRequest",
-          "ledgerLinked"
+          "ledgerLinked",
+          "sourceDeviceId"
         ]
       },
       "AdjustmentPendingListResponse": {
@@ -41708,6 +41739,32 @@
           "noteRequired"
         ]
       },
+      "CatalogAdjustReasonDto": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "stock-count",
+              "damaged",
+              "expired",
+              "shrinkage",
+              "found",
+              "recall",
+              "system-correction",
+              "other"
+            ]
+          },
+          "label": {
+            "type": "string",
+            "description": "The operator-facing label (the web uses the same words)"
+          }
+        },
+        "required": [
+          "code",
+          "label"
+        ]
+      },
       "CatalogSnapshotResponse": {
         "type": "object",
         "properties": {
@@ -41844,6 +41901,13 @@
             "items": {
               "$ref": "#/components/schemas/CatalogMoveReasonDto"
             }
+          },
+          "adjustReasons": {
+            "description": "Story 3-2b (additive): the stock adjustment's reason vocabulary with labels, in order — the handheld's Adjust reason chips (every reason needs the note the adjustment always carries). An older server omits it, and the handheld then offers no Adjust",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogAdjustReasonDto"
+            }
           }
         },
         "required": [
@@ -41864,7 +41928,8 @@
           "openGateIns",
           "receiptDamageReasons",
           "receiptShortReasons",
-          "moveReasons"
+          "moveReasons",
+          "adjustReasons"
         ]
       },
       "GoodsReceiptEntryDto": {

@@ -931,7 +931,10 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
   });
 
   it('permission before validation AND identity: a denied-role member\'s batch-armed adjustment is 403 and leaves zero catalog rows', async () => {
-    const member = await createMember(ownerToken, 'operator'); // holds no stock.adjust
+    // Story 3-2b: the operator now holds `stock.adjust.request` (its armed
+    // adjustment would PEND, not 403), so the denied role is the accountant —
+    // it holds neither adjustment capability. The property is unchanged.
+    const member = await createMember(ownerToken, 'accountant'); // holds no stock.adjust / stock.adjust.request
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       const beforeBatches = await sql`select count(*)::int as n from batches where tenant_id = ${tenantId}`;

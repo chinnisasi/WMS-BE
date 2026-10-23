@@ -3,6 +3,7 @@ import { and, desc, eq, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { auditEvents, idempotencyKeys, stockAdjustmentPendings, stockAdjustmentPolicies } from '../../shared/db/schema';
+import type { AdjustmentPendReason } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import { skuOfClient } from '../../shared/db/client-filter';
 import type { TenantTx } from '../../shared/db/tenant-scope';
@@ -92,7 +93,16 @@ export interface AdjustmentPendingEntry {
   readonly status: string;
   readonly decidedBy: string | null;
   readonly decidedAt: string | null;
-  readonly thresholdQuantityAtRequest: number;
+  /** Story 3-2b: null when a request-only holder's adjustment was force-pended with no policy row. */
+  readonly thresholdQuantityAtRequest: number | null;
+  /**
+   * Story 3-2b — why the row pended (stored, 0090): `threshold` or
+   * `approval-required`. (A decision snapshot stored before 3-2b lacks it;
+   * the decision routes never surface the stored entry, only its id/status.)
+   */
+  readonly pendReason: AdjustmentPendReason;
+  /** Story 3-2b — the handheld that submitted the request; null from the web (and before 3-2b). */
+  readonly sourceDeviceId: string | null;
   /**
    * Story 9-3a — true only when the row recorded the event its approval
    * posted (`ledger_event_id`): the web links "View ledger" from it. False
@@ -179,6 +189,8 @@ function pendingEntry(row: typeof stockAdjustmentPendings.$inferSelect): Adjustm
     decidedBy: row.decidedBy,
     decidedAt: row.decidedAt === null ? null : canonicalInstant(row.decidedAt),
     thresholdQuantityAtRequest: row.thresholdQuantityAtRequest,
+    pendReason: row.pendReason as AdjustmentPendReason,
+    sourceDeviceId: row.sourceDeviceId,
     ledgerLinked: row.ledgerEventId !== null,
     createdAt: canonicalInstant(row.createdAt),
   };

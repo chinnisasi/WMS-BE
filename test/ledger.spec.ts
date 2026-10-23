@@ -430,13 +430,33 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
     expect(await eventCount()).toBe(before + 1);
   });
 
-  it('capability missing: an operator adjustment is 403 role-denied naming role + capability', async () => {
+  // Story 3-2b — the retargeted pin, said openly (guide §4): this test used
+  // the OPERATOR as the role holding neither adjustment capability. Since
+  // 3-2b the operator holds `stock.adjust.request`, so its adjustment PENDS
+  // for the owner (202 `approval-required`, no policy needed) instead of
+  // answering 403. The 403 property is kept on the accountant, which holds
+  // neither — the refusal still names the role and `stock.adjust`.
+  it('capability missing: an accountant adjustment is 403 role-denied naming role + capability', async () => {
+    const accountantToken = (await createMember(ownerToken, 'accountant')).token;
     const before = await eventCount();
-    const denied = await adjust(operatorToken, adjustmentBody({ quantityDelta: 1 })).expect(403);
+    const denied = await adjust(accountantToken, adjustmentBody({ quantityDelta: 1 })).expect(403);
     expect(denied.body).toMatchObject({ status: 403, code: 'role-denied' });
-    expect(denied.body.detail).toContain('operator');
+    expect(denied.body.detail).toContain('accountant');
     expect(denied.body.detail).toContain('stock.adjust');
     // The refusal wrote nothing — the count is exactly what it was.
+    expect(await eventCount()).toBe(before);
+  });
+
+  it('story 3-2b: an operator (stock.adjust.request only) adjustment pends for approval — 202 approval-required, no ledger event', async () => {
+    const before = await eventCount();
+    const pended = await adjust(operatorToken, adjustmentBody({ quantityDelta: 1 })).expect(202);
+    expect(pended.body.pendingAdjustment).toMatchObject({
+      status: 'pending',
+      quantityDelta: 1,
+      pendReason: 'approval-required',
+      // No policy row in this suite: the forced pend records no threshold.
+      thresholdQuantityAtRequest: null,
+    });
     expect(await eventCount()).toBe(before);
   });
 

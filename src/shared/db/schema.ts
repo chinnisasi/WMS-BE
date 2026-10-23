@@ -3857,6 +3857,16 @@ export const ADJUSTMENT_PENDING_STATUSES = ['pending', 'approved', 'rejected'] a
 export type AdjustmentPendingStatus = (typeof ADJUSTMENT_PENDING_STATUSES)[number];
 
 /**
+ * Story 3-2b — why a stock adjustment pended (`stock_adjustment_pendings.pend_reason`,
+ * CHECK in migration 0090): `threshold` — |delta| strictly exceeded the
+ * tenant's policy threshold (every pend before 3-2b); `approval-required` —
+ * the requester holds only `stock.adjust.request`, so the adjustment always
+ * pends whatever its size. Stored, never derived (design review A1).
+ */
+export const ADJUSTMENT_PEND_REASONS = ['threshold', 'approval-required'] as const;
+export type AdjustmentPendReason = (typeof ADJUSTMENT_PEND_REASONS)[number];
+
+/**
  * Adjustment approval policies (story 5-2, FR-19): the per-tenant threshold
  * that turns an over-threshold `stock.adjust` into a PENDING row instead of
  * a ledger event. Config-not-code (epic-5 technical decisions): the row's
@@ -3968,8 +3978,20 @@ export const stockAdjustmentPendings = pgTable(
      * a reject, and on every row decided before 9-3a — those show no link.
      */
     ledgerEventId: uuid('ledger_event_id'),
-    /** The policy threshold as it read at request time (base units). */
-    thresholdQuantityAtRequest: integer('threshold_quantity_at_request').notNull(),
+    /**
+     * The policy threshold as it read at request time (base units). Story
+     * 3-2b (0090): nullable — null means the tenant had NO policy row when a
+     * request-only holder's adjustment was force-pended (`pend_reason =
+     * 'approval-required'`); a `threshold` pend always carries it (CHECK).
+     */
+    thresholdQuantityAtRequest: integer('threshold_quantity_at_request'),
+    /**
+     * Story 3-2b — why the row pended (`ADJUSTMENT_PEND_REASONS`; CHECK in
+     * 0090). Every pre-3-2b row backfilled `threshold` through the default.
+     */
+    pendReason: text('pend_reason').notNull().default('threshold'),
+    /** Story 3-2b — the handheld that submitted the request; null from the web (no FK, guide §3). */
+    sourceDeviceId: uuid('source_device_id'),
     ...tenantTimestamps,
   },
   (table) => [

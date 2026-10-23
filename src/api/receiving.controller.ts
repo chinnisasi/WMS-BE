@@ -14,6 +14,7 @@ import { QcFacade } from '../modules/inbound/qc.facade';
 import { MovementsFacade } from '../modules/movements/transfer.facade';
 import { ClientsFacade } from '../modules/clients/clients.facade';
 import { ReturnsFacade } from '../modules/returns/returns.facade';
+import { InventoryFacade } from '../modules/inventory/inventory.facade';
 // Constructor params are types here but must stay value imports: Nest
 // decorator metadata needs the runtime class tokens (eslint rule bends).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
@@ -77,6 +78,9 @@ export class ReceivingController {
     // Story 1-1: the snapshot's `clients` arm — read through the clients
     // facade (inbound does not own the table), composed here like the others.
     @Inject(ClientsFacade) private readonly clients: ClientsFacade,
+    // Story 3-2b: the snapshot's `adjustReasons` arm (the vocabulary with
+    // labels), read through the inventory facade.
+    @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
   ) {}
 
   @Post(':tenantId/receiving/goods-receipts')
@@ -270,6 +274,10 @@ export class ReceivingController {
       // Story 3-1 — the move reason vocabulary, read through the movements
       // facade (inbound never imports the movements module).
       moveReasons: this.movements.moveReasons().map((reason) => ({ ...reason })),
+      // Story 3-2b (A9) — the adjustment reason vocabulary with labels, read
+      // through the inventory facade (inbound never imports inventory's
+      // vocabulary file); the handheld's Adjust entry shows only when present.
+      adjustReasons: this.inventory.adjustmentReasons().map((reason) => ({ code: reason.code, label: reason.label })),
     };
   }
 
