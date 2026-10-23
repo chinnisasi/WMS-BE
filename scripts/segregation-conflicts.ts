@@ -76,7 +76,7 @@ async function main(): Promise<number> {
     return 2;
   }
   const db = createDatabase();
-  const authDb = createDatabase(process.env.DATABASE_AUTH_URL || requiredDbUrl());
+  const authDb = createDatabase(process.env.DATABASE_AUTH_URL || requiredDbUrl(), 'auth');
   // Tenants are read on the auth connection (BYPASSRLS in production). An
   // empty answer is never "all clear": an RLS-bound role sees no tenants, and
   // a mistyped --tenant names none — both exit 2, never 0.

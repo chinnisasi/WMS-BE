@@ -1,4 +1,6 @@
-import type { AddressInfo } from 'node:net';
+import { spawn } from 'node:child_process';
+import net, { type AddressInfo } from 'node:net';
+import { join } from 'node:path';
 import { Agent, request as httpRequest } from 'node:http';
 import type { INestApplication } from '@nestjs/common';
 import { createApp } from '../src/app.factory';
@@ -16,6 +18,9 @@ import {
   SHUTDOWN_DRAIN_MS,
 } from '../src/shared/lifecycle/shutdown';
 import { ValkeyClient } from '../src/shared/valkey/valkey.client';
+import { registeredJobs, resetWorkerHeartbeats, WORKER_JOBS } from '../src/shared/lifecycle/worker-heartbeat';
+import { JOB_POLL_VARIABLES } from '../src/shared/lifecycle/process-role';
+import { readFileSync } from 'node:fs';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 
 process.env.VALKEY_URL ??= 'redis://localhost:56379/0';
@@ -113,13 +118,13 @@ describe('graceful shutdown (story 6-2a)', () => {
       await expect(settleBefore(Promise.resolve(), Date.now() + 1_000)).resolves.toBe(true);
     });
 
-    it('armForceExit: the first signal arms a timer that exits 1 when the sequence overruns', async () => {
+    it('armForceExit: the first signal arms a timer that exits 75 (story 6-2c, A18 — was 1) when the sequence overruns', async () => {
       const exits: number[] = [];
       const disarm = armForceExit(30, (code) => exits.push(code), ['SIGUSR2']);
       try {
         process.emit('SIGUSR2', 'SIGUSR2');
         await new Promise((resolve) => setTimeout(resolve, 80));
-        expect(exits).toEqual([1]);
+        expect(exits).toEqual([75]);
       } finally {
         disarm();
       }
@@ -136,7 +141,7 @@ describe('graceful shutdown (story 6-2a)', () => {
         await new Promise((resolve) => setTimeout(resolve, 20));
         process.emit('SIGUSR2', 'SIGUSR2');
         await new Promise((resolve) => setTimeout(resolve, 120));
-        expect(exits).toEqual([1]);
+        expect(exits).toEqual([75]);
       } finally {
         disarm();
       }
@@ -312,6 +317,48 @@ describe('graceful shutdown (story 6-2a)', () => {
       }
     });
 
+    it('A2 (story 6-2c): a keep-alive request in flight when the drain begins is answered with Connection: close, and the socket is not kept', async () => {
+      const t = await boot(false);
+      const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+      try {
+        // A first request on the kept-alive socket, answered keep-alive (the drain has not begun).
+        t.handler.resolve(t.ok());
+        const before = await new Promise<{ connection: string | undefined }>((resolve, reject) => {
+          const req = httpRequest({ host: '127.0.0.1', port: t.port, path: '/api/v1/health', agent }, (res) => {
+            res.resume();
+            res.on('end', () => resolve({ connection: res.headers.connection }));
+          });
+          req.on('error', reject);
+          req.end();
+        });
+        expect(before.connection).toBe('keep-alive');
+        // The second request blocks in the handler while the drain begins.
+        const blocked = deferred<HealthResponse>();
+        jest.spyOn(t.app.get(HealthController), 'health').mockImplementation(() => blocked.promise as unknown as HealthResponse);
+        let socketClosed = false;
+        const inFlight = new Promise<{ status: number; connection: string | undefined }>((resolve, reject) => {
+          const req = httpRequest({ host: '127.0.0.1', port: t.port, path: '/api/v1/health', agent }, (res) => {
+            res.socket.once('close', () => (socketClosed = true));
+            res.resume();
+            res.on('end', () => resolve({ status: res.statusCode ?? 0, connection: res.headers.connection }));
+          });
+          req.on('error', reject);
+          req.end();
+        });
+        const drainHttp = t.app.get(HttpDrain);
+        await until(() => drainHttp.inFlightRequests === 1);
+        const closing = t.closeApp();
+        await until(() => drainHttp.isDraining);
+        blocked.resolve(t.ok());
+        expect(await inFlight).toEqual({ status: 200, connection: 'close' });
+        await until(() => socketClosed); // the server ends the socket with the response
+        await closing;
+        expectPoolsLast(t.events);
+      } finally {
+        agent.destroy();
+      }
+    });
+
     it('every JobsModule worker (C23): the timer stops and beforeApplicationShutdown waits for its blocked tick', async () => {
       const POLLS = [
         'OUTBOX_RELAY_POLL_MS', 'OUTBOX_RECONCILE_POLL_MS', 'RESERVATION_REAPER_POLL_MS', 'COUNT_SCHEDULER_POLL_MS',
@@ -342,8 +389,12 @@ describe('graceful shutdown (story 6-2a)', () => {
         });
         return { name: cls.name, worker, release, state };
       });
+      resetWorkerHeartbeats();
       await app.init(); // the timers start here
       for (const row of rows) await until(() => row.state.calls === 1);
+      // Story 6-2c (A3): every enabled worker registered its heartbeat under its own name.
+      expect(registeredJobs().map((entry) => entry.job).sort()).toEqual([...WORKER_JOBS].sort());
+      expect(registeredJobs().every((entry) => entry.inFlight)).toBe(true); // each tick is blocked: in flight
 
       const settling = rows.map((row) =>
         row.worker.beforeApplicationShutdown().then(() => {
@@ -359,8 +410,78 @@ describe('graceful shutdown (story 6-2a)', () => {
       await app.close();
     });
 
+    it('story 6-2c: JOB_POLL_VARIABLES, WORKER_JOBS and this suite\'s POLLS are one set — each worker reads one variable and tracks one name', () => {
+      const POLLS = [
+        'OUTBOX_RELAY_POLL_MS', 'OUTBOX_RECONCILE_POLL_MS', 'RESERVATION_REAPER_POLL_MS', 'COUNT_SCHEDULER_POLL_MS',
+        'REPLENISHMENT_SCHEDULER_POLL_MS', 'CHANNELS_SYNC_POLL_MS', 'STORAGE_SNAPSHOT_POLL_MS', 'PUSH_SENDER_POLL_MS',
+        'WAVE_CUTOFF_SWEEP_POLL_MS', 'AUDIT_EXPORT_POLL_MS', 'LEDGER_INTEGRITY_POLL_MS', 'SESSION_PURGE_POLL_MS',
+        'LICENCE_EXPIRY_POLL_MS',
+      ];
+      expect([...POLLS].sort()).toEqual([...JOB_POLL_VARIABLES].sort());
+      // Names ↔ variables, from the source: per worker class, the variable its constructor parses and the name it tracks.
+      const source = readFileSync(join(__dirname, '..', 'src', 'jobs', 'jobs.module.ts'), 'utf8');
+      const pairs = source
+        .split(/\n@Injectable\(\)\nexport class /)
+        .slice(1)
+        .map((body) => [/this\.pollMs = parse\w+\(process\.env\.([A-Z_]+)\)/.exec(body)?.[1], /this\.ticks\.track\('([a-z-]+)'/.exec(body)?.[1]] as const)
+        .filter(([variable, job]) => variable !== undefined || job !== undefined);
+      expect(pairs).toHaveLength(13);
+      expect(pairs.every(([variable, job]) => variable !== undefined && job !== undefined)).toBe(true);
+      expect(pairs.map(([variable]) => variable).sort()).toEqual([...JOB_POLL_VARIABLES].sort());
+      expect(pairs.map(([, job]) => job).sort()).toEqual([...WORKER_JOBS].sort());
+    });
+
     it('the worker exposes the hook Nest calls before the server closes', () => {
       expect(typeof OutboxRelayWorker.prototype.beforeApplicationShutdown).toBe('function');
+    });
+
+    it('the worker role (story 6-2c): no API listener, /health/worker 200, SIGTERM exits 0', async () => {
+      let port = 0;
+      for (;;) {
+        port = 25_000 + Math.floor(Math.random() * 4_000);
+        const free = await new Promise<boolean>((resolve) => {
+          const probe = net.createServer();
+          probe.once('error', () => resolve(false));
+          probe.listen(port, '0.0.0.0', () => probe.close(() => resolve(true)));
+        });
+        if (free) break;
+      }
+      const child = spawn('bun', ['--no-env-file', 'src/main.ts'], {
+        cwd: join(__dirname, '..'),
+        env: {
+          PATH: process.env.PATH ?? '',
+          HOME: process.env.HOME ?? '',
+          WMS_PROCESS_ROLE: 'worker',
+          PORT: String(port),
+          OUTBOX_RELAY_POLL_MS: '200',
+          DATABASE_URL: process.env.DATABASE_URL ?? '',
+          DATABASE_AUTH_URL: process.env.DATABASE_AUTH_URL ?? '',
+          VALKEY_URL: process.env.VALKEY_URL ?? '',
+          MFA_ENCRYPTION_KEY: process.env.MFA_ENCRYPTION_KEY ?? '',
+          JWT_SECRET: 'shutdown-spec-jwt-secret-0123456789',
+        },
+      });
+      let output = '';
+      child.stdout.on('data', (chunk: Buffer) => (output += chunk.toString()));
+      child.stderr.on('data', (chunk: Buffer) => (output += chunk.toString()));
+      const exited = new Promise<number | null>((resolve) => child.on('exit', (code) => resolve(code)));
+      try {
+        let health: { status: number; body: string } | undefined;
+        const deadline = Date.now() + 25_000;
+        while (Date.now() < deadline) {
+          health = await get(port, '/api/v1/health/worker').catch(() => undefined);
+          if (health?.status === 200) break;
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+        expect(health?.status).toBe(200);
+        expect(JSON.parse(health!.body)).toMatchObject({ status: 'ok', jobs: [{ job: 'outbox-relay', pollMs: 200 }] });
+        expect((await get(port, '/api/v1/tenants/me')).status).toBe(404); // health only: no API on the worker
+        child.kill('SIGTERM');
+        expect(await exited).toBe(0);
+      } finally {
+        if (child.exitCode === null) child.kill('SIGKILL');
+      }
+      expect(output).toMatch(/wms-be worker running outbox-relay/);
     });
   });
 });

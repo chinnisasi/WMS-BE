@@ -642,6 +642,22 @@ describe('the guarded deploy migrator (story 6-2a)', () => {
       expect(result.stderr).toContain('WMS_AUTH_PASSWORD must be set');
     });
 
+    it('story 6-2c (A4): the provisioning and migrate CLIs refuse a TLS configuration with 78, before connecting', () => {
+      for (const [script, reason] of [
+        ['src/shared/db/provision-roles.ts', 'Refusing to provision'],
+        ['src/shared/db/migrate-deploy.ts', 'Refusing to migrate'],
+      ] as const) {
+        const result = spawnSync('bun', [script], {
+          cwd: join(__dirname, '..'),
+          env: { ...process.env, DATABASE_URL: 'postgres://nobody@127.0.0.1:1/none?sslmode=verify-ca', PGSSLROOTCERT: '' },
+          encoding: 'utf8',
+        });
+        expect(result.stderr).toContain(reason);
+        expect(result.stderr).toContain('sslmode=verify-ca');
+        expect(result.status).toBe(78);
+      }
+    });
+
     it('two migrators: the second waits on the lock, and nothing is applied twice', async () => {
       // A held lock parks a migrator before it reads anything.
       const holder = await sql.reserve();
