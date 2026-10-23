@@ -559,7 +559,7 @@ export function shopifyParseOrder(body: Record<string, unknown>): ParsedChannelO
   // cannot be read is refused by name, never ingested as prepaid.
   const codAmountPaise = shopifyCodAmountPaise(body);
   if (codAmountPaise === 'unmappable') {
-    return { refused: 'cod-amount-unmappable' };
+    return { refused: 'cod-amount-unmappable', order: { orderRef, destination, lines } };
   }
   return { orderRef, destination, lines, codAmountPaise };
 }

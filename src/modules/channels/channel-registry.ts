@@ -114,13 +114,17 @@ export interface ParsedChannelOrder {
 
 /**
  * Story 4-2a (A5) — a VERIFIED body the parse arm refuses for a named reason
- * (beside `null`, the generic "no mappable shape"): the controller meters the
- * reason and answers the same 400. `cod-amount-unmappable` — the body says
- * cash on delivery but the amount to collect cannot be read (currency,
- * status or `total_outstanding`): never ingested as a prepaid order.
+ * (beside `null`, the generic "no mappable shape"). `cod-amount-unmappable` —
+ * the body says cash on delivery but the amount to collect cannot be read
+ * (currency, status or `total_outstanding`): never ingested as a prepaid
+ * order. It carries the order as parsed WITHOUT its COD, so the ingest can
+ * still resolve a redelivery of an order it already holds (decision 7: a
+ * redelivery always resolves to its order); only a FIRST delivery is refused
+ * — metered by its reason and the channel order ref, answered 400.
  */
 export interface ParsedChannelRefusal {
   readonly refused: 'cod-amount-unmappable';
+  readonly order: ParsedChannelOrder;
 }
 
 /** Story 4-2a — narrows a parse result to its refusal arm. */

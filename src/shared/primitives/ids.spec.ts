@@ -48,6 +48,19 @@ describe('ids primitives', () => {
     expect(prefix(next) > prefix(ids[ids.length - 1]!)).toBe(true);
   });
 
+  test('story 4-2a: after the clock steps back, ids in that millisecond are monotonic again at once', () => {
+    const prefix = (id: string): bigint => BigInt(`0x${id.replace(/-/g, '').slice(0, 16)}`);
+    const ahead = Date.parse('2099-06-01T00:00:00Z');
+    uuidv7(ahead);
+    // A reading one second earlier (an NTP step back): a fresh sequence there.
+    const back = ahead - 1000;
+    const ids = Array.from({ length: 50 }, () => uuidv7(back));
+    for (let i = 1; i < ids.length; i += 1) expect(prefix(ids[i]!) > prefix(ids[i - 1]!)).toBe(true);
+    // And the real clock (far behind both) is in sequence again too.
+    const real = [uuidv7(), uuidv7(), uuidv7()];
+    expect(real[1]! > real[0]! && real[2]! > real[1]!).toBe(true);
+  });
+
   test('ulid is 26 Crockford base32 chars, time-prefixed and sortable', () => {
     const early = ulid(Date.parse('2026-09-08T00:00:00Z'));
     const late = ulid(Date.parse('2026-09-09T00:00:00Z'));

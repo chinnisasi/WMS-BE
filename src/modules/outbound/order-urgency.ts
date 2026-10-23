@@ -22,6 +22,9 @@ export type OrderType = (typeof ORDER_TYPES)[number];
 export const ORDER_PRIORITIES = ['normal', 'high', 'urgent'] as const;
 export type OrderPriority = (typeof ORDER_PRIORITIES)[number];
 
+/** Story 4-2a (A12) — what a portal client may set; `urgent` is the warehouse's call. */
+export const PORTAL_ORDER_PRIORITIES = ['normal', 'high'] as const satisfies readonly OrderPriority[];
+
 /**
  * The priority rank — urgent first. `orderPriorityRankSql` is its one SQL
  * twin; `test/order-fields.spec.ts` (A10) evaluates the CASE in Postgres for

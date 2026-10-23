@@ -1651,6 +1651,7 @@ export class PickCommandService {
    *
    * Story 4-2a (A2) — the order is EXPLICIT, never the picklist id's: the
    * picklist's urgency key (its most urgent order among its `planned` lines,
+   * one derived row per picklist,
    * by A8's key on `todayIst` — the snapshot's own IST date), then the
    * picklist's `created_at`, its id, the walk position and the line id. The
    * whole-picklist truncation follows that order, so an urgent picklist is
@@ -1663,12 +1664,16 @@ export class PickCommandService {
     const parentLines = alias(orderLines, 'parent_order_lines');
     const parentSkus = alias(skus, 'parent_skus');
     const taskOrders = alias(orders, 'task_orders');
-    // The picklist's most urgent order among its planned lines (A2): a
-    // lateral read per picklist, ordered by A8's key, limit 1.
+    // The picklist's most urgent order among its planned lines (A2): ONE
+    // derived row per picklist (`distinct on (picklist_id)`, ordered by A8's
+    // key), joined once — never a subquery re-run per task row. Scoped to
+    // the same ready picklists of this warehouse the outer read walks.
     const urgencyLines = alias(picklistLines, 'urgency_lines');
     const urgencyOrders = alias(orders, 'urgency_orders');
+    const urgencyPicklists = alias(picklists, 'urgency_picklists');
     const picklistUrgency = tx
-      .select({
+      .selectDistinctOn([urgencyLines.picklistId], {
+        picklistId: sql<string>`${urgencyLines.picklistId}`.as('urgency_picklist_id'),
         due: sql<boolean>`(${urgencyOrders.shipByDate} is not null and ${urgencyOrders.shipByDate} <= ${todayIst}::date)`.as('urgency_due'),
         rank: sql<number>`${orderPriorityRankSql(sql`${urgencyOrders.priority}`)}`.as('urgency_rank'),
         shipBy: sql<string | null>`${urgencyOrders.shipByDate}`.as('urgency_ship_by'),
@@ -1676,16 +1681,18 @@ export class PickCommandService {
         orderId: sql<string>`${urgencyOrders.id}`.as('urgency_order_id'),
       })
       .from(urgencyLines)
+      .innerJoin(urgencyPicklists, eq(urgencyPicklists.id, urgencyLines.picklistId))
       .innerJoin(urgencyOrders, and(eq(urgencyOrders.id, urgencyLines.orderId), eq(urgencyOrders.tenantId, urgencyLines.tenantId)))
       .where(
         and(
           eq(urgencyLines.tenantId, tenantId),
-          // Correlated to the OUTER picklist, table-qualified by hand (Gotcha 9).
-          sql`${urgencyLines.picklistId} = picklists.id`,
+          eq(urgencyPicklists.warehouseId, warehouseId),
+          eq(urgencyPicklists.status, 'ready'),
           eq(urgencyLines.status, 'planned'),
         ),
       )
       .orderBy(
+        urgencyLines.picklistId,
         orderUrgencyOrderBy(todayIst, {
           priority: sql`${urgencyOrders.priority}`,
           shipByDate: sql`${urgencyOrders.shipByDate}`,
@@ -1693,7 +1700,6 @@ export class PickCommandService {
           id: sql`${urgencyOrders.id}`,
         }),
       )
-      .limit(1)
       .as('picklist_urgency');
     const overRead = await tx
       .select({
@@ -1723,7 +1729,7 @@ export class PickCommandService {
       .leftJoin(parentLines, eq(parentLines.id, orderLines.parentLineId))
       .leftJoin(parentSkus, eq(parentSkus.id, parentLines.skuId))
       .innerJoin(taskOrders, and(eq(taskOrders.id, picklistLines.orderId), eq(taskOrders.tenantId, picklistLines.tenantId)))
-      .leftJoinLateral(picklistUrgency, sql`true`)
+      .leftJoin(picklistUrgency, sql`${picklistUrgency.picklistId} = ${picklistLines.picklistId}`)
       .where(
         and(
           eq(picklistLines.tenantId, tenantId),

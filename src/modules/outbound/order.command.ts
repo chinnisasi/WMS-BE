@@ -18,6 +18,7 @@ import {
   MAX_COD_AMOUNT_PAISE,
   ORDER_PRIORITIES,
   ORDER_TYPES,
+  PORTAL_ORDER_PRIORITIES,
   type OrderPriority,
   type OrderType,
 } from './order-urgency';
@@ -2675,7 +2676,7 @@ export function assertOrderFields(
     throw validationFailed(`priority must be one of ${JSON.stringify(ORDER_PRIORITIES)} (got ${JSON.stringify(priority)}).`);
   }
   // A12 — urgent is the warehouse's call; a portal client may ask for high.
-  if (context.surface === 'portal' && priority === 'urgent') {
+  if (context.surface === 'portal' && priority !== null && !(PORTAL_ORDER_PRIORITIES as readonly string[]).includes(priority as string)) {
     throw validationFailed('Urgent priority is set by the warehouse — choose Normal or High.');
   }
   if (shipByDate !== null) {

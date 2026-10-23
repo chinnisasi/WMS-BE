@@ -39,7 +39,7 @@ export function parseProcessRole(raw: string | undefined): ProcessRole {
 }
 
 /**
- * The thirteen job switches (`jobs.module.ts`), each env-gated by its own
+ * The fourteen job switches (`jobs.module.ts`), each env-gated by its own
  * `*_POLL_MS` (unset or `0` = off).
  */
 export const JOB_POLL_VARIABLES = [

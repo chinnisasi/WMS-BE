@@ -39366,12 +39366,10 @@
           },
           "priority": {
             "type": "string",
-            "nullable": true,
             "enum": [
               "normal",
               "high",
-              "urgent",
-              null
+              "urgent"
             ],
             "description": "Story 4-2a — the order priority: 'normal', 'high' or 'urgent' (every order created before 4-2a reads 'normal')."
           },
@@ -42751,7 +42749,7 @@
             }
           },
           "pickTasks": {
-            "description": "Story 4.3 (additive): the pick tasks of every ready picklist on a released wave, in walk order (the bin/batch each names is advisory — the server re-derives both at pick time)",
+            "description": "Story 4.3 (additive): the pick tasks of every ready picklist on a released wave — story 4-2a: whole picklists by urgency (the most urgent planned order of each picklist, judged on the snapshot IST date), each in walk order (the bin/batch each names is advisory — the server re-derives both at pick time)",
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/PickTaskDto"

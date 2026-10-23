@@ -540,12 +540,10 @@ export class OrderEntryDto {
   orderType!: string | null;
 
   @ApiProperty({
-    type: String,
-    nullable: true,
-    enum: [...ORDER_PRIORITIES, null],
+    enum: [...ORDER_PRIORITIES],
     description: `${ORDER_PRIORITY_DOC}`,
   })
-  priority!: string | null;
+  priority!: string;
 
   @ApiProperty({
     type: String,
@@ -1257,7 +1255,6 @@ export class PickTaskDto {
       'Story 11.7: the parent kit SKU\'s code when this task\'s order line is a kit component (order_lines.parent_line_id), null on an ordinary line. Display-only — the device renders "from kit {code}" in the task header; no pick logic reads kit-ness.',
   })
   kitParentSkuCode!: string | null;
-
 
   @ApiProperty({
     enum: [...ORDER_PRIORITIES],

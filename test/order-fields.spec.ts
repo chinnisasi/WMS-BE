@@ -837,6 +837,33 @@ describe('order fields (e2e, story 4-2a)', () => {
       expect(tasks[0]).toMatchObject({ orderPriority: 'high', orderShipByDate: todayIst(), codAmountPaise: 149900 });
       expect(tasks[1]).toMatchObject({ orderPriority: 'normal', orderShipByDate: null, codAmountPaise: null });
     });
+
+    it('A8 due first (pick): an OVERDUE normal picklist leads an older HIGH one that is not due — on the snapshot IST date', async () => {
+      const wh = await freshWarehouse('PDF');
+      await adjust(wh.warehouseId, wh.bins[0]!, sku.get('A-3')!, 10);
+      const high = await createOrder('A-3', { priority: 'high', shipByDate: addIsoDays(todayIst(), 7) }, wh.warehouseId);
+      const overdue = await createOrder('A-3', { shipByDate: todayIst() }, wh.warehouseId);
+      await sql`update orders set ship_by_date = ${addIsoDays(todayIst(), -1)}::date where id = ${overdue}`;
+      const policyId = await policy(wh.warehouseId, 'single');
+      const first = (await generate({ warehouseId: wh.warehouseId, policyId, orderIds: [high] }).expect(201)).body.wave as Wave;
+      const second = (await generate({ warehouseId: wh.warehouseId, policyId, orderIds: [overdue] }).expect(201)).body.wave as Wave;
+      await release(first.id);
+      await release(second.id);
+      const tasks = (await snapshot(wh.warehouseId)).pickTasks as { orderId: string }[];
+      expect(tasks.map((task) => task.orderId)).toEqual([overdue, high]);
+    });
+
+    it('A8 due first (pack): an OVERDUE normal order sits above an older HIGH one that is not due', async () => {
+      const wh = await freshWarehouse('PKD');
+      await adjust(wh.warehouseId, wh.bins[0]!, sku.get('A-3')!, 10);
+      const high = await createOrder('A-3', { priority: 'high', shipByDate: addIsoDays(todayIst(), 7) }, wh.warehouseId);
+      const overdue = await createOrder('A-3', { shipByDate: todayIst() }, wh.warehouseId);
+      await sql`update orders set ship_by_date = ${addIsoDays(todayIst(), -1)}::date where id = ${overdue}`;
+      await pickedOrder(high, wh.warehouseId);
+      await pickedOrder(overdue, wh.warehouseId);
+      const tasks = (await snapshot(wh.warehouseId)).packTasks as { orderId: string }[];
+      expect(tasks.map((task) => task.orderId)).toEqual([overdue, high]);
+    });
   });
 
   // ── pack, label, rate, manifest, dispatch (A17, A18 — AC4, AC5) ───────────

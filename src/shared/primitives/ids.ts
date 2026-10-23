@@ -15,9 +15,11 @@
 // the clock still reads at or before the bumped millisecond continues the
 // sequence from it, so an id never goes back in time. (Before 4-2a the bump
 // was never stored — the next id in the same millisecond embedded the old one
-// again and sorted before the bumped id.) An explicit `now` before the last
-// clock reading (a test minting an id "two hours ago") is not part of the
-// sequence: it embeds exactly that instant with a fresh random sequence.
+// again and sorted before the bumped id.) A reading BEFORE the last one (the
+// clock stepped back, or a test minting an id "two hours ago") restarts the
+// sequence at that reading, as before 4-2a — so ids minted in that
+// millisecond are monotonic again at once, and an explicit far-future `now`
+// never strands later real-clock ids outside the sequence.
 let lastMs = 0;
 let lastRaw = 0;
 let seq = 0;
@@ -35,7 +37,9 @@ export function uuidv7(now: number = Date.now()): string {
     if (seq === 0) lastMs += 1;
     now = lastMs;
   } else {
-    return build(now, Math.floor(Math.random() * 0x0fff));
+    lastMs = now;
+    lastRaw = now;
+    seq = Math.floor(Math.random() * 0x0fff);
   }
   return build(now, seq);
 }

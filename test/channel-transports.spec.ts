@@ -792,15 +792,20 @@ describe('shopify COD parse (story 4-2a, A4)', () => {
   it('status arms: paid, refunded, partially_refunded → prepaid; authorized, voided, missing → unmappable', () => {
     for (const status of ['paid', 'refunded', 'partially_refunded']) expect(shopifyCodAmountPaise(cod({ financial_status: status }))).toBeNull();
     for (const status of ['authorized', 'voided', undefined, 7]) {
-      expect(shopifyParseOrder(cod({ financial_status: status }))).toEqual({ refused: 'cod-amount-unmappable' });
+      expect(shopifyParseOrder(cod({ financial_status: status }))).toMatchObject({ refused: 'cod-amount-unmappable' });
     }
   });
 
   it('bad amounts and a non-INR shop currency are unmappable — never prepaid', () => {
     for (const total_outstanding of ['abc', undefined, '0.00', '0', 1499, '1499.001', '-5', '123456789.00', '1,499.00']) {
-      expect(shopifyParseOrder(cod({ total_outstanding }))).toEqual({ refused: 'cod-amount-unmappable' });
+      expect(shopifyParseOrder(cod({ total_outstanding }))).toMatchObject({ refused: 'cod-amount-unmappable' });
     }
-    expect(shopifyParseOrder(cod({ currency: 'USD' }))).toEqual({ refused: 'cod-amount-unmappable' });
+    expect(shopifyParseOrder(cod({ currency: 'USD' }))).toMatchObject({ refused: 'cod-amount-unmappable' });
+    // The refusal carries the order as parsed WITHOUT its COD (a redelivery of a known order still resolves).
+    expect(shopifyParseOrder(cod({ currency: 'USD' }))).toEqual({
+      refused: 'cod-amount-unmappable',
+      order: { orderRef: '5500000000001', destination: expect.any(Object), lines: [{ externalRef: 'SKU-1', quantity: 1 }] },
+    });
     // The shop currency decides, never the presentment currency.
     expect(shopifyParseOrder(cod({ presentment_currency: 'USD' }))).toMatchObject({ codAmountPaise: 149900 });
     // The ceiling: ₹1 crore is the cap; 99,999,999.99 is above it.

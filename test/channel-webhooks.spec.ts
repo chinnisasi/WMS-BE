@@ -566,9 +566,16 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
       expect(rows.at(-1)).toMatchObject({
         kind: 'order-ingest',
         status: 'validation-failed',
-        error: 'cod-amount-unmappable — the COD amount to collect could not be read (currency, status or total_outstanding)',
+        error: `cod-amount-unmappable — the COD amount to collect could not be read (currency, status or total_outstanding); channel order "${ref}"`,
       });
     }
+  });
+
+  it('story 4-2a (A5 + decision 7): a REDELIVERY of a known order whose COD body is now unreadable resolves to that order — never a 400', async () => {
+    const res = await postOrder(connId, codBody(9_000_000_042_001, { financial_status: 'voided' })).expect(200);
+    expect(res.body.outcome).toBe('replayed');
+    expect(await declareChannelNoOps(tenantId, res.body.orderId as string, 'orders.createOrder:channel-redelivery')).toBe(1);
+    expect((await outbound.findOrderByChannelRef(tenantId, connId, '9000000042001'))!.codAmountPaise).toBe(149900);
   });
 
   it('concurrent same-deliveries resolve to ONE order — both answer it', async () => {

@@ -19,7 +19,7 @@ import {
 import { PORTAL_PAGE_DEFAULT_LIMIT, PORTAL_PAGE_MAX_LIMIT } from '../shared/primitives/portal-page';
 import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../shared/primitives/quantity';
 import { CLIENT_ORDER_REF_RE, MAX_CLIENT_ORDER_REF_LENGTH, MAX_CONSIGNEE_LEGAL_NAME_LENGTH, MAX_SHIP_BY_DAYS_AHEAD, ORDER_SOURCES, ORDER_STATUSES, type OrderStatus } from '../modules/outbound/order.command';
-import { MAX_COD_AMOUNT_PAISE, ORDER_PRIORITIES, ORDER_TYPES } from '../modules/outbound/order-urgency';
+import { MAX_COD_AMOUNT_PAISE, ORDER_PRIORITIES, ORDER_TYPES, PORTAL_ORDER_PRIORITIES } from '../modules/outbound/order-urgency';
 import { ASN_STATUSES, MAX_ASN_CODE_LENGTH, MAX_ASN_LINES, type AsnStatus } from '../modules/inbound/asn.command';
 import { PO_STATUSES, type PoStatus } from '../modules/inbound/po.command';
 import { CHARGE_CODES, RATE_BASES } from '../modules/billing/rate-cards';
@@ -481,7 +481,7 @@ export class PortalCreateOrderDto {
 
   @ApiProperty({
     required: false,
-    enum: ['normal', 'high'],
+    enum: [...PORTAL_ORDER_PRIORITIES],
     description: "Story 4-2a — 'normal' (the default) or 'high'. 'urgent' is set by the warehouse only (400 here).",
   })
   @IsOptional()
