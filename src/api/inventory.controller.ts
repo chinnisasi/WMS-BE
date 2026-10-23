@@ -12,6 +12,7 @@ import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/
 import { UUID_RE } from '../shared/primitives/ids';
 import { CatalogFacade } from '../modules/catalog/catalog.facade';
 import { InventoryFacade } from '../modules/inventory/inventory.facade';
+import { BatchBlockResponse, BlockBatchDto, UnblockBatchDto } from '../modules/catalog/catalog.dto';
 import type { LedgerTimelineQuery } from '../modules/inventory/inventory.facade';
 // Constructor params are types here but must stay value imports: Nest
 // decorator metadata needs the runtime class tokens (eslint rule bends).
@@ -285,7 +286,7 @@ export class InventoryController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks adjustments.approve (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('No pending adjustment with this id exists in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('Already approved/rejected (adjustment-pending-decided), a kit SKU since the pend (kit-cannot-hold-stock), a concurrent idempotent request (conflict), or the world moved since the pend and the re-execution hit a guard whose 409 applies (e.g. a handling unit no longer active)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Already approved/rejected (adjustment-pending-decided), a kit SKU since the pend (kit-cannot-hold-stock), a concurrent idempotent request (conflict), the FEFO-default batch the pend resolved has since been blocked or has expired (batch-blocked / batch-expired — story 3-3a), or the world moved since the pend and the re-execution hit a guard whose 409 applies (e.g. a handling unit no longer active)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse), or the re-execution failed a guard whose 422 applies (insufficient-on-hand — the pending row STAYS pending; the whole decide transaction rolls back)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'pendingId', format: 'uuid' })
@@ -588,7 +589,9 @@ export class InventoryController {
     // The api-layer join (2.4 precedent): catalog owns identity (code,
     // mfg/expiry), inventory owns on-hand — neither facade imports the other.
     const [batches, onHand] = await Promise.all([
-      this.catalogFacade.getBatches(tenantId, query.skuId),
+      // Story 3-3a (A9) — the lifecycle view: who blocked, why, when, and the
+      // server's `expired` judgement (no client-side expiry copy).
+      this.catalogFacade.batchViews(tenantId, query.skuId),
       this.inventoryFacade.batchOnHand(tenantId, warehouseId, {
         skuId: query.skuId,
         binId: query.binId,
@@ -602,9 +605,15 @@ export class InventoryController {
       .map((batch) => ({
         id: batch.id,
         code: batch.code,
-        mfgDate: canonicalDate(batch.mfgDate),
-        expiryDate: canonicalDate(batch.expiryDate),
+        mfgDate: batch.mfgDate,
+        expiryDate: batch.expiryDate,
         status: batch.status,
+        blockedReason: batch.blockedReason,
+        blockedNote: batch.blockedNote,
+        blockedAt: batch.blockedAt,
+        blockedBy: batch.blockedBy,
+        blockedByName: batch.blockedByName,
+        expired: batch.expired,
         quantity: quantityByBatch.get(batch.id) ?? 0,
       }))
       // FEFO order is data, not policy (Design Notes): expiry ASC, nulls
@@ -652,7 +661,7 @@ export class InventoryController {
     }
     // The CHECKPOINT 1 semantics: unknown (or foreign) batch identity is a
     // 404 via the tiny catalog existence read — before any detail query.
-    const identity = await this.catalogFacade.findBatch(tenantId, batchId);
+    const identity = await this.catalogFacade.findBatchView(tenantId, batchId);
     if (identity === null) {
       throw batchNotFound(batchId);
     }
@@ -664,12 +673,84 @@ export class InventoryController {
       id: identity.id,
       skuId: identity.skuId,
       code: identity.code,
-      mfgDate: canonicalDate(identity.mfgDate),
-      expiryDate: canonicalDate(identity.expiryDate),
+      mfgDate: identity.mfgDate,
+      expiryDate: identity.expiryDate,
       status: identity.status,
+      blockedReason: identity.blockedReason,
+      blockedNote: identity.blockedNote,
+      blockedAt: identity.blockedAt,
+      blockedBy: identity.blockedBy,
+      blockedByName: identity.blockedByName,
+      expired: identity.expired,
       bins: bins.map((bin) => ({ warehouseId: bin.warehouseId, binId: bin.binId, quantity: bin.quantity })),
       history,
     };
+  }
+
+  @Post(':tenantId/inventory/batches/:batchId/block')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Blocks a batch (a lot) in every warehouse, with a reason (qc.manage — owner, ops manager): its units stay on hand but are never promised (ATP, the grant ceiling, channel quantities, replenishment) and never default-drawn. Reservations already granted stand; those lines short at the wave. Story 3-3a',
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiBody({ type: BlockBatchDto })
+  @ApiResponse({ status: HttpStatus.CREATED, type: BatchBlockResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a reason outside the vocabulary, reason `other` without a note, or a note over 500 characters (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks qc.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No batch with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The batch is already blocked (batch-already-blocked), or a concurrent request on the same Idempotency-Key (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'batchId', format: 'uuid' })
+  async blockBatch(
+    @Param('tenantId') tenantId: string,
+    @Param('batchId') batchId: string,
+    @Body() body: BlockBatchDto,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<BatchBlockResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    return this.catalogFacade.blockBatch(
+      { tenantId, actorUserId: session.userId, batchId, reason: body.reason, note: body.note },
+      key,
+    );
+  }
+
+  @Post(':tenantId/inventory/batches/:batchId/unblock')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Unblocks a batch (qc.manage), with a required note: its unexpired units are promisable again. An unblocked batch past its expiry stays unpromisable (the response says `expired: true`). Story 3-3a',
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiBody({ type: UnblockBatchDto })
+  @ApiResponse({ status: HttpStatus.CREATED, type: BatchBlockResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or a missing, blank or over-500-character note (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks qc.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No batch with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The batch is not blocked (batch-not-blocked), or a concurrent request on the same Idempotency-Key (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'batchId', format: 'uuid' })
+  async unblockBatch(
+    @Param('tenantId') tenantId: string,
+    @Param('batchId') batchId: string,
+    @Body() body: UnblockBatchDto,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<BatchBlockResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    return this.catalogFacade.unblockBatch(
+      { tenantId, actorUserId: session.userId, batchId, note: body.note },
+      key,
+    );
   }
 
   @Get(':tenantId/inventory/serials/:serialId')
@@ -720,15 +801,6 @@ export class InventoryController {
       history,
     };
   }
-}
-
-/**
- * Catalog batch/serial identity dates come back in Postgres's own text
- * shape; the read contract is ISO-8601 UTC (the same normalization the
- * timeline's instants get — api-layer composition, the facades stay raw).
- */
-function canonicalDate(value: string | null): string | null {
-  return value === null ? null : new Date(value).toISOString();
 }
 
 function batchNotFound(batchId: string): ProblemException {

@@ -22,6 +22,8 @@ import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { getMemberRoleIn } from '../tenancy/tenancy.service';
 import { StockAdjustmentCommand } from './inventory.command';
+import { batchLifecycleInTx } from './reservation.service';
+import { batchExpiryClock, isBatchExpiredAt } from '../../shared/primitives/batch-expiry';
 import type {
   AdjustStockCommand,
   StockAdjustmentSnapshot,
@@ -518,6 +520,38 @@ export class AdjustmentApprovalCommand {
           adjustmentPendingId: row.id,
         };
         await this.stockAdjustment.assertAdjustableInTx(tx, rebuilt);
+        // Story 3-3a (A11; code review) — approval re-runs the FEFO draw
+        // checks. A pend whose batch the FEFO DEFAULT resolved must not draw
+        // a batch that has since been blocked or has since expired — the
+        // default draw skips both, so the immediate path would never have
+        // chosen it. `batch_resolved_by` says how the batch was resolved; a
+        // pend raised before 3-3a (null) keeps the inference it had: a
+        // negative delta with a batch and no override reason. An EXPLICIT
+        // draw is never re-judged — that is how blocked or expired stock is
+        // written off.
+        const fefoDefault =
+          row.quantityMilli < 0 &&
+          row.batchId !== null &&
+          (row.batchResolvedBy === 'fefo' || (row.batchResolvedBy === null && row.batchOverrideReason === null));
+        if (fefoDefault) {
+          const lifecycle = await batchLifecycleInTx(tx, command.tenantId, row.batchId!);
+          if (lifecycle?.status === 'blocked') {
+            throw new ProblemException(
+              'batch-blocked',
+              409,
+              'Batch blocked',
+              'The batch this adjustment would draw (resolved by the FEFO default when it was requested) has since been blocked — reject it and request the adjustment again, naming a batch explicitly with an override reason if the blocked stock is to be written off.',
+            );
+          }
+          if (lifecycle !== null && isBatchExpiredAt(lifecycle.expiryDate, batchExpiryClock.now())) {
+            throw new ProblemException(
+              'batch-expired',
+              409,
+              'Batch expired',
+              'The batch this adjustment would draw (resolved by the FEFO default when it was requested) has expired since — the default draw never takes an expired batch. Reject it and request the adjustment again, naming the batch explicitly with an override reason to write the expired stock off.',
+            );
+          }
+        }
         const applied = await this.stockAdjustment.applyAdjustmentInTx(
           tx,
           rebuilt,

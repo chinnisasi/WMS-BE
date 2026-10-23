@@ -846,16 +846,27 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
     await seedBatchStock(skuId, binA, 3, { code: 'FEFO-SOON', expiryDate: daysFromNow(5) });
     await seedBatchStock(skuId, binA, 6, { code: 'FEFO-GONE', expiryDate: daysFromNow(-1) });
     await seedBatchStock(skuId, binA, 5, { code: 'FEFO-BLOCKED', expiryDate: daysFromNow(60) });
-    // No block-a-batch command exists yet (the catalog lifecycle flag is set
-    // by Epic 2's machinery); flip the identity directly — the planner reads
-    // `batches.status`, which is the contract under test.
-    await sql`
-      update batches set status = 'blocked'
-      where tenant_id = ${tenantId} and sku_id = ${skuId} and code = 'FEFO-BLOCKED'
-    `;
 
+    // Story 3-3a re-establishes this as a DRAW-side test (design review A6):
+    // the order reserves FIRST, against 12 promisable units (the expired
+    // FEFO-GONE's 6 are unpromisable from the start), and the batch is
+    // blocked AFTER — through the block verb, not a raw status flip (the
+    // 0092 pairing CHECK refuses a bare one). A block never touches a granted
+    // reservation, so the 9 stay reserved and the wave must still plan
+    // around the blocked and the expired batch.
     // 18 units on hand, but only FEFO-SOON (3) + FEFO-LATE (4) are drawable.
     const orderId = await createOrder([{ skuId, quantity: 9 }]);
+    const blockedId = (
+      (await sql`
+        select id from batches where tenant_id = ${tenantId} and sku_id = ${skuId} and code = 'FEFO-BLOCKED'
+      `)[0] as unknown as { id: string }
+    ).id;
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/inventory/batches/${blockedId}/block`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ reason: 'recall' })
+      .expect(201);
     const policy = await policyId(`Fefo ${ulid().slice(0, 8)}`, 'single');
     const wave = (await generate({ policyId: policy, orderIds: [orderId] }).expect(201)).body
       .wave as Wave;

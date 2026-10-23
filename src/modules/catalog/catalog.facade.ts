@@ -30,6 +30,18 @@ import {
   settleHandlingUnitIntakeInTx,
 } from './handling-unit.store';
 import { getKitCompositionInTx, getKitSkuIdsInTx } from './kit.store';
+// Story 3-3a — the batch block verb and its lifecycle view (the facade only
+// delegates; `batch-block.command.ts` never imports the facade).
+import {
+  BatchBlockCommand,
+  batchLifecycleViewsInTx,
+  type BatchBlockSnapshot,
+  type BatchLifecycleView,
+  type BlockBatchCommand,
+  type UnblockBatchCommand,
+} from './batch-block.command';
+export { BATCH_BLOCK_NOTE_MAX, BATCH_BLOCK_REASONS } from './batch-block.command';
+export type { BatchBlockReason, BatchBlockSnapshot, BatchLifecycleView } from './batch-block.command';
 import type { KitCompositionLine } from './kit.store';
 import { portalSkusInTx, type PortalSkuRow } from './portal-skus';
 import type { Page } from '../../shared/primitives/pagination';
@@ -182,7 +194,7 @@ export interface CatalogSegregationMatrix {
  * ensure identity here, then hand the resolved ids to the inventory facade
  * (which owns location/quantity/uniqueness-in-a-bin — never this module).
  *
- * Story 2.5: the detail routes' catalog 404 checks — tiny `findBatch` /
+ * Story 2.5: the detail routes' catalog 404 checks — tiny `findBatchView` (3-3a) /
  * `findSerial` existence reads (null when the id is unknown or foreign),
  * checked at the api layer before any detail query (CHECKPOINT 1).
  */
@@ -304,7 +316,56 @@ export interface SkuByCode {
 
 @Injectable()
 export class CatalogFacade {
-  constructor(@Inject(DATABASE) private readonly db: Database) {}
+  constructor(
+    @Inject(DATABASE) private readonly db: Database,
+    // Story 3-3a — the batch block / unblock verb (catalog owns `batches`);
+    // the routes sit beside the batch reads in the api shell's inventory
+    // controller. The command never imports this facade back (guide §7h).
+    @Inject(BatchBlockCommand) private readonly batchBlock: BatchBlockCommand,
+  ) {}
+
+  // ── story 3-3a: block / unblock a batch, and its lifecycle reads ─────────
+
+  /** `POST …/inventory/batches/{batchId}/block` — see `BatchBlockCommand`. */
+  async blockBatch(command: BlockBatchCommand, idempotencyKey: string): Promise<BatchBlockSnapshot> {
+    return this.batchBlock.block(command, idempotencyKey);
+  }
+
+  /** `POST …/inventory/batches/{batchId}/unblock` — see `BatchBlockCommand`. */
+  async unblockBatch(command: UnblockBatchCommand, idempotencyKey: string): Promise<BatchBlockSnapshot> {
+    return this.batchBlock.unblock(command, idempotencyKey);
+  }
+
+  /**
+   * Story 3-3a (A9) — one SKU's batches with their lifecycle facts (who
+   * blocked, why, when, and the server's `expired` judgement), code-ordered:
+   * the batch list's catalog half. `getBatches` stays the lean identity read
+   * the FEFO compositions use.
+   */
+  async batchViews(tenantId: string, skuId: string): Promise<BatchLifecycleView[]> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select()
+        .from(batches)
+        .where(and(eq(batches.tenantId, tenantId), eq(batches.skuId, skuId)))
+        .orderBy(batches.code);
+      return batchLifecycleViewsInTx(tx, tenantId, rows);
+    });
+  }
+
+  /** Story 3-3a (A9) — one batch's lifecycle view, or null when unknown or foreign (the detail's 404 check). */
+  async findBatchView(tenantId: string, batchId: string): Promise<BatchLifecycleView | null> {
+    if (!UUID_RE.test(batchId)) return null;
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select()
+        .from(batches)
+        .where(and(eq(batches.tenantId, tenantId), eq(batches.id, batchId)))
+        .limit(1);
+      if (rows[0] === undefined) return null;
+      return (await batchLifecycleViewsInTx(tx, tenantId, rows))[0]!;
+    });
+  }
 
   // ── story 21-7b: the client portal's SKU list (the announce form) ─────────
   // The 21-7 facade-read pattern — two layers, both required: the
@@ -879,32 +940,6 @@ export class CatalogFacade {
       byCode.set(row.code, list);
     }
     return byCode;
-  }
-
-  /**
-   * The one batch existence read (Story 2.5): null when the id is unknown or
-   * foreign — the batch detail route's catalog 404 check, before any
-   * inventory read. The `skuId` rides along (a batch's SKU identity).
-   */
-  async findBatch(
-    tenantId: string,
-    batchId: string,
-  ): Promise<(BatchIdentity & { readonly skuId: string }) | null> {
-    return withTenantTransaction(this.db, tenantId, async (tx) => {
-      const rows = await tx
-        .select({
-          id: batches.id,
-          skuId: batches.skuId,
-          code: batches.code,
-          mfgDate: batches.mfgDate,
-          expiryDate: batches.expiryDate,
-          status: batches.status,
-        })
-        .from(batches)
-        .where(and(eq(batches.tenantId, tenantId), eq(batches.id, batchId)))
-        .limit(1);
-      return rows[0] ?? null;
-    });
   }
 
   /**

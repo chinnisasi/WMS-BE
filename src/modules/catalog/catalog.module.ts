@@ -8,6 +8,7 @@ import { SkuCommand } from './sku.command';
 import { ProductCommand } from './product.command';
 import { KitCommand } from './kit.command';
 import { SkuClientCommand } from './sku-client.command';
+import { BatchBlockCommand } from './batch-block.command';
 
 /**
  * Catalog module (Story 1.4) — SKUs, UoM conversions, import runs, import
@@ -31,7 +32,7 @@ import { SkuClientCommand } from './sku-client.command';
 @Module({
   imports: [SharedModule, forwardRef(() => TenancyModule)],
   controllers: [CatalogController],
-  providers: [ImportCommand, SkuCommand, ProductCommand, KitCommand, SkuClientCommand, CatalogFacade],
+  providers: [ImportCommand, SkuCommand, ProductCommand, KitCommand, SkuClientCommand, BatchBlockCommand, CatalogFacade],
   exports: [CatalogFacade],
 })
 export class CatalogModule {}

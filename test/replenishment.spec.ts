@@ -1499,8 +1499,15 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
       await backdateBatch('E1', 45);
       await backdateBatch('A1', AGING_DAYS);
       await backdateBatch('A2', AGING_DAYS - 1);
-      await sql`update batches set status = 'blocked'
-        where tenant_id = ${tenantId}::uuid and code = 'BLK'`;
+      // Story 3-3a: blocked through the verb (the 0092 pairing CHECK refuses a
+      // bare status flip); the scan's contract — `status`, read through the
+      // catalog facade — is unchanged.
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/inventory/batches/${await batchIdOf('BLK')}/block`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ reason: 'qc-failed' })
+        .expect(201);
 
       const report = await replenishment.scanScope(tenantId, warehouseId);
       // 7 positive batch scopes (E1..BLK, A1, A2) evaluated; 4 alerts raised —
