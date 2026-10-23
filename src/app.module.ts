@@ -12,6 +12,7 @@ import { InvoicingModule } from './modules/invoicing/invoicing.module';
 import { InventoryModule } from './modules/inventory/inventory.module';
 import { MovementsModule } from './modules/movements/movements.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
+import { MailModule } from './modules/mail/mail.module';
 import { OutboundModule } from './modules/outbound/outbound.module';
 import { PartnersModule } from './modules/partners/partners.module';
 import { PutawayModule } from './modules/putaway/putaway.module';
@@ -50,6 +51,8 @@ import { JobsModule } from './jobs/jobs.module';
     ComplianceModule,
     CarriersModule,
     NotificationsModule,
+    // Story 5-1a — the email queue and its sender.
+    MailModule,
     ReportingModule,
     // Story 13-1 — return authorizations (Epic 13's first module).
     ReturnsModule,

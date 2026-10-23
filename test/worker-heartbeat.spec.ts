@@ -298,6 +298,7 @@ describe('the worker heartbeat (story 6-2c, A3)', () => {
           'AuditExportWorker',
           'ChannelsSyncWorker',
           'CountSchedulerWorker',
+          'EmailSenderWorker',
           'LedgerIntegrityWorker',
           'LicenceExpiryWorker',
           'PushSenderWorker',

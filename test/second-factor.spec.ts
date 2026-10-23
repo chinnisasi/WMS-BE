@@ -221,6 +221,22 @@ describe('two-factor sign-in (e2e, story 6-1b)', () => {
       else process.env.MFA_ENCRYPTION_KEY_PREVIOUS = saved.previous;
     });
 
+    it('golden vector: a blob and a backup-code hash made by the PRE-5-1a code still open and match after seal.ts was extracted', () => {
+      // Generated ONCE (story 5-1a code review) by running the pre-extraction
+      // `second-factor-secrets.ts` (git 9a246e76) under this exact key, tenant
+      // and user. A self-symmetric change to shared/crypto/seal.ts would keep
+      // every round-trip test green while locking out every enrolled owner —
+      // this vector is what fails instead. Never regenerate it.
+      process.env.MFA_ENCRYPTION_KEY = 'golden-vector-mfa-key-0123456789abcdef';
+      delete process.env.MFA_ENCRYPTION_KEY_PREVIOUS;
+      const tenantId = '01900000-0000-7000-8000-0000000000aa';
+      const userId = '01900000-0000-7000-8000-0000000000bb';
+      const sealed = 'v1:8865372e:bq/vQYnXO/jkIv+o:ovdTzDdz2tFWOdkzK4EAug==:4PSr0Y2znbOOXZcZKNfkw46+kM0=';
+      expect(openSecondFactorSecret(sealed, tenantId, userId).toString('utf8')).toBe('0123456789abcdefghij');
+      expect(backupCodeHashCandidates(userId, 'ABCD2345')).toContain('6ed4b61220b99b764ea6a23f512136dbdce34358a87e94398563c00910721804');
+      expect(backupCodeHash(userId, 'ABCD2345')).toBe('6ed4b61220b99b764ea6a23f512136dbdce34358a87e94398563c00910721804');
+    });
+
     it('associated data binds a secret to its row: another user or tenant cannot open it', () => {
       const secret = Buffer.from('twenty-byte-secret!!');
       const sealed = sealSecondFactorSecret(secret, 't-1', 'u-1');

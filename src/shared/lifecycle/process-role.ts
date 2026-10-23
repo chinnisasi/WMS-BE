@@ -56,6 +56,7 @@ export const JOB_POLL_VARIABLES = [
   'LEDGER_INTEGRITY_POLL_MS',
   'SESSION_PURGE_POLL_MS',
   'LICENCE_EXPIRY_POLL_MS',
+  'EMAIL_SEND_POLL_MS',
 ] as const;
 
 /** The job switches set to anything other than off (unset, empty or a numeric 0). */

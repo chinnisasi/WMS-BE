@@ -605,7 +605,9 @@ describe('client portal (e2e, story 21-7)', () => {
     it('the users list carries the client user with its client', async () => {
       const list = await http().get(`${API}/${tenantId}/users?limit=200`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
       const row = (list.body.items as { id: string }[]).find((item) => item.id === portalA.userId);
-      expect(row).toEqual({ id: portalA.userId, email: portalA.email, role: 'client', status: 'active', clientId: clientA, createdAt: expect.any(String), lockedUntil: null, secondFactorEnabled: false, secondFactorResetPending: false });
+      // Story 5-1a — the owner's list also carries `inviteEmail` (null on a
+      // row that is no longer invited); the pin is the whole row's shape.
+      expect(row).toEqual({ id: portalA.userId, email: portalA.email, role: 'client', status: 'active', clientId: clientA, createdAt: expect.any(String), lockedUntil: null, secondFactorEnabled: false, secondFactorResetPending: false, inviteEmail: null });
     });
   });
 

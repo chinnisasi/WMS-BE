@@ -356,6 +356,8 @@ export async function getClientInTx(tx: TenantTx, tenantId: string, clientId: st
 /** A client's facts plus its status — what a priced relationship checks (21-3). */
 export interface LockedClientFacts extends ClientFacts {
   readonly status: ClientStatus;
+  /** Story 5-1a — the brand's name (a portal invite's email names it). */
+  readonly name: string;
 }
 
 /**
@@ -381,7 +383,7 @@ export async function lockClientInTx(
   mode: 'no key update' | 'key share' = 'no key update',
 ): Promise<LockedClientFacts> {
   const rows = await tx
-    .select({ id: clients.id, code: clients.code, systemOwned: clients.systemOwned, status: clients.status })
+    .select({ id: clients.id, code: clients.code, name: clients.name, systemOwned: clients.systemOwned, status: clients.status })
     .from(clients)
     .where(and(eq(clients.tenantId, tenantId), eq(clients.id, clientId)))
     .limit(1)
@@ -432,7 +434,7 @@ export async function assertClientTakesWorkInTx(
   if (row.status === 'departed') {
     throw clientDeparted(clientLabel(row));
   }
-  return { id: row.id, code: row.code, systemOwned: row.systemOwned, status: row.status as ClientStatus };
+  return { id: row.id, code: row.code, name: row.name, systemOwned: row.systemOwned, status: row.status as ClientStatus };
 }
 
 /**
@@ -529,7 +531,7 @@ export async function shareLockClientInTx(
   clientId: string,
 ): Promise<LockedClientFacts> {
   const rows = await tx
-    .select({ id: clients.id, code: clients.code, systemOwned: clients.systemOwned, status: clients.status })
+    .select({ id: clients.id, code: clients.code, name: clients.name, systemOwned: clients.systemOwned, status: clients.status })
     .from(clients)
     .where(and(eq(clients.tenantId, tenantId), eq(clients.id, clientId)))
     .limit(1)

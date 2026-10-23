@@ -49,6 +49,7 @@ export const WORKER_JOBS = [
   'ledger-integrity',
   'session-purge',
   'licence-expiry',
+  'email-sender',
 ] as const;
 export type WorkerJob = (typeof WORKER_JOBS)[number];
 
@@ -77,6 +78,7 @@ export const DEFAULT_NO_PROGRESS_MS: Readonly<Record<WorkerJob, number>> = {
   'ledger-integrity': 60 * MINUTE,
   'session-purge': 20 * MINUTE,
   'licence-expiry': 20 * MINUTE,
+  'email-sender': 20 * MINUTE,
 };
 
 /** The heartbeat clock — assigned by tests (the `rateCardClock` precedent), never spied. */

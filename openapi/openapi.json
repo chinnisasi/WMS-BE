@@ -1744,6 +1744,7 @@
     },
     "/tenants/{tenantId}/users": {
       "post": {
+        "description": "Story 5-1a: the invite email is queued in the same transaction (`inviteEmail.status` `pending`, or `skipped` when the email provider is off or the address is outside the allowlist); `inviteUrl` is the accept link the email carries.",
         "operationId": "UsersController_inviteUser",
         "parameters": [
           {
@@ -1856,7 +1857,7 @@
             "bearer": []
           }
         ],
-        "summary": "Invites a user (Owner only) — returns the one-time invite token",
+        "summary": "Invites a user (Owner only) — returns the one-time invite token and accept link, and queues the invite email",
         "tags": [
           "tenancy"
         ]
@@ -2300,6 +2301,125 @@
           }
         ],
         "summary": "Story 6-1a — reactivates a deactivated user (users.role_change), restoring the status deactivation replaced; a never-accepted invitee gets a fresh invite token. Idempotent",
+        "tags": [
+          "tenancy"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/users/{userId}/resend-invite": {
+      "post": {
+        "operationId": "UsersController_resendInvite",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "userId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InviteUserResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or malformed userId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks users.invite (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "User does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The user is not invited — already active, or deactivated (user-not-invited); a portal user whose client is not active (client-not-active); or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 5-1a — sends an invited user a NEW invitation (users.invite, Owner): a fresh one-time token (the old link stops working), a new 7-day expiry, and a new invite email (older queued ones are cancelled). Keyed; audited user.invite_resent",
         "tags": [
           "tenancy"
         ]
@@ -32120,6 +32240,27 @@
           "role"
         ]
       },
+      "InviteEmailStatusResponse": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "sending",
+              "sent",
+              "failed",
+              "skipped",
+              "expired",
+              "cancelled"
+            ],
+            "example": "pending"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
       "InviteUserResponse": {
         "type": "object",
         "properties": {
@@ -32134,12 +32275,130 @@
             "type": "string",
             "example": "2026-09-15T00:00:00.000Z",
             "description": "One-time link expiry (7 days)"
+          },
+          "inviteUrl": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 5-1a — the accept link, built from the server’s WEB_BASE_URL (the emailed link is the same string). Null when the server has no base URL configured — build it from the web origin"
+          },
+          "inviteEmail": {
+            "nullable": true,
+            "description": "Story 5-1a — the invite email this request queued: `pending`, or `skipped` (email off, or outside the allowlist). Null on a replay of a response stored before 5-1a",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/InviteEmailStatusResponse"
+              }
+            ]
           }
         },
         "required": [
           "user",
           "inviteToken",
-          "inviteExpiresAt"
+          "inviteExpiresAt",
+          "inviteUrl",
+          "inviteEmail"
+        ]
+      },
+      "InviteEmailListStatusResponse": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "sending",
+              "sent",
+              "failed",
+              "skipped",
+              "expired",
+              "cancelled"
+            ],
+            "example": "sent"
+          },
+          "updatedAt": {
+            "type": "string",
+            "example": "2026-10-23T05:30:00.000Z",
+            "description": "When the status last changed"
+          }
+        },
+        "required": [
+          "status",
+          "updatedAt"
+        ]
+      },
+      "UserListItemResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "email": {
+            "type": "string",
+            "example": "dev@example.com"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "owner",
+              "ops_manager",
+              "operator",
+              "accountant",
+              "client"
+            ],
+            "example": "owner"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "invited",
+              "active",
+              "deactivated"
+            ],
+            "example": "active"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 21-7 — the client brand a client-portal user belongs to (role `client`); null for the tenant’s own staff"
+          },
+          "createdAt": {
+            "type": "string",
+            "example": "2026-09-08T00:00:00.000Z"
+          },
+          "lockedUntil": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 6-1a — sign-in is locked for this email (5 failed attempts from one address) until this instant; on the user list only, null or absent when not locked"
+          },
+          "secondFactorEnabled": {
+            "type": "boolean",
+            "description": "Story 6-1b — the user has two-factor sign-in set up; on the user list only (absent on stored invite / role-change snapshots)"
+          },
+          "secondFactorResetPending": {
+            "type": "boolean",
+            "description": "Story 6-1b — an owner reset this user’s two-factor sign-in and they have not set it up again (an enrolment code is outstanding); on the user list only"
+          },
+          "inviteEmail": {
+            "nullable": true,
+            "description": "Story 5-1a — for an `invited` user, the latest invite email’s status (null: none — invited before email existed; null for every other status). Present only when the caller holds users.invite",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/InviteEmailListStatusResponse"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "email",
+          "role",
+          "status",
+          "clientId",
+          "createdAt"
         ]
       },
       "UserListResponse": {
@@ -32148,7 +32407,7 @@
           "items": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/UserResponse"
+              "$ref": "#/components/schemas/UserListItemResponse"
             }
           },
           "nextCursor": {
@@ -32192,6 +32451,21 @@
           },
           "inviteExpiresAt": {
             "type": "string"
+          },
+          "inviteUrl": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 5-1a — beside `inviteToken` only: the accept link (built from the server’s WEB_BASE_URL; the emailed link is the same). Null when the server has no base URL configured — build it from the web origin"
+          },
+          "inviteEmail": {
+            "nullable": true,
+            "description": "Story 5-1a — beside `inviteToken` only: the reissued invite’s email. Null on a replay of a response stored before 5-1a",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/InviteEmailStatusResponse"
+              }
+            ]
           }
         },
         "required": [

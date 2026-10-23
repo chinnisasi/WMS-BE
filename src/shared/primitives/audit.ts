@@ -194,6 +194,8 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'user.deactivated', targetType: 'user' },
   { action: 'user.reactivated', targetType: 'user' },
   { action: 'user.unlocked', targetType: 'user' },
+  // Story 5-1a — an invitation resent with a fresh token (`UsersCommand.resendInvite`).
+  { action: 'user.invite_resent', targetType: 'user' },
   { action: 'device.released', targetType: 'device' },
   { action: 'device.unlocked', targetType: 'device' },
   // Code review (C11) — the security events of a session's life.

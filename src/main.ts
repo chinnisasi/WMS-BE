@@ -1,5 +1,6 @@
 import { API_PREFIX, createApp, parsePort } from './app.factory';
 import { assertSecondFactorKeyConfigured } from './modules/tenancy/second-factor-secrets';
+import { assertMailConfigured } from './modules/mail/mail.config';
 import { assertDatabaseTlsConfig } from './shared/db/pg-tls';
 import {
   assertApiRunsNoJobs,
@@ -20,7 +21,7 @@ import { markWorkerRegistrationComplete, parseHeartbeatEnv, registeredJobs } fro
  *   2. the heartbeat setting (`WORKER_HEARTBEAT_STALE_MS`, every role)
  *   3. the DB TLS configuration, without connecting (A4)
  *   4. a production API runs no job (A9)
- *   5. the MFA key (story 6-1b)
+ *   5. the MFA key (story 6-1b) and the mail configuration (story 5-1a)
  *   6. the app: the API listens; the worker initialises with no API
  *      listener (its health-only listener comes up in `init`), refuses when
  *      no job is enabled, then marks its registration complete
@@ -44,8 +45,12 @@ async function bootstrap(): Promise<void> {
   assertApiRunsNoJobs(role, process.env);
   // Story 6-1b — the app refuses to boot without a usable MFA_ENCRYPTION_KEY:
   // without it every owner would be locked out of sign-in on deploy day.
+  // Story 5-1a — and without a usable mail configuration when mail is on
+  // (`EMAIL_PROVIDER=ses|log` needs EMAIL_FROM, WEB_BASE_URL, EMAIL_SEAL_KEY).
+  // Both are configuration refusals: exit 78 (story 6-2c, A18).
   try {
     assertSecondFactorKeyConfigured();
+    assertMailConfigured();
   } catch (err) {
     throw new ConfigRefusal(err instanceof Error ? err.message : String(err));
   }

@@ -1029,7 +1029,9 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // Story 2-3a: + gate_ins_tenant_isolation and gate_in_documents_tenant_isolation
       // (0086, the plain tenant policy — a truck carries several clients' goods, so
       // neither table has a client; no portal route reads them).
-      expect(policies).toHaveLength(121);
+      // Story 5-1a: + email_messages_tenant_isolation (0089, the plain tenant
+      // policy — the mail queue is operator-side; no portal route reads it).
+      expect(policies).toHaveLength(122);
       const licencePolicy = policies.find((row) => row.policyname === 'licences_tenant_isolation')!;
       expect(licencePolicy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
       expect(licencePolicy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
@@ -1054,6 +1056,7 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
         'licence_policies_tenant_isolation',
         'gate_ins_tenant_isolation',
         'gate_in_documents_tenant_isolation',
+        'email_messages_tenant_isolation',
       ]) {
         expect(policies.find((row) => row.policyname === name)!.qual).toBe(
           "(tenant_id = (NULLIF(current_setting('app.tenant_id'::text, true), ''::text))::uuid)",
