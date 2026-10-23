@@ -22,7 +22,7 @@ if (email === undefined || !email.includes('@')) {
   process.exit(2);
 }
 const db = createDatabase();
-const authDb = createDatabase(process.env.DATABASE_AUTH_URL || requiredDbUrl());
+const authDb = createDatabase(process.env.DATABASE_AUTH_URL || requiredDbUrl(), 'auth');
 const cleared = await unlockSignIn(db, email);
 const account = (await authDb.select({ id: users.id, tenantId: users.tenantId }).from(users).where(eq(users.email, email)).limit(1))[0];
 let secondFactorCleared = 0;

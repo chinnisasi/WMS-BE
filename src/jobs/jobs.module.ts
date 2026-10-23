@@ -1,5 +1,7 @@
 import { Inject, Injectable, Logger, Module, type BeforeApplicationShutdown, type OnApplicationBootstrap, type OnApplicationShutdown } from '@nestjs/common';
 import { InFlightTick } from '../shared/lifecycle/shutdown';
+import { WorkerHealthServer } from '../shared/lifecycle/worker-health-server';
+import { ConfigRefusal } from '../shared/lifecycle/process-role';
 import { sql } from 'drizzle-orm';
 import { SharedModule, AUTH_DATABASE, DATABASE } from '../shared/shared.module';
 import { checkSessionVisibility } from '../shared/db/open-transactions';
@@ -55,7 +57,7 @@ export function parseOutboxPollMs(raw: string | undefined): number {
   }
   const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed < 0) {
-    throw new Error(
+    throw new ConfigRefusal(
       `OUTBOX_RELAY_POLL_MS must be a non-negative integer of milliseconds (got "${raw}")`,
     );
   }
@@ -74,7 +76,7 @@ export function parseReconcilePollMs(raw: string | undefined): number {
   }
   const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed < 0) {
-    throw new Error(
+    throw new ConfigRefusal(
       `OUTBOX_RECONCILE_POLL_MS must be a non-negative integer of milliseconds (got "${raw}")`,
     );
   }
@@ -94,7 +96,7 @@ export function parseReservationReaperPollMs(raw: string | undefined): number {
   }
   const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed < 0) {
-    throw new Error(
+    throw new ConfigRefusal(
       `RESERVATION_REAPER_POLL_MS must be a non-negative integer of milliseconds (got "${raw}")`,
     );
   }
@@ -115,7 +117,7 @@ export function parseCountSchedulerPollMs(raw: string | undefined): number {
   }
   const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed < 0) {
-    throw new Error(
+    throw new ConfigRefusal(
       `COUNT_SCHEDULER_POLL_MS must be a non-negative integer of milliseconds (got "${raw}")`,
     );
   }
@@ -136,7 +138,7 @@ export function parseReplenishmentPollMs(raw: string | undefined): number {
   }
   const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed < 0) {
-    throw new Error(
+    throw new ConfigRefusal(
       `REPLENISHMENT_SCHEDULER_POLL_MS must be a non-negative integer of milliseconds (got "${raw}")`,
     );
   }
@@ -160,7 +162,7 @@ export function parseChannelsSyncPollMs(raw: string | undefined): number {
   }
   const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed < 0) {
-    throw new Error(
+    throw new ConfigRefusal(
       `CHANNELS_SYNC_POLL_MS must be a non-negative integer of milliseconds (got "${raw}")`,
     );
   }
@@ -207,6 +209,8 @@ export class OutboxRelayWorker implements OnApplicationBootstrap, BeforeApplicat
       return; // env-gated off (tests, or a deployment that drains elsewhere)
     }
     this.logger.log(`Outbox relay worker started (poll every ${this.pollMs}ms)`);
+    // Story 6-2c (A3): registered for /health/worker; InFlightTick stamps every tick.
+    this.ticks.track('outbox-relay', this.pollMs);
     this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     // Never hold the process open on the timer alone: shutdown hooks end it.
     this.timer.unref?.();
@@ -280,6 +284,8 @@ export class ReconciliationWorker implements OnApplicationBootstrap, BeforeAppli
       return; // env-gated off (tests, or a deployment that reconciles elsewhere)
     }
     this.logger.log(`Reconciliation worker started (poll every ${this.pollMs}ms)`);
+    // Story 6-2c (A3): registered for /health/worker; InFlightTick stamps every tick.
+    this.ticks.track('reconciliation', this.pollMs);
     this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     // Never hold the process open on the timer alone: shutdown hooks end it.
     this.timer.unref?.();
@@ -361,6 +367,8 @@ export class ReservationReaper implements OnApplicationBootstrap, BeforeApplicat
       return; // env-gated off (tests, or a deployment that reaps elsewhere)
     }
     this.logger.log(`Reservation reaper started (poll every ${this.pollMs}ms)`);
+    // Story 6-2c (A3): registered for /health/worker; InFlightTick stamps every tick.
+    this.ticks.track('reservation-reaper', this.pollMs);
     this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     // Never hold the process open on the timer alone: shutdown hooks end it.
     this.timer.unref?.();
@@ -444,6 +452,8 @@ export class CountSchedulerWorker implements OnApplicationBootstrap, BeforeAppli
       return; // env-gated off (tests, or a deployment that schedules elsewhere)
     }
     this.logger.log(`Count scheduler worker started (poll every ${this.pollMs}ms)`);
+    // Story 6-2c (A3): registered for /health/worker; InFlightTick stamps every tick.
+    this.ticks.track('count-scheduler', this.pollMs);
     this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     // Never hold the process open on the timer alone: shutdown hooks end it.
     this.timer.unref?.();
@@ -489,6 +499,7 @@ export class CountSchedulerWorker implements OnApplicationBootstrap, BeforeAppli
       `)) as unknown as { tenantId: string; warehouseId: string }[];
       let created = 0;
       for (const scope of scopes) {
+        this.ticks.beat(); // Story 6-2c (A3): one beat per scope
         // One warehouse = one tenant transaction — all-or-nothing per
         // warehouse (the matrix's "partial failure → whole tick rolls
         // back", at the RLS boundary). A poison warehouse (a repeatedly
@@ -576,6 +587,8 @@ export class ReplenishmentSchedulerWorker implements OnApplicationBootstrap, Bef
       return; // env-gated off (tests, or a deployment that sweeps elsewhere)
     }
     this.logger.log(`Replenishment scheduler worker started (poll every ${this.pollMs}ms)`);
+    // Story 6-2c (A3): registered for /health/worker; InFlightTick stamps every tick.
+    this.ticks.track('replenishment-scheduler', this.pollMs);
     this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     // Never hold the process open on the timer alone: shutdown hooks end it.
     this.timer.unref?.();
@@ -695,6 +708,7 @@ export class ReplenishmentSchedulerWorker implements OnApplicationBootstrap, Bef
       }
 
       for (const scope of carried) {
+        this.ticks.beat(); // Story 6-2c (A3): one beat per scope
         // One scope = each evaluation's own tenant transactions —
         // all-or-nothing per phase. A poison scope (a repeatedly failing tx,
         // or a Valkey down mid-ATP) must not starve the rest — log and retry
@@ -806,6 +820,8 @@ export class ChannelsSyncWorker implements OnApplicationBootstrap, BeforeApplica
       return; // env-gated off (tests, or a deployment that syncs elsewhere)
     }
     this.logger.log(`Channels sync worker started (poll every ${this.pollMs}ms)`);
+    // Story 6-2c (A3): registered for /health/worker; InFlightTick stamps every tick.
+    this.ticks.track('channels-sync', this.pollMs);
     this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     // Never hold the process open on the timer alone: shutdown hooks end it.
     this.timer.unref?.();
@@ -857,6 +873,7 @@ export class ChannelsSyncWorker implements OnApplicationBootstrap, BeforeApplica
 
       let published = 0;
       for (const { tenantId, connectionId } of connections) {
+        this.ticks.beat(); // Story 6-2c (A3): one beat per connection
         try {
           const outcome = await this.channels.publishConnectionSnapshot(tenantId, connectionId);
           if (outcome === true) {
@@ -924,7 +941,7 @@ export function parseStorageSnapshotPollMs(raw: string | undefined): number {
   }
   const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed < 0) {
-    throw new Error(
+    throw new ConfigRefusal(
       `STORAGE_SNAPSHOT_POLL_MS must be a non-negative integer of milliseconds (got "${raw}")`,
     );
   }
@@ -976,6 +993,8 @@ export class StorageSnapshotWorker implements OnApplicationBootstrap, BeforeAppl
     }
     this.logger.log(`Storage snapshot worker started (poll every ${this.pollMs}ms)`);
     if (this.db !== undefined) void checkSessionVisibility(this.db, this.logger, 'Storage snapshot worker');
+    // Story 6-2c (A3): registered for /health/worker; InFlightTick stamps every tick.
+    this.ticks.track('storage-snapshot', this.pollMs);
     this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     this.timer.unref?.();
   }
@@ -1018,6 +1037,7 @@ export class StorageSnapshotWorker implements OnApplicationBootstrap, BeforeAppl
       `)) as unknown as { tenantId: string }[];
       const scopes: { tenantId: string; clientId: string; warehouseId: string }[] = [];
       for (const { tenantId } of tenants) {
+        this.ticks.beat(); // Story 6-2c (A3): one beat per tenant
         try {
           scopes.push(...(await this.billing.snapshotScopesOf(tenantId)));
         } catch (error) {
@@ -1038,6 +1058,7 @@ export class StorageSnapshotWorker implements OnApplicationBootstrap, BeforeAppl
         );
       }
       for (const scope of carried) {
+        this.ticks.beat(); // and per scope
         try {
           await this.billing.snapshotScope(scope.tenantId, scope.clientId, scope.warehouseId, nowMs);
         } catch (error) {
@@ -1105,7 +1126,7 @@ function parsePollMs(name: string, raw: string | undefined): number {
   }
   const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed < 0) {
-    throw new Error(`${name} must be a non-negative integer of milliseconds (got "${raw}")`);
+    throw new ConfigRefusal(`${name} must be a non-negative integer of milliseconds (got "${raw}")`);
   }
   return parsed;
 }
@@ -1158,6 +1179,8 @@ export class PushSenderWorker implements OnApplicationBootstrap, BeforeApplicati
       return; // env-gated off
     }
     this.logger.log(`Push sender worker started (poll every ${this.pollMs}ms)`);
+    // Story 6-2c (A3): registered for /health/worker; InFlightTick stamps every tick.
+    this.ticks.track('push-sender', this.pollMs);
     this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     this.timer.unref?.();
   }
@@ -1203,6 +1226,7 @@ export class PushSenderWorker implements OnApplicationBootstrap, BeforeApplicati
       const driven: string[] = [];
       const configCodes = new Set<string>();
       for (const { tenantId } of tenants) {
+        this.ticks.beat(); // Story 6-2c (A3): one beat per tenant
         try {
           const summary = await this.notifications.sendDuePushes(tenantId);
           for (const code of summary.configCodes) configCodes.add(code);
@@ -1264,6 +1288,8 @@ export class WaveCutoffSweepWorker implements OnApplicationBootstrap, BeforeAppl
       return; // env-gated off
     }
     this.logger.log(`Wave cutoff sweep worker started (poll every ${this.pollMs}ms)`);
+    // Story 6-2c (A3): registered for /health/worker; InFlightTick stamps every tick.
+    this.ticks.track('wave-cutoff-sweep', this.pollMs);
     this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     this.timer.unref?.();
   }
@@ -1306,6 +1332,7 @@ export class WaveCutoffSweepWorker implements OnApplicationBootstrap, BeforeAppl
       `)) as unknown as { tenantId: string }[];
       const swept: string[] = [];
       for (const { tenantId } of tenants) {
+        this.ticks.beat(); // Story 6-2c (A3): one beat per tenant
         try {
           await this.outbound.sweepCutoffRisk(tenantId);
           swept.push(tenantId);
@@ -1370,6 +1397,8 @@ export class AuditExportWorker implements OnApplicationBootstrap, BeforeApplicat
     }
     this.logger.log(`Audit export worker started (poll every ${this.pollMs}ms)`);
     if (this.db !== undefined) void checkSessionVisibility(this.db, this.logger, 'Audit export worker');
+    // Story 6-2c (A3): registered for /health/worker; InFlightTick stamps every tick.
+    this.ticks.track('audit-export', this.pollMs);
     this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     this.timer.unref?.();
   }
@@ -1413,6 +1442,10 @@ export class AuditExportWorker implements OnApplicationBootstrap, BeforeApplicat
       `)) as unknown as { tenantId: string }[];
       const driven: string[] = [];
       for (const { tenantId } of tenants) {
+        // Story 6-2c (A3): one beat per tenant — one export can page a large
+        // tenant inside the call, hence this job's 60 min bound (PENDING: a
+        // per-page beat needs a seam across the module boundary).
+        this.ticks.beat();
         try {
           const summary = await this.tenancy.runDueAuditExports(tenantId);
           if (summary.claimed !== null) {
@@ -1502,6 +1535,8 @@ export class LedgerIntegrityWorker implements OnApplicationBootstrap, BeforeAppl
       return; // env-gated off (tests, or a deployment that does not check its chain)
     }
     this.logger.log(`Ledger integrity worker started (poll every ${this.pollMs}ms)`);
+    // Story 6-2c (A3): registered for /health/worker; InFlightTick stamps every tick.
+    this.ticks.track('ledger-integrity', this.pollMs);
     this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     this.timer.unref?.();
   }
@@ -1540,6 +1575,7 @@ export class LedgerIntegrityWorker implements OnApplicationBootstrap, BeforeAppl
       `)) as unknown as { tenantId: string }[];
       const scopes: { tenantId: string; warehouseId: string }[] = [];
       for (const { tenantId } of tenants) {
+        this.ticks.beat(); // Story 6-2c (A3): one beat per tenant listing
         try {
           scopes.push(...(await this.inventory.ledgerIntegrityScopesOf(tenantId)));
         } catch (error) {
@@ -1558,6 +1594,8 @@ export class LedgerIntegrityWorker implements OnApplicationBootstrap, BeforeAppl
         );
       }
       for (const scope of carried) {
+        // …and per scope chain (one long chain is inside the call: 60 min bound, PENDING per-page).
+        this.ticks.beat();
         try {
           const summary = await this.inventory.runLedgerIntegrity(scope.tenantId, scope.warehouseId);
           if (summary.anchored > 0 || summary.wormCopied > 0 || summary.baselined) {
@@ -1628,6 +1666,8 @@ export class SessionPurgeWorker implements OnApplicationBootstrap, BeforeApplica
   onApplicationBootstrap(): void {
     if (this.pollMs === 0) return;
     this.logger.log(`Session purge worker started (every ${this.pollMs}ms)`);
+    // Story 6-2c (A3): registered for /health/worker; InFlightTick stamps every tick.
+    this.ticks.track('session-purge', this.pollMs);
     this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     this.timer.unref?.();
   }
@@ -1660,11 +1700,13 @@ export class SessionPurgeWorker implements OnApplicationBootstrap, BeforeApplica
     try {
       // Independent: a failing session purge never stops the counter purge.
       let purged = 0;
+      this.ticks.beat(); // Story 6-2c (A3): one beat per purge block
       try {
         purged = await purgeEndedSessions(this.db, this.authDb);
       } catch (error) {
         this.logger.error(`Session purge failed: ${error instanceof Error ? error.message : String(error)}`);
       }
+      this.ticks.beat();
       try {
         await purgeAuthCounters(this.db);
       } catch (error) {
@@ -1673,6 +1715,7 @@ export class SessionPurgeWorker implements OnApplicationBootstrap, BeforeApplica
       // Story 6-1b — its own block: sign-in challenges that expired over a day
       // ago and pending authenticator secrets older than 24 h. Its own tenant
       // discovery, and a try/catch per tenant inside.
+      this.ticks.beat();
       try {
         await purgeSecondFactorState(this.db, this.authDb, (tenantId, error) =>
           this.logger.error(
@@ -1720,6 +1763,8 @@ export class LicenceExpiryWorker implements OnApplicationBootstrap, BeforeApplic
       return; // env-gated off
     }
     this.logger.log(`Licence expiry worker started (poll every ${this.pollMs}ms)`);
+    // Story 6-2c (A3): registered for /health/worker; InFlightTick stamps every tick.
+    this.ticks.track('licence-expiry', this.pollMs);
     this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     this.timer.unref?.();
   }
@@ -1763,6 +1808,7 @@ export class LicenceExpiryWorker implements OnApplicationBootstrap, BeforeApplic
       `)) as unknown as { tenantId: string }[];
       const swept: string[] = [];
       for (const { tenantId } of tenants) {
+        this.ticks.beat(); // Story 6-2c (A3): one beat per tenant
         try {
           await this.licences.sweepExpiry(tenantId, today);
           swept.push(tenantId);
@@ -1821,6 +1867,8 @@ export class LicenceExpiryWorker implements OnApplicationBootstrap, BeforeApplic
     SessionPurgeWorker,
     // Story 1-6c — the licence expiry sweep (env-gated OFF by default).
     LicenceExpiryWorker,
+    // Story 6-2c (A10): the worker role's health-only listener (idle in the api role).
+    WorkerHealthServer,
   ],
   exports: [],
 })

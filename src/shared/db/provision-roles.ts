@@ -19,6 +19,8 @@ import { createHash, createHmac, pbkdf2Sync, randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import postgres from 'postgres';
+import { ConfigRefusal, EXIT_CONFIG_REFUSAL } from '../lifecycle/process-role';
+import { postgresTlsOptions } from './pg-tls';
 
 export const PROVISION_ROLES_SQL = join(__dirname, '..', '..', '..', 'scripts', 'provision-roles.sql');
 
@@ -68,7 +70,7 @@ export function missingProductionPasswords(env: NodeJS.ProcessEnv = process.env)
 }
 
 export async function provisionRoles(url: string, env: NodeJS.ProcessEnv = process.env): Promise<string[]> {
-  const sql = postgres(url, { max: 1, onnotice: () => undefined });
+  const sql = postgres(url, { max: 1, onnotice: () => undefined, ...postgresTlsOptions(url, env, 'provision') });
   const passwordsSet: string[] = [];
   try {
     await sql.unsafe(readFileSync(PROVISION_ROLES_SQL, 'utf8'));
@@ -89,6 +91,16 @@ async function main(): Promise<void> {
   if (!url) {
     console.error('DATABASE_URL is required (the migrating owner, not wms_app)');
     process.exit(1);
+  }
+  // Story 6-2c (A4): the TLS configuration is judged before connecting (exit 78).
+  try {
+    postgresTlsOptions(url, process.env, 'provision');
+  } catch (err) {
+    if (err instanceof ConfigRefusal) {
+      console.error(`Refusing to provision: ${err.message}`);
+      process.exit(EXIT_CONFIG_REFUSAL);
+    }
+    throw err;
   }
   const missing = missingProductionPasswords();
   if (missing.length > 0) {

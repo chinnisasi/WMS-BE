@@ -17,12 +17,24 @@ import { settleBefore, shutdownDrainDeadline } from './shutdown';
  * A new request on a kept-alive connection is answered 503 from
  * `prepareClose` on (`return503OnClosing`), and `dispose` then closes the
  * server, destroying any socket left (`forceCloseConnections`).
+ *
+ * Story 6-2c (A2) — the drain also closes kept-alive sockets. From the
+ * signal on, every in-flight response whose headers are not yet sent carries
+ * `Connection: close`, and once each response finishes the server's idle
+ * connections are closed (`closeIdleConnections`, a function under Bun 1.4
+ * too). A load balancer holding a kept-alive socket to a draining task is
+ * then told on the last response not to reuse it, and the socket goes as
+ * soon as it is idle — instead of answering `Connection: keep-alive` and
+ * being destroyed under the balancer a moment later by `dispose`.
  */
 @Injectable()
 export class HttpDrain implements OnApplicationBootstrap, OnModuleDestroy, BeforeApplicationShutdown {
   private readonly logger = new Logger('HttpDrain');
   private inFlight = 0;
   private idle: (() => void) | undefined;
+  /** The responses being served, so the drain can mark them `Connection: close` (A2). */
+  private readonly open = new Set<ServerResponse>();
+  private draining = false;
 
   constructor(private readonly adapterHost: HttpAdapterHost) {}
 
@@ -32,18 +44,28 @@ export class HttpDrain implements OnApplicationBootstrap, OnModuleDestroy, Befor
   }
 
   onApplicationBootstrap(): void {
-    this.server()?.on('request', (_req: IncomingMessage, res: ServerResponse) => {
+    const server = this.server();
+    server?.on('request', (_req: IncomingMessage, res: ServerResponse) => {
       this.inFlight += 1;
+      this.open.add(res);
+      if (this.draining) markConnectionClose(res);
       let done = false;
       const finish = (): void => {
         if (done) return;
         done = true;
         this.inFlight -= 1;
+        this.open.delete(res);
+        if (this.draining) closeIdleSoon(server);
         if (this.inFlight === 0) this.idle?.();
       };
       res.once('finish', finish);
       res.once('close', finish);
     });
+  }
+
+  /** True once the drain began (test seam). */
+  get isDraining(): boolean {
+    return this.draining;
   }
 
   /** The requests currently being served (test seam). */
@@ -59,6 +81,8 @@ export class HttpDrain implements OnApplicationBootstrap, OnModuleDestroy, Befor
    */
   onModuleDestroy(): void {
     const server = this.server();
+    this.draining = true;
+    for (const res of this.open) markConnectionClose(res);
     if (server?.listening) {
       server.close(() => undefined);
       server.closeIdleConnections?.();
@@ -75,4 +99,19 @@ export class HttpDrain implements OnApplicationBootstrap, OnModuleDestroy, Befor
       this.logger.warn(`${this.inFlight} request(s) still in flight at the drain deadline — their sockets will be closed`);
     }
   }
+}
+
+/** A2: an unsent response is told the connection ends with it. */
+function markConnectionClose(res: ServerResponse): void {
+  if (!res.headersSent) res.setHeader('Connection', 'close');
+}
+
+/**
+ * A2: close the connections that went idle with this response. Deferred one
+ * turn, so the server has marked the socket idle (its own `finish` handling)
+ * before it is looked at.
+ */
+function closeIdleSoon(server: Server | undefined): void {
+  if (server === undefined) return;
+  setImmediate(() => server.closeIdleConnections?.());
 }
