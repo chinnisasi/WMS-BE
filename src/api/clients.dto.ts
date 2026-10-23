@@ -498,7 +498,7 @@ export class ClientAllocationPolicyResponse extends ClientAllocationPolicyDto {
     type: 'integer',
     minimum: 0,
     description:
-      "Distinct active batches of the client's SKUs with NO expiry date and stock on hand, across warehouses — the minimum cannot limit them",
+      "Distinct active batches of the client's SKUs with NO expiry date and stock on hand (outside the QC-hold, damaged, returns and in-transit system bins), across warehouses — the minimum cannot limit them",
   })
   undatedBatchesOnHand!: number;
 }

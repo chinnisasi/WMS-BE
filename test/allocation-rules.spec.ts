@@ -196,6 +196,7 @@ describe('story 4-3a: client allocation rules (e2e)', () => {
       ['M-CAP', 'pcs', true],
       ['M-EXP', 'pcs', true],
       ['M-BUF', 'pcs', true],
+      ['M-RGRACE', 'pcs', true],
     ]);
     await importSkus('FIFO90', [
       ['Q-REPLAN', 'pcs', true],
@@ -206,6 +207,7 @@ describe('story 4-3a: client allocation rules (e2e)', () => {
     await importSkus('POL', [
       ['P-U1', 'pcs', false],
       ['P-B1', 'pcs', true],
+      ['P-B2', 'pcs', true],
     ]);
     await importSkus('TWO', [['T-TWO', 'pcs', true]]);
 
@@ -249,6 +251,7 @@ describe('story 4-3a: client allocation rules (e2e)', () => {
   afterEach(() => {
     batchExpiryClock.now = () => Date.now();
     picklistLineInsertTuning.maxBindParams = 65_535;
+    picklistLineInsertTuning.onChunk = undefined;
   });
 
   afterAll(async () => {
@@ -472,6 +475,20 @@ describe('story 4-3a: client allocation rules (e2e)', () => {
       await seed('P-B1', 'A-01', 3, { code: 'P-UND-1' });
       await seed('P-B1', 'A-01', 3, { code: 'P-UND-2' });
       await seed('P-B1', 'A-01', 3, { code: 'P-DATED', expiryDate: expiresIn(200) });
+      // Not counted: a BLOCKED undated lot, and one drained to zero.
+      await seed('P-B1', 'A-01', 3, { code: 'P-UND-BLK' });
+      const blockedId = (
+        (await sql`select id from batches where tenant_id = ${tenantId} and code = 'P-UND-BLK'`) as unknown as { id: string }[]
+      )[0]!.id;
+      await http()
+        .post(`${API}/${tenantId}/inventory/batches/${blockedId}/block`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ reason: 'recall' })
+        .expect(201);
+      // P-B2's only lot, drained to zero (the default draw takes it).
+      await seed('P-B2', 'A-01', 3, { code: 'P-UND-ZERO' });
+      await seed('P-B2', 'A-01', -3);
       const pol = await getPolicy(client('POL')).expect(200);
       expect(pol.body).toEqual({
         clientId: client('POL'),
@@ -540,6 +557,20 @@ describe('story 4-3a: client allocation rules (e2e)', () => {
       expect(denied.body.code).toBe('role-denied');
       await putPolicy('01900000-0000-7000-8000-00000000abcd', { allocationRule: 'fifo', minOutboundShelfLifeDays: null }).expect(404);
       await getPolicy('01900000-0000-7000-8000-00000000abcd').expect(404);
+      // A departed client's policy stays editable (a policy is not work).
+      const goneId = (
+        await http().post(`${API}/${tenantId}/clients`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid()).send({ code: 'GONE', name: 'Gone Brand' }).expect(201)
+      ).body.client.id as string;
+      await http()
+        .patch(`${API}/${tenantId}/clients/${goneId}/status`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ status: 'departed' })
+        .expect(200);
+      expect((await putPolicy(goneId, { allocationRule: 'fifo', minOutboundShelfLifeDays: 10 }).expect(200)).body.client).toMatchObject({
+        status: 'departed',
+        allocationPolicy: { allocationRule: 'fifo', minOutboundShelfLifeDays: 10 },
+      });
       const self = await putPolicy(selfClient, { allocationRule: 'fifo', minOutboundShelfLifeDays: 30 }).expect(200);
       expect(self.body.client.allocationPolicy).toEqual({ allocationRule: 'fifo', minOutboundShelfLifeDays: 30 });
       await putPolicy(selfClient, { allocationRule: 'fefo', minOutboundShelfLifeDays: null }).expect(200);
@@ -789,16 +820,25 @@ describe('story 4-3a: client allocation rules (e2e)', () => {
       try {
         // One row per statement: the second row is chunk 2.
         picklistLineInsertTuning.maxBindParams = 18;
+        const chunks: number[] = [];
+        picklistLineInsertTuning.onChunk = (rows) => chunks.push(rows);
         const res = await generate([orderId], await wavePolicy()).expect(409);
+        // Chunk 1 was inserted, and chunk 2 lost the claim.
+        expect(chunks).toEqual([1, 1]);
         expect(res.body.code).toBe('conflict');
         expect(await sql`select 1 from picklist_lines where tenant_id = ${tenantId} and order_id = ${orderId}`).toHaveLength(0);
       } finally {
         picklistLineInsertTuning.maxBindParams = 65_535;
+        picklistLineInsertTuning.onChunk = undefined;
         await sql`delete from picklist_lines where id = ${blockerId}`;
       }
       // With the claim gone the same order waves, in two chunks, both persisted.
       picklistLineInsertTuning.maxBindParams = 18;
+      const chunks: number[] = [];
+      picklistLineInsertTuning.onChunk = (rows) => chunks.push(rows);
       const ok = await generate([orderId], await wavePolicy()).expect(201);
+      picklistLineInsertTuning.onChunk = undefined;
+      expect(chunks).toEqual([1, 1]);
       expect(ok.body.wave.picklists[0].lines).toHaveLength(2);
     });
 
@@ -952,6 +992,21 @@ describe('story 4-3a: client allocation rules (e2e)', () => {
         { allocation_rule: 'fefo', min_outbound_shelf_life_days: null },
         { allocation_rule: 'fefo', min_outbound_shelf_life_days: null },
       ]);
+    });
+
+    it('A3 on the re-plan: planned yesterday, short-picked today, a lot with exactly 90 days left on the plan date (89 today) is re-planned', async () => {
+      await seed('M-RGRACE', 'C-01', 3, { code: 'RG-PLAN', expiryDate: expiresIn(300) });
+      batchExpiryClock.now = () => istTen(-1).getTime();
+      const orderId = await order([{ skuCode: 'M-RGRACE', quantity: 3 }]);
+      const [line] = linesOf(await wave([orderId], { at: istTen(-1) }));
+      expect(line).toMatchObject({ binCode: 'C-01', batchCode: 'RG-PLAN' });
+      // After the plan, A-01 receives a lot with exactly 90 days left on the plan date.
+      await seed('M-RGRACE', 'A-01', 3, { code: 'RG-EDGE', expiryDate: expiresIn(89) });
+      await sql`update picklists set created_at = ${istTen(-1).toISOString()} where id = ${line!.picklistId}`;
+      batchExpiryClock.now = () => Date.now();
+      const res = await pick(line!, { qty: 0, reasonCode: 'bin-empty' }).expect(201);
+      const replanned = res.body.pick.replanned as { binCode: string; batchId: string; qty: number }[];
+      expect(replanned.map((s) => `${s.binCode}:${s.qty}`)).toEqual(['A-01:3']);
     });
 
     it('a short pick on a frozen fifo / 90 line re-plans fifo, excludes short-life stock, and copies the columns', async () => {

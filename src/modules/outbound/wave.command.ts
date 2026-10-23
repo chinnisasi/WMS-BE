@@ -305,7 +305,7 @@ interface PlannedSlice {
  * → 3,640). The wave's order cap bounds orders, not rows (lines per order and
  * slices per line are unbounded). Mutable for the chunk-failure test only.
  */
-export const picklistLineInsertTuning = { maxBindParams: 65_535 };
+export const picklistLineInsertTuning: { maxBindParams: number; onChunk?: ((rows: number) => void) | undefined } = { maxBindParams: 65_535 };
 
 export function bindChunkRows(columnCount: number, maxBindParams = picklistLineInsertTuning.maxBindParams): number {
   return Math.max(1, Math.floor(maxBindParams / columnCount));
@@ -681,8 +681,10 @@ export class WaveCommandService {
         // plan back (nothing persists) and maps to `WaveClaimLostError`.
         const chunkRows = bindChunkRows(Object.keys(lineValues[0] ?? { id: null }).length);
         for (let start = 0; start < lineValues.length; start += chunkRows) {
+          const chunk = lineValues.slice(start, start + chunkRows);
+          picklistLineInsertTuning.onChunk?.(chunk.length);
           try {
-            await tx.insert(picklistLines).values(lineValues.slice(start, start + chunkRows));
+            await tx.insert(picklistLines).values(chunk);
           } catch (err) {
             if (isUniqueViolationOn(err, OPEN_ORDER_LINE_UNIQUE)) {
               // A concurrent generate claimed one of these orders first. This

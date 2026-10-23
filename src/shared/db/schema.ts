@@ -3416,7 +3416,7 @@ export const picklistLines = pgTable(
      * FROZEN at generate (and copied, or freshly stamped for a legacy line,
      * by a re-plan). The pick re-derives its batch with these, never with the
      * live policy. Both null on a pre-4-3a line, which draws as `fefo` with
-     * no minimum. The CHECKs (`picklist_lines_allocation_rule_check`,
+     * no minimum (the named batch first, like every line — A2). The CHECKs (`picklist_lines_allocation_rule_check`,
      * `picklist_lines_min_outbound_shelf_life_range`,
      * `picklist_lines_allocation_pairing`, all NOT VALID) live ONLY in
      * migration 0094.

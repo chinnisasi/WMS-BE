@@ -19,7 +19,8 @@
 --   * `allocation_rule text NULL` and `min_outbound_shelf_life_days integer
 --     NULL` — the policy a line was planned under, FROZEN (decision 7). No
 --     default: an existing line stays NULL, the legacy arm (drawn as `fefo`
---     with no minimum — today's in-bin FEFO draw).
+--     with no minimum: the named batch first, then in-bin FEFO — undated lots
+--     now tie-break on first receipt, not batch id; A2, A4).
 --   * the three CHECKs (range, vocabulary, pairing — A18) are NOT VALID (guide
 --     §3): a VALID add would scan the table under the ADD COLUMN's ACCESS
 --     EXCLUSIVE lock. NOT VALID still enforces every insert and update from

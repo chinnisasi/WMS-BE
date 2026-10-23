@@ -68,7 +68,8 @@ export class ClientsController {
     // (the api shell): the clients module must not import catalog.
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
     // Story 4-3a (A12) — the allocation read's `undatedBatchesOnHand`, composed
-    // here for the same reason (the clients module never imports inventory).
+    // here beside the catalog count: the clients module reaches inventory only
+    // for its departure blockers (`inventory/client-wind-down`), never its facade.
     @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
   ) {}
 

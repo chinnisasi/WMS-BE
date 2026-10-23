@@ -394,7 +394,8 @@ async function minOutboundShelfLifeOfSkuInTx(tx: TenantTx, tenantId: string, sku
 
 /**
  * Story 4-3a (A12) — distinct ACTIVE batches with NO expiry date and positive
- * `batch_on_hand`, of the client's SKUs, across warehouses: the allocation
+ * `batch_on_hand` outside the four subtracted system bins, of the client's
+ * SKUs, across warehouses: the allocation
  * panel's "the minimum cannot limit them" warning. The same locate-only
  * `batches` allowance as `unpromisableBatchUnits` (status, the null expiry,
  * the join key) — no write.
@@ -405,11 +406,21 @@ export async function undatedBatchesOnHandOfClientInTx(tx: TenantTx, tenantId: s
     .from(batchOnHand)
     .innerJoin(batches, and(eq(batches.tenantId, tenantId), eq(batches.id, batchOnHand.batchId)))
     .innerJoin(skus, and(eq(skus.tenantId, tenantId), eq(skus.id, batchOnHand.skuId)))
+    .innerJoin(bins, eq(bins.id, batchOnHand.binId))
     .where(
       and(
         eq(batchOnHand.tenantId, tenantId),
         gt(batchOnHand.quantity, 0),
         eq(skus.clientId, clientId),
+        // The stock the ATP hook judges: not in the four already-subtracted
+        // system bins (QC-HOLD, DAMAGED, RETURNS, IN-TRANSIT).
+        eq(bins.tenantId, tenantId),
+        not(
+          and(
+            eq(bins.systemOwned, true),
+            inArray(bins.code, [QC_HOLD_BIN_CODE, DAMAGED_BIN_CODE, RETURNS_BIN_CODE, IN_TRANSIT_BIN_CODE]),
+          )!,
+        ),
         eq(batches.status, 'active'),
         isNull(batches.expiryDate),
       ),

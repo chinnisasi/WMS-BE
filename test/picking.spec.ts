@@ -2225,6 +2225,13 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     expect(events[1]!.quantity_delta).toBe(-4);
     // 21 seeded − 7 drawn = 14: the mid lot's 6 and the blocked lot's 8.
     expect(await onHand(skuId, binJ)).toBe(14);
+    const remaining = (await sql`
+      select batch_id, quantity from batch_on_hand
+      where tenant_id = ${tenantId} and bin_id = ${binJ} and quantity > 0
+    `) as unknown as { batch_id: string; quantity: number }[];
+    expect(
+      Object.fromEntries(remaining.map((row) => [row.batch_id, fromMilli(Number(row.quantity))])),
+    ).toEqual({ [byCode.get(midCode)!]: 6, [byCode.get(laterCode)!]: 8 });
   });
 
   it('story 4-3a (A2): the pick draws the slice\'s NAMED batch first, even when an earlier-expiring lot arrived after the plan', async () => {

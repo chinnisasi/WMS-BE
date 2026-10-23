@@ -124,13 +124,19 @@ export function rankSlots<T extends RankableSlot>(
   rule: AllocationRule,
   factsOf: (batchId: string) => RankedBatchFacts | undefined,
 ): T[] {
-  const key = (slot: T): [number, number, number] => {
-    if (slot.batchId === null) return [2, 0, 0];
+  // An instant that does not parse ranks LAST in its class (never NaN — a
+  // NaN key would make the comparator inconsistent and the order undefined).
+  const instant = (value: string): number => {
+    const ms = Date.parse(value);
+    return Number.isNaN(ms) ? Number.POSITIVE_INFINITY : ms;
+  };
+  const key = (slot: T): [number, number] => {
+    if (slot.batchId === null) return [2, 0];
     const facts = factsOf(slot.batchId);
-    const received = facts === undefined ? Number.POSITIVE_INFINITY : Date.parse(facts.createdAt);
-    if (rule === 'fifo') return [0, received, 0];
-    if (facts !== undefined && facts.expiryDate !== null) return [0, Date.parse(facts.expiryDate), 0];
-    return [1, received, 0];
+    const received = facts === undefined ? Number.POSITIVE_INFINITY : instant(facts.createdAt);
+    if (rule === 'fifo') return [0, received];
+    if (facts !== undefined && facts.expiryDate !== null) return [0, instant(facts.expiryDate)];
+    return [1, received];
   };
   return [...slots]
     .map((slot) => ({ slot, k: key(slot) }))
