@@ -28,6 +28,7 @@ import {
 } from 'class-validator';
 import { SKU_STATUSES, type SkuStatus } from '../../shared/db/schema';
 import { IMPORT_MODES, GST_RATE_BPS_MAX } from './import.command';
+import { BATCH_BLOCK_NOTE_MAX, BATCH_BLOCK_REASONS, type BatchBlockReason } from './batch-block.command';
 // Story 12-1: the storage-class vocabulary — the DTO mirror of the shared
 // primitive's tuple (the three-layer pattern: TS tuple / DB CHECK / @IsIn).
 import { STORAGE_CLASSES } from '../../shared/primitives/storage-class';
@@ -1272,4 +1273,88 @@ export class KitListResponse {
 
   @ApiProperty({ type: String, nullable: true, description: 'Opaque keyset cursor' })
   nextCursor!: string | null;
+}
+// ── story 3-3a: block / unblock a batch ─────────────────────────────────────
+
+/** `POST …/inventory/batches/{batchId}/block` body. */
+export class BlockBatchDto {
+  @ApiProperty({
+    enum: [...BATCH_BLOCK_REASONS],
+    description: 'Why the lot is blocked — `other` requires a note',
+  })
+  @IsIn(BATCH_BLOCK_REASONS)
+  reason!: BatchBlockReason;
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    type: String,
+    maxLength: BATCH_BLOCK_NOTE_MAX,
+    description: `What happened — trimmed, at most ${BATCH_BLOCK_NOTE_MAX} characters; required when reason is \`other\``,
+  })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsString()
+  // The 500-code-point rule is the command's (trimmed); this edge cap (UTF-16
+  // units) only bounds the body — the SKU status shape.
+  @MaxLength(2000)
+  note?: string | null;
+}
+
+/** `POST …/inventory/batches/{batchId}/unblock` body — lifting a block always says why (A8). */
+export class UnblockBatchDto {
+  @ApiProperty({
+    type: String,
+    minLength: 1,
+    maxLength: BATCH_BLOCK_NOTE_MAX,
+    description: `Why the block is lifted — required, trimmed, 1–${BATCH_BLOCK_NOTE_MAX} characters`,
+  })
+  @IsString()
+  @MaxLength(2000)
+  note!: string;
+}
+
+/** A batch's identity and lifecycle facts (story 3-3a) — the block verbs' answer. */
+export class BatchLifecycleDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty({ description: 'Batch code (unique per tenant + SKU)' })
+  code!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Manufacturing date (ISO-8601 UTC), null when unrecorded' })
+  mfgDate!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Expiry instant (ISO-8601 UTC — the IST midnight beginning the label date), null when unrecorded' })
+  expiryDate!: string | null;
+
+  @ApiProperty({ enum: ['active', 'blocked'], description: '`blocked` — on hand but never promised or default-drawn, in every warehouse' })
+  status!: 'active' | 'blocked';
+
+  @ApiProperty({ type: String, nullable: true, enum: [...BATCH_BLOCK_REASONS, null], description: 'Why it is blocked — null unless blocked' })
+  blockedReason!: BatchBlockReason | null;
+
+  @ApiProperty({ type: String, nullable: true, description: "The block's note (always present with reason `other`) — null when none was given or not blocked" })
+  blockedNote!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'When it was blocked (ISO-8601 UTC) — null unless blocked' })
+  blockedAt!: string | null;
+
+  @ApiProperty({ type: String, format: 'uuid', nullable: true, description: 'Who blocked it — null unless blocked' })
+  blockedBy!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: "The blocker's display name (the member's email handle) — null unless blocked" })
+  blockedByName!: string | null;
+
+  @ApiProperty({ description: 'The server judged the batch past its expiry instant — expired stock is on hand but never promised or default-drawn (blocked or not)' })
+  expired!: boolean;
+}
+
+/** The block / unblock response. */
+export class BatchBlockResponse {
+  @ApiProperty({ type: BatchLifecycleDto })
+  batch!: BatchLifecycleDto;
 }

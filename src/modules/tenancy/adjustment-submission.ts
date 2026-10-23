@@ -3,8 +3,10 @@ import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import { assertUtcIso } from '../../shared/primitives/time';
+import { batchExpiryClock, isBatchExpiredAt } from '../../shared/primitives/batch-expiry';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { CatalogFacade } from '../catalog/catalog.facade';
+import type { BatchResolvedBy } from '../../shared/db/schema';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import type {
   AdjustStockBatch,
@@ -156,10 +158,10 @@ export class AdjustmentSubmission {
     }
 
     // ── 4. composition ────────────────────────────────────────────────────
-    const { batchRef, serialRefs } = await this.composeBatchSerialArms(input, arms, sku);
+    const { batchRef, serialRefs, batchResolvedBy } = await this.composeBatchSerialArms(input, arms, sku);
 
     // ── 5. the command ────────────────────────────────────────────────────
-    const result = await this.inventory.adjustStock({ ...command, batchRef, serialRefs }, idempotencyKey);
+    const result = await this.inventory.adjustStock({ ...command, batchRef, serialRefs, batchResolvedBy }, idempotencyKey);
     return result.kind === 'pending' ? { ...result, pending: withPendReason(result.pending) } : result;
   }
 
@@ -178,7 +180,7 @@ export class AdjustmentSubmission {
     input: Pick<AdjustmentSubmissionInput, 'tenantId' | 'warehouseId' | 'skuId' | 'binId' | 'quantityDelta'>,
     arms: { batch: AdjustStockBatch | undefined; serials: string[] | undefined },
     sku: { batchTracked: boolean; serialTracked: boolean } | null,
-  ): Promise<{ batchRef: string | null; serialRefs: string[] | undefined }> {
+  ): Promise<{ batchRef: string | null; serialRefs: string[] | undefined; batchResolvedBy: BatchResolvedBy | null }> {
     const batch = arms.batch;
     const serials = arms.serials;
     const hasBatch = batch !== undefined;
@@ -188,7 +190,7 @@ export class AdjustmentSubmission {
       // actually tracks neither arm (a read; no identity rows are touched).
       // A tracked SKU without its arm falls through to the 400s below.
       if (sku === null || (!sku.batchTracked && !sku.serialTracked)) {
-        return { batchRef: null, serialRefs: undefined };
+        return { batchRef: null, serialRefs: undefined, batchResolvedBy: null };
       }
     } else if (sku === null) {
       // An unknown SKU with the new fields is 404 here (with no fields the
@@ -198,6 +200,11 @@ export class AdjustmentSubmission {
 
     let batchRef: string | null = null;
     let serialRefs: string[] | undefined;
+    // Story 3-3a (code review) — how the batch was resolved, stored on a pend
+    // so the approval re-runs the FEFO draw checks only on a FEFO default
+    // (`batch_override_reason` cannot tell: the web may name a batch with a
+    // null reason).
+    let batchResolvedBy: BatchResolvedBy | null = null;
 
     if (hasBatch) {
       if (!sku!.batchTracked) {
@@ -268,6 +275,7 @@ export class AdjustmentSubmission {
           { code: batch!.code, mfgDate: batch!.mfgDate, expiryDate: batch!.expiryDate },
         ]);
         batchRef = ensured!.id;
+        batchResolvedBy = 'explicit';
       } else {
         // Explicit draw = FEFO override: the reason is required and recorded
         // in the ledger reference doc (the hash chain is the audit log).
@@ -286,6 +294,7 @@ export class AdjustmentSubmission {
           throw new ProblemException('not-found', 404, 'Batch not found', `No batch with code "${batch!.code}" exists for this SKU.`);
         }
         batchRef = found.id;
+        batchResolvedBy = 'explicit';
         await this.assertBatchCoversDraw(input, found.id, batch!.code);
       }
     } else if (sku!.batchTracked && input.quantityDelta < 0) {
@@ -293,6 +302,7 @@ export class AdjustmentSubmission {
       // in the bin, expiry ASC nulls-last — expired batches are never
       // default-drawn. Judged against the SERVER clock at receipt (A10).
       batchRef = await this.resolveFefoBatch(input);
+      batchResolvedBy = 'fefo';
     } else if (sku!.batchTracked) {
       // Batch-tracked intake without the batch arm: identity cannot be
       // ensured and the ledger's batch fold cannot key — reject.
@@ -312,7 +322,7 @@ export class AdjustmentSubmission {
       );
     }
 
-    return { batchRef, serialRefs };
+    return { batchRef, serialRefs, batchResolvedBy };
   }
 
   /**
@@ -349,12 +359,20 @@ export class AdjustmentSubmission {
       this.catalog.getBatches(input.tenantId, input.skuId),
     ]);
     const byId = new Map(batches.map((batch) => [batch.id, batch]));
-    const now = Date.now();
+    // Story 3-3a — the promise side's clock (`batchExpiryClock`, the server
+    // clock unless a suite moves it), so the default draw and ATP agree.
+    const now = batchExpiryClock.now();
     const candidates: { batchId: string; expiry: string | null }[] = onHand
       .filter((row: BatchOnHandEntry) => row.quantity > 0 && byId.has(row.batchId))
+      // Story 3-3a (decision 9) — a BLOCKED batch is never default-drawn
+      // either (the wave and pick draw already skip it). An explicit batch on
+      // a negative adjustment still draws it, so blocked stock can be
+      // written off.
+      .filter((row) => byId.get(row.batchId)!.status === 'active')
       .map((row) => ({ batchId: row.batchId, expiry: byId.get(row.batchId)!.expiryDate }))
-      // Expired batches are never default-drawn (null expiry never expires).
-      .filter((candidate) => candidate.expiry === null || Date.parse(candidate.expiry) >= now)
+      // Expired batches are never default-drawn (null expiry never expires) —
+      // story 3-3a (A3): the ONE shared expiry predicate.
+      .filter((candidate) => !isBatchExpiredAt(candidate.expiry, now))
       // FEFO: expiry ASC, nulls LAST (a batch without expiry is drawn last).
       .sort((a, b) => {
         if (a.expiry === null) return b.expiry === null ? 0 : 1;
@@ -366,7 +384,7 @@ export class AdjustmentSubmission {
         'insufficient-on-hand',
         422,
         'No batch to draw',
-        `Bin "${input.binId}" holds no non-expired batch stock of this SKU — name a batch explicitly (with an override reason) to draw.`,
+        `Bin "${input.binId}" holds no non-expired, unblocked batch stock of this SKU — name a batch explicitly (with an override reason) to draw.`,
       );
     }
     return candidates[0]!.batchId;

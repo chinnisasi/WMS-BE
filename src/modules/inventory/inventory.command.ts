@@ -10,7 +10,7 @@ import {
   stockAdjustmentPendings,
   stockAdjustmentPolicies,
 } from '../../shared/db/schema';
-import type { AdjustmentPendReason } from '../../shared/db/schema';
+import type { AdjustmentPendReason, BatchResolvedBy } from '../../shared/db/schema';
 import {
   QUANTITY_SCALE,
   assertRecordableQuantity,
@@ -124,6 +124,13 @@ export interface AdjustStockCommand {
    * api layer (catalog owns batch identity, AD-6). Null/omitted = no batch arm.
    */
   readonly batchRef?: string | null | undefined;
+  /**
+   * Story 3-3a — how `batchRef` was resolved (`fefo` default / `explicit`),
+   * stored on a pend (`batch_resolved_by`) so the approval knows whether to
+   * re-run the FEFO draw checks. Never hashed (the fingerprint is over the
+   * raw request arms); omitted by callers that compose no batch.
+   */
+  readonly batchResolvedBy?: BatchResolvedBy | null | undefined;
   /**
    * The resolved serial identities (catalog `serials.id`), same order as
    * `serials`. Present only on serial-tracked movements: the command emits
@@ -621,6 +628,8 @@ export class StockAdjustmentCommand {
             // not survive; only this reason does).
             batchOverrideReason: command.batch?.overrideReason ?? null,
             batchId: command.batchRef ?? null,
+            // Story 3-3a — null without a batch (the 0092 CHECK pairs them).
+            batchResolvedBy: (command.batchRef ?? null) === null ? null : (command.batchResolvedBy ?? null),
             serialIds: serialRefs.length > 0 ? [...serialRefs] : null,
             handlingUnitIds: handlingUnitIds.length > 0 ? [...handlingUnitIds] : null,
             occurredAt,

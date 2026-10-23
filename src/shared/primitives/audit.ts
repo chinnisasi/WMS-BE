@@ -48,6 +48,8 @@ export const AUDIT_TARGET_TYPES = [
   'asn_import',
   // Story 9-3b — the async audit export (`audit_export.requested`).
   'audit_export',
+  // Story 3-3a — a batch (lot) blocked or unblocked (`batch.blocked | batch.unblocked`).
+  'batch',
   'batch_alert',
   'bin',
   // Story 3-1 — a bin-to-bin move (`stock.moved`; `targetId` = the moveId on
@@ -228,6 +230,11 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'qc_hold.receipt_released', targetType: 'goods_receipt' },
   // Story 2-8a — the QC inspection outcome closes one hold (`QcCommand.inspectHold`).
   { action: 'qc_hold.inspected', targetType: 'qc_hold' },
+  // Story 3-3a — the batch block verb (catalog's `BatchBlockCommand`); each
+  // row's `changes` carries the before/after status, reason and note, so the
+  // history survives the unblock clearing the row.
+  { action: 'batch.blocked', targetType: 'batch' },
+  { action: 'batch.unblocked', targetType: 'batch' },
   // Story 1-3 — the business partner master (`PartnersCommand`). The Story
   // 3.1 `vendor.created` audit action left the registry with it (the outbox
   // event of that name stays).

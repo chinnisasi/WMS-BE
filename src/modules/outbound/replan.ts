@@ -6,6 +6,7 @@ import type { CatalogFacade } from '../catalog/catalog.facade';
 // Story 12-1 — the ONE conformance predicate (the temperature hierarchy),
 // shared with putaway, pick and the class-edit guards.
 import { storageClassSatisfies } from '../../shared/primitives/storage-class';
+import { isBatchExpiredAt } from '../../shared/primitives/batch-expiry';
 
 /**
  * Story 4.4 — "where else is this SKU?".
@@ -95,7 +96,9 @@ export function buildStockPool(input: StockPoolInput): Map<string, StockSlot[]> 
       // identity the catalog does not know is not suggestible either.
       return false;
     }
-    return batch.expiryDate === null || Date.parse(batch.expiryDate) >= input.at;
+    // Story 3-3a (A3) — the ONE shared expiry predicate (the promise side's
+    // `unpromisableBatchUnits` reads it too, so promise and draw agree).
+    return !isBatchExpiredAt(batch.expiryDate, input.at);
   };
   const expiryOf = (batchId: string): string | null => batchById.get(batchId)?.expiryDate ?? null;
 

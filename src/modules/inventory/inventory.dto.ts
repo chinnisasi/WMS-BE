@@ -28,7 +28,7 @@ import {
   LEDGER_CHAIN_BREAK_DETECTORS,
   LEDGER_CHAIN_BREAK_KINDS,
 } from '../../shared/db/schema';
-import { ADJUSTMENT_PEND_REASONS } from '../../shared/db/schema';
+import { ADJUSTMENT_PEND_REASONS, BATCH_BLOCK_REASONS, type BatchBlockReason } from '../../shared/db/schema';
 import type { AdjustmentPendReason } from '../../shared/db/schema';
 import { ADJUSTMENT_REASON_CODES } from './adjustment-reason';
 import { IsInstant, BooleanFlag, RepeatableParam } from '../../shared/primitives/instant-range';
@@ -764,8 +764,26 @@ export class BatchListItemDto {
   @ApiProperty({ type: String, nullable: true, description: 'Expiry date (ISO-8601 UTC), null when unrecorded — orders last (FEFO)' })
   expiryDate!: string | null;
 
-  @ApiProperty({ description: 'Batch lifecycle status (active today)' })
-  status!: string;
+  @ApiProperty({ enum: ['active', 'blocked'], description: 'Batch lifecycle status — `blocked` (story 3-3a) is on hand but never promised or default-drawn, in every warehouse' })
+  status!: 'active' | 'blocked';
+
+  @ApiProperty({ type: String, nullable: true, enum: [...BATCH_BLOCK_REASONS, null], description: 'Story 3-3a — why the batch is blocked; null unless blocked' })
+  blockedReason!: BatchBlockReason | null;
+
+  @ApiProperty({ type: String, nullable: true, description: "Story 3-3a — the block's note; null when none was given or not blocked" })
+  blockedNote!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Story 3-3a — when it was blocked (ISO-8601 UTC); null unless blocked' })
+  blockedAt!: string | null;
+
+  @ApiProperty({ type: String, format: 'uuid', nullable: true, description: 'Story 3-3a — who blocked it; null unless blocked' })
+  blockedBy!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: "Story 3-3a — the blocker's display name (the member's email handle); null unless blocked" })
+  blockedByName!: string | null;
+
+  @ApiProperty({ description: 'Story 3-3a — the server judged the batch past its expiry instant: on hand, but never promised (ATP) or default-drawn' })
+  expired!: boolean;
 
   @ApiProperty({ description: 'On-hand of this batch in the queried warehouse (the bin filter applied; 0 when none)' })
   quantity!: number;
@@ -842,8 +860,26 @@ export class BatchDetailResponse {
   @ApiProperty({ type: String, nullable: true, description: 'Expiry date (ISO-8601 UTC), null when unrecorded' })
   expiryDate!: string | null;
 
-  @ApiProperty({ description: 'Batch lifecycle status (active today)' })
-  status!: string;
+  @ApiProperty({ enum: ['active', 'blocked'], description: 'Batch lifecycle status — `blocked` (story 3-3a) is on hand but never promised or default-drawn, in every warehouse' })
+  status!: 'active' | 'blocked';
+
+  @ApiProperty({ type: String, nullable: true, enum: [...BATCH_BLOCK_REASONS, null], description: 'Story 3-3a — why the batch is blocked; null unless blocked' })
+  blockedReason!: BatchBlockReason | null;
+
+  @ApiProperty({ type: String, nullable: true, description: "Story 3-3a — the block's note; null when none was given or not blocked" })
+  blockedNote!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Story 3-3a — when it was blocked (ISO-8601 UTC); null unless blocked' })
+  blockedAt!: string | null;
+
+  @ApiProperty({ type: String, format: 'uuid', nullable: true, description: 'Story 3-3a — who blocked it; null unless blocked' })
+  blockedBy!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: "Story 3-3a — the blocker's display name (the member's email handle); null unless blocked" })
+  blockedByName!: string | null;
+
+  @ApiProperty({ description: 'Story 3-3a — the server judged the batch past its expiry instant: on hand, but never promised (ATP) or default-drawn' })
+  expired!: boolean;
 
   @ApiProperty({ type: [BatchBinOnHandDto], description: 'Per-bin on-hand rows across every warehouse of the tenant' })
   bins!: readonly BatchBinOnHandDto[];

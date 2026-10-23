@@ -6972,7 +6972,7 @@
             }
           },
           "409": {
-            "description": "Already approved/rejected (adjustment-pending-decided), a kit SKU since the pend (kit-cannot-hold-stock), a concurrent idempotent request (conflict), or the world moved since the pend and the re-execution hit a guard whose 409 applies (e.g. a handling unit no longer active)",
+            "description": "Already approved/rejected (adjustment-pending-decided), a kit SKU since the pend (kit-cannot-hold-stock), a concurrent idempotent request (conflict), the FEFO-default batch the pend resolved has since been blocked or has expired (batch-blocked / batch-expired — story 3-3a), or the world moved since the pend and the re-execution hit a guard whose 409 applies (e.g. a handling unit no longer active)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8106,6 +8106,264 @@
           }
         ],
         "summary": "One batch's detail — catalog identity, per-bin on-hand across the tenant, and its full movement history (one query)",
+        "tags": [
+          "inventory"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inventory/batches/{batchId}/block": {
+      "post": {
+        "operationId": "InventoryController_blockBatch",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "batchId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BlockBatchDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchBlockResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a reason outside the vocabulary, reason `other` without a note, or a note over 500 characters (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks qc.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No batch with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The batch is already blocked (batch-already-blocked), or a concurrent request on the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Blocks a batch (a lot) in every warehouse, with a reason (qc.manage — owner, ops manager): its units stay on hand but are never promised (ATP, the grant ceiling, channel quantities, replenishment) and never default-drawn. Reservations already granted stand; those lines short at the wave. Story 3-3a",
+        "tags": [
+          "inventory"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inventory/batches/{batchId}/unblock": {
+      "post": {
+        "operationId": "InventoryController_unblockBatch",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "batchId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UnblockBatchDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchBlockResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a missing, blank or over-500-character note (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks qc.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No batch with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The batch is not blocked (batch-not-blocked), or a concurrent request on the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Unblocks a batch (qc.manage), with a required note: its unexpired units are promisable again. An unblocked batch past its expiry stays unpromisable (the response says `expired: true`). Story 3-3a",
         "tags": [
           "inventory"
         ]
@@ -23707,6 +23965,7 @@
                 "advance_shipment_notice",
                 "asn_import",
                 "audit_export",
+                "batch",
                 "batch_alert",
                 "bin",
                 "bin_move",
@@ -36554,7 +36813,50 @@
           },
           "status": {
             "type": "string",
-            "description": "Batch lifecycle status (active today)"
+            "enum": [
+              "active",
+              "blocked"
+            ],
+            "description": "Batch lifecycle status — `blocked` (story 3-3a) is on hand but never promised or default-drawn, in every warehouse"
+          },
+          "blockedReason": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "recall",
+              "qc-failed",
+              "contamination",
+              "client-instruction",
+              "expiry-review",
+              "other",
+              null
+            ],
+            "description": "Story 3-3a — why the batch is blocked; null unless blocked"
+          },
+          "blockedNote": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 3-3a — the block's note; null when none was given or not blocked"
+          },
+          "blockedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 3-3a — when it was blocked (ISO-8601 UTC); null unless blocked"
+          },
+          "blockedBy": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 3-3a — who blocked it; null unless blocked"
+          },
+          "blockedByName": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 3-3a — the blocker's display name (the member's email handle); null unless blocked"
+          },
+          "expired": {
+            "type": "boolean",
+            "description": "Story 3-3a — the server judged the batch past its expiry instant: on hand, but never promised (ATP) or default-drawn"
           },
           "quantity": {
             "type": "number",
@@ -36567,6 +36869,12 @@
           "mfgDate",
           "expiryDate",
           "status",
+          "blockedReason",
+          "blockedNote",
+          "blockedAt",
+          "blockedBy",
+          "blockedByName",
+          "expired",
           "quantity"
         ]
       },
@@ -36699,7 +37007,50 @@
           },
           "status": {
             "type": "string",
-            "description": "Batch lifecycle status (active today)"
+            "enum": [
+              "active",
+              "blocked"
+            ],
+            "description": "Batch lifecycle status — `blocked` (story 3-3a) is on hand but never promised or default-drawn, in every warehouse"
+          },
+          "blockedReason": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "recall",
+              "qc-failed",
+              "contamination",
+              "client-instruction",
+              "expiry-review",
+              "other",
+              null
+            ],
+            "description": "Story 3-3a — why the batch is blocked; null unless blocked"
+          },
+          "blockedNote": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 3-3a — the block's note; null when none was given or not blocked"
+          },
+          "blockedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 3-3a — when it was blocked (ISO-8601 UTC); null unless blocked"
+          },
+          "blockedBy": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 3-3a — who blocked it; null unless blocked"
+          },
+          "blockedByName": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 3-3a — the blocker's display name (the member's email handle); null unless blocked"
+          },
+          "expired": {
+            "type": "boolean",
+            "description": "Story 3-3a — the server judged the batch past its expiry instant: on hand, but never promised (ATP) or default-drawn"
           },
           "bins": {
             "description": "Per-bin on-hand rows across every warehouse of the tenant",
@@ -36723,8 +37074,153 @@
           "mfgDate",
           "expiryDate",
           "status",
+          "blockedReason",
+          "blockedNote",
+          "blockedAt",
+          "blockedBy",
+          "blockedByName",
+          "expired",
           "bins",
           "history"
+        ]
+      },
+      "BlockBatchDto": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "enum": [
+              "recall",
+              "qc-failed",
+              "contamination",
+              "client-instruction",
+              "expiry-review",
+              "other"
+            ],
+            "description": "Why the lot is blocked — `other` requires a note"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 500,
+            "description": "What happened — trimmed, at most 500 characters; required when reason is `other`"
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "BatchLifecycleDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "description": "Batch code (unique per tenant + SKU)"
+          },
+          "mfgDate": {
+            "type": "string",
+            "nullable": true,
+            "description": "Manufacturing date (ISO-8601 UTC), null when unrecorded"
+          },
+          "expiryDate": {
+            "type": "string",
+            "nullable": true,
+            "description": "Expiry instant (ISO-8601 UTC — the IST midnight beginning the label date), null when unrecorded"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "blocked"
+            ],
+            "description": "`blocked` — on hand but never promised or default-drawn, in every warehouse"
+          },
+          "blockedReason": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "recall",
+              "qc-failed",
+              "contamination",
+              "client-instruction",
+              "expiry-review",
+              "other",
+              null
+            ],
+            "description": "Why it is blocked — null unless blocked"
+          },
+          "blockedNote": {
+            "type": "string",
+            "nullable": true,
+            "description": "The block's note (always present with reason `other`) — null when none was given or not blocked"
+          },
+          "blockedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "When it was blocked (ISO-8601 UTC) — null unless blocked"
+          },
+          "blockedBy": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Who blocked it — null unless blocked"
+          },
+          "blockedByName": {
+            "type": "string",
+            "nullable": true,
+            "description": "The blocker's display name (the member's email handle) — null unless blocked"
+          },
+          "expired": {
+            "type": "boolean",
+            "description": "The server judged the batch past its expiry instant — expired stock is on hand but never promised or default-drawn (blocked or not)"
+          }
+        },
+        "required": [
+          "id",
+          "skuId",
+          "code",
+          "mfgDate",
+          "expiryDate",
+          "status",
+          "blockedReason",
+          "blockedNote",
+          "blockedAt",
+          "blockedBy",
+          "blockedByName",
+          "expired"
+        ]
+      },
+      "BatchBlockResponse": {
+        "type": "object",
+        "properties": {
+          "batch": {
+            "$ref": "#/components/schemas/BatchLifecycleDto"
+          }
+        },
+        "required": [
+          "batch"
+        ]
+      },
+      "UnblockBatchDto": {
+        "type": "object",
+        "properties": {
+          "note": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "description": "Why the block is lifted — required, trimmed, 1–500 characters"
+          }
+        },
+        "required": [
+          "note"
         ]
       },
       "SerialLocationDto": {
@@ -50001,6 +50497,7 @@
               "advance_shipment_notice",
               "asn_import",
               "audit_export",
+              "batch",
               "batch_alert",
               "bin",
               "bin_move",
@@ -50094,6 +50591,7 @@
               "advance_shipment_notice",
               "asn_import",
               "audit_export",
+              "batch",
               "batch_alert",
               "bin",
               "bin_move",

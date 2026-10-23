@@ -151,6 +151,8 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
   const BATCH_SKU_CODE = 'PCK-FEFO';
   /** 4.3b: the batch-arm shortfall, routed by the epoch to 409 or 422. */
   const BATCH_SHORT_SKU_CODE = 'PCK-FEFO3';
+  /** 3-3a (A4): a short pick's regrant against a ceiling a blocked lot lowered. */
+  const BATCH_BLOCK_SKU_CODE = 'PCK-FEFO-BLK';
   /** Its own batch-tracked SKU: the two-arm draw must be the only claim on its bins. */
   const BATCH_SPAN_SKU_CODE = 'PCK-FEFO2';
   const SERIAL_SKU_CODE = 'PCK-SERIAL';
@@ -213,6 +215,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
       `${BATCH_SKU_CODE},Pick SKU ${BATCH_SKU_CODE},pcs,,1800,,true,false,,,`,
       `${BATCH_SPAN_SKU_CODE},Pick SKU ${BATCH_SPAN_SKU_CODE},pcs,,1800,,true,false,,,`,
       `${BATCH_SHORT_SKU_CODE},Pick SKU ${BATCH_SHORT_SKU_CODE},pcs,,1800,,true,false,,,`,
+      `${BATCH_BLOCK_SKU_CODE},Pick SKU ${BATCH_BLOCK_SKU_CODE},pcs,,1800,,true,false,,,`,
       `${SERIAL_SKU_CODE},Pick SKU ${SERIAL_SKU_CODE},pcs,,1800,,false,true,,,`,
       `${SERIAL_SHORT_SKU_CODE},Pick SKU ${SERIAL_SHORT_SKU_CODE},pcs,,1800,,false,true,,,`,
     ].join('\n');
@@ -391,6 +394,18 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
         note: 'picking-suite seed',
         ...extra,
       })
+      .expect(201);
+  }
+
+  /** Story 3-3a — blocks a batch (by code, tenant-wide) through the block verb. */
+  async function blockBatchByCode(code: string): Promise<void> {
+    const rows = (await sql`select id from batches where tenant_id = ${tenantId} and code = ${code}`) as unknown as { id: string }[];
+    expect(rows).toHaveLength(1);
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/inventory/batches/${rows[0]!.id}/block`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ reason: 'recall' })
       .expect(201);
   }
 
@@ -1081,7 +1096,9 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
 
     // A blocked batch is never drawn (epic-2 retro a13's draw side). The bin
     // still HOLDS the units — only the drawable pool is empty.
-    await sql`update batches set status = 'blocked' where tenant_id = ${tenantId} and code = ${batchCode}`;
+    // Story 3-3a: through the block verb (the 0092 pairing CHECK refuses a
+    // bare status flip) — the semantics under test are unchanged.
+    await blockBatchByCode(batchCode);
     expect(await onHand(skuId, binF)).toBe(5);
 
     // No epoch movement: the pre-4.3b outcome, unchanged.
@@ -1519,6 +1536,38 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     expect(after.onHand).toBe(0);
     expect(after.journal).toBe(0);
     expect(after.counter).toBe(after.journal);
+  });
+
+  it('story 3-3a (A4): a short pick whose remainder only a BLOCKED lot could cover is the partial-order path — the regrant is refused like any stock loss', async () => {
+    const skuId = sku(BATCH_BLOCK_SKU_CODE);
+    const binX = await createBin('A-77-01');
+    const binY = await createBin('A-77-02');
+    const far = new Date(Date.now() + 400 * 86_400_000).toISOString();
+    await seedStock(skuId, binX, 5, { batch: { code: 'BLK-PICK-1', expiryDate: far } });
+    await seedStock(skuId, binY, 10, { batch: { code: 'BLK-PICK-2', expiryDate: far } });
+    const { picklist } = await releasedWave([{ skuId, quantity: 5 }], 'short-blocked');
+    const line = picklist.lines[0]!;
+    expect(line.binId).toBe(binX);
+    // The lot in the alternate bin is blocked AFTER the order reserved (its
+    // hold stands), and X really drained while the op sat in the queue.
+    await blockBatchByCode('BLK-PICK-2');
+    await drainStock(skuId, binX, 3);
+    expect((await atpFacts(skuId)).atp).toBe(0);
+
+    // Without the block the remainder of 3 would re-plan onto Y (the 4.4
+    // re-plan test above); the blocked lot lowers the ceiling to 0, so the
+    // regrant refuses and the line takes the partial-order path.
+    const res = await pick(bodyFor(line, { qty: 2, reasonCode: 'bin-empty' })).expect(201);
+    expect(res.body.pick.reservationReleased).toBe(true);
+    expect(res.body.pick.replanReservationId).toBeNull();
+    expect(res.body.pick.replanned).toEqual([]);
+    expect(await reservationState(line.reservationId!)).toBe('released');
+    expect(await lineStatus(line.id)).toBe('short');
+    const after = await atpFacts(skuId);
+    expect(after.onHand).toBe(10);
+    expect(after.journal).toBe(0);
+    expect(after.counter).toBe(after.journal);
+    expect(after.atp).toBe(0);
   });
 
   it('a zero-unit short pick writes no ledger event and no picks row, and still carries the reason and the whole shortfall', async () => {

@@ -451,6 +451,32 @@ describe('architecture: catalog identity is catalog-module-owned (story 10.3)', 
     expect(drizzleWriteOn('skus').test(importCommand)).toBe(true);
   });
 
+  it('story 3-3a: inventory reads catalog `batches` in ONE file, locate-only (status + expiry), and the block verb writes them', () => {
+    // The unpromisable-batch ATP hook (`unpromisableBatchUnits`) and the
+    // approval's blocked-batch re-check (`batchBlockedInTx`) read catalog's
+    // `batches` beside inventory's own `batch_on_hand` — the "locate only"
+    // allowance the system-bin hooks take on tenancy's `bins`. It is narrow:
+    // ONE inventory file, the join key, the lifecycle flag and the expiry —
+    // nothing else — and never a write (the catalog block above).
+    const inventoryRoot = join(SRC_ROOT, 'modules', 'inventory');
+    const ALLOWED = join(inventoryRoot, 'reservation.service.ts');
+    const importsBatches = /import\s*\{[^}]*\bbatches\b[^}]*\}\s*from\s*['"][^'"]*shared\/db\/schema['"]/;
+    const rawBatches = /\b(from|join)\s+"?batches"?\b/i;
+    const readers = files.filter(
+      (file) => file.path.startsWith(inventoryRoot) && (importsBatches.test(file.source) || rawBatches.test(file.source)),
+    );
+    expect(readers.map((file) => file.path)).toEqual([ALLOWED]);
+    const allowed = readers[0]!.source;
+    expect(rawBatches.test(allowed)).toBe(false);
+    const columns = new Set([...allowed.matchAll(/\bbatches\.(\w+)/g)].map((match) => match[1]!));
+    expect([...columns].sort()).toEqual(['expiryDate', 'id', 'status', 'tenantId']);
+    expect(drizzleWriteOn('batches').test(allowed)).toBe(false);
+    expect(allowed).toContain('export async function unpromisableBatchUnits(');
+    // The writer of the lifecycle columns is catalog's block command.
+    const command = readFileSync(join(catalogRoot, 'batch-block.command.ts'), 'utf8');
+    expect(drizzleWriteOn('batches').test(command)).toBe(true);
+  });
+
   it('handling units have exactly ONE writer, and every transition goes through it (story 10.3)', () => {
     // The `ensureSerials` seam, made mechanical. FOUR transitions — create at
     // receipt, settle an over-receipt intake, pack, adjust away — reached from

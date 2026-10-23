@@ -49,6 +49,7 @@ import {
 } from '../../shared/primitives/storage-class';
 import { ORDER_OWNER_TYPE, ORDER_RESERVATION_TTL_SECONDS } from './order.command';
 import type { OrderStatus } from './order.command';
+import { isBatchExpiredAt } from '../../shared/primitives/batch-expiry';
 
 /**
  * The fixed short-pick reason enum (story 4.4): required on EVERY short pick,
@@ -1552,7 +1553,8 @@ export class PickCommandService {
       .filter((row) => {
         const batch = byId.get(row.batchId);
         if (batch === undefined || batch.status !== 'active') return false;
-        return batch.expiryDate === null || Date.parse(batch.expiryDate) >= at;
+        // Story 3-3a (A3) — the ONE shared expiry predicate.
+        return !isBatchExpiredAt(batch.expiryDate, at);
       })
       .sort((a, b) => {
         const left = byId.get(a.batchId)?.expiryDate ?? null;

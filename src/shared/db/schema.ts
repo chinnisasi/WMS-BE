@@ -1132,6 +1132,26 @@ export const kitCompositions = pgTable(
 
 export type KitComposition = typeof kitCompositions.$inferSelect;
 
+/** Story 3-3a — how a pend's batch was resolved (`stock_adjustment_pendings_batch_resolved_by_check`, 0092). */
+export const BATCH_RESOLVED_BY = ['fefo', 'explicit'] as const;
+export type BatchResolvedBy = (typeof BATCH_RESOLVED_BY)[number];
+
+/**
+ * Story 3-3a (decision 4) — why a batch is blocked. A closed vocabulary, the
+ * three mirrored layers (guide §4): this tuple, the `batches_blocked_pairing`
+ * CHECK (0092) and the DTOs' `@IsIn` / enum over the same tuple; pinned TS ↔
+ * DB by test/batch-block.spec.ts. `other` requires a note (the command).
+ */
+export const BATCH_BLOCK_REASONS = [
+  'recall',
+  'qc-failed',
+  'contamination',
+  'client-instruction',
+  'expiry-review',
+  'other',
+] as const;
+export type BatchBlockReason = (typeof BATCH_BLOCK_REASONS)[number];
+
 /**
  * Batch identity (Story 2.4 — catalog-owned, beside `skus`): one row per
  * (tenant, sku, code) batch of a batch-tracked SKU, carrying the intake
@@ -1158,6 +1178,18 @@ export const batches = pgTable(
     mfgDate: timestamp('mfg_date', { withTimezone: true, mode: 'string' }),
     expiryDate: timestamp('expiry_date', { withTimezone: true, mode: 'string' }),
     status: text('status').notNull().default('active'),
+    /**
+     * Story 3-3a — why, when and by whom the batch was blocked (a recall, a
+     * failed QC …). Set together exactly while `status = 'blocked'` and
+     * cleared together by the unblock (with `blocked_note`) — the `batches_blocked_pairing` CHECK
+     * (0092, migration-SQL-only). The history survives on the audit row's
+     * `changes` (`batch.blocked` / `batch.unblocked`).
+     */
+    blockedReason: text('blocked_reason'),
+    blockedAt: timestamp('blocked_at', { withTimezone: true, mode: 'string' }),
+    blockedBy: uuid('blocked_by'),
+    /** Story 3-3a — the block's note (required with reason `other`); cleared by the unblock. */
+    blockedNote: text('blocked_note'),
     ...tenantTimestamps,
   },
   (table) => [
@@ -4021,6 +4053,14 @@ export const stockAdjustmentPendings = pgTable(
     batchOverrideReason: text('batch_override_reason'),
     /** The resolved catalog batch identity — null when the request had none. */
     batchId: uuid('batch_id'),
+    /**
+     * Story 3-3a (0092) — how `batch_id` was resolved at request: `fefo` (the
+     * default draw) or `explicit` (a named batch). Null when there is no batch
+     * and on every pend raised before 3-3a. The approval re-runs the FEFO
+     * draw checks (blocked, expired) only on a `fefo` pend — an explicit draw
+     * of a blocked lot is the write-off. `BATCH_RESOLVED_BY`.
+     */
+    batchResolvedBy: text('batch_resolved_by'),
     /** The resolved serial identities, request order; null when absent. */
     serialIds: jsonb('serial_ids').$type<string[]>(),
     /** The named handling units (catch-weight arm), request order; null when absent. */
