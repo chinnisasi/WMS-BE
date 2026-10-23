@@ -23,12 +23,14 @@ import {
   ClientContactListResponse,
   ClientContactResponse,
   ClientListResponse,
+  ClientAllocationPolicyResponse,
   ClientReceivingPolicyResponse,
   ClientResponse,
   CreateClientContactDto,
   CreateClientDto,
   RenameClientDto,
   UpdateClientAddressesDto,
+  UpdateClientAllocationPolicyDto,
   UpdateClientContactDto,
   UpdateClientReceivingPolicyDto,
   UpdateClientStatusDto,
@@ -38,6 +40,7 @@ import type { ClientContactDto, ClientDto } from './clients.dto';
 import type { ClientContactSnapshot } from '../modules/clients/clients.facade';
 import { toAddressDto } from '../modules/tenancy/tenancy.dto';
 import { CatalogFacade } from '../modules/catalog/catalog.facade';
+import { InventoryFacade } from '../modules/inventory/inventory.facade';
 
 const IDEMPOTENCY_HEADER = [
   {
@@ -64,6 +67,9 @@ export class ClientsController {
     // Story 1-2b — the policy read's `untrackedSkuCount` is composed HERE
     // (the api shell): the clients module must not import catalog.
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
+    // Story 4-3a (A12) — the allocation read's `undatedBatchesOnHand`, composed
+    // here for the same reason (the clients module never imports inventory).
+    @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
   ) {}
 
   @Get(':tenantId/clients')
@@ -368,6 +374,78 @@ export class ClientsController {
         qcOnReceipt: dto.qcOnReceipt,
         expiryRequired: dto.expiryRequired,
         minShelfLifeDays: dto.minShelfLifeDays ?? null,
+      },
+      key,
+    );
+    return { client: toClientDto(snapshot.client) };
+  }
+
+  // ── Story 4-3a — the allocation policy (literal segment under :clientId) ──
+
+  @Get(':tenantId/clients/:clientId/allocation-policy')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Reads a client's outbound allocation policy — the rule (fefo | fifo) and the minimum remaining shelf life at dispatch — plus how many of its SKUs are untracked and how many undated batches it has on hand (any staff session; never the portal). Story 4-3a",
+  })
+  @ApiOkResponse({ type: ClientAllocationPolicyResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed clientId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No client with this id exists in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'clientId', format: 'uuid' })
+  async getAllocationPolicy(
+    @Param('tenantId') tenantId: string,
+    @Param('clientId') clientId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<ClientAllocationPolicyResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam('clientId', clientId);
+    const policy = await this.facade.getAllocationPolicy(tenantId, clientId);
+    const untrackedSkuCount = await this.catalog.countUntrackedSkus(tenantId, clientId);
+    const undatedBatchesOnHand = await this.inventory.undatedBatchesOnHandOfClient(tenantId, clientId);
+    return { clientId, ...policy, untrackedSkuCount, undatedBatchesOnHand };
+  }
+
+  @Put(':tenantId/clients/:clientId/allocation-policy')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Replaces a client's outbound allocation policy whole (owner-only, clients.manage): the rule and the minimum remaining shelf life at dispatch, both required. Applies to waves generated after it and to ATP at once. Allowed on the self client and on a departed one. An unchanged policy is a no-op (nothing written or audited; the key is stored). Story 4-3a",
+  })
+  @ApiBody({ type: UpdateClientAllocationPolicyDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: ClientResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed clientId, or a field that breaks its rule — a rule outside fefo|fifo, a minimum outside 1-3650 whole days, or a missing key (validation-failed, naming the field)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks clients.manage — owner only (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No client with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent request with the same Idempotency-Key (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'clientId', format: 'uuid' })
+  async updateAllocationPolicy(
+    @Param('tenantId') tenantId: string,
+    @Param('clientId') clientId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: UpdateClientAllocationPolicyDto,
+  ): Promise<ClientResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam('clientId', clientId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.command.updateAllocationPolicy(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        clientId,
+        // RAW (A11): no `?? null` — the DTO already refused a missing key.
+        allocationRule: dto.allocationRule,
+        minOutboundShelfLifeDays: dto.minOutboundShelfLifeDays,
       },
       key,
     );

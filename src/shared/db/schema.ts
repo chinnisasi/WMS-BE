@@ -377,6 +377,25 @@ export const clients = pgTable(
      * `expiry_required`).
      */
     minShelfLifeDays: integer('min_shelf_life_days'),
+    /**
+     * Story 4-3a — the client's OUTBOUND allocation policy, applied by the
+     * wave planner, the short-pick re-plan and the pick draw, and (the
+     * minimum only) by ATP. The CHECKs (`clients_allocation_rule_check`,
+     * `clients_min_outbound_shelf_life_range`) live ONLY in
+     * `drizzle/0094_client_allocation_policy.sql`. Written only by
+     * `ClientsCommand.updateAllocationPolicy` (`clients.manage`).
+     *
+     * `allocation_rule`: `fefo` (earliest expiry first; undated batches lot
+     * first received first) or `fifo` (lot first received first).
+     */
+    allocationRule: text('allocation_rule').notNull().default('fefo'),
+    /**
+     * Story 4-3a — the minimum remaining shelf life at dispatch, in IST
+     * calendar days (1–3650, or null for none). It limits DATED batches only:
+     * a batch with no expiry is never limited by it (no pairing with
+     * `expiry_required`, by decision).
+     */
+    minOutboundShelfLifeDays: integer('min_outbound_shelf_life_days'),
   },
   (table) => [
     uniqueIndex('clients_tenant_id_code_unique').on(table.tenantId, table.code),
@@ -3392,6 +3411,18 @@ export const picklistLines = pgTable(
     /** Position on the walk (`bins.code` ascending), per picklist. */
     walkSeq: integer('walk_seq').notNull(),
     status: text('status').notNull().default('planned'),
+    /**
+     * Story 4-3a — the client allocation policy this line was planned under,
+     * FROZEN at generate (and copied, or freshly stamped for a legacy line,
+     * by a re-plan). The pick re-derives its batch with these, never with the
+     * live policy. Both null on a pre-4-3a line, which draws as `fefo` with
+     * no minimum. The CHECKs (`picklist_lines_allocation_rule_check`,
+     * `picklist_lines_min_outbound_shelf_life_range`,
+     * `picklist_lines_allocation_pairing`, all NOT VALID) live ONLY in
+     * migration 0094.
+     */
+    allocationRule: text('allocation_rule'),
+    minOutboundShelfLifeDays: integer('min_outbound_shelf_life_days'),
     ...tenantTimestamps,
   },
   (table) => [

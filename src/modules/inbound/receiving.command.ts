@@ -46,7 +46,7 @@ import {
   assertCatchWeightGrams,
 } from '../catalog/handling-unit';
 import type { CreateHandlingUnitInput } from '../catalog/catalog.facade';
-import { assertUtcIso, isIsoDate, istDateOf, istMidnightOf, nowIso } from '../../shared/primitives/time';
+import { assertUtcIso, isIsoDate, istDateOf, istDaysBetween, istMidnightOf, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
@@ -3251,10 +3251,8 @@ export function toleranceMilli(orderedMilli: number, bps: number, precision: num
   return Number((raw / step) * step);
 }
 
-/** Story 1-2b — IST calendar days from `from` to `to` (both `YYYY-MM-DD`); negative when `to` is earlier. */
-export function istDaysBetween(from: string, to: string): number {
-  return Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000);
-}
+/** Story 1-2b — IST calendar days from `from` to `to`; moved to `shared/primitives/time.ts` (4-3a, A21) and re-exported for its callers. */
+export { istDaysBetween };
 
 /** Story 1-2b — the operator-facing reason of one expiry refusal (the device shows its own words by code). */
 function expiryRefusalReason(entry: ClientRefusedLine, skuCode: string, batchCode: string | null, clientLabel: string): string {

@@ -26,6 +26,9 @@ import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import { CatalogFacade } from '../catalog/catalog.facade';
 import { buildStockPool, pickableBinsInTx } from './replan';
+import { allocationPoliciesInTx, DEFAULT_ALLOCATION_POLICY } from '../clients/clients.facade';
+import type { AllocationRule } from '../../shared/primitives/batch-allocation';
+import type { BatchFacts } from '../catalog/catalog.facade';
 import { WAVE_CLOCK } from './wave.clock';
 import type { WaveClock } from './wave.clock';
 import { fromMilli } from '../../shared/primitives/quantity';
@@ -226,6 +229,18 @@ export interface PicklistLineSnapshot {
   readonly walkSeq: number;
   readonly status: PicklistLineStatus;
   readonly createdAt: string;
+  /**
+   * Story 4-3a — the suggested batch's code, its expiry (IST date) and the
+   * date its lot was first received (IST date), plus the allocation policy
+   * the line was planned under (frozen; both null on a pre-4-3a line).
+   * OPTIONAL: a `WaveSnapshot` stored before 4-3a (a generate, release or
+   * cancel replay) lacks them; every fresh read carries them.
+   */
+  readonly batchCode?: string | null;
+  readonly batchExpiryDate?: string | null;
+  readonly batchReceivedOn?: string | null;
+  readonly allocationRule?: AllocationRule | null;
+  readonly minOutboundShelfLifeDays?: number | null;
 }
 
 export interface PicklistSnapshot {
@@ -278,6 +293,22 @@ interface PlannedSlice {
   readonly shortfallQty: number;
   readonly sliceSeq: number;
   readonly status: PicklistLineStatus;
+  /** Story 4-3a — the SKU's client policy this slice was planned under (frozen on the line). */
+  readonly allocationRule: AllocationRule;
+  readonly minOutboundShelfLifeDays: number | null;
+}
+
+/**
+ * Story 4-3a (A7) — Postgres binds at most 65,535 parameters per statement and
+ * a multi-row insert binds one per column per row, so the picklist-line
+ * insert is chunked at `floor(maxBindParams / columnCount)` rows (18 columns
+ * → 3,640). The wave's order cap bounds orders, not rows (lines per order and
+ * slices per line are unbounded). Mutable for the chunk-failure test only.
+ */
+export const picklistLineInsertTuning = { maxBindParams: 65_535 };
+
+export function bindChunkRows(columnCount: number, maxBindParams = picklistLineInsertTuning.maxBindParams): number {
+  return Math.max(1, Math.floor(maxBindParams / columnCount));
 }
 
 /**
@@ -589,7 +620,7 @@ export class WaveCommandService {
           (a, b) => selectionRank.get(a.orderId)! - selectionRank.get(b.orderId)!,
         );
 
-        // ── the plan: bin walk (bins.code asc) × FEFO within the bin ──────
+        // ── the plan: stock ranked by the client rule (4-3a), walked by bin ─
         const slices = await this.planSlices(tx, command, planningOrder);
 
         // ── the writes ────────────────────────────────────────────────────
@@ -640,18 +671,27 @@ export class WaveCommandService {
             sliceSeq: slice.sliceSeq,
             walkSeq,
             status: slice.status,
+            // Story 4-3a — the policy FROZEN on the line (decision 7).
+            allocationRule: slice.allocationRule,
+            minOutboundShelfLifeDays: slice.minOutboundShelfLifeDays,
           })),
         );
-        try {
-          await tx.insert(picklistLines).values(lineValues);
-        } catch (err) {
-          if (isUniqueViolationOn(err, OPEN_ORDER_LINE_UNIQUE)) {
-            // A concurrent generate claimed one of these orders first. This
-            // transaction rolls back whole (nothing written), and the winner
-            // is re-read outside it — the deterministic loser outcome.
-            throw new WaveClaimLostError(command.tenantId, liveOrderIds);
+        // Story 4-3a (A7) — chunked by the real bind arithmetic, every chunk
+        // in THIS transaction: a claim lost in any chunk rolls the whole
+        // plan back (nothing persists) and maps to `WaveClaimLostError`.
+        const chunkRows = bindChunkRows(Object.keys(lineValues[0] ?? { id: null }).length);
+        for (let start = 0; start < lineValues.length; start += chunkRows) {
+          try {
+            await tx.insert(picklistLines).values(lineValues.slice(start, start + chunkRows));
+          } catch (err) {
+            if (isUniqueViolationOn(err, OPEN_ORDER_LINE_UNIQUE)) {
+              // A concurrent generate claimed one of these orders first. This
+              // transaction rolls back whole (nothing written), and the winner
+              // is re-read outside it — the deterministic loser outcome.
+              throw new WaveClaimLostError(command.tenantId, liveOrderIds);
+            }
+            throw err;
           }
-          throw err;
         }
 
         const snapshot = await this.snapshotById(tx, command.tenantId, waveId);
@@ -1294,10 +1334,13 @@ export class WaveCommandService {
    * hand-created codes. This matches putaway's capacity-only v1 honesty; a
    * real `pick_sequence` needs a maintenance surface nobody has designed.
    *
-   * Within one bin, batches rank FEFO (expiry ascending, nulls last) and
-   * neither a blocked batch nor an expired one is ever suggested. A SKU with
-   * no batch rows in a bin draws against the plain projection and its line
-   * names no batch.
+   * Story 4-3a — a SKU's stock is ranked WAREHOUSE-WIDE by its client's
+   * allocation rule (`fefo` / `fifo`, `rankSlots`), and a batch that is not
+   * allocatable (blocked, expired, or below the client's minimum remaining
+   * shelf life at the wave clock) is never suggested. Every slice is stamped
+   * with the client's rule and minimum, read ONCE for the whole plan (A10).
+   * A SKU with no batch rows in a bin draws against the plain projection and
+   * its line names no batch (walk order, as before).
    *
    * The pool is consumed as it is planned, so two lines of the same SKU
    * never both claim the same units — that honesty is exactly what makes the
@@ -1321,12 +1364,21 @@ export class WaveCommandService {
     // Stock composes through the facades only (AD-6). Story 12-1: the lines'
     // storage classes join the read — the pool filter needs them (FR-40), and
     // the wave planner previously read no SKU rows at all.
-    const [stock, batchStock, batchIdentities, skuClasses] = await Promise.all([
+    const [stock, batchStock, batchIdentities, skuClasses, skuClients] = await Promise.all([
       this.inventory.stockByBinsInTx(tx, command.tenantId, command.warehouseId, skuIds),
       this.inventory.batchOnHandByBinsInTx(tx, command.tenantId, command.warehouseId, skuIds),
-      this.catalog.getBatchesForSkusInTx(tx, command.tenantId, skuIds),
+      // Story 4-3a — the intake facts carry `createdAt` (FIFO's anchor).
+      this.catalog.getBatchIntakesForSkusInTx(tx, command.tenantId, skuIds),
       this.catalog.getSkuStorageClassesInTx(tx, command.tenantId, skuIds),
+      this.catalog.skuClientIdsInTx(tx, command.tenantId, skuIds),
     ]);
+    // Story 4-3a (A10) — every distinct client's policy in ONE read, so every
+    // line of the wave carries the values of that one read.
+    const policies = await allocationPoliciesInTx(tx, command.tenantId, [...new Set(skuClients.values())]);
+    const policyOfSku = (skuId: string) => {
+      const clientId = skuClients.get(skuId);
+      return (clientId === undefined ? undefined : policies.get(clientId)) ?? DEFAULT_ALLOCATION_POLICY;
+    };
 
     // The per-SKU walk: (bin in code order) × (batch in FEFO order). Pure,
     // shared with the re-plan lookup (`replan.ts`), and consumed
@@ -1344,10 +1396,15 @@ export class WaveCommandService {
       batchStock,
       batchIdentities,
       at: this.clock.now().getTime(),
+      policyOf: (skuId) => {
+        const policy = policyOfSku(skuId);
+        return { allocationRule: policy.allocationRule, minDays: policy.minOutboundShelfLifeDays };
+      },
     });
 
     const planned: PlannedSlice[] = [];
     for (const line of lines) {
+      const policy = policyOfSku(line.skuId);
       // Every quantity a picklist names is the order line's `reserved_qty`,
       // never `qty`: a backordered line contributes only what acceptance
       // actually held.
@@ -1371,6 +1428,8 @@ export class WaveCommandService {
           shortfallQty: 0,
           sliceSeq,
           status: 'planned',
+          allocationRule: policy.allocationRule,
+          minOutboundShelfLifeDays: policy.minOutboundShelfLifeDays,
         });
         sliceSeq += 1;
       }
@@ -1390,6 +1449,8 @@ export class WaveCommandService {
           shortfallQty: need,
           sliceSeq,
           status: 'unfulfillable',
+          allocationRule: policy.allocationRule,
+          minOutboundShelfLifeDays: policy.minOutboundShelfLifeDays,
         });
       }
     }
@@ -1539,6 +1600,12 @@ export class WaveCommandService {
             .where(and(eq(orders.tenantId, wave.tenantId), inArray(orders.id, lineOrderIds)))
       ).map((row) => [row.id, row]),
     );
+    // Story 4-3a (A19) — the suggested batches' facts, read ONCE per snapshot.
+    const batchFacts = await this.catalog.batchFactsByIdsInTx(
+      tx,
+      wave.tenantId,
+      lines.flatMap((line) => (line.batchId === null ? [] : [line.batchId])),
+    );
     return {
       wave: {
         id: wave.id,
@@ -1555,6 +1622,7 @@ export class WaveCommandService {
             list,
             lines.filter((line) => line.picklistId === list.id),
             urgencyByOrder,
+            batchFacts,
           ),
         ),
       },
@@ -1586,6 +1654,7 @@ export function picklistSnapshot(
   row: Picklist,
   lines: readonly PicklistLine[],
   urgencyByOrder: ReadonlyMap<string, { readonly priority: string; readonly shipByDate: string | null }>,
+  batchFacts: ReadonlyMap<string, BatchFacts> = new Map(),
 ): PicklistSnapshot {
   const ordered = [...lines].sort((a, b) => a.walkSeq - b.walkSeq);
   const urgency = foldOrderUrgency(
@@ -1611,11 +1680,12 @@ export function picklistSnapshot(
     shipByDate: urgency.shipByDate,
     createdAt: canonicalInstant(row.createdAt),
     updatedAt: canonicalInstant(row.updatedAt),
-    lines: ordered.map(lineSnapshot),
+    lines: ordered.map((line) => lineSnapshot(line, batchFacts)),
   };
 }
 
-export function lineSnapshot(row: PicklistLine): PicklistLineSnapshot {
+export function lineSnapshot(row: PicklistLine, batchFacts: ReadonlyMap<string, BatchFacts> = new Map()): PicklistLineSnapshot {
+  const batch = row.batchId === null ? undefined : batchFacts.get(row.batchId);
   return {
     id: row.id,
     picklistId: row.picklistId,
@@ -1635,6 +1705,13 @@ export function lineSnapshot(row: PicklistLine): PicklistLineSnapshot {
     walkSeq: row.walkSeq,
     status: row.status as PicklistLineStatus,
     createdAt: canonicalInstant(row.createdAt),
+    // Story 4-3a — what the wave detail prints: the batch, its expiry and its
+    // lot's first receipt (IST dates), and the frozen policy.
+    batchCode: batch?.code ?? null,
+    batchExpiryDate: batch?.expiryDate == null ? null : istDateOf(batch.expiryDate),
+    batchReceivedOn: batch === undefined ? null : istDateOf(batch.createdAt),
+    allocationRule: (row.allocationRule as AllocationRule | null) ?? null,
+    minOutboundShelfLifeDays: row.minOutboundShelfLifeDays,
   };
 }
 

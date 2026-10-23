@@ -451,6 +451,30 @@ describe('architecture: catalog identity is catalog-module-owned (story 10.3)', 
     expect(drizzleWriteOn('skus').test(importCommand)).toBe(true);
   });
 
+  it('story 4-3a (A6): ONE allocation ranking and ONE allocatability predicate — the pool and the pick import them, and carry no ranking of their own', () => {
+    // The wave plan / re-plan pool (`replan.ts`) and the pick's batch
+    // re-derivation (`pick.command.ts`) must rank with `rankSlots` and judge
+    // with `isBatchAllocatableAt` from the shared primitive — a second,
+    // drifting copy would route a picker to a lot the planner would never
+    // name, or promise (ATP) what neither will draw. A grep for one spelling
+    // is easy to evade, so the pin is the import plus the absence of any sort
+    // over the ranking facts and of any hand-written expiry comparison.
+    const importsBoth = /import\s*\{[^}]*\brankSlots\b[^}]*\}\s*from\s*['"][^'"]*shared\/primitives\/batch-allocation['"]/;
+    const importsPredicate = /import\s*\{[^}]*\bisBatchAllocatableAt\b[^}]*\}\s*from\s*['"][^'"]*shared\/primitives\/batch-allocation['"]/;
+    const ownSort = /\.sort\(\s*\([^)]*\)\s*=>[\s\S]{0,400}?\b(expiryDate|createdAt)\b/;
+    const parsedExpiry = /Date\.parse\([^)]*expiryDate[^)]*\)/;
+    for (const file of ['modules/outbound/replan.ts', 'modules/outbound/pick.command.ts']) {
+      const source = readFileSync(join(SRC_ROOT, file), 'utf8');
+      expect({ file, rankSlots: importsBoth.test(source), predicate: importsPredicate.test(source) }).toEqual({ file, rankSlots: true, predicate: true });
+      expect({ file, ownSort: ownSort.test(source), parsedExpiry: parsedExpiry.test(source) }).toEqual({ file, ownSort: false, parsedExpiry: false });
+    }
+    // The promise side judges with the same predicate.
+    const reservation = readFileSync(join(SRC_ROOT, 'modules/inventory/reservation.service.ts'), 'utf8');
+    expect(importsPredicate.test(reservation)).toBe(true);
+    // The guard bites: the pre-4-3a in-bin FEFO sort it replaced is caught.
+    expect(ownSort.test('drawable.sort((a, b) => { const left = byId.get(a.batchId)?.expiryDate ?? null; return 0; })')).toBe(true);
+  });
+
   it('story 3-3a: inventory reads catalog `batches` in ONE file, locate-only (status + expiry), and the block verb writes them', () => {
     // The unpromisable-batch ATP hook (`unpromisableBatchUnits`) and the
     // approval's blocked-batch re-check (`batchBlockedInTx`) read catalog's
@@ -472,6 +496,8 @@ describe('architecture: catalog identity is catalog-module-owned (story 10.3)', 
     expect([...columns].sort()).toEqual(['expiryDate', 'id', 'status', 'tenantId']);
     expect(drizzleWriteOn('batches').test(allowed)).toBe(false);
     expect(allowed).toContain('export async function unpromisableBatchUnits(');
+    // Story 4-3a (A12) — the allocation panel's undated-batch count rides the same allowance (same columns).
+    expect(allowed).toContain('export async function undatedBatchesOnHandOfClientInTx(');
     // The writer of the lifecycle columns is catalog's block command.
     const command = readFileSync(join(catalogRoot, 'batch-block.command.ts'), 'utf8');
     expect(drizzleWriteOn('batches').test(command)).toBe(true);

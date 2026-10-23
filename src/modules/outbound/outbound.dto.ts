@@ -34,6 +34,7 @@ import { MAX_COD_AMOUNT_PAISE, ORDER_PRIORITIES, ORDER_TYPES } from './order-urg
 import { MAX_EXTERNAL_ID_LENGTH } from '../../shared/primitives/ids';
 import { AddressDto } from '../tenancy/tenancy.dto';
 import { SHORT_PICK_REASON_CODES } from './pick.command';
+import { ALLOCATION_RULES, MIN_OUTBOUND_SHELF_LIFE_DAYS_MAX, MIN_OUTBOUND_SHELF_LIFE_DAYS_MIN } from '../../shared/primitives/batch-allocation';
 // The pack bounds are the COMMAND's constants, imported rather than copied:
 // a literal here and a constant there drift silently, and the DTO is the
 // gate every HTTP caller actually hits. (`order.command` / `pick.command`
@@ -770,7 +771,7 @@ export class PicklistLineDto {
   @ApiProperty({ type: String, nullable: true, description: 'The suggested bin’s code — the walk key' })
   binCode!: string | null;
 
-  @ApiProperty({ type: String, nullable: true, description: 'Suggested batch (FEFO within the bin); null when the SKU carries no batch stock' })
+  @ApiProperty({ type: String, nullable: true, description: "Suggested batch (ranked by the client's allocation rule, story 4-3a); null when the SKU carries no batch stock" })
   batchId!: string | null;
 
   @ApiProperty({ type: String, nullable: true, description: 'The order line’s journal hold, carried forward — never re-reserved here' })
@@ -808,6 +809,41 @@ export class PicklistLineDto {
 
   @ApiProperty({ description: 'ISO-8601 UTC creation time' })
   createdAt!: string;
+
+  // ── Story 4-3a — OPTIONAL: a wave snapshot stored before 4-3a lacks them. ──
+  @ApiProperty({ type: String, nullable: true, required: false, description: "Story 4-3a — the suggested batch's code; null when none" })
+  batchCode?: string | null;
+
+  @ApiProperty({ type: String, nullable: true, required: false, format: 'date', description: "Story 4-3a — the suggested batch's expiry date (IST, YYYY-MM-DD); null when undated or none" })
+  batchExpiryDate?: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    format: 'date',
+    description: "Story 4-3a — the IST date the suggested batch's LOT was first received in the tenant (batches.created_at — a lot received again keeps its first date); null when none",
+  })
+  batchReceivedOn?: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    enum: [...ALLOCATION_RULES, null],
+    description: 'Story 4-3a — the allocation rule this line was planned under (frozen at generate); null on a line planned before 4-3a (drawn as fefo with no minimum)',
+  })
+  allocationRule?: string | null;
+
+  @ApiProperty({
+    type: 'integer',
+    nullable: true,
+    required: false,
+    minimum: MIN_OUTBOUND_SHELF_LIFE_DAYS_MIN,
+    maximum: MIN_OUTBOUND_SHELF_LIFE_DAYS_MAX,
+    description: 'Story 4-3a — the minimum remaining shelf life (IST days) this line was planned under (frozen); null when none',
+  })
+  minOutboundShelfLifeDays?: number | null;
 }
 
 export class PicklistDto {
@@ -1269,6 +1305,38 @@ export class PickTaskDto {
     description: "Story 4-2a — the task's order ship-by date (IST, YYYY-MM-DD); null when none.",
   })
   orderShipByDate!: string | null;
+
+  // ── Story 4-3a — OPTIONAL: an older server omits them; the device then shows its pre-4-3a text. ──
+  @ApiProperty({ type: String, nullable: true, required: false, format: 'date', description: "Story 4-3a — the suggested batch's expiry date (IST, YYYY-MM-DD); null when undated or none" })
+  batchExpiryDate?: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    format: 'date',
+    description: "Story 4-3a — the IST date the suggested batch's LOT was first received in the tenant (batches.created_at — a lot received again keeps its first date); null when none",
+  })
+  batchReceivedOn?: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    enum: [...ALLOCATION_RULES, null],
+    description: 'Story 4-3a — the allocation rule this line was planned under (frozen at generate); null on a line planned before 4-3a (drawn as fefo with no minimum)',
+  })
+  allocationRule?: string | null;
+
+  @ApiProperty({
+    type: 'integer',
+    nullable: true,
+    required: false,
+    minimum: MIN_OUTBOUND_SHELF_LIFE_DAYS_MIN,
+    maximum: MIN_OUTBOUND_SHELF_LIFE_DAYS_MAX,
+    description: 'Story 4-3a — the minimum remaining shelf life (IST days) this line was planned under (frozen); null when none',
+  })
+  minOutboundShelfLifeDays?: number | null;
 }
 
 // ── Packing (Story 4.5) ─────────────────────────────────────────────────────

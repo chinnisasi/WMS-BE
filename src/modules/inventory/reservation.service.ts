@@ -1,11 +1,15 @@
 import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common';
 import { fromMilli, MAX_QUANTITY_MILLI } from '../../shared/primitives/quantity';
-import { and, asc, eq, gt, inArray, lt, not, notExists, or, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, gte, inArray, isNull, lt, not, notExists, or, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import { AUTH_DATABASE, DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { batches, batchOnHand, bins, inventoryQuarantines, reservations, stockOnHand } from '../../shared/db/schema';
-import { batchExpiryClock, isBatchExpiredAt } from '../../shared/primitives/batch-expiry';
+import { batches, batchOnHand, bins, inventoryQuarantines, reservations, skus, stockOnHand } from '../../shared/db/schema';
+import { batchExpiryClock } from '../../shared/primitives/batch-expiry';
+// Story 4-3a — the ONE allocatability predicate (expiry + the client minimum).
+import { isBatchAllocatableAt } from '../../shared/primitives/batch-allocation';
+import { addIsoDays, istDateOf, istMidnightOf } from '../../shared/primitives/time';
+import { allocationPoliciesInTx } from '../clients/clients.facade';
 import type { Reservation } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
@@ -255,6 +259,18 @@ export async function damagedUnits(
  * system-bin hooks' `bins` read, pinned by `test/architecture.spec.ts` (the
  * 3-3a allowance: this file, those columns, no write). Per-SKU rows on the
  * existing `(tenant, warehouse, sku, …)` indexes — no new index (D27).
+ *
+ * Story 4-3a (decision 8, A10) — the SKU's CLIENT minimum remaining shelf
+ * life at dispatch joins the test: a batch is unpromisable when it is not
+ * `isBatchAllocatableAt(…, minDays)` (blocked, expired, or below the
+ * minimum) — the predicate the wave plan and the pick draw with, so stock no
+ * wave would ever allocate is never promised. The minimum is read LAZILY and
+ * ONCE per evaluation: only when an active, dated, unexpired batch row of the
+ * scope exists (a `limit 1` probe) is `skus.client_id` → `allocationPoliciesInTx`
+ * read. The SQL pre-filter widens from `expiry < at` to `expiry < cutoff`,
+ * where `cutoff` is the IST midnight `minDays` days after `at`'s IST date —
+ * every row the JS predicate could refuse, and no more. The allocation RULE
+ * never affects ATP.
  */
 export async function unpromisableBatchUnits(
   tx: TenantTx,
@@ -275,6 +291,29 @@ export async function unpromisableBatchUnits(
       ),
     );
   const at = batchExpiryClock.now();
+  const scopeRows = and(
+    eq(batchOnHand.tenantId, tenantId),
+    eq(batchOnHand.warehouseId, warehouseId),
+    eq(batchOnHand.skuId, skuId),
+    gt(batchOnHand.quantity, 0),
+  );
+  // Story 4-3a — the client minimum, lazily: only a scope holding an active,
+  // dated, unexpired batch can have stock below it.
+  let minDays: number | null = null;
+  let cutoff = new Date(at).toISOString();
+  const datedLive = await tx
+    .select({ one: sql<number>`1` })
+    .from(batchOnHand)
+    .innerJoin(batches, and(eq(batches.tenantId, tenantId), eq(batches.id, batchOnHand.batchId)))
+    .where(and(scopeRows, eq(batches.status, 'active'), gte(batches.expiryDate, cutoff)))
+    .limit(1);
+  if (datedLive.length > 0) {
+    minDays = await minOutboundShelfLifeOfSkuInTx(tx, tenantId, skuId);
+    if (minDays !== null) {
+      const minimumBoundary = istMidnightOf(addIsoDays(istDateOf(cutoff), minDays));
+      if (minimumBoundary > cutoff) cutoff = minimumBoundary;
+    }
+  }
   const rows = await tx
     .select({
       binId: batchOnHand.binId,
@@ -298,10 +337,7 @@ export async function unpromisableBatchUnits(
     )
     .where(
       and(
-        eq(batchOnHand.tenantId, tenantId),
-        eq(batchOnHand.warehouseId, warehouseId),
-        eq(batchOnHand.skuId, skuId),
-        gt(batchOnHand.quantity, 0),
+        scopeRows,
         // System master data (tenancy-owned), read only to locate the scope.
         eq(bins.tenantId, tenantId),
         not(
@@ -318,12 +354,17 @@ export async function unpromisableBatchUnits(
         // at the SAME clock reading. The JS predicate below stays the
         // authority; the SQL keeps every hot path from scanning every dated
         // batch (code review).
-        or(eq(batches.status, 'blocked'), lt(batches.expiryDate, new Date(at).toISOString())),
+        // Story 4-3a: `cutoff` is `at`, or the client minimum's boundary
+        // when one applies (the JS predicate below stays the authority).
+        or(eq(batches.status, 'blocked'), lt(batches.expiryDate, cutoff)),
       ),
     );
   const byBin = new Map<string, { sum: number; binOnHand: number }>();
   for (const row of rows) {
-    if (row.status !== 'blocked' && !isBatchExpiredAt(row.expiryDate, at)) continue;
+    // Story 4-3a — `blocked`, or not allocatable (expired, or below the
+    // client minimum). The status arm keeps 3-3a's shape: only `blocked` is
+    // refused by status here (the vocabulary is active|blocked).
+    if (row.status !== 'blocked' && isBatchAllocatableAt({ status: 'active', expiryDate: row.expiryDate }, at, minDays)) continue;
     const entry = byBin.get(row.binId) ?? { sum: 0, binOnHand: Number(row.binOnHand) };
     entry.sum += Number(row.quantity);
     byBin.set(row.binId, entry);
@@ -331,6 +372,49 @@ export async function unpromisableBatchUnits(
   let total = 0;
   for (const entry of byBin.values()) total += Math.min(entry.sum, entry.binOnHand);
   return total;
+}
+
+/**
+ * Story 4-3a — the minimum remaining shelf life at dispatch of a SKU's
+ * client: `skus.client_id` (inventory already reads `skus`) → the clients
+ * facade's `allocationPoliciesInTx` (an unknown client reads the default,
+ * no minimum). Null for an unknown SKU.
+ */
+async function minOutboundShelfLifeOfSkuInTx(tx: TenantTx, tenantId: string, skuId: string): Promise<number | null> {
+  const sku = await tx
+    .select({ clientId: skus.clientId })
+    .from(skus)
+    .where(and(eq(skus.tenantId, tenantId), eq(skus.id, skuId)))
+    .limit(1);
+  const clientId = sku[0]?.clientId;
+  if (clientId === undefined) return null;
+  const policies = await allocationPoliciesInTx(tx, tenantId, [clientId]);
+  return policies.get(clientId)?.minOutboundShelfLifeDays ?? null;
+}
+
+/**
+ * Story 4-3a (A12) — distinct ACTIVE batches with NO expiry date and positive
+ * `batch_on_hand`, of the client's SKUs, across warehouses: the allocation
+ * panel's "the minimum cannot limit them" warning. The same locate-only
+ * `batches` allowance as `unpromisableBatchUnits` (status, the null expiry,
+ * the join key) — no write.
+ */
+export async function undatedBatchesOnHandOfClientInTx(tx: TenantTx, tenantId: string, clientId: string): Promise<number> {
+  const rows = await tx
+    .select({ n: sql<string>`count(distinct ${batchOnHand.batchId})::bigint` })
+    .from(batchOnHand)
+    .innerJoin(batches, and(eq(batches.tenantId, tenantId), eq(batches.id, batchOnHand.batchId)))
+    .innerJoin(skus, and(eq(skus.tenantId, tenantId), eq(skus.id, batchOnHand.skuId)))
+    .where(
+      and(
+        eq(batchOnHand.tenantId, tenantId),
+        gt(batchOnHand.quantity, 0),
+        eq(skus.clientId, clientId),
+        eq(batches.status, 'active'),
+        isNull(batches.expiryDate),
+      ),
+    );
+  return Number(rows[0]?.n ?? 0);
 }
 
 /**
@@ -452,7 +536,8 @@ export interface AtpSnapshot {
    */
   readonly damaged: number;
   /**
-   * Story 3-3a: the on-hand of BLOCKED or EXPIRED batches outside the four
+   * Story 3-3a: the on-hand of batches that are blocked, expired or below
+   * the client's minimum remaining shelf life (story 4-3a), outside the four
    * subtracted system bins (`unpromisableBatchUnits`) — on hand, never
    * promised. `onHand` still includes it.
    */
@@ -532,7 +617,7 @@ function bufferOverCeiling(
       (probe.inTransit > 0 ? ` (of which ${fromMilli(probe.inTransit)} are in transit)` : '') +
       (probe.returnsAwaiting > 0 ? ` (of which ${fromMilli(probe.returnsAwaiting)} are returns awaiting disposition)` : '') +
       (probe.damaged > 0 ? ` (of which ${fromMilli(probe.damaged)} are damaged)` : '') +
-      (probe.unpromisableBatch > 0 ? ` (of which ${fromMilli(probe.unpromisableBatch)} in blocked/expired batches)` : '') +
+      (probe.unpromisableBatch > 0 ? ` (of which ${fromMilli(probe.unpromisableBatch)} in blocked or expired batches, or below the client's minimum remaining shelf life)` : '') +
       `, holding ${fromMilli(probe.reserved)} already — the buffer of ${fromMilli(command.targetMilli)} ` +
       `cannot be reserved.`,
   );
@@ -548,7 +633,7 @@ interface StandingBufferProbe {
   readonly returnsAwaiting: number;
   /** Story 2-4a: the DAMAGED bin's units — named in the refusal. */
   readonly damaged: number;
-  /** Story 3-3a: blocked/expired batch units — named in the refusal. */
+  /** Story 3-3a: blocked, expired or below-minimum (4-3a) batch units — named in the refusal. */
   readonly unpromisableBatch: number;
 }
 
@@ -583,7 +668,7 @@ export interface ChannelVisibleSnapshot {
   readonly returnsAwaiting: number;
   /** Story 2-4a: units received damaged (the DAMAGED bin) — outside the pool. */
   readonly damaged: number;
-  /** Story 3-3a: blocked or expired batch units — on hand, outside the pool. */
+  /** Story 3-3a: blocked, expired or below the client's minimum remaining shelf life (4-3a) — on hand, outside the pool. */
   readonly unpromisableBatch: number;
   /** The pool ATP (every holder included). */
   readonly poolAtp: number;
@@ -810,7 +895,7 @@ export class ReservationService implements OnModuleInit {
           (probe.inTransit > 0 ? ` (of which ${fromMilli(probe.inTransit)} are in transit)` : '') +
           (probe.returnsAwaiting > 0 ? ` (of which ${fromMilli(probe.returnsAwaiting)} are returns awaiting disposition)` : '') +
       (probe.damaged > 0 ? ` (of which ${fromMilli(probe.damaged)} are damaged)` : '') +
-          (probe.unpromisableBatch > 0 ? ` (of which ${fromMilli(probe.unpromisableBatch)} in blocked/expired batches)` : '') +
+          (probe.unpromisableBatch > 0 ? ` (of which ${fromMilli(probe.unpromisableBatch)} in blocked or expired batches, or below the client's minimum remaining shelf life)` : '') +
           ` — the request for ${fromMilli(command.quantity)} cannot be reserved.`,
       );
     }
@@ -2387,7 +2472,7 @@ export class ReservationService implements OnModuleInit {
               (probe.inTransit > 0 ? ` (of which ${fromMilli(probe.inTransit)} are in transit)` : '') +
               (probe.returnsAwaiting > 0 ? ` (of which ${fromMilli(probe.returnsAwaiting)} are returns awaiting disposition)` : '') +
       (probe.damaged > 0 ? ` (of which ${fromMilli(probe.damaged)} are damaged)` : '') +
-              (probe.unpromisableBatch > 0 ? ` (of which ${fromMilli(probe.unpromisableBatch)} in blocked/expired batches)` : '') +
+              (probe.unpromisableBatch > 0 ? ` (of which ${fromMilli(probe.unpromisableBatch)} in blocked or expired batches, or below the client's minimum remaining shelf life)` : '') +
               `, holding ${fromMilli(lockedReserved)} already — the buffer of ${fromMilli(targetMilli)} ` +
               `cannot be reserved.`,
           );

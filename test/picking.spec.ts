@@ -2175,12 +2175,22 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
   });
 
   it('a draw larger than the earliest batch spans TWO arms — one event each, FEFO order, and the pick row names no single batch', async () => {
+    // Story 4-3a (A2) RE-ESTABLISHES this test. Before 4-3a the planned batch
+    // was purely advisory and the pick re-ranked the bin FEFO, so an
+    // earlier-expiring lot that arrived after the plan was drawn first. A2
+    // makes the pick draw the slice's NAMED batch first while it is
+    // allocatable — so the spill across two arms is now reached when the named
+    // batch is no longer allocatable (here: blocked after the plan), and the
+    // bin's other batches are drawn in FEFO order.
     const skuId = sku(BATCH_SPAN_SKU_CODE);
     const binJ = await createBin('A-06-01');
     const soon = new Date(Date.now() + 3 * 86_400_000).toISOString();
+    const mid = new Date(Date.now() + 100 * 86_400_000).toISOString();
     const later = new Date(Date.now() + 300 * 86_400_000).toISOString();
-    const soonCode = `PCK-2A-SOON-${ulid().slice(10, 16)}`;
-    const laterCode = `PCK-2A-LATE-${ulid().slice(10, 16)}`;
+    const tag = ulid().slice(10, 16);
+    const soonCode = `PCK-2A-SOON-${tag}`;
+    const midCode = `PCK-2A-MID-${tag}`;
+    const laterCode = `PCK-2A-LATE-${tag}`;
     // Only ONE batch exists when the wave plans, so the planner emits a
     // single 7-unit slice naming it.
     await seedStock(skuId, binJ, 8, { batch: { code: laterCode, expiryDate: later } });
@@ -2188,12 +2198,17 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     const line = picklist.lines.find((candidate) => candidate.binId === binJ)!;
     expect(line.qty).toBe(7);
 
-    // An EARLIER-expiring batch lands in the same bin before the pick. The
-    // plan's batch is advisory and re-derived at pick time, so the draw must
-    // now take the new batch first and spill into the planned one — two arms
-    // from one line. A draw that stopped after the first arm would
-    // under-draw stock while recording the full quantity.
+    // Two more lots land in the bin, and the named one is blocked.
     await seedStock(skuId, binJ, 3, { batch: { code: soonCode, expiryDate: soon } });
+    await seedStock(skuId, binJ, 10, { batch: { code: midCode, expiryDate: mid } });
+    const ids = await sql`select id, code from batches where tenant_id = ${tenantId} and code in (${soonCode}, ${midCode}, ${laterCode})`;
+    const byCode = new Map((ids as unknown as { id: string; code: string }[]).map((r) => [r.code, r.id]));
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/inventory/batches/${byCode.get(laterCode)}/block`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ reason: 'recall', note: 'picking spec: the named batch is no longer allocatable' })
+      .expect(201);
 
     const res = await pick(bodyFor(line)).expect(201);
     // A draw spanning arms names no single batch on the settlement row — the
@@ -2203,25 +2218,30 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
 
     const events = await ledgerFor(line.id);
     expect(events).toHaveLength(2);
-    const ids = await sql`select id, code from batches where tenant_id = ${tenantId} and code in (${soonCode}, ${laterCode})`;
-    const byCode = new Map((ids as unknown as { id: string; code: string }[]).map((r) => [r.code, r.id]));
     // FEFO order: the soon-expiring batch drains first, and in full.
     expect(events[0]!.batch_ref).toBe(byCode.get(soonCode));
     expect(events[0]!.quantity_delta).toBe(-3);
-    expect(events[1]!.batch_ref).toBe(byCode.get(laterCode));
+    expect(events[1]!.batch_ref).toBe(byCode.get(midCode));
     expect(events[1]!.quantity_delta).toBe(-4);
-    // Both quantities actually left: 11 seeded − 7 drawn = 4, all of it in
-    // the later batch (the earlier one drained whole).
-    expect(await onHand(skuId, binJ)).toBe(4);
-    const remaining = await sql`
-      select batch_id, quantity from batch_on_hand
-      where tenant_id = ${tenantId} and bin_id = ${binJ} and quantity > 0
-    `;
-    expect(remaining).toHaveLength(1);
-    expect((remaining[0] as unknown as { batch_id: string; quantity: number }).batch_id).toBe(
-      byCode.get(laterCode),
-    );
-    expect(fromMilli(Number((remaining[0] as unknown as { quantity: number }).quantity))).toBe(4);
+    // 21 seeded − 7 drawn = 14: the mid lot's 6 and the blocked lot's 8.
+    expect(await onHand(skuId, binJ)).toBe(14);
+  });
+
+  it('story 4-3a (A2): the pick draws the slice\'s NAMED batch first, even when an earlier-expiring lot arrived after the plan', async () => {
+    const skuId = sku(BATCH_SPAN_SKU_CODE);
+    const binK = await createBin('A-06-02');
+    const tag = ulid().slice(10, 16);
+    const laterCode = `PCK-NM-LATE-${tag}`;
+    const soonCode = `PCK-NM-SOON-${tag}`;
+    // +50 days: earlier than the SKU's other allocatable stock (the previous
+    // test leaves a +100-day lot in A-06-01), so the plan names this bin.
+    await seedStock(skuId, binK, 8, { batch: { code: laterCode, expiryDate: new Date(Date.now() + 50 * 86_400_000).toISOString() } });
+    const { picklist } = await releasedWave([{ skuId, quantity: 5 }], 'named');
+    const line = picklist.lines.find((candidate) => candidate.binId === binK)!;
+    await seedStock(skuId, binK, 5, { batch: { code: soonCode, expiryDate: new Date(Date.now() + 3 * 86_400_000).toISOString() } });
+    const res = await pick(bodyFor(line)).expect(201);
+    const drawn = await sql`select code from batches where id = ${res.body.pick.batchId as string}`;
+    expect((drawn[0] as unknown as { code: string }).code).toBe(laterCode);
   });
 
   it('a serial-tracked pick writes one ledger event per serial unit; a wrong count, a duplicate or a serial living elsewhere is refused', async () => {

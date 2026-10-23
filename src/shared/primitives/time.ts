@@ -67,6 +67,17 @@ export function addIsoDays(date: string, days: number): string {
   return new Date(Date.parse(`${date}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
 }
 
+/**
+ * Whole IST calendar days from `from` to `to` (both `YYYY-MM-DD`); negative
+ * when `to` is earlier. Story 4-3a (A21) — the one home: receiving's shelf
+ * life (1-2b), the e-way document age and the allocation minimum (4-3a) all
+ * read it. It never throws (an unparseable date yields NaN), so the modules
+ * re-export it plainly, with no typed wrapper (§7c).
+ */
+export function istDaysBetween(from: string, to: string): number {
+  return Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000);
+}
+
 export function nowIso(): string {
   return new Date().toISOString();
 }
