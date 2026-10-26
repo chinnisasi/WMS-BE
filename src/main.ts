@@ -1,6 +1,8 @@
 import { API_PREFIX, createApp, parsePort } from './app.factory';
 import { assertSecondFactorKeyConfigured } from './modules/tenancy/second-factor-secrets';
 import { assertMailConfigured } from './modules/mail/mail.config';
+import { assertFileStoreConfigured } from './modules/attachments/file-store';
+import { parseAttachmentPurgeDays } from './modules/attachments/attachments.facade';
 import { assertDatabaseTlsConfig } from './shared/db/pg-tls';
 import {
   assertApiRunsNoJobs,
@@ -51,6 +53,9 @@ async function bootstrap(): Promise<void> {
   try {
     assertSecondFactorKeyConfigured();
     assertMailConfigured();
+    // Story 2-5a — FILE_STORE=local|s3 needs its bucket, region (and endpoint).
+    assertFileStoreConfigured();
+    parseAttachmentPurgeDays(process.env.ATTACHMENT_PURGE_DAYS);
   } catch (err) {
     throw new ConfigRefusal(err instanceof Error ? err.message : String(err));
   }

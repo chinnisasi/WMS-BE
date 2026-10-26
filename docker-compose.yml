@@ -16,3 +16,27 @@ services:
     container_name: wms-be-valkey
     ports:
       - '56379:6379'
+  minio:
+    # Story 2-5a — the dev file store (FILE_STORE=local): an S3-compatible
+    # server. MinIO's community images are no longer published, so this runs
+    # RustFS (S3 API, SigV4 presigned URLs, response-header overrides),
+    # pinned. S3 API on 9000. Credentials are dev-only.
+    image: rustfs/rustfs:1.0.0
+    container_name: wms-be-minio
+    environment:
+      RUSTFS_ACCESS_KEY: wms-minio
+      RUSTFS_SECRET_KEY: wms-minio-secret
+    ports:
+      - '9000:9000'
+  minio-init:
+    # One-shot: creates the private dev attachments bucket, then exits.
+    image: amazon/aws-cli:2.27.0
+    depends_on:
+      - minio
+    environment:
+      AWS_ACCESS_KEY_ID: wms-minio
+      AWS_SECRET_ACCESS_KEY: wms-minio-secret
+      AWS_DEFAULT_REGION: ap-south-1
+    entrypoint: >
+      /bin/sh -c "for i in 1 2 3 4 5 6 7 8 9 10; do aws --endpoint-url http://minio:9000 s3api head-bucket --bucket wms-attachments-dev && exit 0;
+      aws --endpoint-url http://minio:9000 s3api create-bucket --bucket wms-attachments-dev && exit 0; sleep 2; done; exit 1"

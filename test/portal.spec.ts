@@ -725,8 +725,8 @@ describe('client portal (e2e, story 21-7)', () => {
       // Every allowlisted portal write exists, too.
       expect([...PORTAL_WRITES].filter((id) => !declared.has(id))).toEqual([]);
       // 21-7's ten reads, plus 21-7b's announce and its two form reads, plus
-      // 21-8's service report, plus 4-1a's order.
-      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(15);
+      // 21-8's service report, plus 4-1a's order, plus 2-5a's two goods-receipt reads.
+      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(17);
     });
 
     it('a portal token is refused on EVERY operator route — reads and writes — with the exact fence detail', async () => {
@@ -1182,6 +1182,9 @@ describe('client portal (e2e, story 21-7)', () => {
         [
           '/tenants/{tenantId}/portal/inbound/asns',
           '/tenants/{tenantId}/portal/inbound/asns/{asnId}',
+          // Story 2-5a — the client's goods receipts.
+          '/tenants/{tenantId}/portal/inbound/goods-receipts',
+          '/tenants/{tenantId}/portal/inbound/goods-receipts/{grnId}',
           '/tenants/{tenantId}/portal/inbound/purchase-orders',
           '/tenants/{tenantId}/portal/inbound/purchase-orders/{poId}',
           '/tenants/{tenantId}/portal/invoices',

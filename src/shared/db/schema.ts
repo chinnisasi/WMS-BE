@@ -6087,3 +6087,83 @@ export const returnReceiptLines = pgTable(
 );
 
 export type ReturnReceiptLineRow = typeof returnReceiptLines.$inferSelect;
+
+/**
+ * Story 2-5a — the attachments foundation: one row per stored (or awaited)
+ * file, owned by the `attachments` module (written only through
+ * `modules/attachments/attachment-records.ts` and the sweep facade). Its first
+ * purpose is `receipt-damage` — damage photos on a goods-receipt line.
+ *
+ * Statuses: `uploading` (a reservation taken before the S3 put) → `staged`
+ * (a handheld photo not yet bound to a line) → `attached`; a receipt that
+ * lands first writes an `awaited` placeholder the late upload fills;
+ * `removed` (soft, with a reason), `expired` (an awaited photo that never
+ * arrived), `discarded` (an unbound reservation or staged row whose bytes are
+ * deleted). Rows are never hard-deleted; `purged_at` records when the bytes
+ * were deleted. Every CHECK, the RLS policy (the tenant arm plus the 0041
+ * client clause) and the post-migration probe live ONLY in
+ * `drizzle/0095_attachments.sql`. No FKs (guide §3).
+ */
+export const attachments = pgTable(
+  'attachments',
+  {
+    id: uuid('id').primaryKey(),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id'),
+    warehouseId: uuid('warehouse_id'),
+    purpose: text('purpose').notNull(),
+    status: text('status').notNull(),
+    source: text('source').notNull(),
+    ownerType: text('owner_type'),
+    ownerId: uuid('owner_id'),
+    ownerParentId: uuid('owner_parent_id'),
+    /** The handheld photo's ULID — its op's Idempotency-Key. */
+    clientRef: text('client_ref'),
+    /** The upload request's Idempotency-Key while `uploading`. */
+    uploadKey: text('upload_key'),
+    uploadHash: text('upload_hash'),
+    /** SHA-256 (hex) of the RAW upload bytes — the replay and conflict fingerprint. */
+    rawSha256: text('raw_sha256'),
+    objectKey: text('object_key'),
+    contentType: text('content_type'),
+    byteSize: integer('byte_size'),
+    /** SHA-256 (hex) of the STORED (sanitized) bytes. */
+    sha256: text('sha256'),
+    width: integer('width'),
+    height: integer('height'),
+    capturedAt: timestamp('captured_at', { withTimezone: true, mode: 'string' }),
+    uploadedAt: timestamp('uploaded_at', { withTimezone: true, mode: 'string' }),
+    deviceId: uuid('device_id'),
+    createdBy: uuid('created_by'),
+    removedBy: uuid('removed_by'),
+    removedAt: timestamp('removed_at', { withTimezone: true, mode: 'string' }),
+    removedReason: text('removed_reason'),
+    purgedAt: timestamp('purged_at', { withTimezone: true, mode: 'string' }),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('attachments_tenant_client_ref_unique')
+      .on(table.tenantId, table.clientRef)
+      .where(sql`client_ref is not null and status <> 'discarded'`),
+    uniqueIndex('attachments_tenant_upload_key_unique')
+      .on(table.tenantId, table.uploadKey)
+      .where(sql`status = 'uploading'`),
+    uniqueIndex('attachments_tenant_object_key_unique')
+      .on(table.tenantId, table.objectKey)
+      .where(sql`object_key is not null and purged_at is null`),
+    index('attachments_tenant_parent_idx')
+      .on(table.tenantId, table.ownerParentId, table.ownerId)
+      .where(sql`owner_parent_id is not null`),
+    index('attachments_tenant_device_staged_idx')
+      .on(table.tenantId, table.deviceId)
+      .where(sql`status = 'staged'`),
+    index('attachments_tenant_sweep_idx')
+      .on(table.tenantId, table.status, table.createdAt)
+      .where(
+        sql`status in ('uploading', 'staged', 'awaited') or (status in ('removed', 'discarded') and purged_at is null)`,
+      ),
+    index('attachments_sweep_discovery_idx').on(table.status, table.createdAt),
+  ],
+);
+
+export type AttachmentRow = typeof attachments.$inferSelect;

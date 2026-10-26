@@ -1034,7 +1034,13 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // Story 2-8a: + qc_inspections_tenant_isolation and
       // qc_inspection_lines_tenant_isolation (0091, the plain tenant policy —
       // operator-side, like qc_holds; the portal shows no QC outcome yet).
-      expect(policies).toHaveLength(124);
+      // Story 2-5a: + attachments_tenant_isolation (0095, client-bound on both
+      // arms — the 0084 shape; an unattributed staged photo is invisible to a
+      // portal stamp).
+      expect(policies).toHaveLength(125);
+      const attachmentPolicy = policies.find((row) => row.policyname === 'attachments_tenant_isolation')!;
+      expect(attachmentPolicy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+      expect(attachmentPolicy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
       const licencePolicy = policies.find((row) => row.policyname === 'licences_tenant_isolation')!;
       expect(licencePolicy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
       expect(licencePolicy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");

@@ -336,6 +336,19 @@ export const CAPABILITIES = [
   // contained by the owner's approval for a request-only holder (PENDING).
   // Mirrored into wms-fe `src/lib/users.ts` (CAPABILITIES + the operator grant).
   'stock.adjust.request',
+  // Story 2-5a — add a damage photo to a goods-receipt line from the web
+  // (`ReceiptPhotoCommand.addOnWeb`). Owner, Ops Manager AND Operator: the
+  // dock records what it sees (`gate.manage`'s rationale). The handheld's
+  // own upload needs no capability — it runs the `grn.submit` device gate
+  // (a floor role on an active device). Accountant absent, never a client.
+  // Mirrored into wms-fe `src/lib/users.ts` (CAPABILITIES + the operator grant).
+  'receipt.attach',
+  // Story 2-5a (A20) — remove a damage photo (soft: the row and its audit
+  // stay; the bytes are purged after ATTACHMENT_PURGE_DAYS) or cancel an
+  // awaited one. Owner and Ops Manager only: the photo is evidence in a
+  // vendor or client claim, so an operator cannot take it back. Mirrored
+  // into wms-fe `src/lib/users.ts` (CAPABILITIES).
+  'receipt.photo-remove',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -424,7 +437,9 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     // Story 3-2b — the adjustment request (A6: listed so the BE matches the
     // FE's derived ops_manager set; the manager's own `stock.adjust` still
     // decides — a holder of both keeps the threshold rule).
-    'stock.adjust.request',
+    'stock.adjust.request',    // Story 2-5a — damage photos: add, and remove/cancel (owner holds everything).
+    'receipt.attach',
+    'receipt.photo-remove',
   ]),
   operator: new Set<Capability>([
     'putaway.execute',
@@ -455,7 +470,9 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'stock.move',
     // Story 3-2b — the floor REQUESTS an adjustment (the handheld Adjust
     // screen); it always pends for the owner. Never `stock.adjust` itself.
-    'stock.adjust.request',
+    'stock.adjust.request',    // Story 2-5a — the dock adds a damage photo from the web. Never
+    // `receipt.photo-remove`: evidence is removed by a manager.
+    'receipt.attach',
   ]),
   // Story 8-2b: the accountant's first write — the e-way paperwork (finance
   // work). Story 21-3: the client rate cards (finance work — decision 2,

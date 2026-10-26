@@ -54,3 +54,15 @@ export function lineConditionFields(line: {
     ...(short > 0 && typeof line.shortReasonCode === 'string' ? { shortReasonCode: line.shortReasonCode } : {}),
   };
 }
+
+/**
+ * Story 2-5a (A3) — the photo refs a stored review row's line carries, ONLY
+ * when non-empty, so a row without photos is byte-identical to its pre-2-5a
+ * shape (the `lineConditionFields` precedent). Used by the three review-row
+ * payload builders only (`grn.lines-refused`, `grn.shelf-life-refused`,
+ * `grn.licence-refused`) — never by `clientRefusalLines` or a
+ * `rejectedLines` entry.
+ */
+export function linePhotoFields(line: { readonly photoRefs?: readonly string[] | null | undefined }): { photoRefs?: string[] } {
+  return Array.isArray(line.photoRefs) && line.photoRefs.length > 0 ? { photoRefs: [...line.photoRefs] } : {};
+}

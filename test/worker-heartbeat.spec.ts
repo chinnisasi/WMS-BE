@@ -295,6 +295,7 @@ describe('the worker heartbeat (story 6-2c, A3)', () => {
         .map((body) => body.slice(0, body.indexOf(' ')));
       expect(beating.sort()).toEqual(
         [
+          'AttachmentSweepWorker',
           'AuditExportWorker',
           'ChannelsSyncWorker',
           'CountSchedulerWorker',

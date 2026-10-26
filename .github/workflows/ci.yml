@@ -101,6 +101,54 @@ jobs:
       - name: Round-trip check (schema vs migrations drift guard)
         run: bun run db:verify
 
+  minio-integration:
+    # Story 2-5a (A14) — the file-store adapter against a real S3 API: put,
+    # presign, and a plain fetch of the presigned URL (status, signed
+    # Content-Type and disposition, the EXIF-stripped bytes, a tampered
+    # signature refused). MinIO's community images are no longer published,
+    # so the S3-compatible RustFS runs instead (pinned), as a step. Postgres
+    # is here only because jest's globalSetup builds the suite template.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: wms
+          POSTGRES_PASSWORD: wms
+          POSTGRES_DB: wms
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U wms"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://wms:wms@localhost:55432/wms
+      FILE_STORE_MINIO_TEST_ENDPOINT: http://localhost:9000
+      AWS_ACCESS_KEY_ID: wms-minio
+      AWS_SECRET_ACCESS_KEY: wms-minio-secret
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Start the S3-compatible server
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e RUSTFS_ACCESS_KEY=wms-minio -e RUSTFS_SECRET_KEY=wms-minio-secret \
+            rustfs/rustfs:1.0.0
+          for i in $(seq 1 60); do curl -s -o /dev/null -w '%{http_code}' http://localhost:9000/ | grep -q 403 && exit 0; sleep 1; done
+          docker logs minio; exit 1
+
+      - name: File store against a real S3 API
+        run: bun run test -- test/file-store-minio.spec.ts
+
   openapi:
     runs-on: ubuntu-latest
     steps:

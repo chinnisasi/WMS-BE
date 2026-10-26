@@ -1,5 +1,18 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, UseGuards } from '@nestjs/common';
-import { ApiBearerAuth, ApiBody, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { Body, Controller, createParamDecorator, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, UploadedFile, UseFilters, UseGuards, UseInterceptors } from '@nestjs/common';
+import type { ExecutionContext } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+// Pulls in @types/multer's `Express.Multer.File` namespace augmentation.
+import type {} from 'multer';
+import { ATTACHMENT_UPLOAD_LIMITS, AttachmentUploadFilter } from '../shared/import/attachment-upload-filter';
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import {
+  ReceiptPhotoResponse,
+  ReceiptPhotosResponse,
+  ReceiptPhotoUploadResponse,
+  RemoveReceiptPhotoDto,
+  UploadReceiptPhotoFieldsDto,
+} from '../modules/inbound/receipt-photo.dto';
+import { ApiBearerAuth, ApiBody, ApiConsumes, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
 import { istDateOf } from '../shared/primitives/time';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
@@ -44,6 +57,17 @@ import {
   ReleaseReceiptHoldsResponse,
 } from '../modules/inbound/qc.dto';
 import { assertInstantRange } from '../shared/primitives/instant-range';
+/**
+ * Story 2-5a — the raw `x-op-operator` header (the capturing operator). A
+ * custom decorator, not `@Headers`, so the OpenAPI document carries exactly
+ * the one parameter documented via `@ApiHeaders` (the `IdempotencyKey`
+ * precedent — `@Headers` adds a second, and the two orders drift).
+ */
+const OpOperatorHeader = createParamDecorator((_data: unknown, context: ExecutionContext): string | undefined => {
+  const header = context.switchToHttp().getRequest<{ headers: Record<string, unknown> }>().headers['x-op-operator'];
+  return typeof header === 'string' ? header : undefined;
+});
+
 const IDEMPOTENCY_HEADER = [
   {
     name: 'Idempotency-Key',
@@ -174,6 +198,8 @@ export class ReceivingController {
           ...(line.damageReasonCode === undefined || line.damageReasonCode === null ? {} : { damageReasonCode: line.damageReasonCode }),
           ...(line.shortQty === undefined || line.shortQty === null ? {} : { shortQty: line.shortQty }),
           ...(line.shortReasonCode === undefined || line.shortReasonCode === null ? {} : { shortReasonCode: line.shortReasonCode }),
+          // Story 2-5a: the line's photo refs — absent (or empty) stays absent (hashed only when non-empty).
+          ...(line.photoRefs === undefined || line.photoRefs === null || line.photoRefs.length === 0 ? {} : { photoRefs: line.photoRefs }),
         })),
       },
       key,
@@ -690,10 +716,190 @@ export class ReceivingController {
           : { ...detail.inspection, lines: detail.inspection.lines.map((line) => ({ ...line })) },
     };
   }
+
+  // ── story 2-5a: damage photos on a receipt line ───────────────────────────
+
+  /**
+   * The handheld's photo op (`receipt-photo.stage`). The DEVICE credential
+   * (A7) — the guard admits it without a badge-in — with `x-op-operator`
+   * naming the capturing operator, re-authorized by the command. Guards run
+   * before multer (A15), so an unauthenticated upload is refused before any
+   * body is buffered; the key parse runs after it.
+   */
+  @Post(':tenantId/receiving/receipt-photos')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(DeviceSessionGuard)
+  @UseFilters(AttachmentUploadFilter)
+  @UseInterceptors(FileInterceptor('file', { limits: ATTACHMENT_UPLOAD_LIMITS }))
+  @ApiBearerAuth()
+  @ApiConsumes('multipart/form-data')
+  @ApiOperation({
+    summary:
+      'Story 2-5a — uploads one handheld damage photo (receipt-photo.stage; the device credential + x-op-operator). Idempotency-Key = the photo ULID its receipt names in photoRefs. Sniffed by its bytes (JPEG, PNG or WebP only), metadata stripped, stored; bound to its receipt line in either order',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        capturedAt: { type: 'string', format: 'date-time', description: 'The capture instant, ISO-8601 UTC ending in Z' },
+        file: { type: 'string', format: 'binary', description: 'The photo — JPEG, PNG or WebP, at most 10 MB and 8,000 px a side' },
+      },
+      required: ['capturedAt', 'file'],
+    },
+  })
+  @ApiHeaders([
+    ...IDEMPOTENCY_HEADER,
+    {
+      name: 'x-op-operator',
+      required: true,
+      description: 'The capturing operator\'s user id — the photo is attributed to them, whoever is badged in now',
+      schema: { type: 'string', format: 'uuid' },
+    },
+  ])
+  @ApiResponse({ status: HttpStatus.CREATED, type: ReceiptPhotoUploadResponse, description: 'Stored (staged until its receipt binds it, or attached to the placeholder its receipt left) — the idempotency snapshot; no URL' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, x-op-operator, capturedAt or file, or too many parts (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token (unauthenticated)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Unknown or revoked device (device-revoked), or the operator does not hold a floor role (role-denied)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The ref is already stored with different bytes (attachment-ref-conflict), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 415, ...problemJsonResponse('Not a JPEG, PNG or WebP by its bytes — HEIC, SVG, GIF, PDF, an animated PNG or WebP (attachment-type-unsupported)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Over 10 MB (attachment-too-large), a malformed image or a side outside 1–8,000 px (attachment-content-invalid), or the key reused with a different photo (idempotency-key-reuse)') })
+  @ApiResponse({ status: 429, ...problemJsonResponse('This device has 200 photos waiting for their receipts (attachment-staging-limit) — retried') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('No file storage configured (file-storage-unavailable), the store failed (file-storage-failed), or too many uploads in flight (file-storage-busy) — retried') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the device token)' })
+  async uploadReceiptPhoto(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @OpOperatorHeader() opOperator: string | undefined,
+    @CurrentDeviceSession() session: DeviceSession,
+    @Body() fields: UploadReceiptPhotoFieldsDto,
+    @UploadedFile() file: Express.Multer.File | undefined,
+  ): Promise<ReceiptPhotoUploadResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    const ref = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.receiving.uploadReceiptPhoto(
+      { tenantId, deviceId: session.deviceId, opOperator, capturedAt: fields.capturedAt, bytes: file?.buffer },
+      ref,
+    );
+    return { ref: snapshot.ref, status: snapshot.status };
+  }
+
+  @Get(':tenantId/receiving/goods-receipts/:grnId/photos')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Story 2-5a — one goods receipt\'s damage photos (any staff role): every live photo in receipt order with a short-lived presigned URL, awaited placeholders, then at most the 50 newest removed (with who and why) and never-arrived ones',
+  })
+  @ApiOkResponse({ type: ReceiptPhotosResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed grnId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No goods receipt with this id exists in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'grnId', format: 'uuid' })
+  async listReceiptPhotos(
+    @Param('tenantId') tenantId: string,
+    @Param('grnId') grnId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<ReceiptPhotosResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(grnId, 'grnId');
+    const list = await this.receiving.listReceiptPhotos(tenantId, grnId);
+    return { storageEnabled: list.storageEnabled, photos: list.photos.map((photo) => ({ ...photo })) };
+  }
+
+  @Post(':tenantId/receiving/goods-receipts/:grnId/lines/:lineId/photos')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @UseFilters(AttachmentUploadFilter)
+  @UseInterceptors(FileInterceptor('file', { limits: ATTACHMENT_UPLOAD_LIMITS }))
+  @ApiBearerAuth()
+  @ApiConsumes('multipart/form-data')
+  @ApiOperation({
+    summary:
+      'Story 2-5a — adds a damage photo to one goods-receipt line from the web (receipt.attach). Sniffed by its bytes (JPEG, PNG or WebP), metadata stripped, stored and attached at once',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: { file: { type: 'string', format: 'binary', description: 'The photo — JPEG, PNG or WebP, at most 10 MB and 8,000 px a side' } },
+      required: ['file'],
+    },
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: ReceiptPhotoResponse, description: 'The attached photo (the idempotency snapshot — no URL; read the list for one)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, grnId, lineId or file, or too many parts (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), the caller lacks receipt.attach (role-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No such line on this goods receipt in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The line holds 10 photos or the receipt 50 (attachment-limit-reached), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 415, ...problemJsonResponse('Not a JPEG, PNG or WebP by its bytes (attachment-type-unsupported) — a HEIC photo says so') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Over 10 MB (attachment-too-large), a malformed image or a side outside 1–8,000 px (attachment-content-invalid), or the key reused with a different photo (idempotency-key-reuse)') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('No file storage configured (file-storage-unavailable), the store failed (file-storage-failed), or too many uploads in flight (file-storage-busy)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'grnId', format: 'uuid' })
+  @ApiParam({ name: 'lineId', format: 'uuid' })
+  async addReceiptPhoto(
+    @Param('tenantId') tenantId: string,
+    @Param('grnId') grnId: string,
+    @Param('lineId') lineId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @UploadedFile() file: Express.Multer.File | undefined,
+  ): Promise<ReceiptPhotoResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(grnId, 'grnId');
+    assertUuidParam(lineId, 'lineId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.receiving.addReceiptPhoto(
+      { tenantId, actorUserId: session.userId, grnId, grnLineId: lineId, bytes: file?.buffer },
+      key,
+    );
+    return { attachment: { ...snapshot.attachment } };
+  }
+
+  @Post(':tenantId/receiving/goods-receipts/:grnId/photos/:attachmentId/remove')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Story 2-5a — removes a damage photo (soft — the record and its audit stay; the bytes are deleted after ATTACHMENT_PURGE_DAYS), or cancels an awaited one (receipt.photo-remove — owner and ops manager)',
+  })
+  @ApiBody({ type: RemoveReceiptPhotoDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: ReceiptPhotoResponse, description: 'The removed photo (a matching Idempotency-Key replays it)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, grnId or attachmentId, or a reason outside 1–200 characters (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), the caller lacks receipt.photo-remove (role-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No such photo on this goods receipt (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The photo is already removed, or never arrived (attachment-not-attached), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'grnId', format: 'uuid' })
+  @ApiParam({ name: 'attachmentId', format: 'uuid' })
+  async removeReceiptPhoto(
+    @Param('tenantId') tenantId: string,
+    @Param('grnId') grnId: string,
+    @Param('attachmentId') attachmentId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: RemoveReceiptPhotoDto,
+  ): Promise<ReceiptPhotoResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(grnId, 'grnId');
+    assertUuidParam(attachmentId, 'attachmentId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.receiving.removeReceiptPhoto(
+      { tenantId, actorUserId: session.userId, grnId, attachmentId, reason: dto.reason },
+      key,
+    );
+    return { attachment: { ...snapshot.attachment } };
+  }
 }
 
 /** Receiving uuid path/query params fail 400 (not a 500 from the `::uuid` cast). */
-function assertUuidParam(value: string, name: 'overReceiptId' | 'holdId' | 'warehouseId' | 'grnId'): void {
+function assertUuidParam(value: string, name: 'overReceiptId' | 'holdId' | 'warehouseId' | 'grnId' | 'lineId' | 'attachmentId'): void {
   if (!UUID_RE.test(value)) {
     throw new ProblemException(
       'validation-failed',

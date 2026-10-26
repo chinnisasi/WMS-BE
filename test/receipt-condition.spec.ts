@@ -864,8 +864,11 @@ describe('story 2-4a: damaged and short receipt quantities (e2e)', () => {
         damageReasonCode: 'broken',
         shortQty: 1,
         shortReasonCode: 'other',
+        // Story 2-5a — the read now always carries the line's photo counts.
+        photoCount: 0,
+        pendingPhotoCount: 0,
       },
-      { id: grn.lines[1]!.id, skuId: sku('PLAIN', 'P-A'), skuCode: 'P-A', skuName: 'P-A name', batchId: null, batchCode: null, qty: 3, appliedQty: 3 },
+      { id: grn.lines[1]!.id, skuId: sku('PLAIN', 'P-A'), skuCode: 'P-A', skuName: 'P-A name', batchId: null, batchCode: null, qty: 3, appliedQty: 3, photoCount: 0, pendingPhotoCount: 0 },
     ]);
     await http().get(`${API}/${tenantId}/receiving/goods-receipts/${uuidv7()}/lines`).set('Authorization', `Bearer ${ownerToken}`).expect(404);
     await http().get(`${API}/${tenantId}/receiving/goods-receipts/not-a-uuid/lines`).set('Authorization', `Bearer ${ownerToken}`).expect(400);

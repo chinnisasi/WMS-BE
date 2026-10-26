@@ -1,5 +1,7 @@
 import { forwardRef, Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
+import { AttachmentsModule } from '../attachments/attachments.module';
+import { ReceiptPhotoCommand } from './receipt-photo.command';
 import { CatalogModule } from '../catalog/catalog.module';
 import { InventoryModule } from '../inventory/inventory.module';
 import { PutawayModule } from '../putaway/putaway.module';
@@ -51,7 +53,9 @@ import { GateInFacade } from './gate-in.facade';
 // catalog cycle; the decorator must not touch the loading binding eagerly
 // (the catalog↔tenancy pattern).
 @Module({
-  imports: [SharedModule, forwardRef(() => CatalogModule), InventoryModule, PutawayModule, PartnersModule],
+  // Story 2-5a — AttachmentsModule (the file store, the sanitizer, the
+  // records seam): it imports no sibling module, so no cycle.
+  imports: [SharedModule, forwardRef(() => CatalogModule), InventoryModule, PutawayModule, PartnersModule, AttachmentsModule],
   providers: [
     PurchaseOrderCommand,
     // Story 21-6 — the advance shipment notice lifecycle.
@@ -66,6 +70,8 @@ import { GateInFacade } from './gate-in.facade';
     // Story 2-3a — the gate-in (an inbound vehicle visit).
     GateInCommand,
     GateInFacade,
+    // Story 2-5a — damage photos on a receipt line.
+    ReceiptPhotoCommand,
   ],
   exports: [InboundFacade, ReceivingFacade, QcFacade, GateInFacade],
 })

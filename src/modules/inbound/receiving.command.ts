@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
@@ -52,10 +52,15 @@ import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertDeviceOperatorInTx } from '../tenancy/device-operator';
 import { ensureDamagedBinInTx, ensureReceivingBinInTx } from '../tenancy/receiving-bin';
-import { isDamageReasonCode, isShortReasonCode, lineConditionFields, DAMAGE_REASON_CODES, SHORT_REASON_CODES } from './receipt-condition';
+import { isDamageReasonCode, isShortReasonCode, lineConditionFields, linePhotoFields, DAMAGE_REASON_CODES, SHORT_REASON_CODES } from './receipt-condition';
 import { assertWarehouseInTenant, getMemberRoleIn, getWarehouseCodeInTx } from '../tenancy/tenancy.service';
 import { assertPermission } from '../tenancy/permissions';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
+import {
+  claimRefsInTx,
+  RECEIPT_PHOTOS_MAX_PER_LINE,
+  RECEIPT_PHOTOS_MAX_PER_RECEIPT,
+} from '../attachments/attachment-records';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { CatalogFacade } from '../catalog/catalog.facade';
@@ -141,6 +146,14 @@ export interface GrnLineInput {
   readonly shortQty?: number | null | undefined;
   /** Story 2-4a — required when `shortQty > 0`, refused otherwise (`SHORT_REASON_CODES`). */
   readonly shortReasonCode?: string | null | undefined;
+  /**
+   * Story 2-5a — the line's damage photos by the ULID the handheld minted at
+   * capture, in capture order. Optional on the wire AND on a stored older
+   * payload (normalised `?? []`); hashed as the line's LAST key only when
+   * non-empty, so every receipt without photos hashes byte-for-byte as before.
+   * Never a refusal beyond its shape: a ref the claim cannot bind is skipped.
+   */
+  readonly photoRefs?: readonly string[] | null | undefined;
 }
 
 /** Story 2-4a — a GRN line's input after normalisation: every condition field present. */
@@ -149,6 +162,8 @@ type NormalisedGrnLineInput = GrnLineInput & {
   readonly damageReasonCode: string | null;
   readonly shortQty: number;
   readonly shortReasonCode: string | null;
+  /** Story 2-5a — the photo refs, `[]` when none. */
+  readonly photoRefs: readonly string[];
 };
 
 export interface SubmitGoodsReceiptCommand {
@@ -622,6 +637,8 @@ interface OverReceiptRequest {
  */
 @Injectable()
 export class ReceivingCommand {
+  private readonly logger = new Logger('ReceivingCommand');
+
   constructor(
     @Inject(DATABASE) private readonly db: Database,
     @Inject(OUTBOX_SINK) private readonly outbox: OutboxSink,
@@ -723,6 +740,13 @@ export class ReceivingCommand {
         // before (golden in `test/receipt-condition.spec.ts`); a reason is
         // hashed only beside its quantity (a reason with 0 is a 400 below).
         ...conditionHashFields(line),
+        // ── story 2-5a: ADDITIVE, the conditional-key exception (§4) ──────
+        // The line's LAST key, only when non-empty, in capture order (never
+        // sorted: photo k of the line is the k-th taken). Absent, null and
+        // `[]` hash alike, so every receipt without photos hashes byte for
+        // byte as before (goldens in `test/receipt-photos.spec.ts` and the
+        // untouched older ones).
+        ...photoRefsHashField(line),
       })),
     });
 
@@ -760,8 +784,15 @@ export class ReceivingCommand {
       damageReasonCode: line.damageReasonCode ?? null,
       shortQty: line.shortQty ?? 0,
       shortReasonCode: line.shortReasonCode ?? null,
+      // Story 2-5a — absent on every older payload.
+      photoRefs: line.photoRefs ?? [],
     }));
     assertWeightShape(inputLines);
+    // Story 2-5a — the photo refs' SHAPE, above the transaction (a request
+    // shape, no row needed): ULIDs, ≤ 10 per line, ≤ 50 per receipt, unique
+    // across the receipt. Never a rule about the refs' state — the claim
+    // skips what it cannot bind.
+    assertPhotoRefShape(inputLines);
 
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
       // ── device re-authorization (fail-closed, the selfTestEcho mirror) ──
@@ -2006,6 +2037,35 @@ export class ReceivingCommand {
         },
       };
 
+      // ── story 2-5a: the photo claim (A1, A17, A27) ───────────────────────
+      // After every ledger append and immediately before the outbox append,
+      // so the ref advisory locks are this receipt's LAST locks (refs
+      // sorted). Settled lines only — a refused line's refs ride its review
+      // row (A3). A ref is never a refusal and changes nothing in the
+      // response or the snapshot: a staged photo of THIS device is attached,
+      // an unknown ref gets an awaited placeholder its late upload fills, and
+      // a stale or foreign one is skipped (audited + a warn log).
+      const photoLines = settled
+        .filter((entry) => entry.input.photoRefs.length > 0)
+        .map((entry) => ({ grnLineId: entry.lineId, refs: entry.input.photoRefs }));
+      if (photoLines.length > 0) {
+        const claim = await claimRefsInTx(tx, {
+          tenantId: command.tenantId,
+          deviceId: command.deviceId,
+          grnId,
+          clientId: receiptClientId,
+          warehouseId: command.warehouseId,
+          actorUserId: command.operatorUserId,
+          reference: idempotencyKey,
+          lines: photoLines,
+        });
+        if (claim.skipped.length > 0) {
+          this.logger.warn(
+            `grn.submit ${code} (tenant ${command.tenantId}): ${claim.skipped.length} photo ref(s) skipped — unknown to device ${command.deviceId}, or already bound: ${claim.skipped.join(', ')}`,
+          );
+        }
+      }
+
       // ── in-transaction outbox appends (AD-7) ────────────────────────────
       await this.outbox.append(tx, {
         messageId: uuidv7(),
@@ -2999,6 +3059,8 @@ export class ReceivingCommand {
             ...(line.weightsGrams === null ? {} : { weightsGrams: [...line.weightsGrams] }),
             // Story 2-4a — the line's condition, only when > 0 (base units).
             ...lineConditionFields(line),
+            // Story 2-5a (A3) — the line's photo refs, only when non-empty (they stay staged).
+            ...linePhotoFields(line),
           })),
           refusals: linesRefused.map(refusalEntry),
         },
@@ -3054,6 +3116,8 @@ export class ReceivingCommand {
             ...(line.weightsGrams === null ? {} : { weightsGrams: [...line.weightsGrams] }),
             // Story 2-4a — only when > 0, so Apply re-sends them (a pre-2-4a row is byte-identical).
             ...lineConditionFields(line),
+            // Story 2-5a (A3) — only when non-empty: Apply re-sends them and the re-run binds them.
+            ...linePhotoFields(line),
           })),
           refusals: shelfLifeRefused.map(refusalEntry),
         },
@@ -3118,6 +3182,8 @@ export class ReceivingCommand {
             ...(line.weightsGrams === null ? {} : { weightsGrams: [...line.weightsGrams] }),
             // Story 2-4a — only when > 0, so Apply re-sends them (a pre-2-4a row is byte-identical).
             ...lineConditionFields(line),
+            // Story 2-5a (A3) — only when non-empty: Apply re-sends them and the re-run binds them.
+            ...linePhotoFields(line),
           })),
           refusals: licenceRefused.map(refusalEntry),
           // D1 — no loop: a row raised during a re-run under a shelf-life
@@ -3324,6 +3390,44 @@ function linesRefusedDetail(
 
 function grnValidation(detail: string): ProblemException {
   return new ProblemException('validation-failed', 400, 'Invalid goods receipt', detail);
+}
+
+/** Story 2-5a — the photo refs' hash key: present only when non-empty (the line AS RECEIVED). */
+function photoRefsHashField(line: GrnLineInput): { photoRefs?: string[] } {
+  return Array.isArray(line.photoRefs) && line.photoRefs.length > 0 ? { photoRefs: [...line.photoRefs] } : {};
+}
+
+/**
+ * Story 2-5a — the photo refs' SHAPE (every one a whole-op 400
+ * `validation-failed`, above the transaction): an array of 26-character
+ * ULIDs, at most `RECEIPT_PHOTOS_MAX_PER_LINE` per line and
+ * `RECEIPT_PHOTOS_MAX_PER_RECEIPT` per receipt, each unique across the
+ * receipt — the shape is what keeps a receipt's claim within the caps.
+ */
+function assertPhotoRefShape(lines: readonly NormalisedGrnLineInput[]): void {
+  const seen = new Set<string>();
+  lines.forEach((line, index) => {
+    if (!Array.isArray(line.photoRefs)) {
+      throw grnValidation(`lines[${index}].photoRefs must be an array of photo references.`);
+    }
+    if (line.photoRefs.length > RECEIPT_PHOTOS_MAX_PER_LINE) {
+      throw grnValidation(
+        `lines[${index}] carries ${line.photoRefs.length} photos — at most ${RECEIPT_PHOTOS_MAX_PER_LINE} per line.`,
+      );
+    }
+    for (const ref of line.photoRefs) {
+      if (typeof ref !== 'string' || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(ref)) {
+        throw grnValidation(`lines[${index}].photoRefs: each entry must be a 26-character ULID (got ${JSON.stringify(ref)}).`);
+      }
+      if (seen.has(ref)) {
+        throw grnValidation(`Photo ${ref} is named more than once in this receipt.`);
+      }
+      seen.add(ref);
+    }
+  });
+  if (seen.size > RECEIPT_PHOTOS_MAX_PER_RECEIPT) {
+    throw grnValidation(`This receipt carries ${seen.size} photos — at most ${RECEIPT_PHOTOS_MAX_PER_RECEIPT} per receipt.`);
+  }
 }
 
 /**

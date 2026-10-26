@@ -906,7 +906,9 @@ describe('return receipts (e2e, story 13-2)', () => {
   it('the per-type decision rule: every pre-13-2 op type keeps all three decisions; return.receive, grn.lines-refused and grn.inactive-sku-received only discard; grn.shelf-life-refused and (1-6d) grn.licence-refused apply + discard', () => {
     // Story 2-3a adds a device-uploaded Discard-only type, `gate-in.unload`
     // (a refused unload — re-applying would be refused again). Named here.
-    const discardOnly = new Set(['return.receive', 'grn.lines-refused', 'grn.inactive-sku-received', 'gate-in.unload']);
+    // Story 2-5a adds the device-uploaded Discard-only `receipt-photo.stage`
+    // (a refused damage photo — the device deleted the file). Named here.
+    const discardOnly = new Set(['return.receive', 'grn.lines-refused', 'grn.inactive-sku-received', 'gate-in.unload', 'receipt-photo.stage']);
     for (const type of REJECTED_OP_TYPES) {
       const expected =
         // Story 3-1 adds the device-uploaded `stock.move` — apply + discard (a
