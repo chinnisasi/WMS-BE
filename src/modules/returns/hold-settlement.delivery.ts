@@ -10,7 +10,7 @@ import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { QcFacade } from '../inbound/qc.facade';
-import { dispositionDataFault } from './disposition-split';
+import { assertLinesConservedInTx, dispositionDataFault } from './disposition-split';
 
 /** The two QC events that close a hold (a release; 2-8a's inspection). */
 export const HOLD_SETTLEMENT_EVENTS = ['qc_hold.released', 'qc_hold.inspected'] as const;
@@ -124,6 +124,8 @@ export class ReturnHoldSettlementHandler implements OnModuleInit {
             .set({ openQty: sql`${returnReceiptLines.openQty} + ${outcome.returnedMilli}::bigint` })
             .where(and(eq(returnReceiptLines.tenantId, event.tenantId), eq(returnReceiptLines.id, disposition.lineId)));
         }
+        // A20 — the settlement keeps the line conserving too (a data fault rolls back and acks).
+        await assertLinesConservedInTx(tx, event.tenantId, [disposition.lineId]);
         return 'settled' as const;
       });
     } catch (err) {

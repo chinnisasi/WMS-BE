@@ -277,6 +277,11 @@ BEGIN
 		'quarantine by a device',
 		'scrap without a reason',
 		'scrap by a device',
+		'restock with a hold',
+		'scrap with a bin',
+		'scrap with a hold',
+		'quarantine with a bin',
+		'quarantine of a case',
 		'unknown reason',
 		'other without a note',
 		'blank note',
@@ -311,6 +316,11 @@ BEGIN
 			WHEN 'quarantine by a device' THEN 'return_dispositions_outcome_shape'
 			WHEN 'scrap without a reason' THEN 'return_dispositions_outcome_shape'
 			WHEN 'scrap by a device' THEN 'return_dispositions_outcome_shape'
+			WHEN 'restock with a hold' THEN 'return_dispositions_outcome_shape'
+			WHEN 'scrap with a bin' THEN 'return_dispositions_outcome_shape'
+			WHEN 'scrap with a hold' THEN 'return_dispositions_outcome_shape'
+			WHEN 'quarantine with a bin' THEN 'return_dispositions_outcome_shape'
+			WHEN 'quarantine of a case' THEN 'return_dispositions_outcome_shape'
 			WHEN 'unknown reason' THEN 'return_dispositions_reason_check'
 			WHEN 'other without a note' THEN 'return_dispositions_note_check'
 			WHEN 'blank note' THEN 'return_dispositions_note_check'
@@ -373,6 +383,21 @@ BEGIN
 				WHEN 'scrap by a device' THEN
 					INSERT INTO "return_dispositions" ("id","tenant_id","client_id","warehouse_id","return_receipt_id","return_receipt_line_id","rma_id","sku_id","outcome","qty","reason_code","device_id","decided_by","ledger_event_id","occurred_at")
 					VALUES (gen_random_uuid(), t, c, t, t, l, t, t, 'scrap', 1000, 'damaged', t, t, t, now());
+				WHEN 'restock with a hold' THEN
+					INSERT INTO "return_dispositions" ("id","tenant_id","client_id","warehouse_id","return_receipt_id","return_receipt_line_id","rma_id","sku_id","outcome","qty","handling_unit_id","to_bin_id","qc_hold_id","reason_code","decided_by","ledger_event_id","occurred_at")
+					VALUES (gen_random_uuid(), t, c, t, t, l, t, t, 'restock', 1000, NULL, t, gen_random_uuid(), NULL, t, t, now());
+				WHEN 'scrap with a bin' THEN
+					INSERT INTO "return_dispositions" ("id","tenant_id","client_id","warehouse_id","return_receipt_id","return_receipt_line_id","rma_id","sku_id","outcome","qty","handling_unit_id","to_bin_id","qc_hold_id","reason_code","decided_by","ledger_event_id","occurred_at")
+					VALUES (gen_random_uuid(), t, c, t, t, l, t, t, 'scrap', 1000, NULL, t, NULL, 'damaged', t, t, now());
+				WHEN 'scrap with a hold' THEN
+					INSERT INTO "return_dispositions" ("id","tenant_id","client_id","warehouse_id","return_receipt_id","return_receipt_line_id","rma_id","sku_id","outcome","qty","handling_unit_id","to_bin_id","qc_hold_id","reason_code","decided_by","ledger_event_id","occurred_at")
+					VALUES (gen_random_uuid(), t, c, t, t, l, t, t, 'scrap', 1000, NULL, NULL, gen_random_uuid(), 'damaged', t, t, now());
+				WHEN 'quarantine with a bin' THEN
+					INSERT INTO "return_dispositions" ("id","tenant_id","client_id","warehouse_id","return_receipt_id","return_receipt_line_id","rma_id","sku_id","outcome","qty","handling_unit_id","to_bin_id","qc_hold_id","reason_code","decided_by","ledger_event_id","occurred_at")
+					VALUES (gen_random_uuid(), t, c, t, t, l, t, t, 'quarantine', 1000, NULL, t, gen_random_uuid(), 'damaged', t, NULL, now());
+				WHEN 'quarantine of a case' THEN
+					INSERT INTO "return_dispositions" ("id","tenant_id","client_id","warehouse_id","return_receipt_id","return_receipt_line_id","rma_id","sku_id","outcome","qty","handling_unit_id","to_bin_id","qc_hold_id","reason_code","decided_by","ledger_event_id","occurred_at")
+					VALUES (gen_random_uuid(), t, c, t, t, l, t, t, 'quarantine', 1000, gen_random_uuid(), NULL, gen_random_uuid(), 'damaged', t, NULL, now());
 				WHEN 'unknown reason' THEN
 					INSERT INTO "return_dispositions" ("id","tenant_id","client_id","warehouse_id","return_receipt_id","return_receipt_line_id","rma_id","sku_id","outcome","qty","reason_code","decided_by","ledger_event_id","occurred_at")
 					VALUES (gen_random_uuid(), t, c, t, t, l, t, t, 'scrap', 1000, 'lost', t, t, now());

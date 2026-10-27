@@ -585,15 +585,16 @@ export class ReturnDispositionCommand {
       if (!sku.serialTracked && normalized.serialNumbers !== null) {
         throw invalid(`SKU "${sku.code}" is not serial-tracked — its restock carries no serials.`);
       }
+      // The spec's guard order: precision before batch-required (C11 of the code review).
+      const checked = validateRecordableQuantity(normalized.qty, 'qty', sku.uom, sku.uomPrecision, 'non-negative');
+      if (!checked.ok) throw invalid(checked.detail);
+      const milli = checked.milli;
       if (!sku.serialTracked && sku.batchTracked && normalized.batchCode === null) {
         throw new ProblemException('batch-required', 400, 'Batch required', `SKU "${sku.code}" is batch-tracked — a restock names the batch it puts away.`);
       }
       if (!sku.batchTracked && normalized.batchCode !== null) {
         throw invalid(`SKU "${sku.code}" is not batch-tracked — its restock carries no batch.`);
       }
-      const checked = validateRecordableQuantity(normalized.qty, 'qty', sku.uom, sku.uomPrecision, 'non-negative');
-      if (!checked.ok) throw invalid(checked.detail);
-      const milli = checked.milli;
 
       // ── the candidate lines, locked oldest first ────────────────────────
       const receiptsOfWarehouse = tx
@@ -601,6 +602,8 @@ export class ReturnDispositionCommand {
         .from(returnReceipts)
         .where(and(eq(returnReceipts.tenantId, tenantId), eq(returnReceipts.warehouseId, normalized.warehouseId)));
       let candidates: LockedLine[];
+      // The non-serial candidate predicate (also the uncapped awaiting sum).
+      let candidatePredicate: ReturnType<typeof and> | null = null;
       let serialIdByNumber = new Map<string, string>();
       if (normalized.serialNumbers !== null) {
         serialIdByNumber = new Map(
@@ -639,22 +642,21 @@ export class ReturnDispositionCommand {
           batchKnown = found !== undefined;
           batchId = found?.id ?? null;
         }
+        candidatePredicate = and(
+          eq(returnReceiptLines.tenantId, tenantId),
+          eq(returnReceiptLines.skuId, sku.id),
+          batchId === null ? isNull(returnReceiptLines.batchId) : eq(returnReceiptLines.batchId, batchId),
+          gt(returnReceiptLines.openQty, 0),
+          inArray(returnReceiptLines.condition, [...RESTOCKABLE_ON_DEVICE]),
+          inArray(returnReceiptLines.returnReceiptId, receiptsOfWarehouse),
+        );
         candidates = !batchKnown
           ? []
           : (
               await tx
                 .select(LINE_COLUMNS)
                 .from(returnReceiptLines)
-                .where(
-                  and(
-                    eq(returnReceiptLines.tenantId, tenantId),
-                    eq(returnReceiptLines.skuId, sku.id),
-                    batchId === null ? isNull(returnReceiptLines.batchId) : eq(returnReceiptLines.batchId, batchId),
-                    gt(returnReceiptLines.openQty, 0),
-                    inArray(returnReceiptLines.condition, [...RESTOCKABLE_ON_DEVICE]),
-                    inArray(returnReceiptLines.returnReceiptId, receiptsOfWarehouse),
-                  ),
-                )
+                .where(candidatePredicate)
                 .orderBy(asc(returnReceiptLines.createdAt), asc(returnReceiptLines.id))
                 .limit(MAX_RESTOCK_CANDIDATE_LINES)
                 .for('update')
@@ -695,7 +697,16 @@ export class ReturnDispositionCommand {
           remaining -= take;
         }
         if (remaining > 0) {
-          const awaiting = candidates.reduce((sum, line) => sum + line.openQty, 0);
+          // The locked read is capped; when it hit the cap, the refusal names
+          // the warehouse's whole awaiting figure, not just the first lines'.
+          let awaiting = candidates.reduce((sum, line) => sum + line.openQty, 0);
+          if (candidates.length >= MAX_RESTOCK_CANDIDATE_LINES && candidatePredicate !== null) {
+            const total = await tx
+              .select({ n: sql<string>`coalesce(sum(${returnReceiptLines.openQty}), 0)::bigint` })
+              .from(returnReceiptLines)
+              .where(candidatePredicate);
+            awaiting = Number(total[0]?.n ?? awaiting);
+          }
           throw exceedsAwaiting(
             `${fromMilli(awaiting)} ${sku.uom} of SKU "${sku.code}"${normalized.batchCode === null ? '' : ` batch "${normalized.batchCode}"`} ${awaiting === 0 ? 'is' : 'are'} awaiting a restock in this warehouse (sellable returns only) — the restock names ${fromMilli(milli)}.`,
             awaiting,
@@ -1000,6 +1011,10 @@ export class ReturnDispositionCommand {
     if (ids.length === 0) return;
     const at = typeof atMs === 'number' ? atMs : Date.parse(atMs);
     const batches = (await this.catalog.getBatchesForSkusInTx(tx, tenantId, [sku.id])).filter((batch) => ids.includes(batch.id));
+    if (batches.length !== ids.length) {
+      // A receipt line names a batch the catalog does not hold for its SKU — never skip the gate.
+      throw dispositionDataFault(`A returned unit of SKU "${sku.code}" names a batch the catalog does not hold.`);
+    }
     for (const batch of batches) {
       if (isBatchExpiredAt(batch.expiryDate, at)) {
         throw new ProblemException(

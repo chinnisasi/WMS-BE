@@ -19,6 +19,8 @@ import {
 } from '../src/modules/returns/return-disposition.command';
 import { ReturnHoldSettlementHandler } from '../src/modules/returns/hold-settlement.delivery';
 import { ReturnsController } from '../src/api/returns.controller';
+import { EVENT_BUS } from '../src/shared/events/event-bus';
+import type { EventBus } from '../src/shared/events/event-bus.seam';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { expectAuditRow } from './support/audit-guard';
@@ -450,6 +452,16 @@ describe('returns disposition (e2e, story 4-7a)', () => {
     return settlement.deliver({ eventId: row.message_id, tenantId, type: row.type, occurredAt: String(row.occurred_at), payload: row.payload } as never);
   }
 
+  /** Publish the hold's closing outbox event through the app's routed event bus (as the relay does). */
+  async function publishClose(holdId: string): Promise<void> {
+    const rows = (await sql`
+      select id, type, payload, occurred_at from outbox_messages
+      where tenant_id = ${tenantId} and type in ('qc_hold.released', 'qc_hold.inspected') and payload->>'holdId' = ${holdId}
+      order by created_at desc limit 1`) as unknown as { id: string; type: string; payload: Record<string, unknown>; occurred_at: string }[];
+    const row = rows[0]!;
+    await app.get<EventBus>(EVENT_BUS).publish({ eventId: row.id, tenantId, type: row.type, occurredAt: String(row.occurred_at), payload: row.payload } as never);
+  }
+
   // ── the goldens and the vocabularies ───────────────────────────────────────
 
   describe('fingerprints and vocabularies', () => {
@@ -680,6 +692,8 @@ describe('returns disposition (e2e, story 4-7a)', () => {
       const desk = await http().get(`${API}/${tenantId}/receiving/qc-holds?warehouseId=${warehouseId}`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
       const row = (desk.body.items as { id: string; kind: string; rmaCode?: string }[]).find((item) => item.id === holdId)!;
       expect(row).toMatchObject({ kind: 'return', rmaCode: rma.code });
+      const holdDetail = await http().get(`${API}/${tenantId}/receiving/qc-holds/${holdId}`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
+      expect(holdDetail.body.qcHold).toMatchObject({ kind: 'return', rmaCode: rma.code });
       expect(await lineView(rma.id, line.id)).toMatchObject({ openQty: 1, onHoldQty: 2 });
 
       // A second quarantine of the remaining unit is allowed (prior count 1 on the queue).
@@ -700,7 +714,8 @@ describe('returns disposition (e2e, story 4-7a)', () => {
       expect('kind' in closed[0]!.payload).toBe(false);
       // Before the subscriber runs the units still count as on hold (A1's window).
       expect(await openQty(line.id)).toBe(1000);
-      expect(await deliverClose(holdId)).toBe('settled');
+      // Through the REAL bus (the subscription, not a direct call): one publish settles.
+      await publishClose(holdId);
       expect(await openQty(line.id)).toBe(3000);
       // Redelivery — at-least-once: one settlement, open raised once.
       expect(await deliverClose(holdId)).toBe('already-settled');
@@ -841,6 +856,10 @@ describe('returns disposition (e2e, story 4-7a)', () => {
       expect(scrappedUnit.status).toBe('rejected');
       const doc = (await sql`select reference_doc from ledger_events where id = ${scrapped.ledgerEventId!}`) as unknown as { reference_doc: Record<string, unknown> }[];
       expect(doc[0]!.reference_doc).toMatchObject({ handlingUnitIds: [scrappedUnit.id] });
+      // A returned case is never quarantined (a QC hold carries no case identity).
+      const caseHold = await dispose({ receiptLineId: restockLine!.id, outcome: 'quarantine', qty: 1, reasonCode: 'damaged' }).expect(409);
+      expect(caseHold.body.code).toBe('disposition-not-supported');
+      expect(await openQty(restockLine!.id)).toBe(1000);
       await dispose({ receiptLineId: restockLine!.id, outcome: 'restock', qty: 1, toBinId: shelfA }).expect(201);
       expect((await unitOf(restockLine!.id)).status).toBe('active');
       // A case is disposed whole.
@@ -903,6 +922,11 @@ describe('returns disposition (e2e, story 4-7a)', () => {
       expect(await latest()).toBe(shelfB);
       // Scrap a returned serial on the web — out of stock.
       const scrapped = await receivedReturn('RD-SER', 1, [{ qty: 1, serialNumber: 'RS-3', condition: 'damaged' }], { serials: ['RS-3'] });
+      // A19 — the handheld never restocks a serial graded non-sellable.
+      const graded = await restock({ skuId: sku('RD-SER'), qty: 1, serialNumbers: ['RS-3'], toBinId: shelfB }).expect(409);
+      expect(graded.body).toMatchObject({ code: 'serial-not-awaiting', serialNumber: 'RS-3' });
+      expect(graded.body.detail).toMatch(/graded "damaged"/);
+      expect(await openQty(scrapped.lines[0]!.id)).toBe(1000);
       await dispose({ receiptLineId: scrapped.lines[0]!.id, outcome: 'scrap', qty: 1, reasonCode: 'damaged' }).expect(201);
       const scrapId = ((await sql`select id from serials where tenant_id = ${tenantId} and serial_number = 'RS-3'`) as unknown as { id: string }[])[0]!.id;
       expect(((await sql`select to_bin_id from ledger_events where serial_ref = ${scrapId} order by id desc limit 1`) as unknown as { to_bin_id: string | null }[])[0]!.to_bin_id).toBeNull();
@@ -1224,6 +1248,49 @@ describe('returns disposition (e2e, story 4-7a)', () => {
       await http().get(`${API}/${tenantId}/portal/returns`).set('Authorization', `Bearer ${ownerToken}`).expect(403);
       await http().get(`${API}/${tenantId}/returns/awaiting`).set('Authorization', `Bearer ${portalBrand}`).expect(403);
     });
+  });
+
+  it('the portal on hold: a fully quarantined RMA is awaiting (not dispositioned) with onHoldQty; after a failed inspection it is dispositioned with failedInspectionQty', async () => {
+    const { rma, lines } = await receivedReturn('PB-1', 2, [{ qty: 2, condition: 'opened' }]);
+    const holdId = ((await dispose({ receiptLineId: lines[0]!.id, outcome: 'quarantine', qty: 2, reasonCode: 'needs-inspection' }).expect(201)).body as DispositionBody)
+      .dispositions[0]!.qcHoldId!;
+    const ids = async (state: string): Promise<string[]> =>
+      ((await http().get(`${API}/${tenantId}/portal/returns?dispositionState=${state}`).set('Authorization', `Bearer ${portalBrand}`).expect(200)).body.items as { id: string }[]).map(
+        (item) => item.id,
+      );
+    expect(await ids('awaiting')).toContain(rma.id);
+    expect(await ids('dispositioned')).not.toContain(rma.id);
+    const held = await http().get(`${API}/${tenantId}/portal/returns/${rma.id}`).set('Authorization', `Bearer ${portalBrand}`).expect(200);
+    expect(held.body).toMatchObject({ onHoldTotal: 2, openTotal: 0 });
+    expect(held.body.lines[0]).toMatchObject({ onHoldQty: 2, failedInspectionQty: 0 });
+    await http()
+      .post(`${API}/${tenantId}/receiving/qc-holds/${holdId}/inspect`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ lines: [{ batchId: null, passed: 0, failed: [{ reason: 'damaged', quantity: 2 }] }] });
+    expect(await deliverClose(holdId)).toBe('settled');
+    expect(await ids('dispositioned')).toContain(rma.id);
+    const done = await http().get(`${API}/${tenantId}/portal/returns/${rma.id}`).set('Authorization', `Bearer ${portalBrand}`).expect(200);
+    expect(done.body).toMatchObject({ onHoldTotal: 0, failedInspectionTotal: 2, openTotal: 0 });
+    expect(done.body.lines[0]).toMatchObject({ onHoldQty: 0, failedInspectionQty: 2 });
+  });
+
+  it('A20 — a line that no longer conserves refuses the dispose with 500 data-fault and writes nothing', async () => {
+    const { lines } = await receivedReturn('RD-C', 2, [{ qty: 2 }]);
+    const line = lines[0]!;
+    // Tamper: a disposition the stored open quantity does not account for.
+    await sql`update return_receipt_lines set open_qty = 2000 where id = ${line.id}`;
+    await sql`insert into return_dispositions (id, tenant_id, client_id, warehouse_id, return_receipt_id, return_receipt_line_id, rma_id, sku_id, outcome, qty, to_bin_id, decided_by, ledger_event_id, occurred_at)
+      select gen_random_uuid(), r.tenant_id, r.client_id, r.warehouse_id, r.id, ${line.id}, r.rma_id, ${sku('RD-C')}, 'restock', 1000, ${shelfB}, ${opsUserId}, gen_random_uuid(), now()
+      from return_receipts r join return_receipt_lines l on l.return_receipt_id = r.id where l.id = ${line.id}`;
+    const events = await count(sql`select count(*)::int as n from ledger_events where tenant_id = ${tenantId}`);
+    const res = await dispose({ receiptLineId: line.id, outcome: 'scrap', qty: 1, reasonCode: 'damaged' }).expect(500);
+    expect(res.body.code).toBe('data-fault');
+    expect(await count(sql`select count(*)::int as n from ledger_events where tenant_id = ${tenantId}`)).toBe(events);
+    expect(await count(sql`select count(*)::int as n from return_dispositions where return_receipt_line_id = ${line.id}`)).toBe(1);
+    expect(await openQty(line.id)).toBe(2000);
+    // Repair the tamper so the suite's later reads stay conserving.
+    await sql`delete from return_dispositions where return_receipt_line_id = ${line.id}`;
   });
 
   // ── RLS ────────────────────────────────────────────────────────────────────
