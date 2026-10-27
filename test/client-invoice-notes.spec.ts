@@ -875,6 +875,19 @@ describe('story 5-6a: credit and debit notes', () => {
       ]) {
         expectProblem(await createNote(invoice.id, body), 400, 'validation-failed');
       }
+      // C1: an upper-case line id is the same line (uuids compare lower-case) — and a case variant is a duplicate.
+      await credit(invoice.id, invoice.lineIds[0]!.toUpperCase(), 100).expect(201);
+      expectProblem(
+        await createNote(invoice.id, { kind: 'credit', lines: [{ invoiceLineId: invoice.lineIds[0]!, amountPaise: 1 }, { invoiceLineId: invoice.lineIds[0]!.toUpperCase(), amountPaise: 2 }] }),
+        400,
+        'validation-failed',
+      );
+      // C2: a debit whose tax leaves the exact paise range is a 400, never a 500.
+      expectProblem(
+        await createNote(invoice.id, { kind: 'debit', lines: [{ invoiceLineId: invoice.lineIds[0]!, amountPaise: Number.MAX_SAFE_INTEGER, overrideReason: 'huge' }] }),
+        400,
+        'validation-failed',
+      );
       // 400 beats a used key's replay (shape is above the transaction).
       expectProblem(await http().post(`${API}/${tenantId}/client-invoices/not-a-uuid/notes`).set('Authorization', `Bearer ${makerToken}`).set(KEY_HEADER, ulid()).send({}), 400, 'validation-failed');
     });
@@ -910,8 +923,11 @@ describe('story 5-6a: credit and debit notes', () => {
         { action: 'client_invoice.settled', reference: `note: Settled by credit note ${issued.body.note.noteNo} (key ${key})` },
         { action: 'client_invoice_note.issued', reference: key },
       ]);
-      // A settling credit is never voided (A5).
+      // A settling credit is never voided (A5) — by the command, and (C3) by the trigger under direct SQL.
       expectProblem(await voidNote(drafted.body.note.id as string), 409, 'note-settles-dispute');
+      await expect(
+        sql`update client_invoice_notes set status = 'void', void_note = 'x', voided_at = now(), voided_by = ${makerId} where id = ${drafted.body.note.id as string}`,
+      ).rejects.toMatchObject({ code: 'P0001' });
       // The invoice is settled now: another settling credit is 409 invoice-not-disputed (at create, and at issue).
       expectProblem(await createNote(invoice.id, { kind: 'credit', settlesDispute: true, lines: [{ invoiceLineId: invoice.lineIds[0]!, amountPaise: 1 }] }), 409, 'invoice-not-disputed');
       const other = await seedInvoice({ amounts: [100_000], status: 'disputed' });
@@ -1010,6 +1026,19 @@ describe('story 5-6a: credit and debit notes', () => {
       await expect(
         sql`update client_invoice_notes set status = 'issued', note_no = '29/C2627/000099', fy_label = 'FY-2627', series_seq = 99, issued_at = now(), issued_by = ${makerId} where id = ${other}`,
       ).rejects.toMatchObject({ code: 'P0001' });
+    });
+
+    it('the series exhausted: a credit series at 999,999 refuses the next issue (409 note-series-exhausted) and spends nothing', async () => {
+      const invoice = await seedInvoice({ amounts: [100_000] });
+      await sql`insert into client_invoice_note_series (id, tenant_id, supplier_gstin, kind, fy_label, last_seq)
+        values (${uuidv7()}, ${tenantId}, ${invoice.gstin}, 'credit', 'FY-2627', 999999)`;
+      const note = (await credit(invoice.id, invoice.lineIds[0]!, 100).expect(201)).body.note.id as string;
+      expectProblem(await issueNote(note), 409, 'note-series-exhausted');
+      const series = await sql<{ last_seq: number }[]>`select last_seq from client_invoice_note_series where tenant_id = ${tenantId} and supplier_gstin = ${invoice.gstin} and kind = 'credit'`;
+      expect(series).toEqual([{ last_seq: 999_999 }]);
+      // The debit series is its own: a debit still issues 000001.
+      const debit = (await createNote(invoice.id, { kind: 'debit', lines: [{ invoiceLineId: invoice.lineIds[0]!, amountPaise: 100 }] }).expect(201)).body.note.id as string;
+      expect((await issueNote(debit).expect(200)).body.note.noteNo).toBe('29/D2627/000001');
     });
 
     it('a single-person tenant: the owner PUTs requireSecondApprover:false (audited); then a creator issues; a non-owner PUT is 403 role-denied', async () => {
@@ -1216,6 +1245,11 @@ describe('story 5-6a: credit and debit notes', () => {
       expect(second.body.rows.map((r: { noteId: string }) => r.noteId)).toEqual([b]);
       const voidOnly = await register(`gstin=${invoice.gstin}&from=2027-05-01&to=2027-06-30&status=void`).expect(200);
       expect(voidOnly.body.rows.map((r: { noteId: string }) => r.noteId)).toEqual([b]);
+      // The kind filter (C14).
+      const creditsOnly = await register(`gstin=${invoice.gstin}&from=2027-05-01&to=2027-06-30&kind=credit`).expect(200);
+      expect([...new Set(creditsOnly.body.rows.map((r: { noteId: string }) => r.noteId))]).toEqual([a, c]);
+      const debitsOnly = await register(`gstin=${invoice.gstin}&from=2027-05-01&to=2027-06-30&kind=debit`).expect(200);
+      expect(debitsOnly.body.rows.map((r: { noteId: string }) => r.noteId)).toEqual([b]);
       expectProblem(await register('from=2027-05-01&to=2027-05-31'), 400, 'validation-failed');
       expectProblem(await register(`gstin=${invoice.gstin}&from=2027-05-31&to=2027-05-01`), 400, 'validation-failed');
       expectProblem(await register(`gstin=${invoice.gstin}&from=2027-05-01&to=2027-05-31&cursor=junk`), 400, 'invalid-cursor');

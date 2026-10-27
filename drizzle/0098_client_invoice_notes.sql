@@ -241,7 +241,7 @@ CREATE INDEX IF NOT EXISTS "client_invoice_notes_tenant_gstin_issued_at_id_idx" 
 -- note's own lines (it is still a draft in BEFORE UPDATE) ≤ the invoice
 -- line's, and Σ issued credit payable plus this note's ≤ the invoice
 -- payable. issued → void needs the void stamps (and a second person for a
--- credit). Every other move — void → anything included — is refused.
+-- credit), and never voids a credit that settled a dispute (A5). Every other move — void → anything included — is refused.
 -- DELETE: only a draft with no lines.
 -- VOLATILE: under READ COMMITTED each statement takes a fresh snapshot, so
 -- the sums after the lock see a competitor that just committed. TIME is not
@@ -392,6 +392,10 @@ BEGIN
 		END IF;
 		IF (to_jsonb(NEW) - void_cols) IS DISTINCT FROM (to_jsonb(OLD) - void_cols) THEN
 			RAISE EXCEPTION 'client_invoice_notes: note % is frozen — a void changes only its status, note and stamps', OLD."id";
+		END IF;
+		-- A5: a settled invoice never reopens, so the credit that settled it is never voided.
+		IF OLD."settles_dispute" THEN
+			RAISE EXCEPTION 'client_invoice_notes: credit note % settled its invoice''s dispute — it is never voided', OLD."id";
 		END IF;
 		IF NEW."kind" = 'credit' THEN
 			needs_second := coalesce(
@@ -606,6 +610,9 @@ DECLARE
 	nc uuid := gen_random_uuid();
 	nx uuid := gen_random_uuid();
 	nb uuid := gen_random_uuid();
+	ns uuid := gen_random_uuid();
+	inv2 uuid := gen_random_uuid();
+	il2 uuid := gen_random_uuid();
 	lb uuid := gen_random_uuid();
 	g text := '29AAACT1234A1Z5';
 	pty jsonb := '{"probe": true}'::jsonb;
@@ -691,6 +698,30 @@ BEGIN
 				"issued_at" = now(), "issued_by" = u2
 			WHERE "id" = nc;
 
+		-- ── accepted: a credit that settles a DISPUTED invoice's dispute, issued by a second person.
+		INSERT INTO "client_invoices" ("id","tenant_id","client_id","period_start","period_end","status","supplier_gstin",
+				"place_of_supply","supply_type","subtotal_paise","cgst_paise","sgst_paise","igst_paise","tax_paise","total_paise",
+				"round_off_paise","payable_paise","gaps","warnings","party","content_hash","created_by")
+			VALUES (inv2, t, c, '2026-08-01', '2026-08-31', 'draft', g, '29', 'intra', 1000, 90, 90, 0, 180, 1180, 20, 1200,
+				'[]'::jsonb, '[]'::jsonb, pty, 'probe', u1);
+		INSERT INTO "client_invoice_lines" ("id","tenant_id","invoice_id","rate_card_id","segment_from","segment_to","charge_code","basis",
+				"uom","quantity","unit_amount_paise","amount_paise","sac_code","gst_bps","place_of_supply","supply_type","cgst_paise","sgst_paise","igst_paise")
+			VALUES (il2, t, inv2, gen_random_uuid(), '2026-07-31T18:30:00Z', '2026-08-31T18:30:00Z', 'pick', 'per_pick', NULL, 10, 100, 1000, '996719', 1800, '29', 'intra', 90, 90, 0);
+		UPDATE "client_invoices" SET "status" = 'issued', "invoice_no" = '29/S2627/000002', "fy_label" = 'FY-2627', "series_seq" = 2,
+				"issued_at" = now(), "issued_by" = u1
+			WHERE "id" = inv2;
+		UPDATE "client_invoices" SET "status" = 'disputed', "status_note" = 'probe', "status_changed_at" = now(), "status_changed_by" = u1 WHERE "id" = inv2;
+		INSERT INTO "client_invoice_notes" ("id","tenant_id","client_id","invoice_id","kind","supplier_gstin","place_of_supply","supply_type",
+				"reason","reason_note","settles_dispute","subtotal_paise","cgst_paise","sgst_paise","igst_paise","tax_paise","total_paise","round_off_paise","payable_paise",
+				"party","created_by")
+			VALUES (ns, t, c, inv2, 'credit', g, '29', 'intra', 'deficiency-in-service', 'probe', true, 100, 9, 9, 0, 18, 118, 0, 118, pty, u1);
+		INSERT INTO "client_invoice_note_lines" ("id","tenant_id","note_id","invoice_line_id","charge_code","basis","uom","segment_from","segment_to",
+				"sac_code","gst_bps","place_of_supply","supply_type","amount_paise","cgst_paise","sgst_paise","igst_paise")
+			VALUES (gen_random_uuid(), t, ns, il2, 'pick', 'per_pick', NULL, '2026-07-31T18:30:00Z', '2026-08-31T18:30:00Z', '996719', 1800, '29', 'intra', 100, 9, 9, 0);
+		UPDATE "client_invoice_notes" SET "status" = 'issued', "note_no" = '29/C2627/000005', "fy_label" = 'FY-2627', "series_seq" = 5,
+				"issued_at" = now(), "issued_by" = u2
+			WHERE "id" = ns;
+
 		-- ── a ₹0.01 credit draft (no head) — over the cap once nc is issued.
 		INSERT INTO "client_invoice_notes" ("id","tenant_id","client_id","invoice_id","kind","supplier_gstin","place_of_supply","supply_type",
 				"reason","reason_note","subtotal_paise","cgst_paise","sgst_paise","igst_paise","tax_paise","total_paise","round_off_paise","payable_paise",
@@ -727,6 +758,7 @@ BEGIN
 			'line on an issued note',
 			'line of another invoice',
 			'line that does not copy',
+			'void a settling credit',
 			'invoice void with an issued note',
 			'truncate the notes'
 		] LOOP
@@ -744,6 +776,7 @@ BEGIN
 				WHEN 'line on an issued note' THEN '%lines are frozen%'
 				WHEN 'line of another invoice' THEN '%is not a line of the note%'
 				WHEN 'line that does not copy' THEN '%copies its invoice line%'
+				WHEN 'void a settling credit' THEN '%is never voided%'
 				WHEN 'invoice void with an issued note' THEN '%void its notes first%'
 				ELSE '%never truncated%'
 			END;
@@ -787,6 +820,9 @@ BEGIN
 							VALUES (gen_random_uuid(), t, nx, gen_random_uuid(), 'pick', 'per_pick', NULL, seg_from, seg_to, '996719', 1800, '29', 'intra', 1, 0, 0, 0);
 					WHEN 'line that does not copy' THEN
 						UPDATE "client_invoice_note_lines" SET "sac_code" = '996729' WHERE "id" = lb;
+					WHEN 'void a settling credit' THEN
+						UPDATE "client_invoice_notes" SET "status" = 'void', "void_note" = 'probe', "voided_at" = now(), "voided_by" = u3
+							WHERE "id" = ns;
 					WHEN 'invoice void with an issued note' THEN
 						UPDATE "client_invoices" SET "status" = 'void', "status_note" = 'probe', "status_changed_at" = now(), "status_changed_by" = u1
 							WHERE "id" = inv;

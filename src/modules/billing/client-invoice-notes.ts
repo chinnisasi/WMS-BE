@@ -712,8 +712,10 @@ export function normalizeCreate(command: CreateNoteCommand): NormalizedCreate {
     if (typeof line.invoiceLineId !== 'string' || !UUID_RE.test(line.invoiceLineId)) {
       throw validation(`lines[${index}].invoiceLineId must be a uuid (got ${JSON.stringify(line.invoiceLineId)}).`);
     }
-    if (seen.has(line.invoiceLineId)) throw validation(`Invoice line ${line.invoiceLineId} appears twice — one note line per invoice line.`);
-    seen.add(line.invoiceLineId);
+    // uuids are compared lower-case (the ids are stored lower-case; UUID_RE admits either case).
+    const invoiceLineId = line.invoiceLineId.toLowerCase();
+    if (seen.has(invoiceLineId)) throw validation(`Invoice line ${invoiceLineId} appears twice — one note line per invoice line.`);
+    seen.add(invoiceLineId);
     if (!Number.isSafeInteger(line.amountPaise) || line.amountPaise <= 0) {
       throw validation(`lines[${index}].amountPaise must be a positive whole number of paise (got ${JSON.stringify(line.amountPaise)}).`);
     }
@@ -722,7 +724,7 @@ export function normalizeCreate(command: CreateNoteCommand): NormalizedCreate {
     if (overrideReason !== null && codePoints(overrideReason) > NOTE_TEXT_MAX) {
       throw validation(`lines[${index}].overrideReason is at most ${NOTE_TEXT_MAX} characters (got ${codePoints(overrideReason)}).`);
     }
-    return { invoiceLineId: line.invoiceLineId, amountPaise: line.amountPaise, overrideReason };
+    return { invoiceLineId, amountPaise: line.amountPaise, overrideReason };
   });
   lines.sort((a, b) => (a.invoiceLineId < b.invoiceLineId ? -1 : a.invoiceLineId > b.invoiceLineId ? 1 : 0));
   return { kind, reason: command.reason as NoteReason, reasonNote, settlesDispute, lines };
@@ -776,14 +778,21 @@ export class ClientInvoiceNoteService {
       }
       if (request.kind === 'credit') assertBeforeCreditDeadline(invoice);
       const credits = await this.issuedCreditsInTx(tx, invoice, null);
-      const figures = computeNoteFigures({
-        kind: request.kind,
-        invoicePayablePaise: Number(invoice.payablePaise),
-        invoiceLines: invoiceLines.map((line) => line.facts),
-        issuedCredits: credits.byLine,
-        priorCreditPayablePaise: credits.payable,
-        lines: request.lines,
-      });
+      let figures: NoteFigures;
+      try {
+        figures = computeNoteFigures({
+          kind: request.kind,
+          invoicePayablePaise: Number(invoice.payablePaise),
+          invoiceLines: invoiceLines.map((line) => line.facts),
+          issuedCredits: credits.byLine,
+          priorCreditPayablePaise: credits.payable,
+          lines: request.lines,
+        });
+      } catch (err) {
+        // An amount whose tax or total leaves the exact paise range is a request the server cannot represent — a 400, never a 500.
+        if (err instanceof ArithmeticOverflowError) throw validation(`The note's amounts are too large to compute exactly (${err.message}).`);
+        throw err;
+      }
       if (request.kind === 'debit') {
         const unexplained = request.lines.filter((line) => line.overrideReason === null && line.amountPaise > byId.get(line.invoiceLineId)!.facts.amountPaise);
         if (unexplained.length > 0) {
@@ -931,7 +940,7 @@ export class ClientInvoiceNoteService {
           'note-figures-changed',
           409,
           'The note’s figures changed',
-          'Another credit note was issued against this invoice since this draft was made, so its tax or payable is no longer right — discard this draft and create it again.',
+          'The credit notes on this invoice changed since this draft was made (one was issued or voided), so its tax or payable is no longer right — discard this draft and create it again.',
         );
       }
 

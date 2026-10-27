@@ -935,7 +935,11 @@ describe('users, roles, and permission gating (e2e)', () => {
     // Story 2-5a grows it to 51: `receipt.attach` (owner, ops_manager,
     // operator — the dock adds a damage photo) and `receipt.photo-remove`
     // (owner, ops_manager — evidence is removed by a manager).
-    expect([...CAPABILITIES]).toHaveLength(51);
+    // Story 5-6a grows it to 52: `billing.configure` — OWNER-ONLY, the
+    // credit-note maker/checker switch (never the accountant, who drafts and
+    // issues notes under `billing.invoice`).
+    expect([...CAPABILITIES]).toHaveLength(52);
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('billing.configure'))).toEqual(['owner']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('receipt.attach'))).toEqual(['owner', 'ops_manager', 'operator']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('receipt.photo-remove'))).toEqual(['owner', 'ops_manager']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('stock.adjust.request'))).toEqual(['owner', 'ops_manager', 'operator']);
