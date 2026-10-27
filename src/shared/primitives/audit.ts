@@ -111,6 +111,9 @@ export const AUDIT_TARGET_TYPES = [
   // Story 13-2 — a return receipt (`return_receipt.recorded`; an all-refused
   // receipt targets its `return_authorization` instead).
   'return_receipt',
+  // Story 4-7a — a returns disposition (`return_disposition.recorded`; one row
+  // per command, targeting its first disposition).
+  'return_disposition',
   'sku',
   'stock_adjustment_pending',
   'stock_adjustment_policy',
@@ -189,6 +192,9 @@ export const AUDIT_NEW_ACTIONS = [
   // Story 13-2 — the handheld's return receipt (`ReturnReceiptCommand`); its
   // all-refused arm targets the authorization (pinned in the same suite).
   { action: 'return_receipt.recorded', targetType: 'return_receipt' },
+  // Story 4-7a — the disposition commands (`ReturnDispositionCommand`, web
+  // and handheld): one row per command, the first disposition its target.
+  { action: 'return_disposition.recorded', targetType: 'return_disposition' },
   // The ASN import (2026-10-17) — one row per import run, beside each created
   // ASN's own `asn.created` (all under the import's one key).
   { action: 'asn_import.executed', targetType: 'asn_import' },

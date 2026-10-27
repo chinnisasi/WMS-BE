@@ -690,7 +690,13 @@ export class ReceivingController {
       cursor: query.cursor,
       limit: query.limit,
     });
-    return { items: page.items, nextCursor: page.nextCursor };
+    // Story 4-7a (A14) — a return hold names its return authorization; QC
+    // reads no returns table, so the shell composes the code here.
+    const rmaCodes = await this.returns.rmaCodesByHoldIds(
+      tenantId,
+      page.items.filter((hold) => hold.kind === 'return').map((hold) => hold.id),
+    );
+    return { items: page.items.map((hold) => withRmaCode(hold, rmaCodes)), nextCursor: page.nextCursor };
   }
 
   @Get(':tenantId/receiving/qc-holds/:holdId')
@@ -715,8 +721,9 @@ export class ReceivingController {
     assertOwnTenantToken(session.tenantId, tenantId);
     assertUuidParam(holdId, 'holdId');
     const detail = await this.qc.getQcHold(tenantId, holdId);
+    const rmaCodes = await this.returns.rmaCodesByHoldIds(tenantId, detail.qcHold.kind === 'return' ? [detail.qcHold.id] : []);
     return {
-      qcHold: detail.qcHold,
+      qcHold: withRmaCode(detail.qcHold, rmaCodes),
       arms: detail.arms.map((arm) => ({ ...arm })),
       inspection:
         detail.inspection === null
@@ -936,4 +943,9 @@ function assertOwnTenantToken(tokenTenantId: string, tenantId: string): void {
       'The session token tenant does not own this path.',
     );
   }
+}
+/** Story 4-7a (A14) — a return hold's RMA code, present only when known (never on another kind). */
+function withRmaCode<T extends { readonly id: string }>(hold: T, rmaCodes: ReadonlyMap<string, string>): T & { rmaCode?: string } {
+  const rmaCode = rmaCodes.get(hold.id);
+  return rmaCode === undefined ? { ...hold } : { ...hold, rmaCode };
 }

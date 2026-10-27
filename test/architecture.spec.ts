@@ -2191,9 +2191,17 @@ describe('architecture: return authorizations are returns-module-owned (story 13
    */
   const returnsRoot = join(SRC_ROOT, 'modules', 'returns');
   const returnsFiles = files.filter((file) => file.path.startsWith(returnsRoot));
-  const RETURNS_TABLES = ['returnAuthorizations', 'returnAuthorizationLines', 'returnReceipts', 'returnReceiptLines'] as const;
+  // Story 4-7a — six own tables: the dispositions and the hold settlements.
+  const RETURNS_TABLES = [
+    'returnAuthorizations',
+    'returnAuthorizationLines',
+    'returnReceipts',
+    'returnReceiptLines',
+    'returnDispositions',
+    'returnHoldSettlements',
+  ] as const;
   const RAW_RETURNS_WRITE =
-    /\b(insert into|update|delete from)\s+"?(return_authorizations|return_authorization_lines|return_receipts|return_receipt_lines)\b/i;
+    /\b(insert into|update|delete from)\s+"?(return_authorizations|return_authorization_lines|return_receipts|return_receipt_lines|return_dispositions|return_hold_settlements)\b/i;
   const OWN_SCHEMA_NAMES = new Set([
     'returnAuthorizations',
     'returnAuthorizationLines',
@@ -2203,6 +2211,10 @@ describe('architecture: return authorizations are returns-module-owned (story 13
     'returnReceiptLines',
     'ReturnReceiptRow',
     'ReturnReceiptLineRow',
+    'returnDispositions',
+    'returnHoldSettlements',
+    'ReturnDispositionRow',
+    'ReturnHoldSettlementRow',
     'idempotencyKeys',
     'auditEvents',
   ]);
@@ -2331,6 +2343,30 @@ describe('architecture: return authorizations are returns-module-owned (story 13
     expect(drizzleWriteOn('handlingUnits').test(receipt)).toBe(false);
     expect(receipt).toContain('this.catalog.createHandlingUnits(');
   });
+
+  it('story 4-7a: returns reaches QC only through QcFacade (the return hold, its outcome); qc_holds is never written or named by returns; the settlement subscriber is the only writer of return_hold_settlements', () => {
+    // The inbound files returns may import: the QC facade — and the module
+    // file in returns.module.ts only (the forwardRef import, nothing else).
+    const offenders: string[] = [];
+    for (const file of returnsFiles) {
+      for (const match of file.source.matchAll(/from '\.\.\/inbound\/([a-z.-]+)'/g)) {
+        const allowed = match[1] === 'qc.facade' || (match[1] === 'inbound.module' && file.path === join(returnsRoot, 'returns.module.ts'));
+        if (!allowed) offenders.push(`${file.path}: imports inbound/${match[1]!}`);
+      }
+      if (/\bqcHolds\b|\bqc_holds\b|\bqc_inspection/.test(file.source)) offenders.push(`${file.path}: names a QC table`);
+    }
+    expect(offenders).toEqual([]);
+    const command = readFileSync(join(returnsRoot, 'return-disposition.command.ts'), 'utf8');
+    expect(command).toContain('this.qc.holdReturnLineInTx(');
+    expect(drizzleWriteOn('returnDispositions').test(command)).toBe(true);
+    const subscriber = readFileSync(join(returnsRoot, 'hold-settlement.delivery.ts'), 'utf8');
+    expect(subscriber).toContain('this.qc.returnHoldOutcomeInTx(');
+    // Only the subscriber writes settlements (A1 — "the subscriber is the only writer").
+    const settlementWriters = files.filter((file) => drizzleWriteOn('returnHoldSettlements').test(file.source)).map((file) => file.path);
+    expect(settlementWriters).toEqual([join(returnsRoot, 'hold-settlement.delivery.ts')]);
+    // And it routes by hold id, never by the payload's kind.
+    expect(subscriber).not.toMatch(/payload\??\.kind|\.kind\s*===/);
+  });
 });
 
 describe('architecture: the client portal (story 21-7)', () => {
@@ -2391,6 +2427,8 @@ describe('architecture: the client portal (story 21-7)', () => {
     { file: join(SRC_ROOT, 'modules', 'tenancy', 'tenancy.service.ts'), methods: ['portalWarehouses'] },
     // Story 21-8 — the client's service report (the operator read's twin, stamped).
     { file: join(SRC_ROOT, 'modules', 'reporting', 'reporting.facade.ts'), methods: ['portalServiceReport'] },
+    // Story 4-7a — the client's returns and their dispositions.
+    { file: join(SRC_ROOT, 'modules', 'returns', 'returns.facade.ts'), methods: ['portalReturns', 'portalReturn'] },
   ];
 
   /** The body of one method or function: from its declaration to the next top-level member. */
@@ -2439,6 +2477,8 @@ describe('architecture: the client portal (story 21-7)', () => {
         'portalSkus',
         'portalWarehouses',
         'portalServiceReport',
+        'portalReturns',
+        'portalReturn',
       ].sort(),
     );
   });
@@ -2582,6 +2622,7 @@ describe('architecture: the client portal (story 21-7)', () => {
     catalog: 'CatalogFacade',
     tenancy: 'TenancyService',
     reporting: 'ReportingFacade',
+    returns: 'ReturnsFacade',
   };
 
   /** Each PORTAL_READS file's class — the one the controller injects. */
@@ -2594,6 +2635,7 @@ describe('architecture: the client portal (story 21-7)', () => {
     [join(SRC_ROOT, 'modules', 'catalog', 'catalog.facade.ts'), 'CatalogFacade'],
     [join(SRC_ROOT, 'modules', 'tenancy', 'tenancy.service.ts'), 'TenancyService'],
     [join(SRC_ROOT, 'modules', 'reporting', 'reporting.facade.ts'), 'ReportingFacade'],
+    [join(SRC_ROOT, 'modules', 'returns', 'returns.facade.ts'), 'ReturnsFacade'],
   ]);
 
   /**

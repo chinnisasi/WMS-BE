@@ -315,6 +315,37 @@ export async function lockHandlingUnitsInTx(
 }
 
 /**
+ * Story 4-7a — a returned case leaves `returned` with its disposition: a
+ * restock puts it back into stock (`active` — packable again), a scrap writes
+ * it off (`rejected`, the adjustment's terminal arm). Conditional on
+ * `returned`: the caller locked the units (`lockHandlingUnitsInTx`) and
+ * guarded them, so a short return is the backstop it compares against.
+ */
+export async function settleReturnedHandlingUnitsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  ids: readonly string[],
+  status: 'active' | 'rejected',
+): Promise<HandlingUnitIdentity[]> {
+  const distinct = [...new Set(ids)];
+  if (distinct.length === 0) {
+    return [];
+  }
+  const rows = await tx
+    .update(handlingUnits)
+    .set({ status, updatedAt: nowIso() })
+    .where(
+      and(
+        eq(handlingUnits.tenantId, tenantId),
+        inArray(handlingUnits.id, distinct),
+        eq(handlingUnits.status, 'returned'),
+      ),
+    )
+    .returning();
+  return rows.map(toHandlingUnitIdentity);
+}
+
+/**
  * Story 13-2 — a plain read of a set of units by id (no lock): the return
  * receipt's detail read shows each returned case's captured weight. Unknown
  * or foreign ids are simply absent.

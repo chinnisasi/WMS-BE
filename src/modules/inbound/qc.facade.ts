@@ -16,6 +16,7 @@ import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
 import { canonicalInstant, istDateOf } from '../../shared/primitives/time';
 import { compareBatchIds, compareInspectionLines, openQcHoldsForBinsInTx, QcCommand } from './qc.command';
 import type {
+  HoldReturnLineInput,
   HoldScopeInTxCommand,
   InspectQcHoldCommand,
   InspectQcHoldSnapshot,
@@ -29,6 +30,7 @@ import type {
   ReleaseQcHoldCommand,
   ReleaseReceiptHoldsCommand,
   ReleaseReceiptHoldsSnapshot,
+  ReturnHoldOutcome,
 } from './qc.command';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 
@@ -48,7 +50,7 @@ export interface QcHoldEntry {
   readonly releasedAt: string | null;
   /** Row creation time (the keyset cursor field) — part of the read contract. */
   readonly createdAt: string;
-  /** Story 1-2b — `manual` or `receipt` (QC on receipt). */
+  /** Story 1-2b — `manual` or `receipt` (QC on receipt); story 4-7a — `return` (a returned unit quarantined from RETURNS). */
   readonly kind: QcHoldKind;
   /** Story 1-2b — a receipt hold's GRN line / GRN / code (null on a manual hold). */
   readonly grnLineId?: string;
@@ -200,6 +202,23 @@ export class QcFacade {
     auditReference: string,
   ): Promise<QcHoldSnapshot> {
     return this.qc.holdScopeInTx(tx, command, role, auditReference);
+  }
+
+  /**
+   * Story 4-7a — the returns module quarantines (part of) a return-receipt
+   * line through the ONE hold implementation, inside the caller's
+   * transaction (see `QcCommand.holdReturnLineInTx`). Returns the hold id.
+   */
+  async holdReturnLineInTx(tx: TenantTx, input: HoldReturnLineInput): Promise<string> {
+    return this.qc.holdReturnLineInTx(tx, input);
+  }
+
+  /**
+   * Story 4-7a (A23) — one hold's outcome from QC's own record, inside the
+   * caller's transaction (the returns hold-settlement subscriber).
+   */
+  async returnHoldOutcomeInTx(tx: TenantTx, tenantId: string, holdId: string): Promise<ReturnHoldOutcome | null> {
+    return this.qc.returnHoldOutcomeInTx(tx, tenantId, holdId);
   }
 
   /**

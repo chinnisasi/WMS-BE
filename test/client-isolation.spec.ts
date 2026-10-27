@@ -1040,7 +1040,16 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // Story 2-6a: + goods_receipt_line_serials_tenant_isolation (0096, the
       // plain tenant policy — operator-side, like goods_receipt_lines; no
       // portal route reads it).
-      expect(policies).toHaveLength(126);
+      // Story 4-7a: + return_dispositions_tenant_isolation and
+      // return_hold_settlements_tenant_isolation (0097, client-bound on both
+      // arms — the return_receipts shape; the portal returns read reaches
+      // them under the client stamp).
+      expect(policies).toHaveLength(128);
+      for (const name of ['return_dispositions_tenant_isolation', 'return_hold_settlements_tenant_isolation']) {
+        const policy = policies.find((row) => row.policyname === name)!;
+        expect(policy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+        expect(policy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+      }
       const attachmentPolicy = policies.find((row) => row.policyname === 'attachments_tenant_isolation')!;
       expect(attachmentPolicy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
       expect(attachmentPolicy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");

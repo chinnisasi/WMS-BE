@@ -29,6 +29,19 @@ import type {
 } from './return-authorization.command';
 import { ReturnReceiptCommand, openReturnsInTx, receiptsOfRmaInTx } from './return-receipt.command';
 import type { OpenReturn, ReceiveReturnCommand, ReturnReceiptResult } from './return-receipt.command';
+import { ReturnDispositionCommand } from './return-disposition.command';
+import type { DisposeReturnCommand, RestockReturnCommand, ReturnDispositionResult } from './return-disposition.command';
+import {
+  awaitingDispositionsInTx,
+  portalReturnInTx,
+  portalReturnsInTx,
+  rmaCodesByHoldIdsInTx,
+  type AwaitingDispositionRow,
+  type PortalDispositionState,
+  type PortalReturnDetail,
+  type PortalReturnRow,
+} from './disposition-reads';
+import { PORTAL_PAGE_DEFAULT_LIMIT } from '../../shared/primitives/portal-page';
 
 export {
   MAX_RMA_EXTERNAL_REFERENCE,
@@ -58,6 +71,31 @@ export {
   RETURN_CONDITIONS,
   RETURN_ENTRY_REFUSALS,
 } from './return-receipt.command';
+export {
+  MAX_DISPOSITION_NOTE,
+  MAX_RESTOCK_SERIALS,
+  RESTOCKABLE_ON_DEVICE,
+  RETURN_DISPOSITION_OUTCOMES,
+  RETURN_DISPOSITION_REASONS,
+} from './return-disposition.command';
+export type {
+  DisposeReturnCommand,
+  RestockReturnCommand,
+  ReturnDispositionEntry,
+  ReturnDispositionOutcome,
+  ReturnDispositionReason,
+  ReturnDispositionResult,
+} from './return-disposition.command';
+export { PORTAL_DISPOSITION_STATES } from './disposition-reads';
+export type {
+  AwaitingDispositionRow,
+  PortalDispositionState,
+  PortalReturnDetail,
+  PortalReturnDisposition,
+  PortalReturnLine,
+  PortalReturnRow,
+} from './disposition-reads';
+export { RETURN_DISPOSITION_RECORDED_EVENT, RETURN_SCRAP_RECORDED_EVENT } from './events';
 export type {
   OpenReturn,
   OpenReturnLine,
@@ -71,6 +109,14 @@ export type {
 
 /** The list's page size: 1–100, default 50 (the house list bounds). */
 export const DEFAULT_RMA_PAGE_SIZE = 50;
+
+/** Story 4-7a — the awaiting-disposition queue's query (keyset ASC). */
+export interface ListAwaitingQuery {
+  readonly warehouseId?: string | undefined;
+  readonly clientId?: string | undefined;
+  readonly cursor?: string | undefined;
+  readonly limit?: number | undefined;
+}
 
 export interface ListRmasQuery {
   readonly warehouseId?: string | undefined;
@@ -123,6 +169,7 @@ export class ReturnsFacade {
     @Inject(DATABASE) private readonly db: Database,
     @Inject(ReturnAuthorizationCommand) private readonly command: ReturnAuthorizationCommand,
     @Inject(ReturnReceiptCommand) private readonly receipts: ReturnReceiptCommand,
+    @Inject(ReturnDispositionCommand) private readonly dispositions: ReturnDispositionCommand,
     @Inject(OutboundFacade) private readonly outbound: OutboundFacade,
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
     @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
@@ -139,6 +186,71 @@ export class ReturnsFacade {
   /** Story 13-2 — `return.receive`, the device op (see `ReturnReceiptCommand`). */
   receive(command: ReceiveReturnCommand, idempotencyKey: string): Promise<ReturnReceiptResult> {
     return this.receipts.receive(command, idempotencyKey);
+  }
+
+  /** Story 4-7a — the web's disposition of one receipt line (see `ReturnDispositionCommand.dispose`). */
+  dispose(command: DisposeReturnCommand, idempotencyKey: string): Promise<ReturnDispositionResult> {
+    return this.dispositions.dispose(command, idempotencyKey);
+  }
+
+  /** Story 4-7a — the handheld's `return.restock` (see `ReturnDispositionCommand.restock`). */
+  restock(command: RestockReturnCommand, idempotencyKey: string): Promise<ReturnDispositionResult> {
+    return this.dispositions.restock(command, idempotencyKey);
+  }
+
+  /**
+   * Story 4-7a — the awaiting-disposition queue: receipt lines with units
+   * still awaiting a disposition, oldest first. A member-open read (the
+   * capability gates the writes; the web shows the actions behind it).
+   */
+  async listAwaiting(tenantId: string, query: ListAwaitingQuery = {}): Promise<Page<AwaitingDispositionRow>> {
+    const limit = query.limit ?? DEFAULT_RMA_PAGE_SIZE;
+    const after = query.cursor === undefined ? null : decodeCursorSafe(query.cursor);
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      awaitingDispositionsInTx(tx, this.catalog, tenantId, {
+        warehouseId: query.warehouseId === undefined ? undefined : canonicalUuid(query.warehouseId),
+        clientId: query.clientId === undefined ? undefined : canonicalUuid(query.clientId),
+        after,
+        limit,
+      }),
+    );
+  }
+
+  /**
+   * Story 4-7a (A14) — the RMA code of each return hold among the named QC
+   * holds, in its own transaction: the api shell composes it onto the QC
+   * desk's list (QC never reads a returns table).
+   */
+  async rmaCodesByHoldIds(tenantId: string, holdIds: readonly string[]): Promise<Map<string, string>> {
+    if (holdIds.length === 0) return new Map();
+    return withTenantTransaction(this.db, tenantId, (tx) => rmaCodesByHoldIdsInTx(tx, tenantId, holdIds));
+  }
+
+  /**
+   * Story 4-7a — the client portal's returns (decision 11): newest first,
+   * each with its disposition totals. Two layers: the client-stamped
+   * transaction (RLS) and the `client_id = $client` predicate.
+   */
+  async portalReturns(
+    tenantId: string,
+    clientId: string,
+    query: { readonly cursor?: string; readonly limit?: number; readonly dispositionState?: PortalDispositionState } = {},
+  ): Promise<Page<PortalReturnRow>> {
+    const limit = query.limit ?? PORTAL_PAGE_DEFAULT_LIMIT;
+    const before = query.cursor === undefined ? null : decodeCursorSafe(query.cursor);
+    return withTenantTransaction(
+      this.db,
+      tenantId,
+      (tx) => portalReturnsInTx(tx, tenantId, clientId, { before, limit, dispositionState: query.dispositionState }),
+      { clientId },
+    );
+  }
+
+  /** Story 4-7a — one of the client's returns (null: unknown or another client's — the same 404). */
+  async portalReturn(tenantId: string, clientId: string, rmaId: string): Promise<PortalReturnDetail | null> {
+    return withTenantTransaction(this.db, tenantId, (tx) => portalReturnInTx(tx, this.catalog, tenantId, clientId, canonicalUuid(rmaId)), {
+      clientId,
+    });
   }
 
   /**

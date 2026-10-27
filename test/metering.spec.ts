@@ -649,6 +649,10 @@ describe('story 21-4: metering and storage snapshots', () => {
         'stock.moved': ['both'],
         // Story 2-8a — a QC fail: QC-HOLD → DAMAGED on one event (a relocation, meters 0, as qc.held does).
         'qc.failed': ['both'],
+        // Story 4-7a — a restock: RETURNS → a storage bin on one event (a relocation, meters 0).
+        'return.restocked': ['both'],
+        // Story 4-7a — a scrap: a draw out of RETURNS (on-hand drops).
+        'return.scrapped': ['from'],
       };
 
       it('every registered type is classified, and each arm folds as the replay rule says', async () => {

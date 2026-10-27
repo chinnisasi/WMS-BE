@@ -3,6 +3,9 @@ import { SharedModule } from '../../shared/shared.module';
 import { CatalogModule } from '../catalog/catalog.module';
 import { InventoryModule } from '../inventory/inventory.module';
 import { OutboundModule } from '../outbound/outbound.module';
+import { InboundModule } from '../inbound/inbound.module';
+import { ReturnDispositionCommand } from './return-disposition.command';
+import { ReturnHoldSettlementHandler } from './hold-settlement.delivery';
 import { ReturnAuthorizationCommand } from './return-authorization.command';
 import { ReturnReceiptCommand } from './return-receipt.command';
 import { ReturnsFacade } from './returns.facade';
@@ -25,13 +28,21 @@ import { ReturnsFacade } from './returns.facade';
  * ledger and catalog's handling units only through their facades. Tenancy
  * never imports returns.
  *
+ * Story 4-7a adds `ReturnDispositionCommand` (restock / quarantine / scrap,
+ * web and handheld) and `ReturnHoldSettlementHandler` (the outbox subscriber
+ * that adds a closed return hold's returned units back to awaiting), and two
+ * more tables it owns exclusively (`return_dispositions`,
+ * `return_hold_settlements`). It reaches QC only through `QcFacade` (the
+ * return hold, its outcome) — `forwardRef(InboundModule)`, the compliance
+ * excursion precedent.
+ *
  * Exports only its facade. Nothing imports this module back but the api shell
  * and the root composition, so there is no cycle. `forwardRef(catalog)`: the
  * catalog ↔ tenancy pattern every catalog importer follows.
  */
 @Module({
-  imports: [SharedModule, OutboundModule, InventoryModule, forwardRef(() => CatalogModule)],
-  providers: [ReturnAuthorizationCommand, ReturnReceiptCommand, ReturnsFacade],
+  imports: [SharedModule, OutboundModule, InventoryModule, forwardRef(() => CatalogModule), forwardRef(() => InboundModule)],
+  providers: [ReturnAuthorizationCommand, ReturnReceiptCommand, ReturnDispositionCommand, ReturnHoldSettlementHandler, ReturnsFacade],
   exports: [ReturnsFacade],
 })
 export class ReturnsModule {}

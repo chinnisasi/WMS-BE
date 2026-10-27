@@ -37,6 +37,8 @@ export const SKU_NAMING_OP_TYPES = [
   'stock.move',
   // Story 3-2b — a refused handheld adjustment names its SKU (`skuId`).
   'stock.adjust',
+  // Story 4-7a — a refused handheld restock names its SKU (`skuId`).
+  'return.restock',
 ] as const;
 
 const UUID_TEXT = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';

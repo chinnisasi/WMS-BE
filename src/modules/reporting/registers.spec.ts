@@ -24,6 +24,8 @@ describe('referenceSummary (story 5-3a)', () => {
     [{ kind: 'excursion', excursionId: 'e', binId: 'b', readingC: 9.5 }, 'excursion 9.5 °C'],
     [{ kind: 'transfer', transferId: 't1' }, 'transfer t1'],
     [{ kind: 'return-receipt', returnReceiptId: 'r', rmaId: 'rma1', rmaLineId: 'rl' }, 'return rma1'],
+    [{ kind: 'return-disposition', dispositionId: 'd', returnReceiptLineId: 'rl', rmaId: 'rma1', outcome: 'restock' }, 'return restock rma1'],
+    [{ kind: 'return-disposition', dispositionId: 'd', returnReceiptLineId: 'rl', rmaId: 'rma1', outcome: 'scrap', reasonCode: 'damaged' }, 'return scrap rma1 (damaged)'],
   ];
 
   it.each(cases)('%j → %s', (doc, expected) => {
@@ -31,7 +33,7 @@ describe('referenceSummary (story 5-3a)', () => {
   });
 
   it('covers every kind of the union', () => {
-    expect(new Set(cases.map(([doc]) => doc.kind)).size).toBe(12);
+    expect(new Set(cases.map(([doc]) => doc.kind)).size).toBe(13);
   });
 
   it('a kind this build does not know prints its kind; a non-object prints unknown', () => {

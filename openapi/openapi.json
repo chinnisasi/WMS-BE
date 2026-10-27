@@ -7201,7 +7201,9 @@
                   "return.received",
                   "grn.damaged",
                   "qc.failed",
-                  "stock.moved"
+                  "stock.moved",
+                  "return.restocked",
+                  "return.scrapped"
                 ]
               }
             }
@@ -24566,6 +24568,7 @@
                 "reorder_policy",
                 "return_authorization",
                 "return_receipt",
+                "return_disposition",
                 "sku",
                 "stock_adjustment_pending",
                 "stock_adjustment_policy",
@@ -31032,6 +31035,194 @@
         ]
       }
     },
+    "/tenants/{tenantId}/portal/returns": {
+      "get": {
+        "operationId": "PortalController_portalReturns",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "example": 50,
+              "type": "number"
+            }
+          },
+          {
+            "name": "dispositionState",
+            "required": false,
+            "in": "query",
+            "description": "`awaiting` — units still open or on an unsettled hold; `dispositioned` — every received unit decided",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "awaiting",
+                "dispositioned"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalReturnPageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed cursor (invalid-cursor), a limit outside 1–100 or a status outside its vocabulary (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-7a — this client's return authorizations, newest first (keyset), each with received / restocked / on hold / failed inspection / scrapped / still open totals; optionally only those still awaiting a disposition or fully dispositioned",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/returns/{rmaId}": {
+      "get": {
+        "operationId": "PortalController_portalReturn",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "rmaId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalReturnDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed rmaId path parameter (validation-failed — it must be a uuid)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such return of this client — unknown, or another client's (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-7a — one of this client's returns: per line authorized, received, restocked, on hold, failed inspection, scrapped and open, with the return reason; and every disposition (outcome, quantity, reason, time), oldest first",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
     "/tenants/{tenantId}/portal/invoices": {
       "get": {
         "operationId": "PortalController_invoices",
@@ -31771,6 +31962,354 @@
           }
         ],
         "summary": "return.receive — receives returned units against a return authorization exactly once (badge-in session required): each entry that matches its line books a return.received ledger event into the warehouse's system RETURNS bin (awaiting disposition — outside ATP) with its condition grade; every other entry is refused and lands in ONE review-queue row (Discard only)",
+        "tags": [
+          "returns"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/returns/dispositions": {
+      "post": {
+        "operationId": "ReturnsController_dispose",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DisposeReturnDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The disposition (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReturnDispositionResultDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an invalid body — an unknown outcome, a non-positive qty, a restock without toBinId or with a reason/note, a quarantine or scrap without a reason or with a bin, \"other\" without a note, a note over 200 characters, a quantity finer than its unit, a serial unit or returned case not disposed whole, or a system bin as the target (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks returns.manage (role-denied), or a client-portal session (role-denied — operators only); or a secure target bin without secure.move (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse, the receipt line or the target bin does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The line is another warehouse's (document-warehouse-mismatch); quarantine of a serial-tracked or catch-weight unit (disposition-not-supported); an expired or blocked batch on a restock (batch-expired / batch-blocked); more than the line awaits — member awaitingQty (exceeds-awaiting); a scrap above the tenant's write-off threshold — members awaitingQty, threshold (scrap-above-threshold); a reconcile quarantine on RETURNS or the target (disposition-scope-quarantined); a placement-gate refusal with the gate's own code (bin-retired, bin-blocked, bin-storage-mismatch, bin-client-mismatch, bin-occupancy-conflict, bin-segregation-conflict, bin-full, bin-overweight, bin-volume-exceeded, bin-item-oversize); or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Dispositions a received return unit (returns.manage): restock — return.restocked RETURNS → a storage bin through every placement gate (ATP rises); quarantine — a QC hold of kind return (RETURNS → QC-HOLD; a release brings the units back); scrap — return.scrapped out of RETURNS with a reason (above the tenant write-off threshold refused). At most what the line still awaits",
+        "tags": [
+          "returns"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/returns/restocks": {
+      "post": {
+        "operationId": "ReturnsController_restock",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the device token)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RestockReturnDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The dispositions, one per receipt line drawn (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReturnDispositionResultDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an invalid body — a malformed id, a non-positive qty, a non-UTC occurredAt, repeated or uncounted serials, serials with a batchCode, serials on a SKU that is not serial-tracked (or none on one that is), a batch on an unbatched SKU, a catch-weight SKU (restocked on the web), a quantity finer than its unit, or a system bin as the target (validation-failed); a batch-tracked SKU without its batch (batch-required)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Unknown or revoked device (device-revoked), the operator is not a floor role, or a secure target bin without secure.move (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse, the SKU or the target bin does not exist (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Less is awaiting than the restock names — member awaitingQty (exceeds-awaiting); a named serial is not awaiting (or was graded non-sellable) — member serialNumber (serial-not-awaiting); an expired or blocked batch (batch-expired / batch-blocked); a reconcile quarantine (disposition-scope-quarantined); a placement-gate refusal with the gate's own code; or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "return.restock — restocks returned units into a storage bin exactly once (badge-in session required): the server allocates the SKU (and batch, or the named serials) to the warehouse's oldest sellable (resaleable) awaiting receipt lines and writes one return.restocked per line through every placement gate",
+        "tags": [
+          "returns"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/returns/awaiting": {
+      "get": {
+        "operationId": "ReturnsController_awaiting",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": false,
+            "in": "query",
+            "description": "Only one warehouse's lines (tenant-wide when absent)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Only one client's lines. An unknown id is an empty page",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AwaitingDispositionListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed warehouseId or clientId, a limit outside 1–100 (validation-failed), or a malformed cursor (invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-7a — the awaiting-disposition queue: every received return line with units still awaiting a disposition, OLDEST first (keyset on the line's createdAt, id), optionally one warehouse's and one client's — with the grade, the capture, the open and on-hold quantities and the line's quarantine history",
         "tags": [
           "returns"
         ]
@@ -36281,7 +36820,8 @@
               "gate-in.unload",
               "stock.move",
               "stock.adjust",
-              "receipt-photo.stage"
+              "receipt-photo.stage",
+              "return.restock"
             ]
           },
           "classification": {
@@ -36437,7 +36977,8 @@
               "gate-in.unload",
               "stock.move",
               "stock.adjust",
-              "receipt-photo.stage"
+              "receipt-photo.stage",
+              "return.restock"
             ]
           },
           "classification": {
@@ -44623,9 +45164,10 @@
             "type": "string",
             "enum": [
               "manual",
-              "receipt"
+              "receipt",
+              "return"
             ],
-            "description": "Story 1-2b — `receipt`: placed by the receipt itself (the client's QC on receipt), one per GRN line; `manual`: an Ops Manager's (sku, bin) scope hold. Always present on the list; on a command's answer present only for a receipt hold"
+            "description": "Story 1-2b — `receipt`: placed by the receipt itself (the client's QC on receipt), one per GRN line; `manual`: an Ops Manager's (sku, bin) scope hold; `return` (story 4-7a): a returned unit quarantined from the RETURNS bin. Always present on the list; on a command's answer present only for a receipt hold"
           },
           "grnLineId": {
             "type": "string",
@@ -44948,9 +45490,10 @@
             "type": "string",
             "enum": [
               "manual",
-              "receipt"
+              "receipt",
+              "return"
             ],
-            "description": "Story 1-2b — `receipt`: placed by the receipt itself (the client's QC on receipt), one per GRN line; `manual`: an Ops Manager's (sku, bin) scope hold"
+            "description": "Story 1-2b — `receipt`: placed by the receipt itself (the client's QC on receipt), one per GRN line; `manual`: an Ops Manager's (sku, bin) scope hold; `return` (story 4-7a): a returned unit quarantined from the RETURNS bin"
           },
           "grnLineId": {
             "type": "string",
@@ -44978,6 +45521,10 @@
             "type": "string",
             "format": "uuid",
             "description": "Story 1-2b — the held SKU's client"
+          },
+          "rmaCode": {
+            "type": "string",
+            "description": "Story 4-7a — a return hold's return authorization code (RMA-0001); absent on every other hold"
           },
           "batchId": {
             "type": "string",
@@ -52293,6 +52840,7 @@
               "reorder_policy",
               "return_authorization",
               "return_receipt",
+              "return_disposition",
               "sku",
               "stock_adjustment_pending",
               "stock_adjustment_policy",
@@ -52388,6 +52936,7 @@
               "reorder_policy",
               "return_authorization",
               "return_receipt",
+              "return_disposition",
               "sku",
               "stock_adjustment_pending",
               "stock_adjustment_policy",
@@ -56565,6 +57114,294 @@
           "items"
         ]
       },
+      "PortalReturnRowDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "description": "RMA-0001"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "partially_received",
+              "received",
+              "cancelled"
+            ]
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderReference": {
+            "type": "string",
+            "nullable": true
+          },
+          "externalReference": {
+            "type": "string",
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "lineCount": {
+            "type": "number"
+          },
+          "receivedTotal": {
+            "type": "number",
+            "description": "Base units (summed across lines)"
+          },
+          "restockedTotal": {
+            "type": "number"
+          },
+          "onHoldTotal": {
+            "type": "number"
+          },
+          "failedInspectionTotal": {
+            "type": "number"
+          },
+          "scrappedTotal": {
+            "type": "number"
+          },
+          "openTotal": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "status",
+          "orderId",
+          "orderReference",
+          "externalReference",
+          "createdAt",
+          "lineCount",
+          "receivedTotal",
+          "restockedTotal",
+          "onHoldTotal",
+          "failedInspectionTotal",
+          "scrappedTotal",
+          "openTotal"
+        ]
+      },
+      "PortalReturnPageResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalReturnRowDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "PortalReturnLineDto": {
+        "type": "object",
+        "properties": {
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "authorizedQty": {
+            "type": "number"
+          },
+          "receivedQty": {
+            "type": "number"
+          },
+          "returnReasonCode": {
+            "type": "string",
+            "enum": [
+              "damaged",
+              "defective",
+              "wrong-item",
+              "not-as-described",
+              "changed-mind",
+              "other"
+            ],
+            "description": "Why the customer returned it"
+          },
+          "restockedQty": {
+            "type": "number"
+          },
+          "onHoldQty": {
+            "type": "number"
+          },
+          "failedInspectionQty": {
+            "type": "number"
+          },
+          "scrappedQty": {
+            "type": "number"
+          },
+          "openQty": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "skuCode",
+          "skuName",
+          "authorizedQty",
+          "receivedQty",
+          "returnReasonCode",
+          "restockedQty",
+          "onHoldQty",
+          "failedInspectionQty",
+          "scrappedQty",
+          "openQty"
+        ]
+      },
+      "PortalReturnDispositionDto": {
+        "type": "object",
+        "properties": {
+          "skuCode": {
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "restock",
+              "quarantine",
+              "scrap"
+            ]
+          },
+          "qty": {
+            "type": "number"
+          },
+          "reasonCode": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "damaged",
+              "defective",
+              "expired",
+              "missing-parts",
+              "contaminated",
+              "needs-inspection",
+              "client-instruction",
+              "other",
+              null
+            ],
+            "description": "Quarantine and scrap reasons; null on a restock"
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          }
+        },
+        "required": [
+          "skuCode",
+          "outcome",
+          "qty",
+          "reasonCode",
+          "occurredAt"
+        ]
+      },
+      "PortalReturnDetailResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "description": "RMA-0001"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "partially_received",
+              "received",
+              "cancelled"
+            ]
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderReference": {
+            "type": "string",
+            "nullable": true
+          },
+          "externalReference": {
+            "type": "string",
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "lineCount": {
+            "type": "number"
+          },
+          "receivedTotal": {
+            "type": "number",
+            "description": "Base units (summed across lines)"
+          },
+          "restockedTotal": {
+            "type": "number"
+          },
+          "onHoldTotal": {
+            "type": "number"
+          },
+          "failedInspectionTotal": {
+            "type": "number"
+          },
+          "scrappedTotal": {
+            "type": "number"
+          },
+          "openTotal": {
+            "type": "number"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalReturnLineDto"
+            }
+          },
+          "dispositions": {
+            "description": "Oldest first",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalReturnDispositionDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "status",
+          "orderId",
+          "orderReference",
+          "externalReference",
+          "createdAt",
+          "lineCount",
+          "receivedTotal",
+          "restockedTotal",
+          "onHoldTotal",
+          "failedInspectionTotal",
+          "scrappedTotal",
+          "openTotal",
+          "lines",
+          "dispositions"
+        ]
+      },
       "PortalInvoiceTotalsDto": {
         "type": "object",
         "properties": {
@@ -58266,6 +59103,11 @@
       "ReturnReceiptLineViewDto": {
         "type": "object",
         "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 4-7a — the receipt line's id (a disposition's address)"
+          },
           "rmaLineId": {
             "type": "string",
             "format": "uuid"
@@ -58303,9 +59145,35 @@
             "type": "number",
             "nullable": true,
             "description": "A returned case's captured weight, grams"
+          },
+          "openQty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 4-7a — units still awaiting a disposition, base UoM"
+          },
+          "restockedQty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 4-7a — units restocked to a storage bin, base UoM"
+          },
+          "scrappedQty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 4-7a — units scrapped, base UoM"
+          },
+          "onHoldQty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 4-7a — units on an open return QC hold, base UoM"
+          },
+          "failedInspectionQty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 4-7a — units that failed a return hold's inspection (now in DAMAGED), base UoM"
           }
         },
         "required": [
+          "id",
           "rmaLineId",
           "skuId",
           "qty",
@@ -58313,7 +59181,12 @@
           "note",
           "batchCode",
           "serialNumber",
-          "weightGrams"
+          "weightGrams",
+          "openQty",
+          "restockedQty",
+          "scrappedQty",
+          "onHoldQty",
+          "failedInspectionQty"
         ]
       },
       "ReturnReceiptViewDto": {
@@ -58653,6 +59526,335 @@
           "applied",
           "refused",
           "reviewOpId"
+        ]
+      },
+      "DisposeReturnDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The warehouse — must be the receipt's (409 document-warehouse-mismatch otherwise)"
+          },
+          "receiptLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The return-receipt line dispositioned (the detail read's receipts[].lines[].id)"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "restock",
+              "quarantine",
+              "scrap"
+            ],
+            "description": "restock (to a storage bin), quarantine (a QC hold) or scrap"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units dispositioned, base UoM — at most what the line still awaits. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded. A serial unit or a returned case is exactly 1.",
+            "minimum": 0.001,
+            "maximum": 9007199254740
+          },
+          "toBinId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Restock only — the storage bin the units go to"
+          },
+          "reasonCode": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "damaged",
+              "defective",
+              "expired",
+              "missing-parts",
+              "contaminated",
+              "needs-inspection",
+              "client-instruction",
+              "other",
+              null
+            ],
+            "description": "Quarantine and scrap only (required there)"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "description": "Quarantine and scrap only — trimmed, blank means absent, at most 200 characters; required with the reason \"other\"",
+            "maxLength": 400
+          }
+        },
+        "required": [
+          "warehouseId",
+          "receiptLineId",
+          "outcome",
+          "qty"
+        ]
+      },
+      "ReturnDispositionEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "receiptLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "rmaId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "restock",
+              "quarantine",
+              "scrap"
+            ]
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units, base UoM"
+          },
+          "toBinId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Restock: the storage bin"
+          },
+          "qcHoldId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Quarantine: the QC hold (kind return)"
+          },
+          "ledgerEventId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Restock / scrap: the ledger event"
+          }
+        },
+        "required": [
+          "id",
+          "receiptLineId",
+          "rmaId",
+          "outcome",
+          "qty",
+          "toBinId",
+          "qcHoldId",
+          "ledgerEventId"
+        ]
+      },
+      "ReturnDispositionResultDto": {
+        "type": "object",
+        "properties": {
+          "dispositions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReturnDispositionEntryDto"
+            }
+          }
+        },
+        "required": [
+          "dispositions"
+        ]
+      },
+      "RestockReturnDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The SKU restocked — the server allocates it to the oldest sellable awaiting lines"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units restocked, base UoM. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded.",
+            "minimum": 0.001,
+            "maximum": 9007199254740
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "Batch-tracked (non-serial) SKUs: the batch restocked (required — 400 batch-required)",
+            "maxLength": 128
+          },
+          "serialNumbers": {
+            "nullable": true,
+            "description": "Serial-tracked SKUs: one serial number per unit (qty = count), at most 500",
+            "maxItems": 500,
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "toBinId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The storage bin scanned"
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Device time (ISO-8601 UTC, Z-suffixed) — the ledger event's business time"
+          }
+        },
+        "required": [
+          "warehouseId",
+          "skuId",
+          "qty",
+          "toBinId",
+          "occurredAt"
+        ]
+      },
+      "AwaitingDispositionDto": {
+        "type": "object",
+        "properties": {
+          "receiptLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "receiptCode": {
+            "type": "string",
+            "description": "RRN-0001"
+          },
+          "receivedAt": {
+            "type": "string",
+            "description": "When the unit was received (device time, ISO-8601 UTC)"
+          },
+          "rmaId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "rmaCode": {
+            "type": "string",
+            "description": "RMA-0001"
+          },
+          "orderReference": {
+            "type": "string",
+            "nullable": true
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "uom": {
+            "type": "string",
+            "description": "The base unit of measure"
+          },
+          "condition": {
+            "type": "string",
+            "enum": [
+              "resaleable",
+              "opened",
+              "damaged",
+              "missing-parts"
+            ],
+            "description": "The grade the unit was received with"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "description": "The inspection note at receipt"
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "serialNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true,
+            "description": "A returned case's weight, grams"
+          },
+          "receivedQty": {
+            "type": "number",
+            "description": "Units received on the line, base UoM"
+          },
+          "openQty": {
+            "type": "number",
+            "description": "Units still awaiting a disposition, base UoM"
+          },
+          "onHoldQty": {
+            "type": "number",
+            "description": "Units on an open return QC hold, base UoM"
+          },
+          "priorQuarantines": {
+            "type": "number",
+            "description": "How many times the line was quarantined before"
+          },
+          "lastReasonCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The latest quarantine or scrap reason on the line"
+          }
+        },
+        "required": [
+          "receiptLineId",
+          "receiptCode",
+          "receivedAt",
+          "rmaId",
+          "rmaCode",
+          "orderReference",
+          "clientId",
+          "warehouseId",
+          "skuId",
+          "skuCode",
+          "skuName",
+          "uom",
+          "condition",
+          "note",
+          "batchCode",
+          "serialNumber",
+          "weightGrams",
+          "receivedQty",
+          "openQty",
+          "onHoldQty",
+          "priorQuarantines",
+          "lastReasonCode"
+        ]
+      },
+      "AwaitingDispositionListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AwaitingDispositionDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
         ]
       },
       "ReturnableLineDto": {
