@@ -5,6 +5,7 @@ import type { Database } from '../../shared/db/db';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
+import { UUID_RE } from '../../shared/primitives/ids';
 import { assertWarehouseInTenant, getMemberRoleIn, getWarehouseCodeInTx } from '../tenancy/tenancy.service';
 import { CatalogFacade } from '../catalog/catalog.facade';
 import { InboundFacade } from '../inbound/inbound.facade';
@@ -415,7 +416,7 @@ export class ReportingFacade {
   }
 
   /** `GET …/inventory/recalls/candidates` — one client's batches whose normalised lot code matches (A9). */
-  async recallCandidates(tenantId: string, clientId: string, code: string): Promise<{ normalisedCode: string; items: RecallCandidateView[] }> {
+  async recallCandidates(tenantId: string, clientId: string, code: string): Promise<{ normalisedCode: string; truncated: boolean; items: RecallCandidateView[] }> {
     return this.recallTimed(
       () =>
         withTenantTransaction(
@@ -981,11 +982,18 @@ function recallReportBusy(): ProblemException {
 /** A recall list cursor (`(created_at, id)` — full precision), 400 `invalid-cursor` when malformed. */
 function recallCursor(cursor: string | undefined): { createdAt: string; id: string } | undefined {
   if (cursor === undefined) return undefined;
+  let decoded: { createdAt: string; id: string };
   try {
-    return decodeCursor(cursor);
+    decoded = decodeCursor(cursor);
   } catch {
     throw new ProblemException('invalid-cursor', 400, 'Invalid cursor', 'The cursor is not one this list issued.');
   }
+  // The keyset's halves are bound into uuid and timestamptz compares: a
+  // shape that would fail the cast is the same 400, never a 500.
+  if (!UUID_RE.test(decoded.id) || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/.test(decoded.createdAt) || Number.isNaN(Date.parse(decoded.createdAt))) {
+    throw new ProblemException('invalid-cursor', 400, 'Invalid cursor', 'The cursor is not one this list issued.');
+  }
+  return decoded;
 }
 
 export { invalidRecallQuery };

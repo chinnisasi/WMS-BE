@@ -414,6 +414,8 @@ export class RecallCandidateDto {
 export class RecallCandidatesResponse {
   @ApiProperty({ description: 'The code as matched — letters and digits, upper-cased' })
   normalisedCode!: string;
+  @ApiProperty({ description: 'More batches matched than the 200 listed — narrow the code (the checklist is not complete)' })
+  truncated!: boolean;
   @ApiProperty({ type: [RecallCandidateDto] })
   items!: RecallCandidateDto[];
 }

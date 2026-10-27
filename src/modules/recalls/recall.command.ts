@@ -18,7 +18,7 @@ import { InventoryFacade } from '../inventory/inventory.facade';
 import { OutboundFacade } from '../outbound/outbound.facade';
 import { assertSingleClientInTx } from '../clients/clients.facade';
 import { openLiveRecallLinesForBatchesInTx } from './open-recall-lines';
-import { recallLiveStateInTx } from './recall-figures';
+import { recallLiveStateInTx, type RecallLiveState, type RecallLotRef } from './recall-figures';
 import { buildCloseSummary, type CloseSummaryV1 } from './close-summary';
 
 /**
@@ -38,9 +38,14 @@ export const RECALL_REF_MAX = 100;
 export const RECALL_EVIDENCE_MAX = 200;
 /** A15 — how long a recall command waits on any lock before it answers 503 (milliseconds). */
 export const RECALL_LOCK_TIMEOUT_MS = 5000;
+/** The ceiling on any one statement of a recall command (the close's figure reads included). */
+export const RECALL_STATEMENT_TIMEOUT_MS = 30_000;
+/** The close reads the live figures at most this many times, until two reads agree. */
+const RECALL_STATE_READS = 3;
 
-/** The `55P03` Postgres raises when `lock_timeout` elapses. */
+/** The `55P03` Postgres raises when `lock_timeout` elapses, and the `57014` of `statement_timeout`. */
 const LOCK_NOT_AVAILABLE = '55P03';
+const STATEMENT_TIMEOUT = '57014';
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
 export interface OpenRecallCommand {
@@ -173,6 +178,16 @@ function hasSqlState(err: unknown, code: string): boolean {
     current = candidate.cause;
   }
   return false;
+}
+
+/**
+ * Whether a live recall's line takes responsibility for the lot's block: an
+ * active lot it blocks now, or a lot already blocked for reason `recall` (a
+ * recall block nobody else holds open). A lot blocked for any other reason
+ * keeps it (`blocked_by_recall = false` — decision 4).
+ */
+function adoptsBlock(batch: Batch): boolean {
+  return batch.status === 'active' || (batch.status === 'blocked' && batch.blockedReason === 'recall');
 }
 
 /** The recall code of a sequence number: `RCL-` and at least six digits. */
@@ -428,13 +443,13 @@ export class RecallCommand {
         const batchRows = new Map((await this.catalog.lockBatchesForUpdateInTx(tx, command.tenantId, lines.map((line) => line.batchId))).map((row) => [row.id, row]));
         const lineByBatch = new Map(lines.map((line) => [line.batchId, line]));
 
-        const notOnRecall = [...releaseBatchIds, ...dispositionNotes.map((entry) => entry.batchId)].filter((id) => !lineByBatch.has(id));
+        const notOnRecall = [...new Set([...releaseBatchIds, ...dispositionNotes.map((entry) => entry.batchId)].filter((id) => !lineByBatch.has(id)))];
         if (notOnRecall.length > 0) {
           throw new ProblemException(
             'recall-batch-not-on-recall',
             409,
             'Batch not on this recall',
-            `${[...new Set(notOnRecall)].join(', ')} ${notOnRecall.length === 1 ? 'is' : 'are'} not a lot of ${recall.code} — release and note only its own lots.`,
+            `${notOnRecall.join(', ')} ${notOnRecall.length === 1 ? 'is' : 'are'} not a lot of ${recall.code} — release and note only its own lots.`,
           );
         }
         // A5 — a lot is released only when THIS recall blocked it and the
@@ -457,9 +472,14 @@ export class RecallCommand {
         }
 
         // The figures as of close — the same definition the detail reads live.
-        const state = await recallLiveStateInTx(
+        // This transaction is READ COMMITTED (a repeatable-read snapshot would
+        // turn a parked same-key duplicate into a 40001 instead of a replay),
+        // so each statement sees its own snapshot: a receipt, return or
+        // write-off committing between the on-hand read and the ledger read
+        // would show a bogus `unaccounted`. Read the state until two reads
+        // agree (bounded), so the frozen figures are one consistent moment.
+        const state = await this.settledLiveStateInTx(
           tx,
-          { inventory: this.inventory, outbound: this.outbound },
           command.tenantId,
           recall.clientId,
           lines.map((line) => ({ batchId: line.batchId, skuId: line.skuId })),
@@ -634,9 +654,27 @@ export class RecallCommand {
 
   // ── helpers ──────────────────────────────────────────────────────────────
 
-  /** A15 — every recall command waits at most `RECALL_LOCK_TIMEOUT_MS` on a lock (transaction-local). */
+  /** A15 — every recall command waits at most `RECALL_LOCK_TIMEOUT_MS` on a lock, and runs no statement past `RECALL_STATEMENT_TIMEOUT_MS` (transaction-local). */
   private async armLockTimeout(tx: TenantTx): Promise<void> {
     await tx.execute(sql`select set_config('lock_timeout', ${String(RECALL_LOCK_TIMEOUT_MS)}, true)`);
+    await tx.execute(sql`select set_config('statement_timeout', ${String(RECALL_STATEMENT_TIMEOUT_MS)}, true)`);
+  }
+
+  /** The live state read until two consecutive reads agree on every figure (at most `RECALL_STATE_READS` reads), else 503. */
+  private async settledLiveStateInTx(tx: TenantTx, tenantId: string, clientId: string, lots: readonly RecallLotRef[]): Promise<RecallLiveState> {
+    const sources = { inventory: this.inventory, outbound: this.outbound };
+    let previous = await recallLiveStateInTx(tx, sources, tenantId, clientId, lots);
+    for (let read = 1; read < RECALL_STATE_READS; read += 1) {
+      const next = await recallLiveStateInTx(tx, sources, tenantId, clientId, lots);
+      if (JSON.stringify([...next.figures]) === JSON.stringify([...previous.figures])) return next;
+      previous = next;
+    }
+    throw new ProblemException(
+      'recall-open-contended',
+      503,
+      'Recall contended',
+      'The lots of this recall are moving right now (receipts, picks or write-offs landed while the figures were read) — nothing was changed; try the close again in a moment.',
+    );
   }
 
   /** A 55P03 (the lock timeout) anywhere is 503 `recall-open-contended` — the transaction rolled back whole, no key. */
@@ -644,7 +682,7 @@ export class RecallCommand {
     try {
       return await run();
     } catch (err) {
-      if (hasSqlState(err, LOCK_NOT_AVAILABLE)) {
+      if (hasSqlState(err, LOCK_NOT_AVAILABLE) || hasSqlState(err, STATEMENT_TIMEOUT)) {
         throw new ProblemException(
           'recall-open-contended',
           503,
@@ -738,11 +776,16 @@ export class RecallCommand {
         batchId: batch.id,
         skuId: batch.skuId,
         batchCode: batch.code,
-        blockedByRecall: recall.mode === 'live' && batch.status === 'active',
+        blockedByRecall: recall.mode === 'live' && adoptsBlock(batch),
       })),
     );
     if (recall.mode !== 'live') return blocked;
     const note = truncateCodePoints(`${recall.code}: ${recall.reasonNote}`, RECALL_NOTE_MAX);
+    // An already-blocked lot whose block is a RECALL block (left blocked by an
+    // earlier, closed recall, or a 3-3a standalone `recall` block) is adopted:
+    // its line is `blocked_by_recall`, so this recall's close can release it.
+    // It is on no open live recall (the guard above refused that), and it is
+    // not re-blocked — the block stands as it is.
     for (const batch of batches) {
       if (batch.status !== 'active') continue;
       await this.catalog.blockBatchInTx(tx, {

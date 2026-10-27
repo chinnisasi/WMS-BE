@@ -168,7 +168,7 @@ describe('story 3-7a: batch recall (e2e)', () => {
   const ACME_SKUS = [
     'RC-OPEN', 'RC-OPEN2', 'RC-ATP', 'RC-PRE', 'RC-PREQ', 'RC-HELD', 'RC-OTHER', 'RC-QCB', 'RC-MIX', 'RC-CL', 'RC-UNA', 'RC-TRN',
     'RC-N1', 'RC-N2', 'RC-MOCK', 'RC-LOCK', 'RC-RACE1', 'RC-RACE2', 'RC-PICKR', 'RC-SK1', 'RC-SK2', 'RC-SK3', 'RC-B19', 'RC-ALL',
-    'RC-BIG', 'RC-REP', 'RC-CUT',
+    'RC-BIG', 'RC-REP', 'RC-CUT', 'RC-TWO', 'RC-ZERO', 'RC-AGAIN', 'RC-MANY', 'RC-PREF', 'RC-TRUNC', 'RC-MOCKU',
   ];
 
   beforeAll(async () => {
@@ -557,7 +557,7 @@ describe('story 3-7a: batch recall (e2e)', () => {
 
   let preQc: Lot;
 
-  it('a lot already blocked (qc-failed) keeps its reason (blocked_by_recall false); unblocking ANY lot of an open live recall is 409 batch-under-recall, a mock recall never refuses it', async () => {
+  it('a lot already blocked (qc-failed) keeps its reason (blocked_by_recall false); unblocking ANY lot of an open live recall is 409 batch-under-recall', async () => {
     preQc = await seed('RC-PRE', binA, 3, 'P-QC');
     const active = await seed('RC-PREQ', binA, 3, 'P-OK');
     await block(preQc.id, { reason: 'qc-failed', note: 'lab report 9' }).expect(201);
@@ -620,6 +620,15 @@ describe('story 3-7a: batch recall (e2e)', () => {
     const refused = await http().post(`${API}/${tenantId}/outbound/picks`).set('Authorization', `Bearer ${deviceOperatorToken}`).set(KEY_HEADER, key).send(pickBody).expect(409);
     expect(refused.body).toMatchObject({ code: 'recalled-lot-in-bin', binCode: 'A-01-01', batchCodes: ['M-R'], recallCodes: [recall.body.recall.code] });
     expect(await keyStored(key)).toBe(false);
+    // A zero-unit short report at the same bin is not refused: nothing is drawn.
+    const { picklist: other } = await fixtures.releasedWave([{ skuId: sku('RC-MIX'), quantity: 1 }]);
+    const shortLine = other.lines[0]!;
+    await http()
+      .post(`${API}/${tenantId}/outbound/picks`)
+      .set('Authorization', `Bearer ${deviceOperatorToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ warehouseId: wh, picklistId: shortLine.picklistId, picklistLineId: shortLine.id, skuId: shortLine.skuId, binId: binA, qty: 0, reasonCode: 'bin-empty', occurredAt: nowZ() })
+      .expect(201);
     // The remedy: move the recalled units out (a move of a blocked lot is allowed), then pick.
     await http()
       .post(`${API}/${tenantId}/warehouses/${wh}/inventory/moves`)
@@ -1345,6 +1354,96 @@ describe('story 3-7a: batch recall (e2e)', () => {
       expect((await report(recallId, 'xlsx').expect(422)).body.code).toBe('report-too-large');
     } finally {
       reporting.recallXlsxMaxRows = cap;
+    }
+  });
+
+  // ── review patches (code review C1–C34) ────────────────────────────────────
+
+  it('C1: an order whose ONE pick drew two lots (picks.batch_id null) is refused at dispatch when either lot is recalled', async () => {
+    await seed('RC-TWO', binA, 4, 'TW-A', wh, 100);
+    const planned = await fixtures.releasedWave([{ skuId: sku('RC-TWO'), quantity: 4 }]);
+    await http()
+      .post(`${API}/${tenantId}/warehouses/${wh}/inventory/moves`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ skuId: sku('RC-TWO'), fromBinId: binA, toBinId: binB, qty: 2, batchCode: 'TW-A', reasonCode: 'make-room' })
+      .expect(201);
+    const b = await seed('RC-TWO', binA, 2, 'TW-B', wh, 200);
+    await fixtures.pickAllLines(planned.picklist);
+    await pack(planned.orderId, [{ skuId: sku('RC-TWO'), qty: 4 }]);
+    const picks = (await sql`select batch_id from picks where tenant_id = ${tenantId} and order_id = ${planned.orderId}`) as unknown as { batch_id: string | null }[];
+    expect(picks.map((row) => row.batch_id)).toEqual([null]);
+    await openRecall({ batchIds: [b.id], reasonNote: 'second lot only' }).expect(201);
+    const refused = await dispatch(planned.orderId).expect(409);
+    expect(refused.body).toMatchObject({ code: 'order-holds-recalled-batch', batchCodes: ['TW-B'] });
+  });
+
+  it('C3: a lot blocked for another reason that sits on an open MOCK recall unblocks through 3-3a', async () => {
+    const lot = await seed('RC-MOCKU', binA, 1, 'MU-1');
+    await block(lot.id, { reason: 'qc-failed', note: 'lab' }).expect(201);
+    await openRecall({ batchIds: [lot.id], reasonNote: 'drill', mode: 'mock' }).expect(201);
+    await unblock(lot.id, 'lab re-test passed').expect(201);
+  });
+
+  it('C6: a lot left blocked by a closed recall is adopted by the next live recall (blocked_by_recall) and its close can release it', async () => {
+    const lot = await seed('RC-AGAIN', binA, 1, 'AG-1');
+    const first = await openRecall({ batchIds: [lot.id], reasonNote: 'first' }).expect(201);
+    await closeRecall(first.body.recall.id as string, { note: 'kept blocked' }).expect(201);
+    expect((await batchRow(lot.id)).blocked_reason).toBe('recall');
+    const second = await openRecall({ batchIds: [lot.id], reasonNote: 'second' }).expect(201);
+    expect(second.body.recall.lots[0].blockedByRecall).toBe(true);
+    await closeRecall(second.body.recall.id as string, { note: 'released', releaseBatchIds: [lot.id], overrideReason: 'cleared' }).expect(201);
+    expect((await batchRow(lot.id)).status).toBe('active');
+  });
+
+  it('C17: adding past 50 lots in all is 409 recall-too-many-lots', async () => {
+    const ids: string[] = [];
+    for (let i = 0; i < 51; i += 1) {
+      const id = uuidv7();
+      await sql`insert into batches (id, tenant_id, sku_id, code) values (${id}, ${tenantId}, ${sku('RC-MANY')}, ${`MANY-${String(i).padStart(2, '0')}`})`;
+      ids.push(id);
+    }
+    const opened = await openRecall({ batchIds: ids.slice(0, 50), reasonNote: 'fifty' }).expect(201);
+    const key = ulid();
+    expect((await addBatches(opened.body.recall.id as string, [ids[50]!], key).expect(409)).body.code).toBe('recall-too-many-lots');
+    expect(await keyStored(key)).toBe(false);
+  });
+
+  it('C21–C24: candidates prefer the LIVE recall over a drill naming the same lot, steer to live recalls only, and say when the list is truncated', async () => {
+    const lot = await seed('RC-PREF', binA, 1, 'PF-1');
+    const mock = await openRecall({ batchIds: [lot.id], reasonNote: 'drill', mode: 'mock' }).expect(201);
+    const search = (code: string) => http().get(`${API}/${tenantId}/inventory/recalls/candidates?clientId=${acme}&code=${encodeURIComponent(code)}`).set('Authorization', `Bearer ${operatorToken}`);
+    expect((await search('PF-1').expect(200)).body.items[0].onRecall).toMatchObject({ code: mock.body.recall.code, mode: 'mock' });
+    const live = await openRecall({ batchIds: [lot.id], reasonNote: 'real' }).expect(201);
+    const found = await search('PF-1').expect(200);
+    expect(found.body.truncated).toBe(false);
+    expect(found.body.items[0].onRecall).toMatchObject({ code: live.body.recall.code, mode: 'live' });
+    // A drill on a matching lot does not steer another lot to it.
+    const drillOnly = await seed('RC-PREF', binB, 1, 'PF-2');
+    await openRecall({ batchIds: [drillOnly.id], reasonNote: 'drill two', mode: 'mock' }).expect(201);
+    const sibling = await seed('RC-PREF', binB, 1, 'PF2');
+    const steered = (await search('PF2').expect(200)).body.items as { batchId: string; sameCodeOnOpenRecall: string | null }[];
+    expect(steered.find((row) => row.batchId === sibling.id)!.sameCodeOnOpenRecall).toBeNull();
+    // 201 matches: the 200 listed and `truncated`.
+    for (let i = 0; i < 201; i += 1) {
+      await sql`insert into batches (id, tenant_id, sku_id, code) values (${uuidv7()}, ${tenantId}, ${sku('RC-TRUNC')}, ${`TR${'-'.repeat(i)}9`})`;
+    }
+    const many = await search('TR9').expect(200);
+    expect(many.body.items).toHaveLength(200);
+    expect(many.body.truncated).toBe(true);
+  });
+
+  it('C25–C28: a malformed list, bins or trace cursor is 400 invalid-cursor, never a 500', async () => {
+    const b64 = (value: unknown) => Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
+    const get = (path: string) => http().get(`${API}/${tenantId}/inventory/recalls${path}`).set('Authorization', `Bearer ${operatorToken}`);
+    for (const cursor of [b64(null), b64({ l: 0, s: 1.5, w: uuidv7() }), b64({ l: 0, s: 3_000_000_000, w: uuidv7() }), b64({ l: 'x' }), 'not-base64-json']) {
+      expect((await get(`/${rcl1}/shipments?cursor=${cursor}`).expect(400)).body.code).toBe('invalid-cursor');
+    }
+    for (const cursor of [b64(null), b64({ k: 7 })]) {
+      expect((await get(`/${rcl1}/bins?cursor=${cursor}`).expect(400)).body.code).toBe('invalid-cursor');
+    }
+    for (const cursor of [b64({ createdAt: 'yesterday', id: uuidv7() }), b64({ createdAt: '2026-10-28T00:00:00.000Z', id: 'nope' })]) {
+      expect((await get(`?cursor=${cursor}`).expect(400)).body.code).toBe('invalid-cursor');
     }
   });
 

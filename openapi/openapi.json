@@ -66615,6 +66615,10 @@
             "type": "string",
             "description": "The code as matched — letters and digits, upper-cased"
           },
+          "truncated": {
+            "type": "boolean",
+            "description": "More batches matched than the 200 listed — narrow the code (the checklist is not complete)"
+          },
           "items": {
             "type": "array",
             "items": {
@@ -66624,6 +66628,7 @@
         },
         "required": [
           "normalisedCode",
+          "truncated",
           "items"
         ]
       },

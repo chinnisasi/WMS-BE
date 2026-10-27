@@ -101,7 +101,7 @@ export class RecallsController {
   ): Promise<RecallCandidatesResponse> {
     assertOwnTenant(session, tenantId);
     const result = await this.reporting.recallCandidates(tenantId, query.clientId, query.code);
-    return { normalisedCode: result.normalisedCode, items: result.items.map((item) => ({ ...item })) };
+    return { normalisedCode: result.normalisedCode, truncated: result.truncated, items: result.items.map((item) => ({ ...item })) };
   }
 
   @Get(':tenantId/inventory/recalls')

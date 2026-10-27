@@ -342,7 +342,7 @@ export function pickedBatchRefsQuery(tenantId: string, orderId: string): SQL {
     where le.reference_doc ? 'orderId'
       and (le.reference_doc ->> 'orderId') = ${orderId}
       and le.tenant_id = ${tenantId}::uuid
-      and le.type = 'pick.picked'
+      and le.type = any(${sql.param([...PICK_NETTING_TYPES])}::text[])
       and le.batch_ref is not null
     order by 1
   `;

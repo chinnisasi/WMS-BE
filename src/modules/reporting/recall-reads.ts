@@ -278,7 +278,14 @@ export function recallBinsPage(prepared: PreparedRecall, cursor: string | undefi
     },
   }));
   rows.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
-  const after = cursor === undefined ? null : decodeWalk<{ k: string }>(cursor).k;
+  let after: string | null = null;
+  if (cursor !== undefined) {
+    const decoded = decodeWalk<{ k?: unknown } | null>(cursor);
+    if (typeof decoded !== 'object' || decoded === null || typeof decoded.k !== 'string') {
+      throw new ProblemException('invalid-cursor', 400, 'Invalid cursor', 'The cursor is not one this list issued.');
+    }
+    after = decoded.k;
+  }
   const start = after === null ? 0 : rows.findIndex((row) => row.key > after);
   const from = start === -1 ? rows.length : start;
   const page = rows.slice(from, from + limit);
@@ -332,12 +339,12 @@ function decodeWalk<T>(cursor: string): T {
 
 function walkCursorOf(cursor: string | undefined): RecallWalkCursor {
   if (cursor === undefined) return { lot: 0, after: null };
-  const raw = decodeWalk<{ l?: unknown; s?: unknown; w?: unknown }>(cursor);
-  if (typeof raw.l !== 'number' || !Number.isInteger(raw.l) || raw.l < 0) {
+  const raw = decodeWalk<{ l?: unknown; s?: unknown; w?: unknown } | null>(cursor);
+  if (typeof raw !== 'object' || raw === null || typeof raw.l !== 'number' || !Number.isInteger(raw.l) || raw.l < 0 || raw.l > 10_000) {
     throw new ProblemException('invalid-cursor', 400, 'Invalid cursor', 'The cursor is not one this list issued.');
   }
   if (raw.s === undefined) return { lot: raw.l, after: null };
-  if (typeof raw.s !== 'number' || typeof raw.w !== 'string' || !UUID_RE.test(raw.w)) {
+  if (typeof raw.s !== 'number' || !Number.isInteger(raw.s) || raw.s < 0 || raw.s > 2_147_483_647 || typeof raw.w !== 'string' || !UUID_RE.test(raw.w)) {
     throw new ProblemException('invalid-cursor', 400, 'Invalid cursor', 'The cursor is not one this list issued.');
   }
   return { lot: raw.l, after: { seq: raw.s, warehouseId: raw.w } };
@@ -431,11 +438,14 @@ export async function recallCandidatesInTx(
   tenantId: string,
   clientId: string,
   code: string,
-): Promise<{ normalisedCode: string; items: RecallCandidateView[] }> {
+): Promise<{ normalisedCode: string; truncated: boolean; items: RecallCandidateView[] }> {
   const normalised = normaliseLotCode(code);
   if (normalised === '') throw invalidRecallQuery('code must hold at least one letter or digit.');
   await assertClientInTenantInTx(tx, tenantId, clientId);
-  const rows = await sources.catalog.batchesByNormalisedCodeInTx(tx, tenantId, clientId, code, RECALL_CANDIDATES_MAX);
+  // One past the cap, so a code matching more than the list shows says so (never a silently short checklist).
+  const fetched = await sources.catalog.batchesByNormalisedCodeInTx(tx, tenantId, clientId, code, RECALL_CANDIDATES_MAX + 1);
+  const truncated = fetched.length > RECALL_CANDIDATES_MAX;
+  const rows = fetched.slice(0, RECALL_CANDIDATES_MAX);
   const open = await sources.recalls.openRecallLinesOfClientInTx(tx, tenantId, clientId);
   const onHand = new Map<string, number>();
   if (rows.length > 0) {
@@ -446,9 +456,18 @@ export async function recallCandidatesInTx(
   }
   return {
     normalisedCode: normalised,
+    truncated,
     items: rows.map((row) => {
-      const own = open.find((line) => line.batchId === row.batchId);
-      const same = own === undefined ? open.find((line) => normaliseLotCode(line.batchCode) === normalised) : undefined;
+      // An open LIVE recall naming the batch wins over a mock one (a drill
+      // never hides the recall that actually blocks it); and only a LIVE
+      // recall steers "add it to RCL-x" — a drill is never the place for a
+      // real lot.
+      const mine = open.filter((line) => line.batchId === row.batchId);
+      const own = mine.find((line) => line.mode === 'live') ?? mine[0];
+      const same =
+        own === undefined
+          ? open.find((line) => line.mode === 'live' && normaliseLotCode(line.batchCode) === normalised)
+          : undefined;
       return {
         batchId: row.batchId,
         batchCode: row.code,

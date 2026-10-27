@@ -1,6 +1,7 @@
 import { and, asc, eq, inArray } from 'drizzle-orm';
 import { batchRecallLines, batchRecalls } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
+import { UUID_RE } from '../../shared/primitives/ids';
 
 /**
  * Story 3-7a (A1) — the ONE cross-module read of recall lines: which of these
@@ -27,7 +28,8 @@ export async function openLiveRecallLinesForBatchesInTx(
   tenantId: string,
   batchIds: readonly string[],
 ): Promise<OpenRecallLine[]> {
-  const ids = [...new Set(batchIds)];
+  // A malformed id names no batch (never a raw 22P02 from the uuid compare).
+  const ids = [...new Set(batchIds.filter((id) => UUID_RE.test(id)).map((id) => id.toLowerCase()))];
   if (ids.length === 0) return [];
   return tx
     .select({ batchId: batchRecallLines.batchId, recallId: batchRecalls.id, recallCode: batchRecalls.code })

@@ -17,6 +17,9 @@ import type { RecallReportSink } from '../modules/reporting/reporting.facade';
  * `section=end` row (which carries the row count): a truncated file is
  * recognisable, never silently short.
  */
+/** How long one socket write may wait for the client to read on (A10's deadline covers the reads, not a stalled reader). */
+export const RECALL_DRAIN_TIMEOUT_MS = 30_000;
+
 export function recallReportSink(res: Response, beforeHeaders: (rowCount: number | null) => Promise<void>): RecallReportSink {
   return {
     async begin(file) {
@@ -38,11 +41,20 @@ export function recallReportSink(res: Response, beforeHeaders: (rowCount: number
           resolve();
           return;
         }
+        // A client that stops reading but keeps the socket open must not hold
+        // the report slot and the read transaction forever.
+        const timer = setTimeout(() => {
+          res.off('drain', onDrain);
+          res.off('close', onClose);
+          reject(new Error(`the client stopped reading the recall report for ${RECALL_DRAIN_TIMEOUT_MS / 1000} s`));
+        }, RECALL_DRAIN_TIMEOUT_MS);
         const onDrain = (): void => {
+          clearTimeout(timer);
           res.off('close', onClose);
           resolve();
         };
         const onClose = (): void => {
+          clearTimeout(timer);
           res.off('drain', onDrain);
           reject(new Error('the client closed the recall report download'));
         };

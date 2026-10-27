@@ -1188,7 +1188,18 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // Story 5-2a: + three (0100) — webhook_endpoints, webhook_events and
       // webhook_deliveries, each client-bound on both arms (the 0077
       // client_contacts shape). Retargeted 140 → 143.
-      expect(policies).toHaveLength(143);
+      // Story 3-7a: + two (0101) — batch_recalls (client-bound on both arms,
+      // the 0041 shape on its own client_id) and batch_recall_lines
+      // (tenant-only; the portal reaches a line only through its recall).
+      // Retargeted 143 → 145.
+      expect(policies).toHaveLength(145);
+      {
+        const recalls = policies.find((row) => row.policyname === 'batch_recalls_tenant_isolation')!;
+        expect(recalls.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+        expect(recalls.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+        const lines = policies.find((row) => row.policyname === 'batch_recall_lines_tenant_isolation')!;
+        expect(lines.qual).not.toContain('app.client_id');
+      }
       for (const name of ['webhook_endpoints_tenant_isolation', 'webhook_events_tenant_isolation', 'webhook_deliveries_tenant_isolation']) {
         const policy = policies.find((row) => row.policyname === name)!;
         expect(policy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");

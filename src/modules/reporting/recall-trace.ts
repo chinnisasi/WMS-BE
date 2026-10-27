@@ -610,12 +610,19 @@ export function snapshotRows(prepared: PreparedRecall): ExportCell[][] {
   }
   if (prepared.surface === 'staff') {
     for (const task of prepared.plannedTasks) {
-      const lot = prepared.lots.find((candidate) => candidate.skuId === task.skuId);
+      // The task's own lot when the plan named one of the recall's lots; else
+      // a lot of its SKU for the SKU columns, with the lot columns blank (the
+      // plan's batch is another, unrecalled lot — never another lot's expiry).
+      const planned = task.plannedBatchId === null ? undefined : lots.get(task.plannedBatchId);
+      const lot = planned ?? prepared.lots.find((candidate) => candidate.skuId === task.skuId);
       if (lot === undefined) continue;
       const order = prepared.state.orders.get(task.orderId) ?? null;
       const row = lotRow('planned_pick_in_recalled_bin', prepared, lot);
       orderCells(row, order);
-      row[COL.batch_code!] = task.plannedBatchId === null ? null : (lots.get(task.plannedBatchId)?.batchCode ?? null);
+      if (planned === undefined) {
+        row[COL.batch_code!] = null;
+        row[COL.expiry_date!] = null;
+      }
       row[COL.warehouse_code!] = prepared.state.warehouses.get(task.warehouseId) ?? task.warehouseId;
       row[COL.location!] = binCodeOf(prepared, task.binId);
       row[COL.reason!] = 'a planned pick at a bin holding the recalled lot — it refuses until the recalled units are moved out';
