@@ -1,5 +1,5 @@
-import { and, eq } from 'drizzle-orm';
-import { bins, zones } from '../../shared/db/schema';
+import { and, eq, inArray } from 'drizzle-orm';
+import { bins, warehouses, zones } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { QUANTITY_SCALE } from '../../shared/primitives/quantity';
@@ -527,4 +527,27 @@ async function ensureReservedSystemBinInTx(
     throw pair.conflict(warehouseId, 'zone', zone.id);
   }
   return { zoneId: zone.id, binId: bin.id };
+}
+
+/**
+ * Story 2-6a — bin codes (and their warehouse codes) by bin id, in the
+ * CALLER's transaction: a refusal names the bin a serial sits in ("already in
+ * stock at A-01-03 (WH1)"), and bin master data stays tenancy-owned (AD-6).
+ * An unknown id is absent.
+ */
+export async function binCodesByIdsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  binIds: readonly string[],
+): Promise<ReadonlyMap<string, { readonly binCode: string; readonly warehouseCode: string }>> {
+  const distinct = [...new Set(binIds)];
+  if (distinct.length === 0) {
+    return new Map();
+  }
+  const rows = await tx
+    .select({ id: bins.id, binCode: bins.code, warehouseCode: warehouses.code })
+    .from(bins)
+    .innerJoin(warehouses, and(eq(warehouses.tenantId, bins.tenantId), eq(warehouses.id, bins.warehouseId)))
+    .where(and(eq(bins.tenantId, tenantId), inArray(bins.id, distinct)));
+  return new Map(rows.map((row) => [row.id, { binCode: row.binCode, warehouseCode: row.warehouseCode }]));
 }

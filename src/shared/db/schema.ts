@@ -830,6 +830,16 @@ export const skus = pgTable(
      */
     catchWeightTracked: boolean('catch_weight_tracked').notNull().default(false),
     /**
+     * Story 2-6a — the serial's FORMAT, consulted only while the SKU is
+     * serial-tracked: `free` (any 1–64 printable ASCII characters, exact and
+     * case-sensitive) or `imei` (exactly 15 ASCII digits whose last is the
+     * Luhn check digit of the first 14 — `isValidImei`,
+     * `src/shared/primitives/serial.ts`). The CHECK lives only in
+     * `drizzle/0096_serial_capture_at_receipt.sql` (`SERIAL_FORMATS`). An edit
+     * that ends serial tracking resets it to `free`.
+     */
+    serialFormat: text('serial_format').notNull().default('free'),
+    /**
      * Story 11.2 — the SKU's STATIC physical attributes (FR-36): the catalog
      * weight and dimensions carriers rate and print labels from, and the
      * second hard input behind 4-6d and 11-5's capacity checks. Integer
@@ -2651,6 +2661,51 @@ export const goodsReceiptLines = pgTable(
 );
 
 export type GoodsReceiptLine = typeof goodsReceiptLines.$inferSelect;
+
+/**
+ * Story 2-6a — the serials captured on a GRN line, ONE row per captured unit
+ * in capture order (`ordinal` 0..n−1, unique per line), inbound-owned
+ * (`test/architecture.spec.ts` pins `src/modules/inbound` as the only
+ * writer). `goods_receipt_lines` is immutable and never altered by it.
+ *
+ * `state`: `applied` (booked at submit, or approved later — the serial's
+ * `grn.received` exists), `pending` (on the line's open over-receipt,
+ * `over_receipt_id`), `rejected` (that excess was rejected) or `unreadable`
+ * (a unit whose serial could not be read — recorded, never booked:
+ * `serial_id` NULL). `after_write_off` marks a serial received again after a
+ * write-off (its latest event was a negative `stock.adjusted`).
+ *
+ * The CHECKs, RLS policy and the pending-uniqueness backstop are declared in
+ * the migration SQL (0096); the indexes here mirror it. No FKs (guide §3).
+ */
+export const goodsReceiptLineSerials = pgTable(
+  'goods_receipt_line_serials',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    grnId: uuid('grn_id').notNull(),
+    grnLineId: uuid('grn_line_id').notNull(),
+    ordinal: integer('ordinal').notNull(),
+    serialId: uuid('serial_id'),
+    state: text('state').notNull(),
+    overReceiptId: uuid('over_receipt_id'),
+    afterWriteOff: boolean('after_write_off').notNull().default(false),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('goods_receipt_line_serials_line_ordinal_unique').on(table.tenantId, table.grnLineId, table.ordinal),
+    index('goods_receipt_line_serials_tenant_serial_idx')
+      .on(table.tenantId, table.serialId)
+      .where(sql`"serial_id" IS NOT NULL`),
+    uniqueIndex('goods_receipt_line_serials_pending_unique')
+      .on(table.tenantId, table.serialId)
+      .where(sql`"state" = 'pending'`),
+  ],
+);
+
+export type GoodsReceiptLineSerial = typeof goodsReceiptLineSerials.$inferSelect;
 
 /**
  * Pending over-receipts (Story 3.3): one row per GRN line whose physically

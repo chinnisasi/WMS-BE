@@ -9,6 +9,7 @@ import {
   bins,
   devices,
   goodsReceiptLines,
+  goodsReceiptLineSerials,
   goodsReceiptNotes,
   idempotencyKeys,
   ledgerEvents,
@@ -1754,6 +1755,70 @@ export async function resolveSerialRefsInTx(
     resolved.push(id);
   }
   return resolved;
+}
+
+/**
+ * Story 2-6a (A14) — per serial-tracked GRN line, its BOOKED serials (rows
+ * `applied`, capture order) that are still located in the Receiving bin,
+ * as serial numbers. A line with no serial rows (received before 2-6a) is
+ * ABSENT, so its task keeps the pooled bound. Reads the inbound-owned
+ * `goods_receipt_line_serials` and the catalog's `serials` read-only (the
+ * `goods_receipt_lines` / `resolveSerialRefsInTx` precedent); location comes
+ * from the ledger through the inventory facade, one read per SKU.
+ */
+export async function receivingSerialsByLineInTx(
+  tx: TenantTx,
+  inventory: { serialsLocatedInBinInTx(tx: TenantTx, tenantId: string, skuId: string, binId: string): Promise<readonly { serialRef: string }[]> },
+  args: {
+    readonly tenantId: string;
+    readonly receivingBinId: string;
+    readonly lines: readonly { readonly grnLineId: string; readonly skuId: string }[];
+  },
+): Promise<Map<string, string[]>> {
+  const result = new Map<string, string[]>();
+  if (args.lines.length === 0) {
+    return result;
+  }
+  const rows = await tx
+    .select({ grnLineId: goodsReceiptLineSerials.grnLineId, serialId: goodsReceiptLineSerials.serialId })
+    .from(goodsReceiptLineSerials)
+    .where(
+      and(
+        eq(goodsReceiptLineSerials.tenantId, args.tenantId),
+        inArray(goodsReceiptLineSerials.grnLineId, args.lines.map((line) => line.grnLineId)),
+        eq(goodsReceiptLineSerials.state, 'applied'),
+      ),
+    )
+    .orderBy(goodsReceiptLineSerials.grnLineId, goodsReceiptLineSerials.ordinal);
+  const idsByLine = new Map<string, string[]>();
+  for (const row of rows) {
+    if (row.serialId === null) continue;
+    const list = idsByLine.get(row.grnLineId) ?? [];
+    list.push(row.serialId);
+    idsByLine.set(row.grnLineId, list);
+  }
+  const located = new Set<string>();
+  for (const skuId of [...new Set(args.lines.filter((line) => idsByLine.has(line.grnLineId)).map((line) => line.skuId))]) {
+    for (const entry of await inventory.serialsLocatedInBinInTx(tx, args.tenantId, skuId, args.receivingBinId)) {
+      located.add(entry.serialRef);
+    }
+  }
+  const allIds = [...new Set([...idsByLine.values()].flat())];
+  const numberRows =
+    allIds.length === 0
+      ? []
+      : await tx
+          .select({ id: serials.id, serialNumber: serials.serialNumber })
+          .from(serials)
+          .where(and(eq(serials.tenantId, args.tenantId), inArray(serials.id, allIds)));
+  const numberById = new Map(numberRows.map((row) => [row.id, row.serialNumber]));
+  for (const [grnLineId, ids] of idsByLine) {
+    result.set(
+      grnLineId,
+      ids.filter((id) => located.has(id)).map((id) => numberById.get(id)).filter((number): number is string => number !== undefined),
+    );
+  }
+  return result;
 }
 
 function putawayValidation(detail: string): ProblemException {

@@ -36,6 +36,7 @@ import {
 import { MAX_HANDLING_UNITS_PER_GRN_LINE, REJECTED_GRN_LINE_CODES, UNMATCHED_LINE_REASONS } from './receiving.command';
 import { DAMAGE_REASON_CODES, SHORT_REASON_CODES } from './receipt-condition';
 import { RECEIPT_PHOTOS_MAX_PER_LINE } from '../attachments/attachment-records';
+import { GRN_LINE_SERIAL_STATES, MAX_GRN_SERIALS_PER_LINE, SERIAL_FORMATS } from '../../shared/primitives/serial';
 import { ADJUSTMENT_REASON_CODES } from '../inventory/inventory.facade';
 // Story 3.5 (additive): the snapshot's putaway decision fields reuse the
 // putaway module's DTOs (one shape on every surface).
@@ -215,6 +216,37 @@ export class GrnLineInputDto {
   @IsString({ each: true })
   @Matches(/^[0-9A-HJKMNP-TV-Z]{26}$/, { each: true, message: 'each photoRefs entry must be a 26-character ULID' })
   photoRefs?: string[];
+
+  @ApiProperty({
+    required: false,
+    type: [String],
+    nullable: true,
+    maxItems: MAX_GRN_SERIALS_PER_LINE,
+    description:
+      "Story 2-6a — the line's serial numbers (one per GOOD unit, in capture order), required on a serial-tracked SKU's line and refused on any other: `qty` must equal the count. Each is trimmed, then must be 1–64 printable ASCII characters with no whitespace; case-sensitive; none may repeat for the same SKU across the receipt; ≤ 500 per line (with unreadableSerialQty) and ≤ 1,000 per receipt — each a 400. On an `imei` SKU each must be a 15-digit, Luhn-valid IMEI. A serial already in stock, in transit, on a pending over-receipt, dispatched on an order, blocked, or (imei) badly formed is refused PER SERIAL into `rejectedLines` (`serialsOnly`) and the rest of the line books. Omit (or send an empty array) when the line has none",
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(MAX_GRN_SERIALS_PER_LINE)
+  @IsString({ each: true })
+  @MaxLength(128, { each: true })
+  serials?: string[] | null;
+
+  @ApiProperty({
+    required: false,
+    type: 'integer',
+    nullable: true,
+    minimum: 0,
+    maximum: MAX_GRN_SERIALS_PER_LINE,
+    description:
+      "Story 2-6a — units of a serial-tracked line whose serial could not be read: RECORDED on the line, never booked or credited (set them aside and report). Needs at least one serial on the line; counts toward the 500-per-line cap. Omit (or 0) when none",
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(MAX_GRN_SERIALS_PER_LINE)
+  unreadableSerialQty?: number | null;
 }
 
 /** POST /tenants/{tenantId}/receiving/goods-receipts body (device session). */
@@ -361,6 +393,33 @@ export class GrnLineDto {
       'Catch weight (story 10.3): the handling units this line produced, in the order their weights were supplied — present only on a catch-weight line. These ids are what a unit label carries and what the pack bench scans back.',
   })
   handlingUnitIds?: readonly string[];
+
+  @ApiProperty({ required: false, type: [String], description: 'Story 2-6a — the serial numbers this line BOOKED now (one `grn.received` each), in capture order; present only on a serial line that booked some' })
+  serials?: readonly string[];
+
+  @ApiProperty({ required: false, type: [String], description: "Story 2-6a — the serial numbers set aside on this line's over-receipt (they book, in order, when it is approved); present only when some pend" })
+  pendingSerials?: readonly string[];
+
+  @ApiProperty({ required: false, type: 'integer', minimum: 1, description: 'Story 2-6a — units recorded without a readable serial (not booked); present only when > 0' })
+  unreadableSerialQty?: number;
+
+  @ApiProperty({ required: false, enum: ['serial-tracked'], description: "Story 2-6a — present on a serial line of a QC-on-receipt client's receipt: it booked UNHELD (QC on receipt does not hold serial-tracked lines)" })
+  qcSkipped?: 'serial-tracked';
+}
+
+/** Story 2-6a — where one refused serial is (in stock / in transit), or the other IMEI SKU that holds it. */
+export class RejectedSerialDetailDto {
+  @ApiProperty({ description: 'The refused serial number, as sent (trimmed)' })
+  serial!: string;
+
+  @ApiProperty({ required: false, description: 'The bin code it is in (in stock), or the in-transit bin' })
+  binCode?: string;
+
+  @ApiProperty({ required: false, description: "That bin's warehouse code" })
+  warehouseCode?: string;
+
+  @ApiProperty({ required: false, description: 'An imei SKU: the OTHER SKU this IMEI is held under' })
+  skuCode?: string;
 }
 
 /** Story 1-6d — one need of a `licence-not-covered` line that no valid licence covers. */
@@ -404,7 +463,7 @@ export class RejectedGrnLineDto {
   @ApiProperty({
     enum: [...REJECTED_GRN_LINE_CODES],
     description:
-      'Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients. Story 1-1: `sku-client-mismatch` — a BLIND receipt\'s line whose SKU belongs to another client than the receipt\'s; it goes to the review queue (Discard only). Story 1-2a: `client-departed` — a line of ANY receipt whose SKU\'s client has departed; also to review (Discard only — re-receive after an owner reactivates the client). Story 1-2b — the expiry rules, each per line: `expiry-on-untracked`, `expiry-before-mfg`, `batch-expiry-mismatch`, `expiry-required` (review, Discard only) and `shelf-life-short` (its own review row — Accept anyway with a note, or Discard). Story 1-6d: `licence-not-covered` — licence enforcement is on and no valid client and site licence covers the line\'s drug or food goods on the receipt\'s IST date; its own review row (`grn.licence-refused` — an owner may accept it anyway with a note, or discard it)',
+      'Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients. Story 1-1: `sku-client-mismatch` — a BLIND receipt\'s line whose SKU belongs to another client than the receipt\'s; it goes to the review queue (Discard only). Story 1-2a: `client-departed` — a line of ANY receipt whose SKU\'s client has departed; also to review (Discard only — re-receive after an owner reactivates the client). Story 1-2b — the expiry rules, each per line: `expiry-on-untracked`, `expiry-before-mfg`, `batch-expiry-mismatch`, `expiry-required` (review, Discard only) and `shelf-life-short` (its own review row — Accept anyway with a note, or Discard). Story 1-6d: `licence-not-covered` — licence enforcement is on and no valid client and site licence covers the line\'s drug or food goods on the receipt\'s IST date; its own review row (`grn.licence-refused` — an owner may accept it anyway with a note, or discard it). Story 2-6a — serial capture, all to `grn.lines-refused` (Discard only): the WHOLE line is refused `serials-required` (a serial-tracked SKU sent without serials — an older build or queued op) or `serials-on-untracked` (serials on a SKU that is not serial-tracked); PER SERIAL (`serialsOnly`, the rest books — or the whole line when every serial is refused): `serial-format-invalid` (not a valid IMEI on an imei SKU), `serial-in-stock` (on hand in any bin of any warehouse, or — imei — under another imei SKU), `serial-in-transit` (on a transfer), `serial-pending-approval` (on another receipt\'s open over-receipt), `serial-dispatched-use-returns` (it left on an order — receive it as a return) and `serial-blocked`',
   })
   code!: string;
 
@@ -436,6 +495,18 @@ export class RejectedGrnLineDto {
       'Story 1-6d — `licence-not-covered` only: each need no valid licence covers on the receipt\'s IST date, and which holder lacks it (the entry also carries `index`)',
   })
   missing?: readonly MissingLicenceDto[];
+
+  @ApiProperty({ required: false, type: [String], description: "Story 2-6a — the refused serial numbers (a serial refusal), or the refused line's serials (a `serials-*` line refusal)" })
+  serials?: readonly string[];
+
+  @ApiProperty({ required: false, enum: [true], description: 'Story 2-6a — ONLY these serials of line `index` were refused; the rest of the line booked (qty = the refused count)' })
+  serialsOnly?: true;
+
+  @ApiProperty({ required: false, type: [RejectedSerialDetailDto], description: 'Story 2-6a — per refused serial: where it is, or the other IMEI SKU holding it' })
+  serialDetails?: readonly RejectedSerialDetailDto[];
+
+  @ApiProperty({ required: false, type: 'integer', minimum: 1, description: "Story 2-6a — a whole-line refusal's unreadable units (not booked); present only when > 0" })
+  unreadableSerialQty?: number;
 }
 
 /** Story 21-6 — one request line that settled unmatched (applied in full, no line credited). */
@@ -800,6 +871,30 @@ export class GoodsReceiptLineEntryDto {
 
   @ApiProperty({ minimum: 0, description: "Story 2-5a — the line's photos the receipt named that have not arrived yet (awaited)" })
   pendingPhotoCount!: number;
+
+  @ApiProperty({ required: false, type: () => [GrnLineSerialEntryDto], description: "Story 2-6a — the line's captured serials in capture order, each with its state; present only on a line that captured serials" })
+  serials?: readonly GrnLineSerialEntryDto[];
+
+  @ApiProperty({ required: false, type: 'integer', minimum: 1, description: 'Story 2-6a — units recorded without a readable serial (not booked); present only when > 0' })
+  unreadableSerialQty?: number;
+
+  @ApiProperty({ required: false, enum: ['serial-tracked'], description: "Story 2-6a — QC on receipt was skipped for this serial line (it booked unheld; derived: serial rows, no receipt hold, and the receipt's client has QC on receipt NOW)" })
+  qcSkipped?: 'serial-tracked';
+}
+
+/** Story 2-6a — one captured serial of a GRN line as the web reads it. */
+export class GrnLineSerialEntryDto {
+  @ApiProperty({ description: 'The serial number (IMEI 1 on an imei SKU)' })
+  serial!: string;
+
+  @ApiProperty({
+    enum: GRN_LINE_SERIAL_STATES.filter((state) => state !== 'unreadable'),
+    description: '`applied` — booked; `pending` — awaiting the over-receipt approval; `rejected` — that approval was rejected',
+  })
+  state!: 'applied' | 'pending' | 'rejected';
+
+  @ApiProperty({ required: false, enum: [true], description: 'Present when this serial was received again after a write-off' })
+  afterWriteOff?: true;
 }
 
 /** Story 2-5a — the device snapshot's damage-photo arm. */
@@ -903,6 +998,9 @@ export class OverReceiptDto {
     description: "Story 1-2b — on an approval's answer only: the receipt QC hold the approved excess was put on (the client's QC on receipt)",
   })
   qcHoldId?: string;
+
+  @ApiProperty({ required: false, type: [String], description: "Story 2-6a — on a serial line's over-receipt: the serial numbers of the excess, in capture order (they book when approved). Present only when the excess carries serials" })
+  serials?: readonly string[];
 }
 
 export class OverReceiptListQuery {
@@ -1032,6 +1130,13 @@ export class CatalogSnapshotSkuDto {
 
   @ApiProperty()
   serialTracked!: boolean;
+
+  @ApiProperty({
+    enum: [...SERIAL_FORMATS],
+    description:
+      "Story 2-6a: the serial format (`free` | `imei`) — the device's offline serial gate. A device whose snapshot lacks it (a pre-2-6a server) refuses to receive a serial-tracked SKU rather than capture anonymously",
+  })
+  serialFormat!: string;
 
   @ApiProperty({
     description:

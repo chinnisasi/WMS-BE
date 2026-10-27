@@ -451,7 +451,7 @@ function serialUnknown(serialRef: string): ProblemException {
  * reads: an intake event (`to_bin_id` set) means the serial IS in that bin; a
  * draw event (`from_bin_id` set) means the serial is OUT of stock (last seen
  * leaving that bin). Tenant-wide (a serial's location can cross warehouses),
- * via the `(tenant_id, serial_ref, seq)` index — never projected (AD-6: the
+ * ordered by event id (story 2-6a, A2), narrowed by the `(tenant_id, serial_ref, seq)` index — never projected (AD-6: the
  * ledger is the only source of serial location and history).
  */
 async function serialLatestEventInTx(
@@ -463,7 +463,12 @@ async function serialLatestEventInTx(
     .select({ fromBinId: ledgerEvents.fromBinId, toBinId: ledgerEvents.toBinId })
     .from(ledgerEvents)
     .where(and(eq(ledgerEvents.tenantId, tenantId), eq(ledgerEvents.serialRef, serialRef)))
-    .orderBy(desc(ledgerEvents.seq))
+    // Story 2-6a (A2) — by `id`, NEVER `seq`: `seq` is per (tenant,
+    // warehouse), so across a 5-1 transfer the destination's low seq would
+    // read the source's IN-TRANSIT intake as the latest event. The id is a
+    // process-monotonic uuidv7 minted inside `appendMovement` AFTER the
+    // serial advisory lock, so every append of one serial orders by it.
+    .orderBy(desc(ledgerEvents.id))
     .limit(1);
   return rows[0];
 }

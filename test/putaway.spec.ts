@@ -200,6 +200,8 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     batchCode: string | null;
     mfgDate: string | null;
     qty: number;
+    /** Story 2-6a — one per unit on a serial-tracked SKU's line. */
+    serials?: string[];
   }
 
   /**
@@ -965,7 +967,10 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
   // ── The serial arm (matrix row 13) ─────────────────────────────────────────
 
   it('serial-tracked placements: missing/wrong-count/duplicate serials are 400, an unknown serial never creates identity, the happy path writes one event per unit, a located serial is 409', async () => {
-    const first = await blindGrn([{ poLineId: null, skuId: serialSkuId, batchCode: null, mfgDate: null, qty: 3 }]);
+    // Story 2-6a (A24): a serial-tracked line now carries its serials (an
+    // anonymous one is refused `serials-required`); these book into Receiving
+    // beside the adjustment-intaken PW-SN-1/2 this test places.
+    const first = await blindGrn([{ poLineId: null, skuId: serialSkuId, batchCode: null, mfgDate: null, qty: 3, serials: ['PW-GRN-1', 'PW-GRN-2', 'PW-GRN-3'] }]);
     const line = first.lines[0]!;
     const bin = await receivingBinId();
 
@@ -1068,7 +1073,7 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     // (c) A serial drawn OUT of the Receiving bin by a −1 adjustment: the
     // placement's relocation guard takes the "already drawn out" arm — 409
     // serial-elsewhere naming the bin the draw left.
-    const serialGrn = await blindGrn([{ poLineId: null, skuId: serialSkuId, batchCode: null, mfgDate: null, qty: 2 }]);
+    const serialGrn = await blindGrn([{ poLineId: null, skuId: serialSkuId, batchCode: null, mfgDate: null, qty: 2, serials: ['PW-GRN-D1', 'PW-GRN-D2'] }]);
     const serialLine = serialGrn.lines[0]!;
     const receiving = await receivingBinId();
     await adjust({

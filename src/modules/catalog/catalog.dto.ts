@@ -1,3 +1,4 @@
+import { SERIAL_FORMATS, type SerialFormat } from '../../shared/primitives/serial';
 import { ApiProperty } from '@nestjs/swagger';
 import {
   MAX_QUANTITY_BASE,
@@ -230,6 +231,14 @@ export class SkuResponse {
 
   @ApiProperty({ example: false })
   serialTracked!: boolean;
+
+  @ApiProperty({
+    required: false,
+    enum: [...SERIAL_FORMATS],
+    description:
+      'Story 2-6a — the serial format, consulted only while serialTracked: `free` (any 1–64 printable characters) or `imei` (a 15-digit, Luhn-valid IMEI 1). Absent on a SKU write replayed from before 2-6a',
+  })
+  serialFormat?: SerialFormat;
 
   @ApiProperty({
     example: false,
@@ -681,6 +690,16 @@ export class CreateSkuDto extends GoodsTypeFieldsDto {
   @IsBoolean()
   serialTracked!: boolean;
 
+  @ApiProperty({
+    required: false,
+    enum: [...SERIAL_FORMATS],
+    description:
+      'Story 2-6a — `free` (default) or `imei`: an IMEI SKU\'s receipt accepts only a 15-digit, Luhn-valid IMEI 1 per unit. `imei` without serialTracked is a 400',
+  })
+  @IsOptional()
+  @IsIn(SERIAL_FORMATS as unknown as string[])
+  serialFormat?: SerialFormat;
+
   @ApiProperty({ example: false, description: 'Handled by unit, priced by weight. Mutually exclusive with serialTracked' })
   @IsBoolean()
   catchWeightTracked!: boolean;
@@ -862,6 +881,16 @@ export class PatchSkuDto extends GoodsTypeFieldsDto {
   @IsOptional()
   @IsBoolean()
   serialTracked?: boolean;
+
+  @ApiProperty({
+    required: false,
+    enum: [...SERIAL_FORMATS],
+    description:
+      'Story 2-6a — `free` | `imei`. Absent = unchanged, except that an edit ending serial tracking resets it to `free`. `imei` on a SKU that will not be serial-tracked is a 400. Changing it affects new captures only',
+  })
+  @IsOptional()
+  @IsIn(SERIAL_FORMATS as unknown as string[])
+  serialFormat?: SerialFormat;
 
   @ApiProperty({
     required: false,

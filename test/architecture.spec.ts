@@ -1111,6 +1111,23 @@ describe('architecture: clients are clients-module-owned (story 21-1)', () => {
     }
   });
 
+  it('story 2-6a (A3): only the receiving command writes goods_receipt_line_serials; the serial arm opens on grn.received alone', () => {
+    const writers = files
+      .filter((file) => drizzleWriteOn('goodsReceiptLineSerials').test(file.source) || rawWriteOn('goods_receipt_line_serials').test(file.source))
+      .map((file) => file.path.slice(SRC_ROOT.length + 1))
+      .sort();
+    // Meaningful: the one writer is the receipt + approval command.
+    expect(writers).toEqual(['modules/inbound/receiving.command.ts']);
+    // Readers outside inbound stay reads (putaway's task derivation).
+    const putaway = readFileSync(join(SRC_ROOT, 'modules', 'putaway', 'putaway.command.ts'), 'utf8');
+    expect(putaway).toContain('.from(goodsReceiptLineSerials)');
+    // The serial identities a receipt books are created in ITS transaction,
+    // through the catalog facade (never a direct `serials` write).
+    const receiving = readFileSync(join(SRC_ROOT, 'modules', 'inbound', 'receiving.command.ts'), 'utf8');
+    expect(receiving).toContain('this.catalog.ensureSerialsInTx(');
+    expect(receiving).not.toMatch(/\.insert\(serials\)/);
+  });
+
   /**
    * Story 1-2a — "no new work": every path that creates work for a client
    * runs the one gate, `assertClientTakesWorkInTx`. A path that dropped it

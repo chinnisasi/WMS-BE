@@ -127,7 +127,7 @@ export class ReceivingController {
     description:
       'GRN recorded: server-assigned code, per-line physical/applied/excess quantities, ledger events for the applied portion (the idempotency snapshot). Story 21-9: a receipt against a closed PO or a cancelled/closed ASN is no longer refused — every line pends as an over-receipt against that document (applied 0); a closed PO with an open carried successor is booked against the successor instead (poId/poCode name it)',
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or an invalid body (validation-failed) — story 1-1: a clientId beside a poId or an asnId; story 2-4a: a damaged or short quantity without its reason, a reason with 0 or outside its vocabulary, a negative or over-maximum quantity, a line with qty + damagedQty = 0, or damage on a serial-tracked or catch-weight SKU') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or an invalid body (validation-failed) — story 1-1: a clientId beside a poId or an asnId; story 2-4a: a damaged or short quantity without its reason, a reason with 0 or outside its vocabulary, a negative or over-maximum quantity, a line with qty + damagedQty = 0, or damage on a serial-tracked or catch-weight SKU; story 2-6a: a serial that is blank, over 64 characters or holds whitespace after trimming, a serial named twice for one SKU, serials not one per good unit, unreadable units without a serial, over 500 serial units on a line or 1,000 serials on a receipt') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Unknown or revoked device (device-revoked), or the operator was demoted to accountant (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, purchase order, advance shipment notice, a blind receipt\'s client (story 1-1), or a line\'s SKU does not exist in this tenant (not-found)') })
@@ -200,6 +200,14 @@ export class ReceivingController {
           ...(line.shortReasonCode === undefined || line.shortReasonCode === null ? {} : { shortReasonCode: line.shortReasonCode }),
           // Story 2-5a: the line's photo refs — absent (or empty) stays absent (hashed only when non-empty).
           ...(line.photoRefs === undefined || line.photoRefs === null || line.photoRefs.length === 0 ? {} : { photoRefs: line.photoRefs }),
+          // Story 2-6a (A1): this mapping names every key — an unmapped DTO
+          // field is silently dropped. The serials only when non-empty, the
+          // unreadable units only when > 0 (the command hashes each only
+          // then, so absent, null, [] and 0 hash alike).
+          ...(line.serials === undefined || line.serials === null || line.serials.length === 0 ? {} : { serials: line.serials }),
+          ...(line.unreadableSerialQty === undefined || line.unreadableSerialQty === null || line.unreadableSerialQty === 0
+            ? {}
+            : { unreadableSerialQty: line.unreadableSerialQty }),
         })),
       },
       key,
@@ -432,7 +440,7 @@ export class ReceivingController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks review.decide (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('No over-receipt with this id exists in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('Already approved/rejected (over-receipt-decided), the SKU became a kit since the GRN — the excess can never apply to it (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Already approved/rejected (over-receipt-decided), the SKU became a kit since the GRN — the excess can never apply to it (kit-cannot-hold-stock, naming it), story 2-6a: a serial of the excess can no longer book — it is now in stock or in transit (serial-in-stock / serial-in-transit, naming the serial and its bin), on another receipt\'s pending excess (serial-pending-approval), left on an order (serial-dispatched-use-returns) or blocked (serial-blocked) — reject the excess instead; or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'overReceiptId', format: 'uuid' })

@@ -30,6 +30,7 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/quantity';
+import { SERIAL_FORMATS, isSerialFormat, type SerialFormat } from '../../shared/primitives/serial';
 import { isFractionalUom, resolveUom, serialTrackedFractionalUomDetail, unknownUomDetail, uomPrecision } from './uom';
 import { countLiveHandlingUnitsInTx } from './handling-unit.store';
 import { assertSkuAttributes } from './sku-attributes';
@@ -145,6 +146,12 @@ export interface SkuSnapshot {
   readonly hsn: string | null;
   readonly batchTracked: boolean;
   readonly serialTracked: boolean;
+  /**
+   * Story 2-6a — the serial format (`free` | `imei`), consulted only while
+   * `serialTracked`. OPTIONAL on the read shape: a SKU write stored before
+   * 2-6a replays its snapshot without it.
+   */
+  readonly serialFormat?: SerialFormat;
   /** Story 10.3 — handled by unit, priced by weight (`handling_units`). */
   readonly catchWeightTracked: boolean;
   /**
@@ -299,6 +306,8 @@ export interface CreateSkuCommand extends GoodsTypeInput {
   readonly barcode?: string | undefined;
   readonly batchTracked: boolean;
   readonly serialTracked: boolean;
+  /** Story 2-6a — `free` (the default) or `imei`; `imei` needs `serialTracked`. */
+  readonly serialFormat?: string | undefined;
   readonly catchWeightTracked: boolean;
   readonly weightGrams?: number | undefined;
   readonly lengthMm?: number | undefined;
@@ -355,6 +364,12 @@ export interface EditSkuCommand extends GoodsTypeInput {
   readonly hsn?: string | null | undefined;
   readonly batchTracked?: boolean | undefined;
   readonly serialTracked?: boolean | undefined;
+  /**
+   * Story 2-6a — `free` | `imei`; absent = unchanged, EXCEPT that an edit
+   * ending serial tracking without naming it resets it to `free` (A15).
+   * `imei` on a SKU that will not be serial-tracked is a 400.
+   */
+  readonly serialFormat?: string | undefined;
   /** Story 10.3 — catch weight. Mutually exclusive with `serialTracked`. */
   readonly catchWeightTracked?: boolean | undefined;
   /**
@@ -583,6 +598,10 @@ export class SkuCommand {
       barcodes: packaging.barcodes,
       ...presentGoodsTypeKeys(goods),
       ...(command.clientId === undefined ? {} : { clientId: command.clientId }),
+      // Story 2-6a — LAST, only when present (`?? undefined`), so a create
+      // naming no format hashes byte for byte as before (the pre-2-6a create
+      // golden in test/sku-goods-type.spec.ts stays untouched).
+      serialFormat: command.serialFormat ?? undefined,
     });
 
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
@@ -627,6 +646,8 @@ export class SkuCommand {
           `SKU "${code}" would be both serial-tracked and catch-weight tracked. Both systems claim to identify the same physical unit — a serial from the ledger, a handling unit from its own row — and nothing decides which one a scan names. Pick one.`,
         );
       }
+      // Story 2-6a — the serial format, behind the replay lookup.
+      const serialFormat = assertSerialFormatFor(command.serialFormat, command.serialTracked, code);
       assertSkuAttributes({
         weightGrams: command.weightGrams,
         lengthMm: command.lengthMm,
@@ -694,6 +715,7 @@ export class SkuCommand {
             hsn: hsn ?? null,
             batchTracked: command.batchTracked,
             serialTracked: command.serialTracked,
+            serialFormat,
             catchWeightTracked: command.catchWeightTracked,
             weightGrams: command.weightGrams ?? null,
             lengthMm: command.lengthMm ?? null,
@@ -986,13 +1008,16 @@ export class SkuCommand {
       // derived from stored state would make one request hash differently
       // depending on the row (Design Notes).
       ...canonicalGoodsType(pickGoodsType(command)),
+      // Story 2-6a — the serial format, LAST: `undefined` drops out of the
+      // spread hash, so a pre-2-6a body hashes byte for byte as before.
+      serialFormat: command.serialFormat,
     };
     if (Object.values(fields).every((value) => value === undefined)) {
       throw new ProblemException(
         'validation-failed',
         400,
         'Empty SKU edit',
-        'At least one of name, gstRate, hsn, batchTracked, serialTracked, catchWeightTracked, weightGrams, lengthMm, widthMm, heightMm, countryOfOrigin, reorderPoint, reorderQty, barcode, productId, variantValues, storageClass, hazardClass, abcClass, shelfLifeDays, drugSchedules, foodCategory, allergens, dgUnNumber, dgClass, dgSubsidiaryClasses, dgPackingGroup, highValue, fragile, maxStackLayers is required.',
+        'At least one of name, gstRate, hsn, batchTracked, serialTracked, catchWeightTracked, weightGrams, lengthMm, widthMm, heightMm, countryOfOrigin, reorderPoint, reorderQty, barcode, productId, variantValues, storageClass, hazardClass, abcClass, shelfLifeDays, drugSchedules, foodCategory, allergens, dgUnNumber, dgClass, dgSubsidiaryClasses, dgPackingGroup, highValue, fragile, maxStackLayers, serialFormat is required.',
       );
     }
     // ── story 11.2: this hash did NOT break ──────────────────────────────────
@@ -1532,6 +1557,19 @@ export class SkuCommand {
           );
         }
 
+        // Story 2-6a — the serial format over the RESULTING state (the
+        // catch-weight rule's shape): `imei` needs serial tracking, and an
+        // edit that ENDS serial tracking without naming a format resets it
+        // to `free` (A15) — a later re-enable then starts from the default,
+        // never from a stale `imei`. Changing the format affects new
+        // captures only (decision 2).
+        const resultingSerialFormat: SerialFormat =
+          fields.serialFormat !== undefined
+            ? assertSerialFormatFor(fields.serialFormat, resultingSerialTracked, current.code)
+            : resultingSerialTracked
+              ? (current.serialFormat as SerialFormat)
+              : 'free';
+
         // Story 10.3: the flag may not move while the SKU still has LIVE
         // handling units (`active` or `pending_approval`). Turning it OFF
         // strands them — their stock stays on hand and ships accounted for by
@@ -1641,6 +1679,7 @@ export class SkuCommand {
         if (fields.hsn !== undefined) updates.hsn = fields.hsn;
         if (fields.batchTracked !== undefined) updates.batchTracked = fields.batchTracked;
         if (fields.serialTracked !== undefined) updates.serialTracked = fields.serialTracked;
+        if (resultingSerialFormat !== current.serialFormat) updates.serialFormat = resultingSerialFormat;
         if (fields.catchWeightTracked !== undefined)
           updates.catchWeightTracked = fields.catchWeightTracked;
         // Story 11.2 — absent = unchanged, null = cleared (the `hsn`
@@ -1768,6 +1807,8 @@ function toSnapshot(row: typeof skus.$inferSelect): SkuSnapshot {
     hsn: row.hsn,
     batchTracked: row.batchTracked,
     serialTracked: row.serialTracked,
+    // Story 2-6a — the serial format (optional on the shape: a snapshot stored before 2-6a replays without it).
+    serialFormat: row.serialFormat as SerialFormat,
     catchWeightTracked: row.catchWeightTracked,
     // Story 11.2 — absent attributes read `null` (no backfill; a pre-11.2 row
     // and an import that left the columns blank both read the same).
@@ -2081,4 +2122,33 @@ function invalidCursor(): ProblemException {
     'Malformed pagination cursor',
     'The cursor parameter is not a valid opaque page cursor.',
   );
+}
+
+/**
+ * Story 2-6a — a requested serial format, validated against the SKU's
+ * (resulting) serial tracking: absent → `free`; outside `SERIAL_FORMATS` →
+ * 400; `imei` on a SKU that is not serial-tracked → 400 (the format would
+ * gate nothing). Behind the replay lookup, like every typed rule here.
+ */
+function assertSerialFormatFor(requested: string | undefined, serialTracked: boolean, skuCode: string): SerialFormat {
+  if (requested === undefined) {
+    return 'free';
+  }
+  if (!isSerialFormat(requested)) {
+    throw new ProblemException(
+      'validation-failed',
+      400,
+      'Unknown serial format',
+      `serialFormat must be one of ${JSON.stringify(SERIAL_FORMATS)} (got ${JSON.stringify(requested)}).`,
+    );
+  }
+  if (requested === 'imei' && !serialTracked) {
+    throw new ProblemException(
+      'validation-failed',
+      400,
+      'IMEI needs serial tracking',
+      `SKU "${skuCode}" is not serial-tracked — an IMEI serial format applies only to a serial-tracked SKU. Turn serial tracking on, or leave the format free.`,
+    );
+  }
+  return requested;
 }

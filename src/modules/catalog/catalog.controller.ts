@@ -304,6 +304,8 @@ export class CatalogController {
         barcode: dto.barcode,
         batchTracked: dto.batchTracked,
         serialTracked: dto.serialTracked,
+        // Story 2-6a — absent stays absent (hashed only when present).
+        serialFormat: dto.serialFormat,
         catchWeightTracked: dto.catchWeightTracked,
         weightGrams: dto.attributes?.weightGrams,
         lengthMm: dto.attributes?.lengthMm,
@@ -588,6 +590,8 @@ export class CatalogController {
         hsn: dto.hsn === undefined ? undefined : dto.hsn === '' ? null : dto.hsn,
         batchTracked: dto.batchTracked,
         serialTracked: dto.serialTracked,
+        // Story 2-6a — absent stays absent (hashed only when present).
+        serialFormat: dto.serialFormat,
         catchWeightTracked: dto.catchWeightTracked,
         // Story 11.2 — the physical attributes pass through WYSIWYG (grams /
         // millimetres); `countryOfOrigin` follows the `hsn` template, '' → null.

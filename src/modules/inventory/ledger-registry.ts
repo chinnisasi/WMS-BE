@@ -350,16 +350,18 @@ registerLedgerEventType({
  * within-open portion at submit; the excess again on over-receipt approval),
  * landing stock in the warehouse's system Receiving bin. Batch-tracked
  * receipts carry the batch arm (identity ensured through the catalog facade
- * first); serial intake has no receive path yet (serials stay ledger-capable,
- * the story's Never list keeps serial capture out) — the serial arm stays
- * closed on this type.
+ * first). Story 2-6a opens the serial arm: a serial-tracked line books ONE
+ * event per captured unit (+1, `serialRef` = the catalog serial id, the
+ * line's batch carried) — at submit for the applied units, at over-receipt
+ * approval for the pending ones. Additive: every older event carries a null
+ * serial arm and verifies identically; the flag gates new writes only.
  */
 registerLedgerEventType({
   type: 'grn.received',
   sinceVersion: 1,
   referenceKinds: ['grn-receipt'],
   allowsBatchArm: true,
-  allowsSerialArm: false,
+  allowsSerialArm: true,
 });
 
 /**
