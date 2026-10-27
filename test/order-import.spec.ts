@@ -238,7 +238,7 @@ describe('order import — staff (e2e, story 4-1c)', () => {
     return (opts.dryRun === true ? withFields.field('dryRun', 'true') : withFields).attach(
       'file',
       typeof content === 'string' ? Buffer.from(content, 'utf8') : content,
-      { filename: opts.filename ?? 'orders.csv', contentType: opts.filename?.endsWith('.xlsx') ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' : 'text/csv' },
+      { filename: opts.filename ?? 'orders.csv', contentType: opts.filename?.endsWith('.xlsx') ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' : opts.filename?.endsWith('.pdf') ? 'application/pdf' : 'text/csv' },
     );
   }
 
@@ -348,7 +348,8 @@ describe('order import — staff (e2e, story 4-1c)', () => {
     expect(checked.errors.map((error) => [error.rowNumber, error.code])).toEqual([[3, 'validation-failed']]);
     const body = (await upload(content).expect(201)).body as ImportBody;
     expect(body.orders.map((order) => order.clientOrderRef)).toEqual([`${p}-1`, `${p}-3`]);
-    expect(body.errors).toEqual([{ rowNumber: 3, orderRef: `${p}-2`, sku: 'A-1', quantity: '1', code: 'validation-failed', detail: expect.stringContaining('pincode') }]);
+    // An order-level refusal does not echo its first row's line cells (C10).
+    expect(body.errors).toEqual([{ rowNumber: 3, orderRef: `${p}-2`, sku: null, quantity: null, code: 'validation-failed', detail: expect.stringContaining('pincode') }]);
     expect(await count(ordersOf(`${p}-2`))).toBe(0);
   });
 
@@ -487,6 +488,11 @@ describe('order import — staff (e2e, story 4-1c)', () => {
     expect(await count(ordersOf(`${p}-2`))).toBe(0);
     jest.restoreAllMocks();
 
+    // C4 — a second abort right after the settled SO-1 counts only THIS run's creations.
+    jest.spyOn(store, 'grantReservation').mockRejectedValue(new Error('connection refused'));
+    expect((await upload(content, { key }).expect(503)).body.detail).toContain('0 orders were created');
+    jest.restoreAllMocks();
+
     // A7 — the resume runs tomorrow: SO-1 replays without being re-judged.
     licenceClock.now = () => Date.parse(`${addIsoDays(TODAY, 1)}T06:00:00Z`);
     const resumed = (await upload(content, { key }).expect(201)).body as ImportBody;
@@ -583,7 +589,7 @@ describe('order import — staff (e2e, story 4-1c)', () => {
     expect((await upload(content, { key }).expect(201)).body).toEqual(done.body);
   });
 
-  it('settle-once (A1/K3): an order whose derived key was committed by another writer between Transaction A and its call counts created (replayed), whatever its own call answered', async () => {
+  it('settle-once (A1/K3) and A6: a derived key committed between Transaction A and the call with ANOTHER payload is order-changed-since-first-run (never counted created); the Transaction B re-read does not flip it', async () => {
     const p = refs();
     const content = file(row(`${p}-1`, 'A-1', '1'), row(`${p}-2`, 'A-1', '1'));
     const key = ulid();
@@ -598,10 +604,9 @@ describe('order import — staff (e2e, story 4-1c)', () => {
       );
     };
     const body = (await upload(content, { key }).expect(201)).body as ImportBody;
-    expect(body.errors).toEqual([]);
-    expect(body.orders.map((order) => [order.clientOrderRef, order.replayed])).toEqual([
-      [`${p}-1`, false],
-      [`${p}-2`, true],
+    expect(body.orders.map((order) => [order.clientOrderRef, order.replayed])).toEqual([[`${p}-1`, false]]);
+    expect(body.errors).toEqual([
+      expect.objectContaining({ orderRef: `${p}-2`, code: 'order-changed-since-first-run', sku: null, detail: expect.stringContaining(`find it by order number ${p}-2`) }),
     ]);
     expect(await count(ordersOf(`${p}-2`))).toBe(1);
   });
@@ -640,5 +645,67 @@ describe('order import — staff (e2e, story 4-1c)', () => {
     const schemas = doc.body.components.schemas;
     expect([...schemas.OrderImportRowErrorDto.properties.code.enum].sort()).toEqual([...ORDER_IMPORT_ROW_ERROR_CODES].sort());
     expect(Object.keys(schemas.PortalOrderImportOrderDto.properties).sort()).toEqual(['clientOrderRef', 'firstRow', 'lineCount', 'orderId', 'replayed']);
+  });
+
+  it('C15: Valkey unreachable when the lease is taken → 503 reservation-store-unavailable, nothing read or created', async () => {
+    const p = refs();
+    jest.spyOn(app.get(ValkeyClient), 'acquireLease').mockRejectedValue(new Error('connection refused'));
+    const res = (await upload(file(row(`${p}-1`, 'A-1', '1'))).expect(503)).body;
+    expect(res).toMatchObject({ code: 'reservation-store-unavailable', detail: expect.stringContaining('nothing was created') });
+    expect(await count(ordersOf(`${p}-1`))).toBe(0);
+  });
+
+  it('a non-sheet file is 415 unsupported-file-type', async () => {
+    expect((await upload('%PDF-1.4', { filename: 'orders.pdf' }).expect(415)).body.code).toBe('unsupported-file-type');
+  });
+
+  it('C14: the create’s own refusals pass through by code — a departed client, an inactive SKU short of stock', async () => {
+    const p = refs();
+    await sql`update clients set status = 'departed' where id = ${beta}`;
+    await sql`update skus set status = 'inactive' where id = ${sku.get('A-KG')!}`;
+    try {
+      const body = (await upload(file(row(`${p}-GONE`, 'B-1', '1'), row(`${p}-OLD`, 'A-KG', '9999'), row(`${p}-OK`, 'A-1', '1'))).expect(201)).body as ImportBody;
+      expect(body.errors.map((error) => [error.orderRef, error.code])).toEqual([
+        [`${p}-GONE`, 'client-departed'],
+        [`${p}-OLD`, 'sku-inactive'],
+      ]);
+      expect(body.orders.map((order) => order.clientOrderRef)).toEqual([`${p}-OK`]);
+    } finally {
+      await sql`update clients set status = 'active' where id = ${beta}`;
+      await sql`update skus set status = 'active' where id = ${sku.get('A-KG')!}`;
+    }
+  });
+
+  it('C12: the pace check holds back an order its measured ms-per-line says would end past the budget, while time remains', async () => {
+    const p = refs();
+    const big = Array.from({ length: 10 }, (_, i) => row(`${p}-2`, `P-${i}`, '1', i === 0 ? {} : { addr: BLANK_ADDR }));
+    const content = file(row(`${p}-1`, 'A-1', '1'), ...big);
+    let fake = Date.now();
+    orderImportClock.now = () => fake;
+    // Each grant "takes" 2 s: SO-1's one line measures 2 s/line, so SO-2's ten lines project 20 s.
+    const store = app.get(ValkeyClient);
+    const real = ValkeyClient.prototype.grantReservation;
+    jest.spyOn(store, 'grantReservation').mockImplementation(async (...args) => {
+      fake += 2_000;
+      return real.apply(store, args as Parameters<ValkeyClient['grantReservation']>);
+    });
+    const body = (await upload(content).expect(200)).body as ImportBody;
+    expect(body).toMatchObject({ complete: false, acceptedCount: 1, notAttemptedCount: 1 });
+    expect(await count(ordersOf(`${p}-2`))).toBe(0);
+  });
+
+  it('C17: the run’s first order always starts even when Transaction A spent the budget; a Check stopped by it is complete:false too', async () => {
+    const p = refs();
+    const content = file(row(`${p}-1`, 'A-1', '1'), row(`${p}-2`, 'A-1', '1'));
+    const base = Date.now();
+    let calls = 0;
+    // The first read is the run's start; every later read is 20 s on.
+    orderImportClock.now = () => (calls++ === 0 ? base : base + 20_000);
+    const checked = (await upload(content, { dryRun: true }).expect(200)).body as ImportBody;
+    expect(checked).toMatchObject({ dryRun: true, complete: false, acceptedCount: 1, notAttemptedCount: 1 });
+    calls = 0;
+    const imported = (await upload(content).expect(200)).body as ImportBody;
+    expect(imported).toMatchObject({ complete: false, acceptedCount: 1, notAttemptedCount: 1 });
+    expect(await count(ordersOf(`${p}-1`))).toBe(1);
   });
 });

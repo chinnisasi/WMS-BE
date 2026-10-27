@@ -335,4 +335,18 @@ describe('order import — client portal (e2e, story 4-1c)', () => {
     expect((await upload(content, { dryRun: true, token: ownerToken }).expect(403)).body.detail).toBe('This is a client-portal surface.');
     expect((await upload(content, { dryRun: true, route: 'staff' }).expect(403)).body.detail).toBe('This is an operator surface.');
   });
+
+  it('C13: authority is re-read in Transaction B — a client suspended during the LAST order aborts 403 with no import key and no import audit row; the orders stay', async () => {
+    const p = refs();
+    const content = file(row(`${p}-1`, 'A-1', '1'), row(`${p}-2`, 'A-1', '1'));
+    const key = ulid();
+    orderImportHooks.afterOrder = async (index) => {
+      if (index === 1) await sql`update clients set status = 'suspended' where id = ${acme}`;
+    };
+    expect((await upload(content, { key }).expect(403)).body.code).toBe('client-suspended');
+    expect(await count(ordersOf(`${p}-1`))).toBe(1);
+    expect(await count(ordersOf(`${p}-2`))).toBe(1);
+    expect(await count(sql`select count(*)::int as n from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`)).toBe(0);
+    expect(await count(sql`select count(*)::int as n from audit_events where tenant_id = ${tenantId} and reference = ${key}`)).toBe(0);
+  });
 });

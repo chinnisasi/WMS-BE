@@ -10203,7 +10203,7 @@
             }
           },
           "422": {
-            "description": "More than 5 MB, 2,000 data rows or 200 orders (import-too-large), or the Idempotency-Key reused with a different file or warehouse (idempotency-key-reuse)",
+            "description": "More than 5 MB, 300 data rows or 100 orders (import-too-large), or the Idempotency-Key reused with a different file or warehouse (idempotency-key-reuse)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -10228,7 +10228,7 @@
             "bearer": []
           }
         ],
-        "summary": "Imports orders from a CSV/XLSX file (orders.manage) — one row per order line, grouped by client + order_ref; each order is created exactly as the create form would (its own derived key, its own reservations, backorders as usual), and an order with any bad row is refused whole. dryRun=true checks the file through the create's rules and writes nothing (no stock is promised). ≤ 2,000 rows, ≤ 200 orders, ≤ 200 lines per order, ≤ 5 MB; a run stops starting orders after 15 s (complete: false — Import again with the same file)",
+        "summary": "Imports orders from a CSV/XLSX file (orders.manage) — one row per order line, grouped by client + order_ref; each order is created exactly as the create form would (its own derived key, its own reservations, backorders as usual), and an order with any bad row is refused whole. dryRun=true checks the file through the create's rules and writes nothing (no stock is promised). ≤ 300 rows, ≤ 100 orders, ≤ 200 lines per order, ≤ 5 MB; a run stops starting orders after 15 s (complete: false — Import again with the same file; a Check stopped so leaves the rest unchecked)",
         "tags": [
           "outbound"
         ]
@@ -33487,7 +33487,7 @@
             }
           },
           "422": {
-            "description": "More than 5 MB, 2,000 data rows or 200 orders (import-too-large), or the Idempotency-Key reused with a different file or warehouse (idempotency-key-reuse)",
+            "description": "More than 5 MB, 300 data rows or 100 orders (import-too-large), or the Idempotency-Key reused with a different file or warehouse (idempotency-key-reuse)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -33512,7 +33512,7 @@
             "bearer": []
           }
         ],
-        "summary": "Imports this client's orders from a CSV/XLSX file (orders.place) — one row per order line, grouped by order_ref; each order is placed exactly as Place order would (your own active SKUs, every line reserved in full or that order is refused), and an order with any bad row is refused whole. dryRun=true checks the file and writes nothing (it cannot promise stock). ≤ 2,000 rows, ≤ 200 orders, ≤ 200 lines per order, ≤ 5 MB",
+        "summary": "Imports this client's orders from a CSV/XLSX file (orders.place) — one row per order line, grouped by order_ref; each order is placed exactly as Place order would (your own active SKUs, every line reserved in full or that order is refused), and an order with any bad row is refused whole. dryRun=true checks the file and writes nothing (it cannot promise stock). A run stops starting orders after 15 s (complete: false — Import again with the same file; a Check stopped so leaves the rest unchecked). ≤ 300 rows, ≤ 100 orders, ≤ 200 lines per order, ≤ 5 MB",
         "tags": [
           "portal"
         ]
@@ -45482,7 +45482,7 @@
           },
           "complete": {
             "type": "boolean",
-            "description": "False when the 15-second budget stopped the run before every order was tried (answered 200, nothing stored) — Import again with the same file to finish"
+            "description": "False when the 15-second budget stopped the run before every order was tried (answered 200, nothing stored) — Import again with the same file to finish; on a Check, the orders not reached were not checked"
           },
           "notAttemptedCount": {
             "type": "number",
@@ -63762,7 +63762,7 @@
           },
           "complete": {
             "type": "boolean",
-            "description": "False when the 15-second budget stopped the run before every order was tried — Import again with the same file to finish"
+            "description": "False when the 15-second budget stopped the run before every order was tried — Import again with the same file to finish; on a Check, the orders not reached were not checked"
           },
           "notAttemptedCount": {
             "type": "number",

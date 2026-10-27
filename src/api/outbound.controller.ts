@@ -178,7 +178,7 @@ export class OutboundController {
   @ApiConsumes('multipart/form-data')
   @ApiOperation({
     summary:
-      'Imports orders from a CSV/XLSX file (orders.manage) — one row per order line, grouped by client + order_ref; each order is created exactly as the create form would (its own derived key, its own reservations, backorders as usual), and an order with any bad row is refused whole. dryRun=true checks the file through the create\'s rules and writes nothing (no stock is promised). ≤ 2,000 rows, ≤ 200 orders, ≤ 200 lines per order, ≤ 5 MB; a run stops starting orders after 15 s (complete: false — Import again with the same file)',
+      'Imports orders from a CSV/XLSX file (orders.manage) — one row per order line, grouped by client + order_ref; each order is created exactly as the create form would (its own derived key, its own reservations, backorders as usual), and an order with any bad row is refused whole. dryRun=true checks the file through the create\'s rules and writes nothing (no stock is promised). ≤ 300 rows, ≤ 100 orders, ≤ 200 lines per order, ≤ 5 MB; a run stops starting orders after 15 s (complete: false — Import again with the same file; a Check stopped so leaves the rest unchecked)',
   })
   @ApiBody({
     schema: {
@@ -212,7 +212,7 @@ export class OutboundController {
   @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse does not exist in this tenant (not-found)') })
   @ApiResponse({ status: 409, ...problemJsonResponse('This import is still running under the same Idempotency-Key (import-in-progress — wait, then Import again to read its result), or a concurrent import with the same key committed first (conflict)') })
   @ApiResponse({ status: 415, ...problemJsonResponse('Not a .csv/.xlsx file (unsupported-file-type)') })
-  @ApiResponse({ status: 422, ...problemJsonResponse('More than 5 MB, 2,000 data rows or 200 orders (import-too-large), or the Idempotency-Key reused with a different file or warehouse (idempotency-key-reuse)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('More than 5 MB, 300 data rows or 100 orders (import-too-large), or the Idempotency-Key reused with a different file or warehouse (idempotency-key-reuse)') })
   @ApiResponse({ status: 503, ...problemJsonResponse('The stock reservation store is unreachable (reservation-store-unavailable) — the detail says how many orders were created; Import again with the same file to finish without duplicates') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async importOrders(

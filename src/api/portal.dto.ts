@@ -899,7 +899,7 @@ export class PortalOrderImportResponseDto {
   @ApiProperty({ description: 'Orders refused whole (an order with any bad row)' })
   refusedCount!: number;
 
-  @ApiProperty({ description: 'False when the 15-second budget stopped the run before every order was tried — Import again with the same file to finish' })
+  @ApiProperty({ description: 'False when the 15-second budget stopped the run before every order was tried — Import again with the same file to finish; on a Check, the orders not reached were not checked' })
   complete!: boolean;
 
   @ApiProperty({ description: 'Orders the run did not reach (0 when complete)' })

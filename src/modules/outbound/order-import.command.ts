@@ -155,7 +155,7 @@ export type PortalOrderImportResponse = ImportResponseBase<PortalOrderImportOrde
 // ── internals ────────────────────────────────────────────────────────────────
 
 /** The create's own codes, passed through as row errors with the create's detail (A6). */
-const PASSED_THROUGH: ReadonlySet<string> = new Set<OrderImportRowErrorCode>([
+const PASSED_THROUGH_CODES: readonly OrderImportRowErrorCode[] = [
   'validation-failed',
   'not-found',
   'duplicate-client-order-ref',
@@ -166,7 +166,8 @@ const PASSED_THROUGH: ReadonlySet<string> = new Set<OrderImportRowErrorCode>([
   'order-catalog-changed',
   'order-backorder-rejected',
   'mixed-client',
-]);
+];
+const PASSED_THROUGH: ReadonlySet<string> = new Set<string>(PASSED_THROUGH_CODES);
 
 // A compile-time-free sanity check that the passed-through codes are on the published list.
 for (const code of PASSED_THROUGH) {
@@ -176,6 +177,21 @@ for (const code of PASSED_THROUGH) {
 }
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
+
+/**
+ * The codes that judge the WHOLE order (they sit on its first row): the
+ * report leaves that row's sku and quantity cells out, so it does not point
+ * at a line that did not cause it.
+ */
+const ORDER_LEVEL_CODES: ReadonlySet<string> = new Set<OrderImportRowErrorCode>([
+  'client-required',
+  'mixed-client',
+  'duplicate-order-in-file',
+  'too-many-lines',
+  'order-changed-since-first-run',
+  'order-refused',
+  ...PASSED_THROUGH_CODES,
+]);
 
 interface Surface {
   readonly kind: OrderImportSurface;
@@ -368,7 +384,11 @@ export class OrderImportCommand {
     } finally {
       // Never throws: the run's answer stands whatever happens to the lease (it expires anyway).
       try {
-        await this.valkey.releaseLease(leaseKey, token);
+        if (!(await this.valkey.releaseLease(leaseKey, token))) {
+          // The lease expired under this run (and may have been re-taken): the
+          // overlap residual in PENDING — say so, so an operator can correlate.
+          this.logger.warn(`order import lease ${leaseKey} had expired before the run ended (TTL ${ORDER_IMPORT_LEASE_TTL_MS} ms)`);
+        }
       } catch (error) {
         this.logger.warn(`order import lease release failed (it expires in ${ORDER_IMPORT_LEASE_TTL_MS} ms): ${(error as Error).message}`);
       }
@@ -407,9 +427,11 @@ export class OrderImportCommand {
     // A3 — the budget: no order starts once it is spent, nor one that the
     // run's own measured pace (ms per line so far) says would end past it,
     // so a long order near the end cannot carry the request past the drain.
-    // The first order always starts (a run must make progress). Once one
-    // order is held back every later one is too — orders run in file order.
+    // The run's first attempted order always starts, however long
+    // Transaction A took (a run must make progress, or a retry would loop).
+    // Once one order is held back every later one is too — file order.
     let budgetSpent = false;
+    let attempted = 0;
     let spentMs = 0;
     let spentLines = 0;
     for (let index = 0; index < groups.length; index += 1) {
@@ -417,7 +439,7 @@ export class OrderImportCommand {
       if (outcome.kind !== 'ready') continue;
       const elapsed = orderImportClock.now() - started;
       const projected = spentLines === 0 ? 0 : (spentMs / spentLines) * outcome.order.lines.length;
-      if (budgetSpent || elapsed >= orderImportClock.budgetMs || elapsed + projected > orderImportClock.budgetMs) {
+      if (attempted > 0 && (budgetSpent || elapsed >= orderImportClock.budgetMs || elapsed + projected > orderImportClock.budgetMs)) {
         budgetSpent = true;
         outcomes[index] = { kind: 'not-attempted' };
         continue;
@@ -425,6 +447,7 @@ export class OrderImportCommand {
       const group = groups[index]!;
       const derivedKey = keys[index] ?? null;
       const attemptStarted = orderImportClock.now();
+      attempted += 1;
       try {
         outcomes[index] = await this.attempt(surface, group, outcome.order, derivedKey, portalClientId);
       } catch (error) {
@@ -433,7 +456,8 @@ export class OrderImportCommand {
           // Decision 5 — the run aborts: no import key, no audit row; every
           // order created so far keeps its own key and replays on the retry.
           if (problem !== null && problem.status === 503) {
-            const created = outcomes.filter((entry) => entry.kind === 'created').length;
+            // THIS run's creations only — orders settled from an earlier run are not news.
+            const created = outcomes.filter((entry) => entry.kind === 'created' && !entry.replayed).length;
             throw new ProblemException(
               problem.code,
               503,
@@ -445,9 +469,12 @@ export class OrderImportCommand {
           }
           throw error;
         }
-        // Settle-once (A1/K3): any 4xx — a committed derived key counts the order created.
+        // Settle-once (A1/K3): any 4xx — a committed derived key counts the
+        // order created. Except a 422 on the derived key itself (A6): the key
+        // committed with ANOTHER payload, so the order that exists is not this
+        // row's — it is reported `order-changed-since-first-run`, never as created.
         const committed =
-          derivedKey === null
+          derivedKey === null || problem.code === 'idempotency-key-reuse'
             ? undefined
             : (await surface.transaction((tx) => readKeysInTx(tx, surface.tenantId, [derivedKey]))).get(derivedKey);
         const settled = committed === undefined ? null : this.settledOutcome(surface, committed.responseSnapshot);
@@ -473,7 +500,11 @@ export class OrderImportCommand {
       await surface.authorize(tx);
       // The belt-and-braces re-read (B1): an order whose derived key committed
       // is created, whatever its call answered.
-      const pending = keys.flatMap((derived, index) => (derived !== null && outcomes[index]!.kind === 'refused' && refusals.has(index) ? [derived] : []));
+      const pending = keys.flatMap((derived, index) =>
+        derived !== null && outcomes[index]!.kind === 'refused' && refusals.has(index) && refusals.get(index)!.code !== 'order-changed-since-first-run'
+          ? [derived]
+          : [],
+      );
       if (pending.length > 0) {
         const committed = await readKeysInTx(tx, surface.tenantId, pending);
         keys.forEach((derived, index) => {
@@ -895,7 +926,13 @@ export class OrderImportCommand {
     const errors = [...planned.errors, ...refusals.values()]
       .map((error, index) => ({ error, index }))
       .sort((a, b) => a.error.rowNumber - b.error.rowNumber || a.index - b.index)
-      .map(({ error }) => ({ ...error, sku: cell(error.rowNumber, 'sku'), quantity: cell(error.rowNumber, 'quantity') }));
+      // An order-level refusal sits on the order's first row but is not about
+      // that row's line: its sku and quantity cells are not echoed.
+      .map(({ error }) =>
+        ORDER_LEVEL_CODES.has(error.code)
+          ? { ...error, sku: null, quantity: null }
+          : { ...error, sku: cell(error.rowNumber, 'sku'), quantity: cell(error.rowNumber, 'quantity') },
+      );
     const orders: (OrderImportOrder | PortalOrderImportOrder)[] = [];
     planned.groups.forEach((group, index) => {
       const outcome = planned.outcomes[index]!;
