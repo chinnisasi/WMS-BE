@@ -956,7 +956,9 @@ describe('story 1-2b: the client receiving policy (e2e)', () => {
       expect(SKU_NAMING_OP_TYPES).toContain('grn.shelf-life-refused');
       // Story 1-6d — the per-line vocabulary is exact (the licence code joins
       // last), and the licence row is waivable like the shelf-life one.
-      expect([...REJECTED_GRN_LINE_CODES]).toEqual([
+      // Story 2-6a — the eight serial codes join after it (pinned in order
+      // in test/serial-receipt.spec.ts); every pre-2-6a code keeps its place.
+      expect([...REJECTED_GRN_LINE_CODES].slice(0, 11)).toEqual([
         'po-line-not-found',
         'po-line-not-open',
         'asn-line-not-found',
@@ -1153,7 +1155,8 @@ describe('story 1-2b: the client receiving policy (e2e)', () => {
     });
 
     it('a serial-tracked line of a QC client books unheld and is counted (qcSkippedLines)', async () => {
-      const grn = (await receive(blind('QC', [line(sku('QC', 'QC-SER'), 1)])).expect(201)).body.goodsReceipt as GoodsReceipt;
+      // Story 2-6a (A24): the serial line carries its serial (anonymous is refused `serials-required`).
+      const grn = (await receive(blind('QC', [line(sku('QC', 'QC-SER'), 1, { serials: ['QC-SER-1'] } as never)])).expect(201)).body.goodsReceipt as GoodsReceipt;
       expect(grn.qcSkippedLines).toBe(1);
       expect(grn.qcHeldLines).toBeUndefined();
       expect(await sql`select 1 from qc_holds where grn_line_id = ${grn.lines[0]!.id}`).toHaveLength(0);

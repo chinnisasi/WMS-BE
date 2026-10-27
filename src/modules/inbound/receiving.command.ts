@@ -8,6 +8,7 @@ import {
   auditEvents,
   devices,
   goodsReceiptLines,
+  goodsReceiptLineSerials,
   goodsReceiptNotes,
   idempotencyKeys,
   overReceipts,
@@ -51,8 +52,16 @@ import { ProblemException, isUniqueViolationOn } from '../../shared/problem-deta
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertDeviceOperatorInTx } from '../tenancy/device-operator';
-import { ensureDamagedBinInTx, ensureReceivingBinInTx } from '../tenancy/receiving-bin';
-import { isDamageReasonCode, isShortReasonCode, lineConditionFields, linePhotoFields, DAMAGE_REASON_CODES, SHORT_REASON_CODES } from './receipt-condition';
+import { binCodesByIdsInTx, ensureDamagedBinInTx, ensureReceivingBinInTx } from '../tenancy/receiving-bin';
+import {
+  isDamageReasonCode,
+  isShortReasonCode,
+  lineConditionFields,
+  linePhotoFields,
+  lineSerialFields,
+  DAMAGE_REASON_CODES,
+  SHORT_REASON_CODES,
+} from './receipt-condition';
 import { assertWarehouseInTenant, getMemberRoleIn, getWarehouseCodeInTx } from '../tenancy/tenancy.service';
 import { assertPermission } from '../tenancy/permissions';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
@@ -61,6 +70,13 @@ import {
   RECEIPT_PHOTOS_MAX_PER_LINE,
   RECEIPT_PHOTOS_MAX_PER_RECEIPT,
 } from '../attachments/attachment-records';
+import {
+  MAX_GRN_SERIALS_PER_LINE,
+  MAX_GRN_SERIALS_PER_RECEIPT,
+  MAX_SERIAL_NUMBER_LENGTH,
+  SERIAL_NUMBER_RE,
+  isValidImei,
+} from '../../shared/primitives/serial';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { CatalogFacade } from '../catalog/catalog.facade';
@@ -154,6 +170,22 @@ export interface GrnLineInput {
    * Never a refusal beyond its shape: a ref the claim cannot bind is skipped.
    */
   readonly photoRefs?: readonly string[] | null | undefined;
+  /**
+   * Story 2-6a — the line's serial numbers, ONE per good unit, in capture
+   * order (`qty === serials.length`). Optional on the wire AND on a stored
+   * older payload (normalised: absent, null and `[]` → null); hashed after
+   * `photoRefs` only when non-empty, so every receipt without serials
+   * hashes byte for byte as before. Required on a serial-tracked SKU's line
+   * (`serials-required` per line), refused on any other
+   * (`serials-on-untracked`).
+   */
+  readonly serials?: readonly string[] | null | undefined;
+  /**
+   * Story 2-6a (A9) — units of a serial line whose serial could not be read:
+   * recorded (`unreadable` rows), never booked or credited. Normalised
+   * `?? 0`; hashed after `serials` only when > 0.
+   */
+  readonly unreadableSerialQty?: number | null | undefined;
 }
 
 /** Story 2-4a — a GRN line's input after normalisation: every condition field present. */
@@ -164,6 +196,10 @@ type NormalisedGrnLineInput = GrnLineInput & {
   readonly shortReasonCode: string | null;
   /** Story 2-5a — the photo refs, `[]` when none. */
   readonly photoRefs: readonly string[];
+  /** Story 2-6a — the serials TRIMMED, in capture order; null when none. */
+  readonly serials: readonly string[] | null;
+  /** Story 2-6a — 0 when none. */
+  readonly unreadableSerialQty: number;
 };
 
 export interface SubmitGoodsReceiptCommand {
@@ -279,6 +315,16 @@ export interface GoodsReceiptLineSnapshot {
    * is where they have to surface.
    */
   readonly handlingUnitIds?: readonly string[];
+  /**
+   * Story 2-6a — each present only when non-empty / set, so a line without
+   * serials is byte-identical to its pre-2-6a shape: the serial numbers
+   * booked now, those set aside on the line's over-receipt, the units
+   * recorded unreadable, and the QC-on-receipt skip.
+   */
+  readonly serials?: readonly string[];
+  readonly pendingSerials?: readonly string[];
+  readonly unreadableSerialQty?: number;
+  readonly qcSkipped?: 'serial-tracked';
 }
 
 /**
@@ -306,6 +352,19 @@ export const REJECTED_GRN_LINE_CODES = [
   // covers the line's drug or food goods on the receipt's IST date. Its own
   // review row (`grn.licence-refused` — an owner may Apply with a note).
   'licence-not-covered',
+  // Story 2-6a — serial capture, all to `grn.lines-refused` (Discard only).
+  // LINE-level (the whole line is refused): a serial-tracked SKU's line sent
+  // without serials, and serials on a SKU that is not serial-tracked.
+  'serials-required',
+  'serials-on-untracked',
+  // SERIAL-level (only the offending serials — `serialsOnly`; the line books
+  // the rest, or is refused whole when none is left).
+  'serial-format-invalid',
+  'serial-in-stock',
+  'serial-in-transit',
+  'serial-pending-approval',
+  'serial-dispatched-use-returns',
+  'serial-blocked',
 ] as const;
 export type RejectedGrnLineCode = (typeof REJECTED_GRN_LINE_CODES)[number];
 
@@ -324,11 +383,52 @@ type LineRefusalCode =
   | 'batch-expiry-mismatch'
   | 'expiry-required'
   | 'shelf-life-short'
-  | 'licence-not-covered';
+  | 'licence-not-covered'
+  | SerialLineRefusalCode
+  | SerialRefusalCode;
+
+/** Story 2-6a — the line-level serial codes (the whole line is refused). */
+type SerialLineRefusalCode = 'serials-required' | 'serials-on-untracked';
+/** Story 2-6a — the serial-level codes (only the offending serials are refused). */
+export type SerialRefusalCode =
+  | 'serial-format-invalid'
+  | 'serial-in-stock'
+  | 'serial-in-transit'
+  | 'serial-pending-approval'
+  | 'serial-dispatched-use-returns'
+  | 'serial-blocked';
+const SERIAL_REFUSAL_CODES: ReadonlySet<string> = new Set<SerialRefusalCode>([
+  'serial-format-invalid',
+  'serial-in-stock',
+  'serial-in-transit',
+  'serial-pending-approval',
+  'serial-dispatched-use-returns',
+  'serial-blocked',
+]);
+
+/** Story 2-6a — one refused serial and where it is (in stock / in transit), or the other IMEI SKU holding it. */
+export interface RefusedSerialDetail {
+  readonly serial: string;
+  readonly binCode?: string;
+  readonly warehouseCode?: string;
+  readonly skuCode?: string;
+}
+
 interface ClientRefusedLine {
   readonly index: number;
   readonly line: GrnLineInput;
   readonly code: LineRefusalCode;
+  /**
+   * Story 2-6a — a SERIAL refusal: the refused serials (with where each is).
+   * `line` then carries ONLY those serials (`qty` = their count).
+   */
+  readonly refusedSerials?: readonly RefusedSerialDetail[];
+  /**
+   * Story 2-6a — ONLY `refusedSerials` of line `index` were refused; the line
+   * books the rest. Unset when the line is refused whole (every serial
+   * refused, or a line-level code).
+   */
+  serialsOnly?: boolean;
   /**
    * Story 1-2b — the expiry the rule judged (the line's own, or — for
    * `expiry-required` / `shelf-life-short` — the effective one: the line's,
@@ -364,6 +464,16 @@ export const LINES_REFUSED_CODE_PRECEDENCE = [
   'expiry-before-mfg',
   'expiry-on-untracked',
   'expiry-required',
+  // Story 2-6a — after every older code (a row of older refusals keeps its
+  // problemCode); the line-level codes before the serial-level ones.
+  'serials-required',
+  'serials-on-untracked',
+  'serial-in-stock',
+  'serial-in-transit',
+  'serial-pending-approval',
+  'serial-dispatched-use-returns',
+  'serial-blocked',
+  'serial-format-invalid',
 ] as const satisfies readonly LineRefusalCode[];
 
 /** Story 1-2b — the expiry codes (the refusal entries of these carry the line's identity). */
@@ -410,6 +520,16 @@ export interface RejectedGrnLine {
   readonly damageReasonCode?: string;
   readonly shortQty?: number;
   readonly shortReasonCode?: string;
+  /**
+   * Story 2-6a — present only on a serial refusal (the 8 codes), so every
+   * older entry is unchanged: the refused serial numbers, `serialsOnly` when
+   * the rest of line `index` booked, where each refused serial is, and a
+   * whole-line refusal's unreadable units.
+   */
+  readonly serials?: readonly string[];
+  readonly serialsOnly?: true;
+  readonly serialDetails?: readonly RefusedSerialDetail[];
+  readonly unreadableSerialQty?: number;
 }
 
 /**
@@ -559,6 +679,11 @@ export interface OverReceiptEntry {
    * approved excess was put on (a QC-on-receipt client). Absent otherwise.
    */
   readonly qcHoldId?: string;
+  /**
+   * Story 2-6a — a serial line's excess: its serial numbers in capture order
+   * (they book on approval). Present only when the excess carries serials.
+   */
+  readonly serials?: readonly string[];
 }
 
 /** The decide response (the idempotency snapshot). */
@@ -747,6 +872,14 @@ export class ReceivingCommand {
         // byte as before (goldens in `test/receipt-photos.spec.ts` and the
         // untouched older ones).
         ...photoRefsHashField(line),
+        // ── story 2-6a: ADDITIVE, the conditional-key exception (§4) ──────
+        // After `photoRefs` (A20): the serials only when non-empty, AS SENT
+        // (capture order, untrimmed — the hash is the cross-version contract
+        // over the line as received), then the unreadable units only when
+        // > 0. Absent, null and `[]` / 0 hash alike, so every receipt without
+        // serials hashes byte for byte as before (goldens untouched; new ones
+        // in `test/serial-receipt.spec.ts`).
+        ...serialHashFields(line),
       })),
     });
 
@@ -765,6 +898,14 @@ export class ReceivingCommand {
     // reads the normalised form, so an absent key means exactly what null
     // means — an old op re-applies cleanly. The HASH above is untouched: it
     // was computed over the command as received.
+    // Story 2-6a — the serials' SHAPE, above the transaction (a request
+    // shape, no row needed — the 10.3 weights precedent): each trimmed
+    // serial 1–64 printable ASCII, no repeat for one SKU across the receipt,
+    // one per good unit, the unreadable units beside at least one serial,
+    // ≤ 500 per line (with unreadable) and ≤ 1,000 per receipt. Whether the
+    // SKU may (or must) carry serials needs its row, so that is per line,
+    // behind the replay lookup.
+    assertSerialShape(command.lines);
     const asnId = command.asnId ?? null;
     const requestedClientId = command.clientId ?? null;
     // Story 2-3a — the named gate-in, normalised (the replay rebuild passes a
@@ -786,6 +927,10 @@ export class ReceivingCommand {
       shortReasonCode: line.shortReasonCode ?? null,
       // Story 2-5a — absent on every older payload.
       photoRefs: line.photoRefs ?? [],
+      // Story 2-6a — absent on every older payload; trimmed (the shape check
+      // above has refused anything a trim could not make a serial).
+      serials: Array.isArray(line.serials) && line.serials.length > 0 ? line.serials.map((serial) => serial.trim()) : null,
+      unreadableSerialQty: line.unreadableSerialQty ?? 0,
     }));
     assertWeightShape(inputLines);
     // Story 2-5a — the photo refs' SHAPE, above the transaction (a request
@@ -982,11 +1127,61 @@ export class ReceivingCommand {
         waived: command.shelfLifeWaiver !== undefined && command.shelfLifeWaiver !== null,
       });
       clientRefused.push(...expiryPhase.refused);
+
+      // ── story 2-6a: the serial rules, PER LINE (§7g, decision 4 / A4) ───
+      // Beside the expiry phase, over the lines no client or expiry rule
+      // refused — never a whole-op 400, because a flag or format change while
+      // an op was queued must not drop the other lines:
+      //   * a serial-tracked SKU's line without serials → `serials-required`
+      //     (the whole line: an older build or a queued pre-2-6a op no longer
+      //     books anonymous serial units);
+      //   * serials on a SKU that is not serial-tracked → `serials-on-untracked`;
+      //   * on an `imei` SKU, each serial that is not a valid IMEI →
+      //     `serial-format-invalid`, ONLY those serials (the line shrinks; a
+      //     line left with none is refused whole).
+      // `effectiveInput` is each line as it will settle (base units): its
+      // serials and `qty` shrink with every serial refused.
+      const effectiveInput: NormalisedGrnLineInput[] = [...inputLines];
+      /** Story 2-6a — serial refusals not yet folded into `clientRefused` (`flushSerialRefusals`). */
+      const partialSerialRefusals: { index: number; code: SerialRefusalCode; details: RefusedSerialDetail[] }[] = [];
+      /** Story 2-6a — the request indexes whose every serial was refused (the line is refused whole). */
+      const serialEmptiedIndexes = new Set<number>();
+      const shrinkSerials = (index: number, refused: ReadonlySet<string>): readonly string[] => {
+        const current = effectiveInput[index]!;
+        const remaining = (current.serials ?? []).filter((serial) => !refused.has(serial));
+        effectiveInput[index] = { ...current, serials: remaining, qty: remaining.length };
+        return remaining;
+      };
+      {
+        const out = new Set(clientRefused.map((entry) => entry.index));
+        for (const [index, line] of inputLines.entries()) {
+          if (out.has(index)) continue;
+          const sku = skuById.get(line.skuId)!;
+          if (!sku.serialTracked) {
+            if (line.serials !== null) {
+              clientRefused.push({ index, line, code: 'serials-on-untracked' });
+            }
+            continue;
+          }
+          if (line.serials === null) {
+            clientRefused.push({ index, line, code: 'serials-required' });
+            continue;
+          }
+          if (sku.serialFormat !== 'imei') continue;
+          const bad = line.serials.filter((serial) => !isValidImei(serial));
+          if (bad.length === 0) continue;
+          partialSerialRefusals.push({ index, code: 'serial-format-invalid', details: bad.map((serial) => ({ serial })) });
+          if (shrinkSerials(index, new Set(bad)).length === 0) {
+            serialEmptiedIndexes.add(index);
+          }
+        }
+      }
       clientRefused.sort((a, b) => a.index - b.index);
-      if (clientRefused.length > 0) {
+      if (clientRefused.length > 0 || partialSerialRefusals.length > 0) {
         clientLabels = await getClientLabelsInTx(tx, command.tenantId, [
           ...(namedBlindClientId === null ? [] : [namedBlindClientId]),
           ...clientRefused.map((entry) => skuById.get(entry.line.skuId)!.clientId),
+          ...partialSerialRefusals.map((entry) => skuById.get(inputLines[entry.index]!.skuId)!.clientId),
         ]);
       }
       /**
@@ -995,11 +1190,18 @@ export class ReceivingCommand {
        * line's own client (every such line is a departed client's).
        */
       let refusalClientId =
-        namedBlindClientId ?? (clientRefused.length > 0 ? skuById.get(clientRefused[0]!.line.skuId)!.clientId : null);
-      const refusedIndexes = new Set(clientRefused.map((entry) => entry.index));
+        namedBlindClientId ??
+        (clientRefused.length > 0
+          ? skuById.get(clientRefused[0]!.line.skuId)!.clientId
+          : partialSerialRefusals.length > 0
+            ? skuById.get(inputLines[partialSerialRefusals[0]!.index]!.skuId)!.clientId
+            : null);
+      // Story 2-6a — a line whose every serial was refused is out too.
+      const refusedIndexes = new Set([...clientRefused.map((entry) => entry.index), ...serialEmptiedIndexes]);
       /** The request index of each receivable line (unmatchedLines name request indexes). */
       const receivableIndexes = inputLines.map((_, index) => index).filter((index) => !refusedIndexes.has(index));
-      const receivableInput = receivableIndexes.map((index) => inputLines[index]!);
+      // Story 2-6a — each line as it will settle (its refused serials removed).
+      const receivableInput = receivableIndexes.map((index) => effectiveInput[index]!);
 
       // ── story 11.4: a kit SKU never receives stock (FR-38) ──────────────
       // A kit's stock IS its components' — a GRN line against a kit SKU
@@ -1116,7 +1318,9 @@ export class ReceivingCommand {
             const missing = missingBySku.get(`${sku.clientId}|${sku.code}`);
             if (missing === undefined) continue;
             licenceRefusedIndexes.add(index);
-            clientRefused.push({ index, line, code: 'licence-not-covered', missing, siteCode });
+            // Story 2-6a — the line as it would have settled (its refused
+            // serials removed), so the row's Apply re-sends only those.
+            clientRefused.push({ index, line: effectiveInput[index]!, code: 'licence-not-covered', missing, siteCode });
           }
           clientRefused.sort((a, b) => a.index - b.index);
           clientLabels = await getClientLabelsInTx(tx, command.tenantId, [
@@ -1147,7 +1351,59 @@ export class ReceivingCommand {
        * expiry refusals), and after the batch ensure when the expiry race
        * refused every remaining line.
        */
+      /** Story 1-2b — the lines a concurrent writer beat to their batch's expiry (refused per line after the ensure). */
+      const racedLineIndexes = new Set<number>();
+      /** Story 2-6a (code review C24) — the serial lines the fold will reject (an unknown or non-open document line): nothing of theirs books. */
+      const foldRejectIndexes = new Set<number>();
+      /**
+       * Story 2-6a (A4) — fold the serial refusals into `clientRefused`, ONCE,
+       * right before the refusals are rendered (the all-refused arm, or the
+       * settlement): only then is it known whether each refused serial's line
+       * still books (`serialsOnly`) or was refused whole. A line refused
+       * whole FOR ITS SERIALS carries its condition and unreadable units on
+       * its first entry; a line refused for another reason carries them on
+       * that reason's entry.
+       */
+      let serialRefusalsFlushed = false;
+      const flushSerialRefusals = async (): Promise<void> => {
+        if (serialRefusalsFlushed) return;
+        serialRefusalsFlushed = true;
+        if (partialSerialRefusals.length === 0) return;
+        const conditionCarried = new Set<number>();
+        for (const refusal of partialSerialRefusals) {
+          const original = inputLines[refusal.index]!;
+          const settles =
+            settlingIndexes.includes(refusal.index) &&
+            !racedLineIndexes.has(refusal.index) &&
+            !serialEmptiedIndexes.has(refusal.index) &&
+            !foldRejectIndexes.has(refusal.index);
+          const carries = serialEmptiedIndexes.has(refusal.index) && !conditionCarried.has(refusal.index);
+          if (carries) conditionCarried.add(refusal.index);
+          clientRefused.push({
+            index: refusal.index,
+            code: refusal.code,
+            refusedSerials: refusal.details,
+            serialsOnly: settles,
+            line: {
+              ...original,
+              serials: refusal.details.map((detail) => detail.serial),
+              qty: refusal.details.length,
+              unreadableSerialQty: carries ? original.unreadableSerialQty : 0,
+              ...(carries
+                ? {}
+                : { damagedQty: 0, damageReasonCode: null, shortQty: 0, shortReasonCode: null, photoRefs: [] }),
+            } satisfies NormalisedGrnLineInput,
+          });
+        }
+        clientRefused.sort((a, b) => a.index - b.index);
+        clientLabels = await getClientLabelsInTx(tx, command.tenantId, [
+          ...(namedBlindClientId === null ? [] : [namedBlindClientId]),
+          ...clientRefused.map((entry) => skuById.get(entry.line.skuId)!.clientId),
+        ]);
+        refusalClientId ??= skuById.get(clientRefused[0]!.line.skuId)!.clientId;
+      };
       const settleAllRefused = async (refusalClient: string): Promise<RefusedReceiptSnapshot> => {
+        await flushSerialRefusals();
         const rejectedLines = this.clientRefusalLines(clientRefused, skuById, clientLabels, namedBlindClientId);
         const review = await this.raiseRefusalReviewsInTx(tx, command, idempotencyKey, {
           grnId: null,
@@ -1342,7 +1598,6 @@ export class ReceivingCommand {
       // receipt judged its lines against (another receipt filled the null
       // first) refuses those lines `batch-expiry-mismatch`, per line — never
       // a 409 (a retry replays the same input, and the device drops a 409).
-      const racedLineIndexes = new Set<number>();
       for (const [receivableIndex, input] of lines.entries()) {
         if (!skuById.get(input.skuId)!.batchTracked || input.batchCode === null) {
           continue;
@@ -1356,7 +1611,7 @@ export class ReceivingCommand {
         if (resolved === null || istDateOf(canonicalInstant(resolved)) !== expected) {
           const index = settlingIndexes[receivableIndex]!;
           racedLineIndexes.add(index);
-          clientRefused.push({ index, line: inputLines[index]!, code: 'batch-expiry-mismatch', expiryDate: input.expiryDate ?? expected });
+          clientRefused.push({ index, line: effectiveInput[index]!, code: 'batch-expiry-mismatch', expiryDate: input.expiryDate ?? expected });
         }
       }
       if (racedLineIndexes.size > 0) {
@@ -1369,6 +1624,74 @@ export class ReceivingCommand {
         // Story 1-2b — the race refused every remaining line: the same
         // all-refused arm, never an empty GRN header.
         if (lines.every((_, receivableIndex) => racedLineIndexes.has(settlingIndexes[receivableIndex]!))) {
+          return settleAllRefused(refusalClientId);
+        }
+      }
+
+      // ── story 2-6a: the LATE serial phase (A4–A8) ───────────────────────
+      // After the race arm (raced lines are excluded — K6), under the SKU,
+      // document and line locks: resolve the serials' identities → lock the
+      // existing ones (sorted) → judge each (A6: in stock, in transit,
+      // pending on an over-receipt, dispatched on an order, blocked; A7: an
+      // IMEI held under ANOTHER imei SKU) → ensure identities for the
+      // SETTLING serials only (a refused serial creates none) → lock the new
+      // ones → re-judge them (a concurrent writer may have committed one).
+      // Each refused serial leaves its line; the line books the rest, and a
+      // line left with none is refused whole (`serialEmptiedIndexes`).
+      // `settleInput` is `lines` as each will settle (milli-units).
+      const settleInput: NormalisedGrnLineInput[] = [...lines];
+      const lateSerials = await this.serialLatePhaseInTx(
+        tx,
+        command.tenantId,
+        lines.flatMap((input, receivableIndex) => {
+          const index = settlingIndexes[receivableIndex]!;
+          if (racedLineIndexes.has(index) || input.serials === null || input.serials.length === 0) return [];
+          // A line the fold will reject (an unknown or non-open line of an
+          // OPEN document — a stale cache) books nothing: its serials are
+          // neither judged nor given an identity (A8).
+          if (!terminal && !retargeted && (po !== null || asn !== null)) {
+            const reference = po !== null ? input.poLineId : (input.asnLineId ?? null);
+            if (reference !== null) {
+              const documentLine = po !== null ? poLines.find((line) => line.id === reference) : asnLineRows.find((line) => line.id === reference);
+              if (documentLine === undefined || (po !== null && 'status' in documentLine && documentLine.status !== 'open' && documentLine.skuId === input.skuId)) {
+                foldRejectIndexes.add(index);
+                return [];
+              }
+            }
+          }
+          return [{ index, skuId: input.skuId, serials: input.serials }];
+        }),
+        skuById,
+      );
+      if (lateSerials.refusals.length > 0) {
+        const byIndex = new Map<number, Map<SerialRefusalCode, RefusedSerialDetail[]>>();
+        for (const refusal of lateSerials.refusals) {
+          const codes = byIndex.get(refusal.index) ?? new Map<SerialRefusalCode, RefusedSerialDetail[]>();
+          codes.set(refusal.code, [...(codes.get(refusal.code) ?? []), refusal.detail]);
+          byIndex.set(refusal.index, codes);
+        }
+        for (const index of [...byIndex.keys()].sort((a, b) => a - b)) {
+          const codes = byIndex.get(index)!;
+          const refused = new Set([...codes.values()].flat().map((detail) => detail.serial));
+          const receivableIndex = settlingIndexes.indexOf(index);
+          const current = settleInput[receivableIndex]!;
+          const remaining = (current.serials ?? []).filter((serial) => !refused.has(serial));
+          settleInput[receivableIndex] = { ...current, serials: remaining, qty: remaining.length * QUANTITY_SCALE };
+          effectiveInput[index] = { ...effectiveInput[index]!, serials: remaining, qty: remaining.length };
+          if (remaining.length === 0) serialEmptiedIndexes.add(index);
+          for (const [code, details] of codes) {
+            partialSerialRefusals.push({ index, code, details });
+          }
+        }
+        refusalClientId ??= skuById.get(inputLines[lateSerials.refusals[0]!.index]!.skuId)!.clientId;
+        // Every remaining line raced or lost all its serials: the all-refused
+        // arm, never an empty GRN header.
+        if (
+          lines.every((_, receivableIndex) => {
+            const index = settlingIndexes[receivableIndex]!;
+            return racedLineIndexes.has(index) || serialEmptiedIndexes.has(index);
+          })
+        ) {
           return settleAllRefused(refusalClientId);
         }
       }
@@ -1433,6 +1756,8 @@ export class ReceivingCommand {
 
       // Story 1-1 — the per-line refusals (client, and story 1-2b's expiry
       // rules), in request order, ahead of any document-line rejection.
+      // Story 2-6a — the serial refusals join them here (A4: one set).
+      await flushSerialRefusals();
       rejected.push(...this.clientRefusalLines(clientRefused, skuById, clientLabels, namedBlindClientId));
       /**
        * Story 1-2b — the tolerance ceiling still open on a document line:
@@ -1442,11 +1767,16 @@ export class ReceivingCommand {
        * equals `openRemaining`, so the fold is the pre-1-2b fold exactly.
        */
       const ceilingRemaining = new Map<string, number>();
-      for (const [receivableIndex, input] of lines.entries()) {
+      for (const receivableIndex of lines.keys()) {
         const index = settlingIndexes[receivableIndex]!;
         if (racedLineIndexes.has(index)) {
           continue; // story 1-2b — refused per line after the ensure (above)
         }
+        if (serialEmptiedIndexes.has(index)) {
+          continue; // story 2-6a — every serial refused (above)
+        }
+        // Story 2-6a — the line as it settles: its refused serials removed.
+        const input = settleInput[receivableIndex]!;
         const identity = batchIdentity.get(`${input.skuId}:${input.batchCode}`) ?? null;
         const base = {
           input,
@@ -1619,6 +1949,19 @@ export class ReceivingCommand {
         }
       }
 
+      // ── story 2-6a (A21): a serial line applies WHOLE units ─────────────
+      // One serial is one unit, so the applied slice (and the excess) of a
+      // serial line must be whole units. Unreachable — a serial SKU has a
+      // whole-unit UoM (catalog entry) and every document quantity is then
+      // whole — so a violation is a data fault, never a request error.
+      for (const entry of settled) {
+        if (entry.input.serials !== null && entry.applied % QUANTITY_SCALE !== 0) {
+          throw new Error(
+            `grn.submit: serial line of SKU ${entry.input.skuId} applied ${entry.applied} milli-units — not whole units (data fault)`,
+          );
+        }
+      }
+
       // ── story 2-4a: the DAMAGED bin, only when a SETTLED line carries
       // damage — after the fold, so a damaged line rejected as
       // `po-line-not-found` / `asn-line-not-found` / `po-line-not-open`
@@ -1720,9 +2063,38 @@ export class ReceivingCommand {
       }
 
       // Ledger events: one per applied line — the batch arm rides on
-      // batch-tracked receipts; the serial arm stays closed (no serial intake).
+      // batch-tracked receipts. Story 2-6a: a serial line books ONE event per
+      // applied serial (+1 unit, `serialRef` = the catalog id), its serials
+      // in capture order — the first `applied / 1000` of them (the rest pend
+      // on the line's over-receipt). Their locks were taken in the late
+      // phase (sorted), so each append's own serial lock is a no-op.
       for (const entry of settled) {
         if (entry.applied <= 0) {
+          continue;
+        }
+        if (entry.input.serials !== null) {
+          for (const serial of entry.input.serials.slice(0, entry.applied / QUANTITY_SCALE)) {
+            await this.inventory.appendLedgerEventInTx(tx, {
+              tenantId: command.tenantId,
+              warehouseId: command.warehouseId,
+              type: 'grn.received',
+              skuId: entry.input.skuId,
+              quantityDelta: signedQuantity(QUANTITY_SCALE),
+              fromBinId: null,
+              toBinId: receivingBin.binId,
+              batchRef: entry.batchId,
+              serialRef: lateSerials.idOf(entry.input.skuId, serial),
+              actorUserId: command.operatorUserId,
+              occurredAt,
+              recordedAt,
+              referenceDoc: grnReferenceDoc(grnId, {
+                poId: po?.id ?? null,
+                poLineId: entry.poLineId,
+                asnId,
+                asnLineId: entry.asnLineId,
+              }),
+            });
+          }
           continue;
         }
         const movement: LedgerMovement = {
@@ -1893,6 +2265,51 @@ export class ReceivingCommand {
         });
       }
 
+      // ── story 2-6a: the line's serial rows (A3) ────────────────────────
+      // One row per captured unit, ordinal 0..n−1 in capture order: the
+      // first `applied / 1000` are `applied` (booked above), the rest
+      // `pending` on the line's over-receipt; then the `unreadable` rows (no
+      // serial, never booked). After the over-receipt rows, whose ids the
+      // pending rows name. A serial received again after a write-off is
+      // marked (`after_write_off`) and audited once per receipt (A6).
+      const overReceiptIdByLine = new Map(pendingOverReceipts.map((pending) => [pending.request.grnLineId, pending.id]));
+      const serialRows: (typeof goodsReceiptLineSerials.$inferInsert)[] = [];
+      for (const entry of settled) {
+        const serials = entry.input.serials;
+        if (serials === null) continue;
+        const appliedUnits = entry.applied / QUANTITY_SCALE;
+        serials.forEach((serial, ordinal) => {
+          const serialId = lateSerials.idOf(entry.input.skuId, serial);
+          serialRows.push({
+            id: uuidv7(),
+            tenantId: command.tenantId,
+            grnId,
+            grnLineId: entry.lineId,
+            ordinal,
+            serialId,
+            state: ordinal < appliedUnits ? 'applied' : 'pending',
+            overReceiptId: ordinal < appliedUnits ? null : overReceiptIdByLine.get(entry.lineId)!,
+            afterWriteOff: lateSerials.afterWriteOff.has(serialId),
+          });
+        });
+        for (let unreadable = 0; unreadable < entry.input.unreadableSerialQty; unreadable += 1) {
+          serialRows.push({
+            id: uuidv7(),
+            tenantId: command.tenantId,
+            grnId,
+            grnLineId: entry.lineId,
+            ordinal: serials.length + unreadable,
+            serialId: null,
+            state: 'unreadable',
+            overReceiptId: null,
+          });
+        }
+      }
+      if (serialRows.length > 0) {
+        await tx.insert(goodsReceiptLineSerials).values(serialRows);
+      }
+      const reReceivedAfterWriteOff = serialRows.some((row) => row.afterWriteOff === true);
+
       // ── story 1-1: ONE review row for the client-refused lines (§7g) ────
       // Server-raised through tenancy (inbound writes no rejected_ops row),
       // its op id DERIVED from the key and recorded in the snapshot, so a
@@ -2025,6 +2442,9 @@ export class ReceivingCommand {
             ...(handlingUnitIdsByLine.has(entry.lineId)
               ? { handlingUnitIds: handlingUnitIdsByLine.get(entry.lineId)! }
               : {}),
+            // Story 2-6a: present only on a serial line, so a line without
+            // serials is byte-identical to its pre-2-6a shape.
+            ...serialSnapshotFields(entry.input, entry.applied, policyOfSku(entry.input.skuId).qcOnReceipt),
           })),
           ...(rejected.length === 0 ? {} : { rejectedLines: rejected }),
           ...(unmatched.length === 0 ? {} : { unmatchedLines: unmatched }),
@@ -2129,6 +2549,20 @@ export class ReceivingCommand {
         reference: idempotencyKey,
         occurredAt: nowIso(),
       });
+      // Story 2-6a (A6) — a serial received again after a write-off: one row
+      // per receipt (the operator), beside `goods_receipt.submitted`.
+      if (reReceivedAfterWriteOff) {
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.operatorUserId,
+          action: 'goods_receipt.serial_re_received',
+          targetType: 'goods_receipt',
+          targetId: grnId,
+          reference: idempotencyKey,
+          occurredAt: nowIso(),
+        });
+      }
       // Story 1-2b — one audit row per receipt placed on QC holds.
       if (qcHeld.length > 0) {
         await tx.insert(auditEvents).values({
@@ -2261,6 +2695,28 @@ export class ReceivingCommand {
         .limit(1);
       const grnLine = grnLineRows[0]!;
 
+      // Story 2-6a — the excess's serials (`pending` rows naming this
+      // over-receipt), in capture order, and their numbers for the answer.
+      // Read plainly here; the approve arm locks them after the document and
+      // line (the canonical order), the reject arm writes only their state.
+      const excessSerialRows = await tx
+        .select({ id: goodsReceiptLineSerials.id, serialId: goodsReceiptLineSerials.serialId })
+        .from(goodsReceiptLineSerials)
+        .where(
+          and(
+            eq(goodsReceiptLineSerials.tenantId, command.tenantId),
+            eq(goodsReceiptLineSerials.overReceiptId, row.id),
+            eq(goodsReceiptLineSerials.state, 'pending'),
+          ),
+        )
+        .orderBy(goodsReceiptLineSerials.ordinal);
+      const excessSerialNumbers = await this.catalog.serialNumbersByIdsInTx(
+        tx,
+        command.tenantId,
+        excessSerialRows.map((serialRow) => serialRow.serialId!),
+      );
+      const excessAfterWriteOff = new Set<string>();
+
       const decidedAt = nowIso();
       const status = command.decision === 'approve' ? 'approved' : 'rejected';
       // The audit action / outbox type: over_receipt.approved | rejected.
@@ -2293,6 +2749,8 @@ export class ReceivingCommand {
             clientId: skus.clientId,
             serialTracked: skus.serialTracked,
             catchWeightTracked: skus.catchWeightTracked,
+            // Story 2-6a (code review C1) — an imei SKU's excess is judged across every imei SKU.
+            serialFormat: skus.serialFormat,
           })
           .from(skus)
           .where(and(eq(skus.tenantId, command.tenantId), eq(skus.id, row.skuId)))
@@ -2375,31 +2833,109 @@ export class ReceivingCommand {
           );
         }
 
+        // ── story 2-6a (decision 5, A5): a serial line's excess books its
+        // pending serials, in capture order, one event each ─────────────────
+        // Lock order: over-receipt row → SKU → document → line (above) →
+        // the line's pending serial rows → the serial advisory locks (sorted)
+        // → the warehouse advisory inside each append. Each serial is judged
+        // as at submit (A6): one now in stock (or in transit, dispatched,
+        // blocked, pending elsewhere) is a 409 naming it — the reviewer
+        // rejects the excess. A line with no serial rows (pre-2-6a) approves
+        // anonymously, exactly as before.
+        if (excessSerialRows.length > 0) {
+          if (row.excessQty !== excessSerialRows.length * QUANTITY_SCALE) {
+            throw new Error(
+              `over-receipt ${row.id}: excess ${row.excessQty} milli-units against ${excessSerialRows.length} pending serial(s) (data fault)`,
+            );
+          }
+          const ids = excessSerialRows.map((serialRow) => serialRow.serialId!);
+          const imei = lockedSkus[0]?.serialFormat === 'imei';
+          const numbers = ids.map((id) => excessSerialNumbers.get(id) ?? id);
+          if (imei) {
+            // The receipt's IMEI-number locks first (code review C2), then the ids.
+            await this.inventory.lockSerialsInTx(tx, command.tenantId, numbers.map((number) => `imei:${number}`));
+          }
+          await this.inventory.lockSerialsInTx(tx, command.tenantId, ids);
+          if (imei) {
+            // A7 at approval (code review C1): the same IMEI in stock, in
+            // transit or pending under ANOTHER imei SKU since the receipt.
+            const others = (
+              await this.catalog.serialIdentitiesAcrossSkusInTx(
+                tx,
+                command.tenantId,
+                await this.catalog.imeiSkuIdsInTx(tx, command.tenantId),
+                numbers,
+              )
+            ).filter((identity) => identity.skuId !== row.skuId);
+            if (others.length > 0) {
+              await this.inventory.lockSerialsInTx(tx, command.tenantId, others.map((identity) => identity.id));
+              const otherVerdicts = await this.judgeSerialsInTx(
+                tx,
+                command.tenantId,
+                new Map(others.map((identity) => [identity.id, { status: identity.status }])),
+              );
+              for (const identity of others) {
+                const verdict = otherVerdicts.get(identity.id);
+                if (
+                  verdict !== undefined &&
+                  'code' in verdict &&
+                  (verdict.code === 'serial-in-stock' || verdict.code === 'serial-in-transit' || verdict.code === 'serial-pending-approval')
+                ) {
+                  const where = verdict.binId === undefined ? undefined : (await binCodesByIdsInTx(tx, command.tenantId, [verdict.binId])).get(verdict.binId);
+                  throw excessSerialRefused('serial-in-stock', identity.serialNumber, where, identity.skuCode);
+                }
+              }
+            }
+          }
+          const identities = await this.catalog.serialIdentitiesInTx(tx, command.tenantId, row.skuId, { ids });
+          const verdicts = await this.judgeSerialsInTx(
+            tx,
+            command.tenantId,
+            new Map(identities.map((identity) => [identity.id, { status: identity.status }])),
+            row.id,
+          );
+          for (const id of ids) {
+            const verdict = verdicts.get(id);
+            if (verdict === undefined) continue;
+            if ('code' in verdict) {
+              const where = verdict.binId === undefined ? undefined : (await binCodesByIdsInTx(tx, command.tenantId, [verdict.binId])).get(verdict.binId);
+              throw excessSerialRefused(verdict.code, excessSerialNumbers.get(id) ?? id, where);
+            }
+            excessAfterWriteOff.add(id);
+          }
+        }
+
         // The excess applies as a normal ledger append (corrections are new
         // events) — the system Receiving bin (ensured, idempotent) is its
         // location, the GRN line's batch identity its batch arm.
         const receivingBin = await ensureReceivingBinInTx(tx, command.tenantId, row.warehouseId);
-        await this.inventory.appendLedgerEventInTx(tx, {
-          tenantId: command.tenantId,
-          warehouseId: row.warehouseId,
-          type: 'grn.received',
-          skuId: row.skuId,
-          quantityDelta: signedQuantity(row.excessQty),
-          fromBinId: null,
-          toBinId: receivingBin.binId,
-          batchRef: grnLine.batchId,
-          serialRef: null,
-          actorUserId: command.actorUserId,
-          occurredAt: decidedAt,
-          recordedAt: decidedAt,
-          // Story 21-6: the same reference shape as the submit's event.
-          referenceDoc: grnReferenceDoc(row.grnId, {
-            poId: row.poId,
-            poLineId: row.poLineId,
-            asnId: row.asnId,
-            asnLineId: row.asnLineId,
-          }),
-        });
+        const excessMovements: { quantityDelta: number; serialRef: string | null }[] =
+          excessSerialRows.length > 0
+            ? excessSerialRows.map((serialRow) => ({ quantityDelta: QUANTITY_SCALE, serialRef: serialRow.serialId }))
+            : [{ quantityDelta: row.excessQty, serialRef: null }];
+        for (const excessMovement of excessMovements) {
+          await this.inventory.appendLedgerEventInTx(tx, {
+            tenantId: command.tenantId,
+            warehouseId: row.warehouseId,
+            type: 'grn.received',
+            skuId: row.skuId,
+            quantityDelta: signedQuantity(excessMovement.quantityDelta),
+            fromBinId: null,
+            toBinId: receivingBin.binId,
+            batchRef: grnLine.batchId,
+            serialRef: excessMovement.serialRef,
+            actorUserId: command.actorUserId,
+            occurredAt: decidedAt,
+            recordedAt: decidedAt,
+            // Story 21-6: the same reference shape as the submit's event.
+            referenceDoc: grnReferenceDoc(row.grnId, {
+              poId: row.poId,
+              poLineId: row.poLineId,
+              asnId: row.asnId,
+              asnLineId: row.asnLineId,
+            }),
+          });
+        }
         if (row.poLineId !== null) {
           await tx
             .update(purchaseOrderLines)
@@ -2502,6 +3038,46 @@ export class ReceivingCommand {
         command.decision,
       );
 
+      // ── story 2-6a (A5): the excess's serial rows follow the decision ───
+      // `pending → applied` (booked above, one event each; a serial received
+      // again after a write-off is marked) or `pending → rejected`. Neither
+      // creates or destroys a row — the units physically arrived either way.
+      if (excessSerialRows.length > 0) {
+        const next = command.decision === 'approve' ? 'applied' : 'rejected';
+        await tx
+          .update(goodsReceiptLineSerials)
+          .set({ state: next, updatedAt: decidedAt })
+          .where(
+            and(
+              eq(goodsReceiptLineSerials.tenantId, command.tenantId),
+              eq(goodsReceiptLineSerials.overReceiptId, row.id),
+              eq(goodsReceiptLineSerials.state, 'pending'),
+            ),
+          );
+        if (excessAfterWriteOff.size > 0) {
+          await tx
+            .update(goodsReceiptLineSerials)
+            .set({ afterWriteOff: true, updatedAt: decidedAt })
+            .where(
+              and(
+                eq(goodsReceiptLineSerials.tenantId, command.tenantId),
+                eq(goodsReceiptLineSerials.overReceiptId, row.id),
+                inArray(goodsReceiptLineSerials.serialId, [...excessAfterWriteOff]),
+              ),
+            );
+          await tx.insert(auditEvents).values({
+            id: uuidv7(),
+            tenantId: command.tenantId,
+            actorUserId: command.actorUserId,
+            action: 'goods_receipt.serial_re_received',
+            targetType: 'goods_receipt',
+            targetId: row.grnId,
+            reference: idempotencyKey,
+            occurredAt: decidedAt,
+          });
+        }
+      }
+
       await tx
         .update(overReceipts)
         .set({ status, decidedBy: command.actorUserId, decidedAt, updatedAt: decidedAt })
@@ -2561,6 +3137,10 @@ export class ReceivingCommand {
           createdAt: canonicalInstant(row.createdAt),
           // Story 1-2b: present only when the approved excess was QC-held.
           ...(excessHoldId === null ? {} : { qcHoldId: excessHoldId }),
+          // Story 2-6a: present only on a serial line's excess.
+          ...(excessSerialRows.length === 0
+            ? {}
+            : { serials: excessSerialRows.map((serialRow) => excessSerialNumbers.get(serialRow.serialId!) ?? serialRow.serialId!) }),
         },
       };
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
@@ -2569,6 +3149,278 @@ export class ReceivingCommand {
   }
 
   // ── shared pieces ─────────────────────────────────────────────────────────
+
+  /**
+   * Story 2-6a (A6) — judges serials by their identity status, any `pending`
+   * receipt row, and their latest ledger event (tenant-wide, by event id —
+   * A2). Call it under the serials' advisory locks. Returns a verdict per id
+   * that is refused or marked; an id absent from the result is clean.
+   *
+   * | latest event / state                    | verdict                          |
+   * |-----------------------------------------|----------------------------------|
+   * | identity `blocked`                      | `serial-blocked`                 |
+   * | a `pending` row (any GRN line)          | `serial-pending-approval`        |
+   * | an intake (`to_bin_id` set)             | `serial-in-stock` (its bin)      |
+   * | `transfer.outbound` (into IN-TRANSIT)   | `serial-in-transit` (its bin)    |
+   * | `pick.picked` (left on an order)        | `serial-dispatched-use-returns`  |
+   * | a negative `stock.adjusted` (write-off) | allowed, `afterWriteOff`         |
+   * | any other draw, or never moved          | allowed                          |
+   */
+  private async judgeSerialsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    identities: ReadonlyMap<string, { readonly status: string }>,
+    /** The approve arm: this over-receipt's own `pending` rows are not "pending elsewhere". */
+    exceptOverReceiptId?: string,
+  ): Promise<Map<string, { code: SerialRefusalCode; binId?: string } | { afterWriteOff: true }>> {
+    const verdicts = new Map<string, { code: SerialRefusalCode; binId?: string } | { afterWriteOff: true }>();
+    const ids = [...identities.keys()];
+    if (ids.length === 0) {
+      return verdicts;
+    }
+    const latest = await this.inventory.serialLatestEventsInTx(tx, tenantId, ids);
+    const pendingRows = await tx
+      .select({ serialId: goodsReceiptLineSerials.serialId })
+      .from(goodsReceiptLineSerials)
+      .where(
+        and(
+          eq(goodsReceiptLineSerials.tenantId, tenantId),
+          eq(goodsReceiptLineSerials.state, 'pending'),
+          inArray(goodsReceiptLineSerials.serialId, ids),
+          exceptOverReceiptId === undefined
+            ? undefined
+            : sql`${goodsReceiptLineSerials.overReceiptId} <> ${exceptOverReceiptId}::uuid`,
+        ),
+      );
+    const pending = new Set(pendingRows.map((row) => row.serialId));
+    for (const [id, identity] of identities) {
+      const event = latest.get(id);
+      if (identity.status === 'blocked') {
+        verdicts.set(id, { code: 'serial-blocked' });
+      } else if (pending.has(id)) {
+        verdicts.set(id, { code: 'serial-pending-approval' });
+      } else if (event !== undefined && event.toBinId !== null) {
+        verdicts.set(id, {
+          code: event.type === 'transfer.outbound' ? 'serial-in-transit' : 'serial-in-stock',
+          binId: event.toBinId,
+        });
+      } else if (event?.type === 'pick.picked') {
+        verdicts.set(id, { code: 'serial-dispatched-use-returns' });
+      } else if (event?.type === 'stock.adjusted' && event.quantityDelta < 0) {
+        verdicts.set(id, { afterWriteOff: true });
+      }
+    }
+    return verdicts;
+  }
+
+  /**
+   * Story 2-6a — the LATE serial phase of `grn.submit` (A4–A8), over the
+   * settling serial lines (raced lines excluded), under the receipt's SKU,
+   * document and line locks:
+   *   1. resolve the serials' existing identities per SKU — and, for an
+   *      `imei` SKU's serials, the same numbers under EVERY imei SKU of the
+   *      tenant (A7: one handset, whichever SKU received it);
+   *   2. lock them all, sorted (`lockSerialsInTx`);
+   *   3. judge them (`judgeSerialsInTx`) → per-serial refusals;
+   *   4. ensure identities for the SETTLING serials only (`ensureSerialsInTx`
+   *      — a refused serial creates none);
+   *   5. lock the newly created ones, sorted (a second batch — Design Notes
+   *      names the residual cycle);
+   *   6. re-judge them: a concurrent writer may have committed one.
+   * Returns every refusal (request index, code, where), the id of every
+   * settling serial and the ids received again after a write-off.
+   */
+  private async serialLatePhaseInTx(
+    tx: TenantTx,
+    tenantId: string,
+    lines: readonly { readonly index: number; readonly skuId: string; readonly serials: readonly string[] }[],
+    skuById: Map<string, typeof skus.$inferSelect>,
+  ): Promise<{
+    refusals: { index: number; code: SerialRefusalCode; detail: RefusedSerialDetail }[];
+    afterWriteOff: ReadonlySet<string>;
+    idOf: (skuId: string, serial: string) => string;
+  }> {
+    const keyOf = (skuId: string, serial: string): string => `${skuId}\u0000${serial}`;
+    const idBySkuSerial = new Map<string, string>();
+    const idOf = (skuId: string, serial: string): string => {
+      const id = idBySkuSerial.get(keyOf(skuId, serial));
+      if (id === undefined) {
+        throw new Error(`grn.submit: serial "${serial}" of SKU ${skuId} has no identity after the ensure (invariant)`);
+      }
+      return id;
+    };
+    const refusals: { index: number; code: SerialRefusalCode; detail: RefusedSerialDetail }[] = [];
+    const afterWriteOff = new Set<string>();
+    if (lines.length === 0) {
+      return { refusals, afterWriteOff, idOf };
+    }
+
+    // 0. (code review C2) an IMEI is one handset whichever SKU receives it,
+    // but identities are per SKU — two receipts of one NEW IMEI under two
+    // imei SKUs would lock two different ids and both book. So the imei
+    // NUMBERS are locked first (the serial advisory family, keyed
+    // `imei:<number>`, sorted): the second receipt waits, then resolves the
+    // first's committed identity below and refuses it.
+    const imeiLineNumbers = [
+      ...new Set(lines.filter((line) => skuById.get(line.skuId)!.serialFormat === 'imei').flatMap((line) => line.serials)),
+    ];
+    await this.inventory.lockSerialsInTx(tx, tenantId, imeiLineNumbers.map((number) => `imei:${number}`));
+
+    // 1. resolve.
+    const numbersBySku = new Map<string, Set<string>>();
+    for (const line of lines) {
+      const set = numbersBySku.get(line.skuId) ?? new Set<string>();
+      for (const serial of line.serials) set.add(serial);
+      numbersBySku.set(line.skuId, set);
+    }
+    const own = new Map<string, { id: string; status: string }>();
+    for (const [skuId, numbers] of numbersBySku) {
+      for (const identity of await this.catalog.serialIdentitiesInTx(tx, tenantId, skuId, { numbers: [...numbers] })) {
+        own.set(keyOf(skuId, identity.serialNumber), { id: identity.id, status: identity.status });
+      }
+    }
+    const imeiNumbers = lines
+      .filter((line) => skuById.get(line.skuId)!.serialFormat === 'imei')
+      .flatMap((line) => line.serials);
+    const crossByNumber = new Map<string, { id: string; status: string; skuId: string; skuCode: string }[]>();
+    if (imeiNumbers.length > 0) {
+      const imeiSkuIds = await this.catalog.imeiSkuIdsInTx(tx, tenantId);
+      for (const identity of await this.catalog.serialIdentitiesAcrossSkusInTx(tx, tenantId, imeiSkuIds, imeiNumbers)) {
+        crossByNumber.set(identity.serialNumber, [...(crossByNumber.get(identity.serialNumber) ?? []), identity]);
+      }
+    }
+
+    // 2. lock every existing identity, sorted (the serial advisory family).
+    const existing = new Map<string, { status: string }>();
+    for (const identity of own.values()) existing.set(identity.id, { status: identity.status });
+    for (const identities of crossByNumber.values()) {
+      for (const identity of identities) existing.set(identity.id, { status: identity.status });
+    }
+    await this.inventory.lockSerialsInTx(tx, tenantId, [...existing.keys()]);
+
+    // 3. judge.
+    const verdicts = await this.judgeSerialsInTx(tx, tenantId, existing);
+    const binIds = new Set<string>();
+    const refusedKeys = new Set<string>();
+    const pendingRefusals: { index: number; code: SerialRefusalCode; serial: string; binId?: string; skuCode?: string }[] = [];
+    const judgeLine = (
+      line: (typeof lines)[number],
+      verdictOf: (serial: string) => { code: SerialRefusalCode; binId?: string } | { afterWriteOff: true } | undefined,
+    ): void => {
+      const imei = skuById.get(line.skuId)!.serialFormat === 'imei';
+      for (const serial of line.serials) {
+        if (refusedKeys.has(keyOf(line.skuId, serial))) continue;
+        const verdict = verdictOf(serial);
+        if (verdict !== undefined && 'code' in verdict) {
+          refusedKeys.add(keyOf(line.skuId, serial));
+          pendingRefusals.push({ index: line.index, code: verdict.code, serial, ...(verdict.binId === undefined ? {} : { binId: verdict.binId }) });
+          if (verdict.binId !== undefined) binIds.add(verdict.binId);
+          continue;
+        }
+        if (!imei) continue;
+        // A7 — the same IMEI under another imei SKU, in stock or pending.
+        for (const other of crossByNumber.get(serial) ?? []) {
+          if (other.skuId === line.skuId) continue;
+          const otherVerdict = verdicts.get(other.id);
+          if (
+            otherVerdict !== undefined &&
+            'code' in otherVerdict &&
+            (otherVerdict.code === 'serial-in-stock' ||
+              otherVerdict.code === 'serial-in-transit' ||
+              otherVerdict.code === 'serial-pending-approval')
+          ) {
+            refusedKeys.add(keyOf(line.skuId, serial));
+            pendingRefusals.push({
+              index: line.index,
+              code: 'serial-in-stock',
+              serial,
+              skuCode: other.skuCode,
+              ...(otherVerdict.binId === undefined ? {} : { binId: otherVerdict.binId }),
+            });
+            if (otherVerdict.binId !== undefined) binIds.add(otherVerdict.binId);
+            break;
+          }
+        }
+      }
+    };
+    for (const line of lines) {
+      judgeLine(line, (serial) => {
+        const identity = own.get(keyOf(line.skuId, serial));
+        return identity === undefined ? undefined : verdicts.get(identity.id);
+      });
+    }
+    // (code review C3) the same IMEI on lines of two imei SKUs in THIS
+    // receipt: the first occurrence keeps it, every later one is refused
+    // `serial-in-stock` naming the first's SKU (the shape check's repeat rule
+    // is per SKU).
+    const imeiFirstSku = new Map<string, string>();
+    for (const line of lines) {
+      if (skuById.get(line.skuId)!.serialFormat !== 'imei') continue;
+      for (const serial of line.serials) {
+        if (refusedKeys.has(keyOf(line.skuId, serial))) continue;
+        const first = imeiFirstSku.get(serial);
+        if (first === undefined) {
+          imeiFirstSku.set(serial, line.skuId);
+        } else if (first !== line.skuId) {
+          refusedKeys.add(keyOf(line.skuId, serial));
+          pendingRefusals.push({ index: line.index, code: 'serial-in-stock', serial, skuCode: skuById.get(first)!.code });
+        }
+      }
+    }
+
+    // 4. ensure the settling serials' identities (order-preserving per SKU).
+    const settlingBySku = new Map<string, string[]>();
+    for (const line of lines) {
+      for (const serial of line.serials) {
+        if (refusedKeys.has(keyOf(line.skuId, serial))) continue;
+        settlingBySku.set(line.skuId, [...(settlingBySku.get(line.skuId) ?? []), serial]);
+      }
+    }
+    const created = new Map<string, { status: string }>();
+    for (const [skuId, numbers] of settlingBySku) {
+      const ensured = await this.catalog.ensureSerialsInTx(tx, tenantId, skuId, numbers);
+      ensured.forEach((identity, position) => {
+        idBySkuSerial.set(keyOf(skuId, numbers[position]!), identity.id);
+        if (!existing.has(identity.id)) created.set(identity.id, { status: identity.status });
+      });
+    }
+
+    // 5. + 6. lock the new identities, then re-judge them.
+    if (created.size > 0) {
+      await this.inventory.lockSerialsInTx(tx, tenantId, [...created.keys()]);
+      const late = await this.judgeSerialsInTx(tx, tenantId, created);
+      if (late.size > 0) {
+        for (const line of lines) {
+          judgeLine(line, (serial) => {
+            const id = idBySkuSerial.get(keyOf(line.skuId, serial));
+            return id === undefined || !created.has(id) ? undefined : late.get(id);
+          });
+        }
+        for (const [id, verdict] of late) {
+          if (!('code' in verdict)) afterWriteOff.add(id);
+        }
+      }
+    }
+    for (const [id, verdict] of verdicts) {
+      if (!('code' in verdict)) afterWriteOff.add(id);
+    }
+
+    const where = await binCodesByIdsInTx(tx, tenantId, [...binIds]);
+    for (const refusal of pendingRefusals) {
+      const bin = refusal.binId === undefined ? undefined : where.get(refusal.binId);
+      refusals.push({
+        index: refusal.index,
+        code: refusal.code,
+        detail: {
+          serial: refusal.serial,
+          ...(bin === undefined ? {} : { binCode: bin.binCode, warehouseCode: bin.warehouseCode }),
+          ...(refusal.skuCode === undefined ? {} : { skuCode: refusal.skuCode }),
+        },
+      });
+    }
+    refusals.sort((a, b) => a.index - b.index);
+    return { refusals, afterWriteOff, idOf };
+  }
 
   /**
    * Story 21-9 (decision 5) — the open successor of a CLOSED purchase order:
@@ -2904,6 +3756,32 @@ export class ReceivingCommand {
       const { line, code } = entry;
       const sku = skuById.get(line.skuId)!;
       const skuClient = clientLabels.get(sku.clientId) ?? sku.clientId;
+      if (isSerialCode(code)) {
+        // Story 2-6a — the line's identity, the refused serials (the line's,
+        // for a line-level code), whether the rest of the line booked, and
+        // where each refused serial is.
+        const serials = line.serials ?? [];
+        return {
+          poLineId: line.poLineId,
+          ...(line.asnLineId === null || line.asnLineId === undefined ? {} : { asnLineId: line.asnLineId }),
+          skuId: line.skuId,
+          qty: line.qty,
+          code,
+          reason: serialRefusalReason(
+            code,
+            sku.code,
+            entry.refusedSerials ?? serials.map((serial) => ({ serial })),
+          ),
+          index: entry.index,
+          ...(serials.length === 0 ? {} : { serials: [...serials] }),
+          ...(entry.serialsOnly === true ? { serialsOnly: true as const } : {}),
+          ...serialDetailFields(entry.refusedSerials),
+          ...lineConditionFields(line),
+          ...(typeof line.unreadableSerialQty === 'number' && line.unreadableSerialQty > 0
+            ? { unreadableSerialQty: line.unreadableSerialQty }
+            : {}),
+        };
+      }
       if (code === 'licence-not-covered') {
         // Story 1-6d — the full entry: the line's identity plus what is missing.
         const missing = entry.missing ?? [];
@@ -3015,6 +3893,14 @@ export class ReceivingCommand {
               ...(entry.remainingDays === undefined ? {} : { remainingDays: entry.remainingDays }),
             }
           : {}),
+        // Story 2-6a — a serial refusal names its serials (and where each is).
+        ...(isSerialCode(entry.code)
+          ? {
+              serials: (entry.line.serials ?? []).map((serial) => serial),
+              ...(entry.serialsOnly === true ? { serialsOnly: true } : {}),
+              ...serialDetailFields(entry.refusedSerials),
+            }
+          : {}),
         // Story 1-6d — what no valid licence covers (the web and the handheld word it).
         ...(entry.code === 'licence-not-covered'
           ? {
@@ -3061,6 +3947,8 @@ export class ReceivingCommand {
             ...lineConditionFields(line),
             // Story 2-5a (A3) — the line's photo refs, only when non-empty (they stay staged).
             ...linePhotoFields(line),
+            // Story 2-6a — only when non-empty / > 0: Apply re-sends them (a pre-2-6a row is byte-identical).
+            ...lineSerialFields(line),
           })),
           refusals: linesRefused.map(refusalEntry),
         },
@@ -3118,6 +4006,8 @@ export class ReceivingCommand {
             ...lineConditionFields(line),
             // Story 2-5a (A3) — only when non-empty: Apply re-sends them and the re-run binds them.
             ...linePhotoFields(line),
+            // Story 2-6a — only when non-empty / > 0: Apply re-sends them (a pre-2-6a row is byte-identical).
+            ...lineSerialFields(line),
           })),
           refusals: shelfLifeRefused.map(refusalEntry),
         },
@@ -3184,6 +4074,8 @@ export class ReceivingCommand {
             ...lineConditionFields(line),
             // Story 2-5a (A3) — only when non-empty: Apply re-sends them and the re-run binds them.
             ...linePhotoFields(line),
+            // Story 2-6a — only when non-empty / > 0: Apply re-sends them (a pre-2-6a row is byte-identical).
+            ...lineSerialFields(line),
           })),
           refusals: licenceRefused.map(refusalEntry),
           // D1 — no loop: a row raised during a re-run under a shelf-life
@@ -3346,12 +4238,22 @@ function expiryRefusalReason(entry: ClientRefusedLine, skuCode: string, batchCod
  */
 function linesRefusedDetail(
   problemCode: (typeof LINES_REFUSED_CODE_PRECEDENCE)[number],
-  refused: readonly ClientRefusedLine[],
+  refusedIn: readonly ClientRefusedLine[],
   grnCode: string | null,
   clientLabel: string,
 ): string {
-  const clientOnly = refused.every((entry) => entry.code === 'client-departed' || entry.code === 'sku-client-mismatch');
-  const mixedTail = clientOnly ? '' : ' Other lines were refused for their expiry date — each line names its reason.';
+  let refused = refusedIn;
+  // Story 2-6a — serial refusals get their own sentence; a row with none
+  // keeps its pre-2-6a words byte for byte.
+  const serialEntries = refused.filter((entry) => isSerialCode(entry.code));
+  const lineEntries = refused.filter((entry) => !isSerialCode(entry.code));
+  if (lineEntries.length === 0) {
+    return serialRefusalsDetail(serialEntries, grnCode);
+  }
+  const serialTail = serialEntries.length === 0 ? '' : ` ${serialRefusalsDetail(serialEntries, grnCode)}`;
+  const clientOnly = lineEntries.every((entry) => entry.code === 'client-departed' || entry.code === 'sku-client-mismatch');
+  const mixedTail = (clientOnly ? '' : ' Other lines were refused for their expiry date — each line names its reason.') + serialTail;
+  refused = lineEntries;
   if (problemCode === 'client-departed') {
     return (
       (grnCode === null
@@ -3385,11 +4287,229 @@ function linesRefusedDetail(
   const parts = LINES_REFUSED_CODE_PRECEDENCE.filter((code) => counts.has(code) && why[code] !== undefined).map(
     (code) => `${counts.get(code)} with ${why[code]}`,
   );
-  return `${head} (${parts.join('; ')}). Check the labels and receive them again.`;
+  return `${head} (${parts.join('; ')}). Check the labels and receive them again.${serialTail}`;
+}
+
+/**
+ * Story 2-6a — the serial part of a `grn.lines-refused` row's detail: how
+ * many serial units were not booked and why, by code (in precedence order),
+ * and whether whole lines were refused.
+ */
+function serialRefusalsDetail(entries: readonly ClientRefusedLine[], grnCode: string | null): string {
+  const why: Record<string, string> = {
+    'serials-required': 'no serials on a serial-tracked SKU (an older build or a queued receipt)',
+    'serials-on-untracked': 'serials on a SKU that is not serial-tracked',
+    'serial-in-stock': 'already in stock',
+    'serial-in-transit': 'in transit on a stock transfer',
+    'serial-pending-approval': "awaiting approval on another receipt's over-receipt",
+    'serial-dispatched-use-returns': 'left on a customer order — receive them as a return',
+    'serial-blocked': 'blocked',
+    'serial-format-invalid': 'not a valid IMEI',
+  };
+  const units = new Map<string, number>();
+  for (const entry of entries) units.set(entry.code, (units.get(entry.code) ?? 0) + entry.line.qty);
+  const parts = LINES_REFUSED_CODE_PRECEDENCE.filter((code) => units.has(code) && why[code] !== undefined).map(
+    (code) => `${units.get(code)} ${why[code]}`,
+  );
+  const total = [...units.values()].reduce((sum, value) => sum + value, 0);
+  const wholeLines = new Set(entries.filter((entry) => entry.serialsOnly !== true).map((entry) => entry.index)).size;
+  const head =
+    grnCode === null
+      ? `No goods receipt was recorded — ${total} serial unit(s) were not booked`
+      : `${total} serial unit(s) of goods receipt "${grnCode}" were not booked`;
+  const linesNote = wholeLines === 0 ? ' The rest of each line booked.' : ` ${wholeLines} line(s) were refused whole.`;
+  return `${head} (${parts.join('; ')}).${linesNote} Each entry names its serials — check the units, then discard this review.`;
+}
+
+/** Story 2-6a — the line-level and serial-level serial codes (the 8 that join `REJECTED_GRN_LINE_CODES`). */
+function isSerialCode(code: string): boolean {
+  return code === 'serials-required' || code === 'serials-on-untracked' || SERIAL_REFUSAL_CODES.has(code);
+}
+
+/** Story 2-6a — `serialDetails`, only when some refused serial has a location or another SKU to name. */
+function serialDetailFields(details: readonly RefusedSerialDetail[] | undefined): { serialDetails?: RefusedSerialDetail[] } {
+  const named = (details ?? []).filter(
+    (detail) => detail.binCode !== undefined || detail.skuCode !== undefined || detail.warehouseCode !== undefined,
+  );
+  return named.length === 0 ? {} : { serialDetails: (details ?? []).map((detail) => ({ ...detail })) };
+}
+
+/**
+ * Story 2-6a — a settled serial line's snapshot keys, each present only when
+ * set (a line without serials adds nothing): the serials booked now (the
+ * first `applied / 1000`), those pending on its over-receipt, the unreadable
+ * units, and the QC-on-receipt skip (A22 — QC on receipt never holds a
+ * serial line).
+ */
+function serialSnapshotFields(
+  input: NormalisedGrnLineInput,
+  appliedMilli: number,
+  qcOnReceipt: boolean,
+): { serials?: string[]; pendingSerials?: string[]; unreadableSerialQty?: number; qcSkipped?: 'serial-tracked' } {
+  if (input.serials === null) {
+    return {};
+  }
+  const appliedUnits = appliedMilli / QUANTITY_SCALE;
+  const booked = input.serials.slice(0, appliedUnits);
+  const pending = input.serials.slice(appliedUnits);
+  return {
+    ...(booked.length > 0 ? { serials: [...booked] } : {}),
+    ...(pending.length > 0 ? { pendingSerials: [...pending] } : {}),
+    ...(input.unreadableSerialQty > 0 ? { unreadableSerialQty: input.unreadableSerialQty } : {}),
+    ...(qcOnReceipt ? { qcSkipped: 'serial-tracked' as const } : {}),
+  };
+}
+
+/** Story 2-6a — at most this many serials are spelled out in one refusal's words (the rest are counted). */
+const SERIALS_NAMED_IN_REASON = 10;
+
+function namedSerials(details: readonly RefusedSerialDetail[], describe: (detail: RefusedSerialDetail) => string): string {
+  const shown = details.slice(0, SERIALS_NAMED_IN_REASON).map(describe).join(', ');
+  return details.length > SERIALS_NAMED_IN_REASON ? `${shown} and ${details.length - SERIALS_NAMED_IN_REASON} more` : shown;
+}
+
+/** Story 2-6a — where a refused serial is, in words: `"S" at A-01-03 (WH1)` / `"S" under SKU "P1"`. */
+function serialWhere(detail: RefusedSerialDetail): string {
+  if (detail.skuCode !== undefined) {
+    return `"${detail.serial}" under SKU "${detail.skuCode}"${detail.binCode === undefined ? '' : ` at ${detail.binCode}${detail.warehouseCode === undefined ? '' : ` (${detail.warehouseCode})`}`}`;
+  }
+  if (detail.binCode !== undefined) {
+    return `"${detail.serial}" at ${detail.binCode}${detail.warehouseCode === undefined ? '' : ` (${detail.warehouseCode})`}`;
+  }
+  return `"${detail.serial}"`;
+}
+
+/** Story 2-6a — a serial refusal's operator-facing reason (the handheld words it by code; the web shows this). */
+export function serialRefusalReason(code: string, skuCode: string, details: readonly RefusedSerialDetail[]): string {
+  const count = details.length;
+  switch (code) {
+    case 'serials-required':
+      return `SKU "${skuCode}" is serial-tracked — each unit needs its serial, and this line carried none (an older handheld build, or a receipt queued before serial capture). Receive it again on the current build, scanning each unit's serial.`;
+    case 'serials-on-untracked':
+      return `SKU "${skuCode}" is not serial-tracked — its line carries no serials. Receive it again without serials.`;
+    case 'serial-format-invalid':
+      return `SKU "${skuCode}" takes IMEI 1 as its serial (15 digits with a check digit) — ${count} serial(s) are not valid IMEIs: ${namedSerials(details, serialWhere)}.`;
+    case 'serial-in-stock':
+      return `${count} serial(s) of SKU "${skuCode}" are already in stock: ${namedSerials(details, serialWhere)} — a serial is one unit; check the label.`;
+    case 'serial-in-transit':
+      return `${count} serial(s) of SKU "${skuCode}" are in transit on a stock transfer: ${namedSerials(details, serialWhere)} — confirm the transfer's arrival instead.`;
+    case 'serial-pending-approval':
+      return `${count} serial(s) of SKU "${skuCode}" are awaiting approval on another receipt's over-receipt: ${namedSerials(details, serialWhere)}.`;
+    case 'serial-dispatched-use-returns':
+      return `${count} serial(s) of SKU "${skuCode}" left on a customer order: ${namedSerials(details, serialWhere)} — receive them as a return, not on a goods receipt.`;
+    case 'serial-blocked':
+      return `${count} serial(s) of SKU "${skuCode}" are blocked: ${namedSerials(details, serialWhere)}.`;
+    default:
+      return `SKU "${skuCode}": ${count} serial(s) refused (${code}).`;
+  }
+}
+
+/** Story 2-6a — a pending serial of an excess that can no longer book: 409 naming it (the reviewer rejects the excess). */
+function excessSerialRefused(
+  code: SerialRefusalCode,
+  serial: string,
+  where: { readonly binCode: string; readonly warehouseCode: string } | undefined,
+  /** Code review C1 — an IMEI held under ANOTHER imei SKU. */
+  otherSkuCode?: string,
+): ProblemException {
+  const at = (otherSkuCode === undefined ? '' : ` under SKU "${otherSkuCode}"`) + (where === undefined ? '' : ` at ${where.binCode} (${where.warehouseCode})`);
+  const why: Record<SerialRefusalCode, string> = {
+    'serial-in-stock': `is already in stock${at}`,
+    'serial-in-transit': `is in transit on a stock transfer${at}`,
+    'serial-pending-approval': "is awaiting approval on another receipt's over-receipt",
+    'serial-dispatched-use-returns': 'left on a customer order since this receipt',
+    'serial-blocked': 'is blocked',
+    'serial-format-invalid': 'is not a valid serial for this SKU',
+  };
+  return new ProblemException(
+    code,
+    409,
+    'A serial of this excess cannot be booked',
+    `Serial "${serial}" ${why[code]} — one serial is one unit, so this excess cannot be approved. Reject it, then check the units.`,
+  );
 }
 
 function grnValidation(detail: string): ProblemException {
   return new ProblemException('validation-failed', 400, 'Invalid goods receipt', detail);
+}
+
+/** Story 2-6a — the serial hash keys, after `photoRefs`: each only when non-empty / > 0 (the line AS RECEIVED). */
+function serialHashFields(line: GrnLineInput): { serials?: string[]; unreadableSerialQty?: number } {
+  return {
+    ...(Array.isArray(line.serials) && line.serials.length > 0 ? { serials: [...line.serials] } : {}),
+    ...(typeof line.unreadableSerialQty === 'number' && line.unreadableSerialQty > 0
+      ? { unreadableSerialQty: line.unreadableSerialQty }
+      : {}),
+  };
+}
+
+/**
+ * Story 2-6a — the serials' SHAPE over the lines AS RECEIVED (every one a
+ * whole-op 400 `validation-failed`, above the transaction — the replay is
+ * never reached; the device never produces any of them). Each serial is
+ * trimmed, then must match `SERIAL_NUMBER_RE`; none may repeat for one SKU
+ * across the receipt (case-sensitive); a line carries exactly one serial per
+ * good unit; `unreadableSerialQty` is an integer 0–500 that needs at least
+ * one serial beside it; a line carries at most `MAX_GRN_SERIALS_PER_LINE`
+ * serial rows (serials + unreadable) and a receipt at most
+ * `MAX_GRN_SERIALS_PER_RECEIPT` serials.
+ */
+function assertSerialShape(lines: readonly GrnLineInput[]): void {
+  const seen = new Set<string>();
+  let total = 0;
+  lines.forEach((line, index) => {
+    const raw = line.serials ?? null;
+    const unreadable = line.unreadableSerialQty ?? 0;
+    if (typeof unreadable !== 'number' || !Number.isInteger(unreadable) || unreadable < 0 || unreadable > MAX_GRN_SERIALS_PER_LINE) {
+      throw grnValidation(`lines[${index}].unreadableSerialQty must be a whole number from 0 to ${MAX_GRN_SERIALS_PER_LINE} (got ${String(unreadable)}).`);
+    }
+    if (raw === null) {
+      if (unreadable > 0) {
+        throw grnValidation(
+          `lines[${index}] records ${unreadable} unit(s) with an unreadable serial but no serial — a line of unreadable units only cannot be received; set them aside and report them.`,
+        );
+      }
+      return;
+    }
+    if (!Array.isArray(raw)) {
+      throw grnValidation(`lines[${index}].serials must be an array of serial numbers.`);
+    }
+    if (raw.length === 0) {
+      if (unreadable > 0) {
+        throw grnValidation(
+          `lines[${index}] records ${unreadable} unit(s) with an unreadable serial but no serial — a line of unreadable units only cannot be received; set them aside and report them.`,
+        );
+      }
+      return;
+    }
+    if (raw.length + unreadable > MAX_GRN_SERIALS_PER_LINE) {
+      throw grnValidation(
+        `lines[${index}] carries ${raw.length + unreadable} serial unit(s) — at most ${MAX_GRN_SERIALS_PER_LINE} per line, unreadable units included. Split the line.`,
+      );
+    }
+    for (const entry of raw) {
+      const serial = typeof entry === 'string' ? entry.trim() : entry;
+      if (typeof serial !== 'string' || !SERIAL_NUMBER_RE.test(serial)) {
+        throw grnValidation(
+          `lines[${index}].serials: each serial must be 1–${MAX_SERIAL_NUMBER_LENGTH} printable characters with no spaces (got ${JSON.stringify(entry)}).`,
+        );
+      }
+      const key = `${line.skuId}\u0000${serial}`;
+      if (seen.has(key)) {
+        throw grnValidation(`Serial "${serial}" is named more than once for the same SKU in this receipt — one serial is one unit.`);
+      }
+      seen.add(key);
+    }
+    if (line.qty !== raw.length) {
+      throw grnValidation(
+        `A serial-tracked line carries exactly one serial per good unit received: qty is ${String(line.qty)} but serials has ${raw.length} entr${raw.length === 1 ? 'y' : 'ies'}.`,
+      );
+    }
+    total += raw.length;
+  });
+  if (total > MAX_GRN_SERIALS_PER_RECEIPT) {
+    throw grnValidation(`This receipt carries ${total} serials — at most ${MAX_GRN_SERIALS_PER_RECEIPT} per receipt. Split it into several receipts.`);
+  }
 }
 
 /** Story 2-5a — the photo refs' hash key: present only when non-empty (the line AS RECEIVED). */

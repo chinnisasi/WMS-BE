@@ -6,13 +6,16 @@ import {
   advanceShipmentNotices,
   asnLines,
   goodsReceiptLines,
+  goodsReceiptLineSerials,
   goodsReceiptNotes,
   overReceipts,
+  qcHolds,
   purchaseOrderLines,
   purchaseOrders,
   skus as skusTable,
 } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
+import { receivingPoliciesInTx } from '../clients/clients.facade';
 import { skuOfClient } from '../../shared/db/client-filter';
 import type { Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
@@ -109,6 +112,15 @@ export interface GoodsReceiptLineEntry {
   /** Story 2-5a — attached damage photos, and those the receipt named that have not arrived. */
   readonly photoCount: number;
   readonly pendingPhotoCount: number;
+  /**
+   * Story 2-6a (A19, A22) — each present only on a line that captured
+   * serials: the serials in capture order with their state (booked, awaiting
+   * approval, approval rejected; re-received after a write-off marked), the
+   * unreadable units, and the QC-on-receipt skip.
+   */
+  readonly serials?: readonly { readonly serial: string; readonly state: 'applied' | 'pending' | 'rejected'; readonly afterWriteOff?: true }[];
+  readonly unreadableSerialQty?: number;
+  readonly qcSkipped?: 'serial-tracked';
 }
 
 export interface ListGoodsReceiptsQuery {
@@ -160,6 +172,8 @@ export interface CatalogSnapshot {
     readonly serialTracked: boolean;
     /** Story 10.3: handled by unit, priced by weight — the device's offline catch-weight prompt. */
     readonly catchWeightTracked: boolean;
+    /** Story 2-6a: `free` | `imei` — the device's offline serial gate. Tenth mirror of the `SkuSummary` arm. */
+    readonly serialFormat: string;
     /**
      * Story 11.7: the SKU's values on its product's declared variant axes —
      * null when the SKU is unattached. Third mirror of the `SkuSummary` arm
@@ -251,6 +265,8 @@ export interface CatalogSnapshot {
     readonly qty: number;
     readonly suggestedBin: { readonly binId: string; readonly binCode: string } | null;
     readonly rationale: string;
+    /** Story 2-6a (A14): a serial task's serials in Receiving (present only on a serial-tracked task). */
+    readonly serialNumbers?: readonly string[];
   }[];
   /** Story 2-3a (additive): the open gate-ins the dock unloads and receives against (decision 15). */
   readonly openGateIns: readonly OpenGateInView[];
@@ -567,6 +583,8 @@ export class ReceivingFacade {
           damageReasonCode: goodsReceiptLines.damageReasonCode,
           shortQty: goodsReceiptLines.shortQty,
           shortReasonCode: goodsReceiptLines.shortReasonCode,
+          // Story 2-6a — the QC skip label reads the SKU's client's policy.
+          skuClientId: skusTable.clientId,
         })
         .from(goodsReceiptLines)
         .innerJoin(skusTable, and(eq(skusTable.tenantId, goodsReceiptLines.tenantId), eq(skusTable.id, goodsReceiptLines.skuId)))
@@ -578,6 +596,52 @@ export class ReceivingFacade {
         [...new Set(rows.map((row) => row.batchId).filter((id): id is string => id !== null))],
       );
       const photos = (await photoCountsByParentInTx(tx, tenantId, [grnId])).get(grnId)?.byLine;
+      // ── story 2-6a: the captured serials (A19) and the QC skip (A22) ────
+      const serialRows = await tx
+        .select({
+          grnLineId: goodsReceiptLineSerials.grnLineId,
+          serialId: goodsReceiptLineSerials.serialId,
+          state: goodsReceiptLineSerials.state,
+          afterWriteOff: goodsReceiptLineSerials.afterWriteOff,
+        })
+        .from(goodsReceiptLineSerials)
+        .where(and(eq(goodsReceiptLineSerials.tenantId, tenantId), eq(goodsReceiptLineSerials.grnId, grnId)))
+        .orderBy(goodsReceiptLineSerials.grnLineId, goodsReceiptLineSerials.ordinal);
+      const serialNumbers = await this.catalog.serialNumbersByIdsInTx(
+        tx,
+        tenantId,
+        serialRows.map((row) => row.serialId).filter((id): id is string => id !== null),
+      );
+      const serialsByLine = new Map<string, { serial: string; state: 'applied' | 'pending' | 'rejected'; afterWriteOff?: true }[]>();
+      const unreadableByLine = new Map<string, number>();
+      for (const row of serialRows) {
+        if (row.serialId === null) {
+          unreadableByLine.set(row.grnLineId, (unreadableByLine.get(row.grnLineId) ?? 0) + 1);
+          continue;
+        }
+        const list = serialsByLine.get(row.grnLineId) ?? [];
+        list.push({
+          serial: serialNumbers.get(row.serialId) ?? row.serialId,
+          state: row.state as 'applied' | 'pending' | 'rejected',
+          ...(row.afterWriteOff ? { afterWriteOff: true as const } : {}),
+        });
+        serialsByLine.set(row.grnLineId, list);
+      }
+      // QC skipped = serial rows, no receipt hold of the line, and the line's
+      // client has QC on receipt NOW (the label reads the current policy —
+      // PENDING records it).
+      const serialLineIds = [...new Set(serialRows.map((row) => row.grnLineId))];
+      const heldLineIds = new Set(
+        serialLineIds.length === 0
+          ? []
+          : (
+              await tx
+                .select({ grnLineId: qcHolds.grnLineId })
+                .from(qcHolds)
+                .where(and(eq(qcHolds.tenantId, tenantId), inArray(qcHolds.grnLineId, serialLineIds)))
+            ).map((row) => row.grnLineId),
+      );
+      const qcClients = serialLineIds.length === 0 ? new Map() : await receivingPoliciesInTx(tx, tenantId, rows.filter((row) => serialLineIds.includes(row.id)).map((row) => row.skuClientId));
       return rows.map((row) => ({
         id: row.id,
         skuId: row.skuId,
@@ -594,6 +658,11 @@ export class ReceivingFacade {
         ...(row.shortQty > 0 && row.shortReasonCode !== null ? { shortReasonCode: row.shortReasonCode } : {}),
         photoCount: photos?.get(row.id)?.photoCount ?? 0,
         pendingPhotoCount: photos?.get(row.id)?.pendingPhotoCount ?? 0,
+        ...(serialsByLine.has(row.id) ? { serials: serialsByLine.get(row.id)! } : {}),
+        ...(unreadableByLine.has(row.id) ? { unreadableSerialQty: unreadableByLine.get(row.id)! } : {}),
+        ...(serialLineIds.includes(row.id) && !heldLineIds.has(row.id) && qcClients.get(row.skuClientId)?.qcOnReceipt === true
+          ? { qcSkipped: 'serial-tracked' as const }
+          : {}),
       }));
     });
   }
@@ -649,6 +718,28 @@ export class ReceivingFacade {
         )
         .orderBy(desc(overReceipts.createdAt), desc(overReceipts.id))
         .limit(pageSize + 1);
+      // Story 2-6a (A5) — each excess's serials, capture order (one read for the page).
+      const pageIds = rows.slice(0, pageSize).map(({ overReceipt }) => overReceipt.id);
+      const excessSerialRows =
+        pageIds.length === 0
+          ? []
+          : await tx
+              .select({ overReceiptId: goodsReceiptLineSerials.overReceiptId, serialId: goodsReceiptLineSerials.serialId })
+              .from(goodsReceiptLineSerials)
+              .where(and(eq(goodsReceiptLineSerials.tenantId, tenantId), inArray(goodsReceiptLineSerials.overReceiptId, pageIds)))
+              .orderBy(goodsReceiptLineSerials.overReceiptId, goodsReceiptLineSerials.ordinal);
+      const excessNumbers = await this.catalog.serialNumbersByIdsInTx(
+        tx,
+        tenantId,
+        excessSerialRows.map((row) => row.serialId).filter((id): id is string => id !== null),
+      );
+      const serialsByOverReceipt = new Map<string, string[]>();
+      for (const serialRow of excessSerialRows) {
+        if (serialRow.overReceiptId === null || serialRow.serialId === null) continue;
+        const list = serialsByOverReceipt.get(serialRow.overReceiptId) ?? [];
+        list.push(excessNumbers.get(serialRow.serialId) ?? serialRow.serialId);
+        serialsByOverReceipt.set(serialRow.overReceiptId, list);
+      }
       const items = rows.map(({ overReceipt: row, grnCode, asnCode }) => ({
         id: row.id,
         tenantId: row.tenantId,
@@ -671,6 +762,8 @@ export class ReceivingFacade {
         decidedBy: row.decidedBy,
         decidedAt: row.decidedAt === null ? null : canonicalInstant(row.decidedAt),
         createdAt: canonicalInstant(row.createdAt),
+        // Story 2-6a (A5) — present only on a serial line's excess.
+        ...(serialsByOverReceipt.has(row.id) ? { serials: serialsByOverReceipt.get(row.id)! } : {}),
       }));
       return fullPrecisionPage(rows, items, pageSize);
     });

@@ -1037,7 +1037,10 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // Story 2-5a: + attachments_tenant_isolation (0095, client-bound on both
       // arms — the 0084 shape; an unattributed staged photo is invisible to a
       // portal stamp).
-      expect(policies).toHaveLength(125);
+      // Story 2-6a: + goods_receipt_line_serials_tenant_isolation (0096, the
+      // plain tenant policy — operator-side, like goods_receipt_lines; no
+      // portal route reads it).
+      expect(policies).toHaveLength(126);
       const attachmentPolicy = policies.find((row) => row.policyname === 'attachments_tenant_isolation')!;
       expect(attachmentPolicy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
       expect(attachmentPolicy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");

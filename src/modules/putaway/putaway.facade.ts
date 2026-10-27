@@ -38,9 +38,11 @@ import {
   openReceiptHoldQtyByLine,
   pickPutawayCandidate,
   putawayRationale,
+  receivingSerialsByLineInTx,
   type PutawayBinCandidate,
 } from './putaway.command';
-import { fromMilli } from '../../shared/primitives/quantity';
+import { QUANTITY_SCALE, fromMilli } from '../../shared/primitives/quantity';
+import { InventoryFacade } from '../inventory/inventory.facade';
 import { SEGREGATION_PROFILE_COLUMNS } from '../../shared/primitives/segregation';
 
 export const DEFAULT_PUTAWAY_PAGE_SIZE = 50;
@@ -88,6 +90,12 @@ export interface PutawayTask {
   readonly suggestedBin: { readonly binId: string; readonly binCode: string } | null;
   /** The one-line capacity-only rationale (FR-10 v1). */
   readonly rationale: string;
+  /**
+   * Story 2-6a (A14) — a serial-tracked task only: the line's `applied`
+   * serials still located in the Receiving bin, in capture order. `qty` is
+   * `min(remaining, their count)`; a task at 0 is dropped.
+   */
+  readonly serialNumbers?: readonly string[];
 }
 
 /** One bin of the snapshot's bins payload (blocked/system bins INCLUDED — the device needs them to reject a scan against them). */
@@ -129,6 +137,9 @@ export class PutawayFacade {
   constructor(
     @Inject(DATABASE) private readonly db: Database,
     @Inject(PutawayCommand) private readonly putaway: PutawayCommand,
+    // Story 2-6a (A14) — the serials located in Receiving (the ledger is the
+    // only source of serial location).
+    @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
   ) {}
 
   /** `putaway.place` — the device-authenticated idempotent placement command. */
@@ -348,6 +359,8 @@ export class PutawayFacade {
         id: skus.id,
         code: skus.code,
         batchTracked: skus.batchTracked,
+        // Story 2-6a (A14) — a serial task carries its serials.
+        serialTracked: skus.serialTracked,
         // Story 11-5: the task-derivation fit consumes the same attributes —
         // the suggestion never points at a bin the gates would refuse.
         weightGrams: skus.weightGrams,
@@ -407,7 +420,30 @@ export class PutawayFacade {
     // The suggestion candidates (capacity-only v1) — one read for the page.
     const candidates = await binCandidatesInTx(tx, tenantId, warehouseId);
 
-    const picked: { row: (typeof lineRows)[number]; sku: (typeof skuRows)[number]; remaining: number; fit: PutawayBinCandidate | null }[] = [];
+    // ── story 2-6a (A14): a serial-tracked line's own serials ───────────
+    // Receiving is POOLED per (sku, batch), so `min(putaway qty, on-hand)`
+    // cannot tell whose units are left: a serial line's task is bounded by
+    // ITS booked (`applied`) serials still located in Receiving (the
+    // ledger's latest event per serial — `serialsLocatedInBinInTx`), and it
+    // carries their numbers so the handheld verifies each scan offline. A
+    // line with no serial rows (received before 2-6a) keeps the pooled
+    // bound and no list (the handheld refuses it, as before).
+    const serialLineIds = lineRows
+      .filter((row) => skuById.get(row.skuId)?.serialTracked === true)
+      .map((row) => row.grnLineId);
+    const serialNumbersByLine = await receivingSerialsByLineInTx(tx, this.inventory, {
+      tenantId,
+      receivingBinId: receivingBin.id,
+      lines: lineRows.filter((row) => serialLineIds.includes(row.grnLineId)).map((row) => ({ grnLineId: row.grnLineId, skuId: row.skuId })),
+    });
+
+    const picked: {
+      row: (typeof lineRows)[number];
+      sku: (typeof skuRows)[number];
+      remaining: number;
+      fit: PutawayBinCandidate | null;
+      serialNumbers: readonly string[] | null;
+    }[] = [];
     for (const row of lineRows) {
       const sku = skuById.get(row.skuId);
       if (sku === undefined) {
@@ -417,7 +453,15 @@ export class PutawayFacade {
         row.batchId !== null
           ? (bySkuBatch.get(`${row.skuId}:${row.batchId}`) ?? 0)
           : (plainBySku.get(row.skuId) ?? 0);
-      const remaining = Math.min(row.putawayQty, onHand);
+      let remaining = Math.min(row.putawayQty, onHand);
+      const lineSerials = serialNumbersByLine.get(row.grnLineId) ?? null;
+      let serialNumbers: readonly string[] | null = null;
+      if (lineSerials !== null) {
+        // Whole units only: a serial SKU has a 0-dp UoM (catalog entry).
+        const units = Math.min(Math.floor(remaining / QUANTITY_SCALE), lineSerials.length);
+        remaining = units * QUANTITY_SCALE;
+        serialNumbers = lineSerials.slice(0, units);
+      }
       if (remaining <= 0) {
         continue; // already placed (or the stock moved elsewhere) — no task
       }
@@ -430,7 +474,7 @@ export class PutawayFacade {
       // placement re-derives exactly this, so a followed suggestion needs no
       // mismatch reason.
       const fit = pickPutawayCandidate(candidates, sku, remaining, row.skuId, { preferOwn: true });
-      picked.push({ row, sku, remaining, fit });
+      picked.push({ row, sku, remaining, fit, serialNumbers });
     }
     // Story 1-5b: the dedicated clients' labels for the rationale — one read.
     const labels = await dedicatedClientLabelsInTx(
@@ -438,7 +482,7 @@ export class PutawayFacade {
       tenantId,
       picked.map((entry) => entry.fit).filter((fit): fit is PutawayBinCandidate => fit !== null),
     );
-    const tasks: PutawayTask[] = picked.map(({ row, sku, remaining, fit }) => ({
+    const tasks: PutawayTask[] = picked.map(({ row, sku, remaining, fit, serialNumbers }) => ({
       grnId: row.grnId,
       grnCode: row.grnCode,
       grnLineId: row.grnLineId,
@@ -450,6 +494,8 @@ export class PutawayFacade {
       qty: fromMilli(remaining),
       suggestedBin: fit === null ? null : { binId: fit.binId, binCode: fit.binCode },
       rationale: fit === null ? 'No conforming storage bin has room for these units' : putawayRationale(fit, labels),
+      // Story 2-6a — present only on a serial line that captured serials.
+      ...(serialNumbers === null ? {} : { serialNumbers }),
     }));
     return tasks;
   }

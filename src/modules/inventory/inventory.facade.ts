@@ -358,6 +358,21 @@ export interface BatchLedgerEntry {
   readonly eventHash: string;
 }
 
+/**
+ * Story 2-6a (A6) — a serial's latest ledger event: an intake (`toBinId`
+ * set) means it is in that bin (`transfer.outbound` — in transit); a draw
+ * (`toBinId` null) means it left stock (`pick.picked` — on an order; a
+ * negative `stock.adjusted` — written off).
+ */
+export interface SerialLatestEvent {
+  readonly type: string;
+  readonly warehouseId: string;
+  readonly fromBinId: string | null;
+  readonly toBinId: string | null;
+  /** Milli-units, signed. */
+  readonly quantityDelta: number;
+}
+
 /** A serial's derived current location (the ledger's latest event's bin). */
 export interface SerialLocation {
   readonly warehouseId: string;
@@ -1526,7 +1541,7 @@ export class InventoryFacade {
    * any warehouse), in the CALLER's transaction: the serial's latest event is
    * an intake (`to_bin_id` set). Answers `serialId → binId` for those only.
    * The serial guard's own definition (`assertSerialArmLegal`'s "latest
-   * event" read, tenant-wide, `seq` descending), asked up front so the return
+   * event" read, tenant-wide, event `id` descending — story 2-6a, A2), asked up front so the return
    * receipt can REFUSE such a unit per entry (`serial-in-stock`) rather than
    * have the intake's guard throw for the whole receipt. Call it under the
    * serial advisory locks (`lockSerialsInTx`) so the answer cannot move
@@ -1548,7 +1563,7 @@ export class InventoryFacade {
       })
       .from(ledgerEvents)
       .where(and(eq(ledgerEvents.tenantId, tenantId), inArray(ledgerEvents.serialRef, distinct)))
-      .orderBy(ledgerEvents.serialRef, desc(ledgerEvents.seq));
+      .orderBy(ledgerEvents.serialRef, desc(ledgerEvents.id));
     const inStock = new Map<string, string>();
     for (const row of rows) {
       if (row.serialRef !== null && row.toBinId !== null) {
@@ -1556,6 +1571,50 @@ export class InventoryFacade {
       }
     }
     return inStock;
+  }
+
+  /**
+   * Story 2-6a (A6) — the LATEST ledger event of each of a set of serials
+   * (tenant-wide, any warehouse), in the CALLER's transaction: its type, its
+   * warehouse and both bin arms. A serial the ledger has never seen is
+   * absent. Ordered by event `id` descending (A2 — never `seq`, which is per
+   * warehouse). Call it under the serial advisory locks (`lockSerialsInTx`)
+   * so the answer cannot move before the append. `serialsInStockInTx` is
+   * this read narrowed to intakes.
+   */
+  async serialLatestEventsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    serialIds: readonly string[],
+  ): Promise<ReadonlyMap<string, SerialLatestEvent>> {
+    const distinct = [...new Set(serialIds)];
+    if (distinct.length === 0) {
+      return new Map();
+    }
+    const rows = await tx
+      .selectDistinctOn([ledgerEvents.serialRef], {
+        serialRef: ledgerEvents.serialRef,
+        type: ledgerEvents.type,
+        warehouseId: ledgerEvents.warehouseId,
+        fromBinId: ledgerEvents.fromBinId,
+        toBinId: ledgerEvents.toBinId,
+        quantityDelta: ledgerEvents.quantityDelta,
+      })
+      .from(ledgerEvents)
+      .where(and(eq(ledgerEvents.tenantId, tenantId), inArray(ledgerEvents.serialRef, distinct)))
+      .orderBy(ledgerEvents.serialRef, desc(ledgerEvents.id));
+    const latest = new Map<string, SerialLatestEvent>();
+    for (const row of rows) {
+      if (row.serialRef === null) continue;
+      latest.set(row.serialRef, {
+        type: row.type,
+        warehouseId: row.warehouseId,
+        fromBinId: row.fromBinId,
+        toBinId: row.toBinId,
+        quantityDelta: Number(row.quantityDelta),
+      });
+    }
+    return latest;
   }
 
   /**
@@ -2078,7 +2137,9 @@ export class InventoryFacade {
         })
         .from(ledgerEvents)
         .where(and(eq(ledgerEvents.tenantId, tenantId), eq(ledgerEvents.serialRef, serialId)))
-        .orderBy(asc(ledgerEvents.seq));
+        // Story 2-6a (A2) — a serial's events span warehouses, whose `seq`s
+        // are independent: order by the event id (append order), never `seq`.
+        .orderBy(asc(ledgerEvents.id));
       return rows.map((row) => ({
         ...row,
         // Read model — base units at the edge (story 10.1).
@@ -2091,7 +2152,7 @@ export class InventoryFacade {
 
   /**
    * A serial's current location (Story 2.4): derived from its latest ledger
-   * event — the from/to bin of the highest-seq row, tenant-wide (a serial's
+   * event — the from/to bin of the latest row by event id (story 2-6a, A2), tenant-wide (a serial's
    * location can cross warehouses). One query; null when never moved. For a
    * serial in stock this is its bin; for a serial drawn out of stock it is
    * the last-known bin (the derived state, never a projection).
@@ -2106,7 +2167,8 @@ export class InventoryFacade {
         })
         .from(ledgerEvents)
         .where(and(eq(ledgerEvents.tenantId, tenantId), eq(ledgerEvents.serialRef, serialId)))
-        .orderBy(desc(ledgerEvents.seq))
+        // Story 2-6a (A2) — by event id, never the per-warehouse `seq`.
+        .orderBy(desc(ledgerEvents.id))
         .limit(1);
       const latest = rows[0];
       if (latest === undefined) {
@@ -2336,7 +2398,8 @@ export class InventoryFacade {
       .from(
         sql`(
           select serial_ref, batch_ref, to_bin_id,
-                 row_number() over (partition by serial_ref order by seq desc) as rn
+                 -- story 2-6a (A2): by event id, never the per-warehouse seq
+                 row_number() over (partition by serial_ref order by id desc) as rn
           from ledger_events
           where tenant_id = ${tenantId} and sku_id = ${skuId} and serial_ref is not null
         ) as latest`,

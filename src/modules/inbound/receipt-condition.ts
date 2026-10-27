@@ -66,3 +66,21 @@ export function lineConditionFields(line: {
 export function linePhotoFields(line: { readonly photoRefs?: readonly string[] | null | undefined }): { photoRefs?: string[] } {
   return Array.isArray(line.photoRefs) && line.photoRefs.length > 0 ? { photoRefs: [...line.photoRefs] } : {};
 }
+
+/**
+ * Story 2-6a — the serial keys a stored review row's line carries, each ONLY
+ * when non-empty / > 0, so a row without serials is byte-identical to its
+ * pre-2-6a shape (the `linePhotoFields` precedent). Used by the three
+ * review-row payload builders, so an Apply re-sends exactly these.
+ */
+export function lineSerialFields(line: {
+  readonly serials?: readonly string[] | null | undefined;
+  readonly unreadableSerialQty?: number | null | undefined;
+}): { serials?: string[]; unreadableSerialQty?: number } {
+  return {
+    ...(Array.isArray(line.serials) && line.serials.length > 0 ? { serials: [...line.serials] } : {}),
+    ...(typeof line.unreadableSerialQty === 'number' && line.unreadableSerialQty > 0
+      ? { unreadableSerialQty: line.unreadableSerialQty }
+      : {}),
+  };
+}

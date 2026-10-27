@@ -17,6 +17,7 @@ import {
 import { GOODS_SEGREGATION_RULES } from '../../shared/primitives/segregation';
 import type { HazardClass, SegregationPair } from '../../shared/primitives/hazard';
 import type { ImportMode } from './import.command';
+import type { SerialFormat } from '../../shared/primitives/serial';
 import { uomPrecision } from './uom';
 // The handling-unit seam lives in its own file (see the block inside the
 // class): these are re-exported so a consumer that already holds the facade
@@ -226,6 +227,12 @@ export interface SkuSummary {
    * only the server knows about never happens on the floor.
    */
   readonly catchWeightTracked: boolean;
+  /**
+   * Story 2-6a: the serial format (`free` | `imei`) — the device's offline
+   * serial gate (an `imei` SKU's capture accepts only a Luhn-valid 15-digit
+   * IMEI). Meaningful only while `serialTracked`. Tenth mirror of the arm.
+   */
+  readonly serialFormat: SerialFormat;
   /**
    * Story 11.7: the SKU's values on its product's declared variant axes
    * (`size: M, colour: Red`), null when the SKU is unattached. It rides the
@@ -669,6 +676,8 @@ export class CatalogFacade {
         batchTracked: skus.batchTracked,
         serialTracked: skus.serialTracked,
         catchWeightTracked: skus.catchWeightTracked,
+        // Story 2-6a — the device's offline serial gate.
+        serialFormat: skus.serialFormat,
         // Story 11.7: the variant identity rides the scan surface. The values
         // are already a `skus` column; the axes are the ATTACHED PRODUCT's, so
         // a left join — an unattached SKU carries null on both.
@@ -744,6 +753,7 @@ export class CatalogFacade {
       ...row,
       isKit: kitIds.has(row.id),
       status: row.status as SkuStatus,
+      serialFormat: row.serialFormat as SerialFormat,
       uomPrecision: uomPrecision(row.uom),
       packBarcodes: packBySku.get(row.id) ?? [],
       // Story 1-6a — the DG arm, null unless both halves are set (the
@@ -1152,43 +1162,128 @@ export class CatalogFacade {
 
   /**
    * Idempotent serial-identity creation — the `ensureSerials` twin of
-   * `ensureBatches` (404 unknown SKU, 400 non-serial-tracked SKU).
+   * `ensureBatches` (404 unknown SKU, 400 non-serial-tracked SKU). Story
+   * 2-6a: the body is `ensureSerialsInTx`; this wrapper opens its own
+   * transaction exactly as before.
    */
   async ensureSerials(
     tenantId: string,
     skuId: string,
     serialNumbers: readonly string[],
   ): Promise<SerialIdentity[]> {
-    return withTenantTransaction(this.db, tenantId, async (tx) => {
-      await this.assertSkuTracked(tx, tenantId, skuId, 'serialTracked', 'serial');
-      const numbers = [...new Set(serialNumbers)];
-      if (numbers.length > 0) {
-        await tx
-          .insert(serials)
-          .values(numbers.map((serialNumber) => ({ id: uuidv7(), tenantId, skuId, serialNumber })))
-          .onConflictDoNothing({
-            target: [serials.tenantId, serials.skuId, serials.serialNumber],
-          });
-      }
-      const rows =
-        numbers.length === 0
-          ? []
-          : await tx
-              .select({
-                id: serials.id,
-                serialNumber: serials.serialNumber,
-                status: serials.status,
-              })
-              .from(serials)
-              .where(
-                and(
-                  eq(serials.tenantId, tenantId),
-                  eq(serials.skuId, skuId),
-                  inArray(serials.serialNumber, numbers),
-                ),
-              );
-      return serialNumbers.map((serialNumber) => rows.find((row) => row.serialNumber === serialNumber)!);
-    });
+    return withTenantTransaction(this.db, tenantId, (tx) => this.ensureSerialsInTx(tx, tenantId, skuId, serialNumbers));
+  }
+
+  /**
+   * Story 2-6a — `ensureSerials` inside the CALLER's transaction (the
+   * `ensureBatchesInTx` shape): the receipt creates the identities of the
+   * serials it books in the same transaction as their ledger events, so a
+   * refused or rolled-back receipt creates none. Order-preserving; 404
+   * unknown SKU, 400 non-serial-tracked SKU.
+   */
+  async ensureSerialsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    skuId: string,
+    serialNumbers: readonly string[],
+  ): Promise<SerialIdentity[]> {
+    await this.assertSkuTracked(tx, tenantId, skuId, 'serialTracked', 'serial');
+    const numbers = [...new Set(serialNumbers)];
+    if (numbers.length > 0) {
+      await tx
+        .insert(serials)
+        .values(numbers.map((serialNumber) => ({ id: uuidv7(), tenantId, skuId, serialNumber })))
+        .onConflictDoNothing({
+          target: [serials.tenantId, serials.skuId, serials.serialNumber],
+        });
+    }
+    const rows =
+      numbers.length === 0
+        ? []
+        : await tx
+            .select({
+              id: serials.id,
+              serialNumber: serials.serialNumber,
+              status: serials.status,
+            })
+            .from(serials)
+            .where(
+              and(
+                eq(serials.tenantId, tenantId),
+                eq(serials.skuId, skuId),
+                inArray(serials.serialNumber, numbers),
+              ),
+            );
+    return serialNumbers.map((serialNumber) => rows.find((row) => row.serialNumber === serialNumber)!);
+  }
+
+  /**
+   * Story 2-6a (A7) — the serial identities carrying any of `numbers` under
+   * ANY of `skuIds` (the tenant's `imei` SKUs), in the caller's transaction:
+   * an IMEI is one physical handset whichever SKU it was received under, so
+   * the receipt's in-stock and pending checks cover them all. Rides
+   * `serials_tenant_sku_serial_unique` (`sku_id = ANY(…)`, the number). Only
+   * matches come back, with their SKU and its code.
+   */
+  async serialIdentitiesAcrossSkusInTx(
+    tx: TenantTx,
+    tenantId: string,
+    skuIds: readonly string[],
+    numbers: readonly string[],
+  ): Promise<readonly (SerialIdentity & { readonly skuId: string; readonly skuCode: string })[]> {
+    const skuSet = [...new Set(skuIds)];
+    const numberSet = [...new Set(numbers)];
+    if (skuSet.length === 0 || numberSet.length === 0) {
+      return [];
+    }
+    return tx
+      .select({
+        id: serials.id,
+        serialNumber: serials.serialNumber,
+        status: serials.status,
+        skuId: serials.skuId,
+        skuCode: skus.code,
+      })
+      .from(serials)
+      .innerJoin(skus, and(eq(skus.tenantId, serials.tenantId), eq(skus.id, serials.skuId)))
+      .where(
+        and(
+          eq(serials.tenantId, tenantId),
+          inArray(serials.skuId, skuSet),
+          inArray(serials.serialNumber, numberSet),
+        ),
+      )
+      .orderBy(serials.serialNumber, serials.skuId);
+  }
+
+  /**
+   * Story 2-6a — the tenant's `imei`-format serial-tracked SKUs (ids), in the
+   * caller's transaction: the scope of A7's cross-SKU IMEI check.
+   */
+  async imeiSkuIdsInTx(tx: TenantTx, tenantId: string): Promise<readonly string[]> {
+    const rows = await tx
+      .select({ id: skus.id })
+      .from(skus)
+      .where(and(eq(skus.tenantId, tenantId), eq(skus.serialTracked, true), eq(skus.serialFormat, 'imei')))
+      .orderBy(skus.id);
+    return rows.map((row) => row.id);
+  }
+
+  /**
+   * Story 2-6a — serial numbers by catalog id (id → number), in the caller's
+   * transaction: the reads that hold ledger `serial_ref`s and must speak the
+   * number printed on the unit. An unknown id is absent.
+   */
+  async serialNumbersByIdsInTx(tx: TenantTx, tenantId: string, ids: readonly string[]): Promise<ReadonlyMap<string, string>> {
+    const distinct = [...new Set(ids)];
+    if (distinct.length === 0) {
+      return new Map();
+    }
+    const rows = await tx
+      .select({ id: serials.id, serialNumber: serials.serialNumber })
+      .from(serials)
+      .where(and(eq(serials.tenantId, tenantId), inArray(serials.id, distinct)));
+    return new Map(rows.map((row) => [row.id, row.serialNumber]));
   }
 
   // ── kits (Story 11.4 — the composition seam) ──────────────────────────────

@@ -263,6 +263,9 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'licence.enforcement_enabled', targetType: 'licence_policy' },
   { action: 'licence.enforcement_disabled', targetType: 'licence_policy' },
   { action: 'goods_receipt.licence_waived', targetType: 'goods_receipt' },
+  // Story 2-6a (A6) — a serial received again after its write-off: one row
+  // per receipt (the operator) or approved excess (the approver), on the GRN.
+  { action: 'goods_receipt.serial_re_received', targetType: 'goods_receipt' },
   // Story 2-3a — the gate-in (`GateInCommand`). An unload that fills nothing
   // is a declared no-op (`gateIns.unload:already-recorded` — the key is
   // stored, nothing audited); an end with no start audits only

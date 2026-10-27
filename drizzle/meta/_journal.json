@@ -673,6 +673,13 @@
       "when": 1793034925213,
       "tag": "0095_attachments",
       "breakpoints": true
+    },
+    {
+      "idx": 96,
+      "version": "7",
+      "when": 1793054656006,
+      "tag": "0096_serial_capture_at_receipt",
+      "breakpoints": true
     }
   ]
 }

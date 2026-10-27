@@ -231,6 +231,14 @@ export class PutawayTaskDto {
 
   @ApiProperty({ description: 'The one-line capacity-only rationale' })
   rationale!: string;
+
+  @ApiProperty({
+    required: false,
+    type: [String],
+    description:
+      "Story 2-6a — present only on a SERIAL-TRACKED task: the GRN line's booked serial numbers still in the Receiving bin, in capture order (qty is their count). The handheld verifies each scan against this list offline; a serial task without it (an older server, a legacy anonymous line) cannot be placed from the handheld",
+  })
+  serialNumbers?: readonly string[];
 }
 
 export class PutawayTaskListQuery {
