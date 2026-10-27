@@ -701,6 +701,13 @@
       "when": 1793082443271,
       "tag": "0099_contract_billing",
       "breakpoints": true
+    },
+    {
+      "idx": 100,
+      "version": "7",
+      "when": 1793123120613,
+      "tag": "0100_client_webhooks",
+      "breakpoints": true
     }
   ]
 }

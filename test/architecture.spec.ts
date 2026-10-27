@@ -3465,3 +3465,101 @@ describe('architecture: the gate-in is inbound-owned (story 2-3a)', () => {
     expect(command).toMatch(/payload:\s*\{\s*\.\.\.\(effect\.extra \?\? \{\}\),\s*gateIn:\s*outboxGateIn\(effect\.gateIn\)\s*\}/);
   });
 });
+
+describe('architecture: the client-webhooks module (story 5-2a)', () => {
+  const root = join(SRC_ROOT, 'modules', 'client-webhooks');
+  const moduleFiles = files.filter((file) => file.path.startsWith(root) && !file.path.endsWith('.spec.ts'));
+  const TABLES = ['webhookEndpoints', 'webhookEvents', 'webhookDeliveries'] as const;
+  const RAW_WRITE = /\b(insert into|update|delete from)\s+webhook_(endpoints|events|deliveries)\b/i;
+  const HTTP = join(root, 'webhook-http.ts');
+  const ENQUEUE = join(root, 'webhook.enqueue.ts');
+  const SENDER = join(root, 'webhook.sender.ts');
+  const SECRETS = join(root, 'webhook-secrets.ts');
+  const SOCKET_IMPORT = /from\s+['"](?:node:)?(?:https?|tls|dns(?:\/promises)?|undici)['"]|\bfetch\(/;
+
+  it('the detectors bite', () => {
+    expect(moduleFiles.length).toBeGreaterThanOrEqual(10);
+    expect(drizzleWriteOn('webhookDeliveries').test(readFileSync(SENDER, 'utf8'))).toBe(true);
+    expect(RAW_WRITE.test(readFileSync(SENDER, 'utf8'))).toBe(true);
+    expect(SOCKET_IMPORT.test(readFileSync(HTTP, 'utf8'))).toBe(true);
+    expect(SOCKET_IMPORT.test("import https from 'node:https';")).toBe(true);
+    expect(SOCKET_IMPORT.test('await fetch(url)')).toBe(true);
+  });
+
+  it('only src/modules/client-webhooks writes webhook_endpoints, webhook_events and webhook_deliveries', () => {
+    const offenders = files
+      .filter((file) => !file.path.startsWith(root))
+      .filter((file) => TABLES.some((table) => drizzleWriteOn(table).test(file.source)) || RAW_WRITE.test(file.source))
+      .map((file) => file.path);
+    expect(offenders).toEqual([]);
+  });
+
+  it('webhook-http.ts is the ONLY file in the module that opens a socket; the enqueue imports no network module, the sender does (A11, decision 11)', () => {
+    expect(moduleFiles.filter((file) => file.path !== HTTP && SOCKET_IMPORT.test(file.source)).map((file) => file.path)).toEqual([]);
+    const enqueue = readFileSync(ENQUEUE, 'utf8');
+    expect(SOCKET_IMPORT.test(enqueue)).toBe(false);
+    expect(/webhook-http|node:net/.test(enqueue)).toBe(false);
+    expect(readFileSync(SENDER, 'utf8')).toMatch(/from '\.\/webhook-http'/);
+  });
+
+  it('the transport’s test-only address exemption is named nowhere else in src', () => {
+    expect(files.filter((file) => file.path !== HTTP && !file.path.endsWith('.spec.ts') && file.source.includes('trustedTestAddresses')).map((file) => file.path)).toEqual([]);
+  });
+
+  it('it imports siblings only through their facades and exported …InTx functions', () => {
+    const ALLOWED = new Set([
+      '../clients/clients.facade',
+      '../tenancy/tenancy.service',
+      '../tenancy/permissions',
+      '../tenancy/idempotency-guard',
+      '../tenancy/registration.command',
+      '../outbound/outbound.facade',
+      '../catalog/catalog.facade',
+      '../inbound/inbound.facade',
+      '../outbound/outbound.module',
+      '../catalog/catalog.module',
+      '../inbound/inbound.module',
+    ]);
+    const offenders: string[] = [];
+    for (const file of moduleFiles) {
+      for (const match of file.source.matchAll(/from\s+['"](\.\.\/[a-z-]+\/[^'"]+)['"]/g)) {
+        if (!ALLOWED.has(match[1]!)) offenders.push(`${file.path}: ${match[1]}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+    // Meaningful: the enqueue does read three facades.
+    expect(readFileSync(ENQUEUE, 'utf8')).toMatch(/from '\.\.\/outbound\/outbound\.facade'/);
+  });
+
+  it('WEBHOOK_SEAL_KEY is named only in webhook-secrets.ts and read only through seal.ts', () => {
+    const DIRECT_READ = /\benv(?:\.|\[\s*['"`])WEBHOOK_SEAL_KEY/;
+    const NAMED = /['"]WEBHOOK_SEAL_KEY(?:_PREVIOUS)?['"]/;
+    const source = files.filter((file) => !file.path.endsWith('.spec.ts'));
+    expect(source.filter((file) => DIRECT_READ.test(file.source)).map((file) => file.path)).toEqual([]);
+    expect(source.filter((file) => NAMED.test(file.source)).map((file) => file.path)).toEqual([SECRETS]);
+    expect(readFileSync(SECRETS, 'utf8')).toContain("env: 'WEBHOOK_SEAL_KEY'");
+    expect(/['"]WEBHOOK_SEAL_KEY/.test(readFileSync(join(SRC_ROOT, 'shared', 'crypto', 'seal.ts'), 'utf8'))).toBe(false);
+  });
+
+  it('A25: only the webhook enqueue subscribes to the bus in onApplicationBootstrap; every other subscriber in onModuleInit', () => {
+    const subscribers = files.filter((file) => /eventBus\.subscribe\(/.test(file.source) && !file.path.endsWith('.spec.ts'));
+    expect(subscribers.length).toBeGreaterThanOrEqual(7);
+    expect(subscribers.filter((file) => /onApplicationBootstrap\(\)/.test(file.source)).map((file) => file.path)).toEqual([ENQUEUE]);
+    expect(subscribers.filter((file) => file.path !== ENQUEUE && !/onModuleInit\(\)/.test(file.source)).map((file) => file.path)).toEqual([]);
+  });
+
+  it('the boot check runs in main.ts before createApp', () => {
+    const main = readFileSync(join(SRC_ROOT, 'main.ts'), 'utf8');
+    const check = main.indexOf('assertWebhooksConfigured()');
+    expect(check).toBeGreaterThan(-1);
+    expect(check).toBeLessThan(main.indexOf('await createApp('));
+  });
+
+  it('the controller is the module’s only HTTP surface and is never a portal route', () => {
+    const portal = readFileSync(join(SRC_ROOT, 'api', 'portal.controller.ts'), 'utf8');
+    expect(/ClientWebhooks/.test(portal)).toBe(false);
+    const controller = readFileSync(join(SRC_ROOT, 'api', 'client-webhooks.controller.ts'), 'utf8');
+    expect(controller).toContain('TenantSessionGuard');
+    expect(controller).not.toContain('PortalSessionGuard');
+  });
+});

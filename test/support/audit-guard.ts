@@ -118,6 +118,9 @@ export const AUDIT_NO_OP_ARMS = {
     Array.isArray(snapshot.created) &&
     snapshot.created.length === 0 &&
     Array.isArray(snapshot.skipped),
+  /** Story 5-2a — `ClientWebhooksCommand.update` with nothing changed (stores the key with `{ endpoint, signingSecret: null }`). */
+  'clientWebhooks.update:unchanged': (snapshot: unknown) =>
+    isRecord(snapshot) && sameKeys(snapshot, ['endpoint', 'signingSecret']) && snapshot.signingSecret === null && isRecord(snapshot.endpoint),
   /** Story 6-1b — `SecondFactorCommand.reset` of a user with no two-factor sign-in and no enrolment code. */
   'users.resetSecondFactor:not-enrolled': (snapshot: unknown) =>
     isRecord(snapshot) &&

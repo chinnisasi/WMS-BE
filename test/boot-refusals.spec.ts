@@ -49,7 +49,7 @@ describe('boot refusals exit 78 (story 6-2c, A18)', () => {
     });
 
     it('a production API with a job switched on refuses; 0, unset, dev, WMS_API_RUNS_JOBS=1 and the worker role do not', () => {
-      expect(JOB_POLL_VARIABLES).toHaveLength(15);
+      expect(JOB_POLL_VARIABLES).toHaveLength(16); // 5-2a added WEBHOOK_SEND_POLL_MS
       const prod = { NODE_ENV: 'production' };
       expect(() => assertApiRunsNoJobs('api', { ...prod, OUTBOX_RELAY_POLL_MS: '2000' })).toThrow(/OUTBOX_RELAY_POLL_MS/);
       expect(() => assertApiRunsNoJobs('api', { ...prod, SESSION_PURGE_POLL_MS: 'x' })).toThrow(ConfigRefusal); // non-zero, if malformed

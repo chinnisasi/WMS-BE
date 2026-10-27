@@ -24584,6 +24584,7 @@
                 "warehouse",
                 "wave",
                 "wave_policy",
+                "webhook_endpoint",
                 "zone",
                 "vendor"
               ]
@@ -26554,6 +26555,1311 @@
         "summary": "Removes a client contact (owner-only, clients.manage). The primary cannot be removed while other contacts remain",
         "tags": [
           "clients"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/clients/{clientId}/webhook-endpoints": {
+      "get": {
+        "operationId": "ClientWebhooksController_list",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookEndpointListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed clientId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), a client-portal session, or the caller lacks clients.manage — owner only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists a client's webhook endpoints, oldest first (owner-only, clients.manage). Never shows a signing secret — only its last four characters",
+        "tags": [
+          "client-webhooks"
+        ]
+      },
+      "post": {
+        "operationId": "ClientWebhooksController_create",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWebhookEndpointDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The endpoint and its one-time signing secret",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookEndpointResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed clientId, a URL that breaks a rule (scheme, userinfo, fragment, host, port, length — named), an unknown or repeated event type, a description over 200 characters, or the warehouse’s own client (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), a client-portal session, or the caller lacks clients.manage — owner only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The client already has 5 endpoints (webhook-endpoint-limit), another of its endpoints has this URL (duplicate-webhook-url), the client has departed (client-departed), WEBHOOK_SEAL_KEY is not configured (webhooks-unavailable), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Adds a webhook endpoint for a client (owner-only, clients.manage). The answer carries the signing secret ONCE (`signingSecret`); a replay answers null — rotate to get a new one. At most 5 endpoints per client",
+        "tags": [
+          "client-webhooks"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/clients/{clientId}/webhook-endpoints/{endpointId}": {
+      "patch": {
+        "operationId": "ClientWebhooksController_update",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpointId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateWebhookEndpointDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookEndpointResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed id, a URL or event type that breaks its rule, or `held` without `status: active` (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), a client-portal session, or the caller lacks clients.manage — owner only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id, or no live webhook endpoint with this id for this client (not-found — another client’s endpoint is the same 404)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Another endpoint of the client has this URL (duplicate-webhook-url), re-enabling with held deliveries and no `held` decision (held-decision-required, `heldCount`), re-enabling for a departed client (client-departed), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Edits a webhook endpoint (owner-only, clients.manage): an absent field is unchanged. `status: disabled` disables it by hand (its pending and held deliveries fail); `status: active` re-enables it — with `held: release | discard` when it holds deliveries. A new URL resets the failure counters. An unchanged edit is a no-op (nothing written or audited; the key is stored)",
+        "tags": [
+          "client-webhooks"
+        ]
+      },
+      "delete": {
+        "operationId": "ClientWebhooksController_remove",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpointId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookEndpointResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed id (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), a client-portal session, or the caller lacks clients.manage — owner only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id, or no live webhook endpoint with this id for this client (not-found — another client’s endpoint is the same 404)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Deletes a webhook endpoint (owner-only, clients.manage). Soft: it stops sending at once, its pending and held deliveries fail, and its delivery log stays readable for 30 days",
+        "tags": [
+          "client-webhooks"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/clients/{clientId}/webhook-endpoints/{endpointId}/rotate-secret": {
+      "post": {
+        "operationId": "ClientWebhooksController_rotateSecret",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpointId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RotateWebhookSecretDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookEndpointResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed id (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), a client-portal session, or the caller lacks clients.manage — owner only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id, or no live webhook endpoint with this id for this client (not-found — another client’s endpoint is the same 404)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "WEBHOOK_SEAL_KEY is not configured (webhooks-unavailable), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Rotates the signing secret (owner-only, clients.manage). The answer carries the new secret ONCE. The old secret keeps signing beside it for 24 hours (`revokePrevious: true` ends it now); a second rotation inside that window drops the oldest",
+        "tags": [
+          "client-webhooks"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/clients/{clientId}/webhook-endpoints/{endpointId}/test": {
+      "post": {
+        "operationId": "ClientWebhooksController_test",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpointId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookTestResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed id (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), a client-portal session, or the caller lacks clients.manage — owner only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id, or no live webhook endpoint with this id for this client (not-found — another client’s endpoint is the same 404)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Sending is off on this server — WEBHOOK_GATEWAY=off (webhooks-unavailable), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "More than 10 test sends and redeliveries this minute on this endpoint (rate-limited; `retryAfterSeconds`)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Sends one signed `webhook.test` event to the endpoint now and answers the outcome (owner-only, clients.manage). Allowed while the endpoint is disabled; stores no delivery and never moves the failure counters. At most 10 test sends and redeliveries a minute per endpoint",
+        "tags": [
+          "client-webhooks"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/clients/{clientId}/webhook-endpoints/{endpointId}/deliveries": {
+      "get": {
+        "operationId": "ClientWebhooksController_deliveries",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpointId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "The previous page’s nextCursor",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50,
+              "type": "number"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "sending",
+                "held",
+                "succeeded",
+                "failed"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookDeliveryListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed id, cursor, limit or status (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), a client-portal session, or the caller lacks clients.manage — owner only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client, or no endpoint with this id for this client (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists an endpoint's deliveries, newest first (owner-only, clients.manage). A deleted endpoint's log stays readable for 30 days",
+        "tags": [
+          "client-webhooks"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/clients/{clientId}/webhook-endpoints/{endpointId}/deliveries/redeliver": {
+      "post": {
+        "operationId": "ClientWebhooksController_bulkRedeliver",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpointId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkRedeliverWebhooksDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookBulkRedeliverResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed id, `since` not an instant with a zone, or an unknown status (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), a client-portal session, or the caller lacks clients.manage — owner only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id, or no live webhook endpoint with this id for this client (not-found — another client’s endpoint is the same 404)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The endpoint is not active (webhook-endpoint-disabled), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "More than 10 test sends and redeliveries this minute on this endpoint (rate-limited; `retryAfterSeconds`)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Redelivers every failed delivery (or only the expired ones) created since `since` — at most 1000 a call, oldest first; call again while `remaining` > 0 (owner-only, clients.manage). Refused on an endpoint that is not active",
+        "tags": [
+          "client-webhooks"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/clients/{clientId}/webhook-endpoints/{endpointId}/deliveries/{deliveryId}": {
+      "get": {
+        "operationId": "ClientWebhooksController_delivery",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpointId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "deliveryId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookDeliveryDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed id (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), a client-portal session, or the caller lacks clients.manage — owner only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client, endpoint or delivery with this id (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "The delivery is older than 30 days and was purged (delivery-purged)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One delivery with the exact body every attempt sends (owner-only, clients.manage)",
+        "tags": [
+          "client-webhooks"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/clients/{clientId}/webhook-endpoints/{endpointId}/deliveries/{deliveryId}/redeliver": {
+      "post": {
+        "operationId": "ClientWebhooksController_redeliver",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpointId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "deliveryId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookRedeliverResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed id (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), a client-portal session, or the caller lacks clients.manage — owner only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client, live endpoint or delivery with this id (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The delivery is still pending, sending or held (delivery-in-progress), the endpoint is not active (webhook-endpoint-disabled), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "The delivery is older than 30 days and was purged (delivery-purged)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "More than 10 test sends and redeliveries this minute on this endpoint (rate-limited; `retryAfterSeconds`)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Redelivers one failed or succeeded delivery: the same bytes and `webhook-id`, a fresh timestamp and signature, a fresh retry schedule (owner-only, clients.manage). Refused on an endpoint that is not active",
+        "tags": [
+          "client-webhooks"
         ]
       }
     },
@@ -54858,6 +56164,7 @@
               "warehouse",
               "wave",
               "wave_policy",
+              "webhook_endpoint",
               "zone",
               "vendor"
             ],
@@ -54958,6 +56265,7 @@
               "warehouse",
               "wave",
               "wave_policy",
+              "webhook_endpoint",
               "zone",
               "vendor"
             ],
@@ -55800,6 +57108,701 @@
             "description": "true makes this the primary contact (the previous primary is cleared). false is refused — make another contact primary instead"
           }
         }
+      },
+      "WebhookEndpointListEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "url": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "eventTypes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "receipt.recorded",
+                "order.dispatched"
+              ]
+            }
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "disabled",
+              "deleted"
+            ]
+          },
+          "disabledReason": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "manual",
+              "failing",
+              "gone",
+              "client-departed",
+              null
+            ],
+            "description": "`manual` — by staff; `failing` — ten final failures over 24 h (deliveries held); `gone` — the receiver answered 410; `client-departed`"
+          },
+          "disabledAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time"
+          },
+          "schemaVersion": {
+            "type": "number",
+            "enum": [
+              1
+            ]
+          },
+          "secretHint": {
+            "type": "string",
+            "description": "The signing secret’s last four characters (the secret itself is shown once)"
+          },
+          "previousSecretExpiresAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the previous secret stops signing (a rotation’s overlap)"
+          },
+          "consecutiveFailures": {
+            "type": "number",
+            "description": "Consecutive FINAL delivery failures (reset by any success)"
+          },
+          "failingSince": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time"
+          },
+          "lastSuccessAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "heldCount": {
+            "type": "number",
+            "description": "Deliveries held while the endpoint was failing"
+          }
+        },
+        "required": [
+          "id",
+          "clientId",
+          "url",
+          "description",
+          "eventTypes",
+          "status",
+          "disabledReason",
+          "disabledAt",
+          "schemaVersion",
+          "secretHint",
+          "previousSecretExpiresAt",
+          "consecutiveFailures",
+          "failingSince",
+          "lastSuccessAt",
+          "createdAt",
+          "updatedAt",
+          "heldCount"
+        ]
+      },
+      "WebhookEndpointListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "description": "Oldest first; deleted endpoints are not listed",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WebhookEndpointListEntryDto"
+            }
+          },
+          "warnings": {
+            "type": "array",
+            "description": "`webhooks-unavailable` — sending is off on this server (deliveries are paused)",
+            "items": {
+              "type": "string",
+              "enum": [
+                "webhooks-unavailable"
+              ]
+            }
+          }
+        },
+        "required": [
+          "items",
+          "warnings"
+        ]
+      },
+      "CreateWebhookEndpointDto": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "example": "https://hooks.acme.example/wms",
+            "maxLength": 2048,
+            "description": "An https URL with a public DNS host (no IP literal, no localhost / .local / .internal / .home.arpa), port 443 or 1024–65535, no user name or #fragment. Stored normalised (lower-case host, default port dropped)"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200,
+            "description": "What the endpoint is for (blank for none)"
+          },
+          "eventTypes": {
+            "type": "array",
+            "description": "The event types it receives — at least one, none twice",
+            "items": {
+              "type": "string",
+              "enum": [
+                "receipt.recorded",
+                "order.dispatched"
+              ]
+            }
+          }
+        },
+        "required": [
+          "url",
+          "eventTypes"
+        ]
+      },
+      "WebhookEndpointDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "url": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "eventTypes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "receipt.recorded",
+                "order.dispatched"
+              ]
+            }
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "disabled",
+              "deleted"
+            ]
+          },
+          "disabledReason": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "manual",
+              "failing",
+              "gone",
+              "client-departed",
+              null
+            ],
+            "description": "`manual` — by staff; `failing` — ten final failures over 24 h (deliveries held); `gone` — the receiver answered 410; `client-departed`"
+          },
+          "disabledAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time"
+          },
+          "schemaVersion": {
+            "type": "number",
+            "enum": [
+              1
+            ]
+          },
+          "secretHint": {
+            "type": "string",
+            "description": "The signing secret’s last four characters (the secret itself is shown once)"
+          },
+          "previousSecretExpiresAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the previous secret stops signing (a rotation’s overlap)"
+          },
+          "consecutiveFailures": {
+            "type": "number",
+            "description": "Consecutive FINAL delivery failures (reset by any success)"
+          },
+          "failingSince": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time"
+          },
+          "lastSuccessAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "clientId",
+          "url",
+          "description",
+          "eventTypes",
+          "status",
+          "disabledReason",
+          "disabledAt",
+          "schemaVersion",
+          "secretHint",
+          "previousSecretExpiresAt",
+          "consecutiveFailures",
+          "failingSince",
+          "lastSuccessAt",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "WebhookEndpointResponse": {
+        "type": "object",
+        "properties": {
+          "endpoint": {
+            "$ref": "#/components/schemas/WebhookEndpointDto"
+          },
+          "signingSecret": {
+            "type": "string",
+            "nullable": true,
+            "description": "The raw `whsec_…` signing secret — ONLY in the response to a fresh create or rotate; null on every replay and every other write. It is never shown again: rotate to get a new one"
+          },
+          "heldReleased": {
+            "type": "number",
+            "description": "A re-enable: the held deliveries released to send"
+          },
+          "heldDiscarded": {
+            "type": "number",
+            "description": "A re-enable: the held deliveries discarded"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "webhooks-unavailable"
+              ]
+            }
+          }
+        },
+        "required": [
+          "endpoint",
+          "signingSecret",
+          "warnings"
+        ]
+      },
+      "UpdateWebhookEndpointDto": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "maxLength": 2048,
+            "description": "A new URL (the same rules as on create); resets the failure counters"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200
+          },
+          "eventTypes": {
+            "type": "array",
+            "description": "Narrowing fails the dropped types’ pending and held deliveries (`unsubscribed`)",
+            "items": {
+              "type": "string",
+              "enum": [
+                "receipt.recorded",
+                "order.dispatched"
+              ]
+            }
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "disabled"
+            ],
+            "description": "`disabled` — by staff (its pending and held deliveries fail); `active` — re-enable (counters cleared)"
+          },
+          "held": {
+            "type": "string",
+            "enum": [
+              "release",
+              "discard"
+            ],
+            "description": "Required when re-enabling an endpoint that holds deliveries: `release` sends them, `discard` fails them"
+          }
+        }
+      },
+      "RotateWebhookSecretDto": {
+        "type": "object",
+        "properties": {
+          "revokePrevious": {
+            "type": "boolean",
+            "description": "true — the old secret stops signing now (no 24-hour overlap)"
+          }
+        }
+      },
+      "WebhookTestResultDto": {
+        "type": "object",
+        "properties": {
+          "statusCode": {
+            "type": "number",
+            "nullable": true,
+            "description": "The receiver’s HTTP status; null when no response came back"
+          },
+          "errorCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "null on a 2xx; else `http-<status>`, or `network`, `timeout`, `dns-failed`, `tls-handshake`, `tls-cert`, `target-blocked`, `secret-unavailable`"
+          },
+          "durationMs": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "statusCode",
+          "errorCode",
+          "durationMs"
+        ]
+      },
+      "WebhookTestResponse": {
+        "type": "object",
+        "properties": {
+          "test": {
+            "$ref": "#/components/schemas/WebhookTestResultDto"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "webhooks-unavailable"
+              ]
+            }
+          }
+        },
+        "required": [
+          "test",
+          "warnings"
+        ]
+      },
+      "WebhookDeliveryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "endpointId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "eventId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The webhook event id — the `webhook-id` header and the body’s `id`"
+          },
+          "eventType": {
+            "type": "string",
+            "enum": [
+              "receipt.recorded",
+              "order.dispatched"
+            ]
+          },
+          "subjectId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The receipt (GRN) id or the order id"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "sending",
+              "held",
+              "succeeded",
+              "failed"
+            ]
+          },
+          "attempts": {
+            "type": "number"
+          },
+          "nextAttemptAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "A pending delivery’s next try"
+          },
+          "lastAttemptAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time"
+          },
+          "lastStatusCode": {
+            "type": "number",
+            "nullable": true
+          },
+          "lastErrorCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "A bounded code (`http-500`, `timeout`, `expired`, …) — never a message"
+          },
+          "lastDurationMs": {
+            "type": "number",
+            "nullable": true
+          },
+          "succeededAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time"
+          },
+          "redeliveryCount": {
+            "type": "number"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "endpointId",
+          "eventId",
+          "eventType",
+          "subjectId",
+          "status",
+          "attempts",
+          "nextAttemptAt",
+          "lastAttemptAt",
+          "lastStatusCode",
+          "lastErrorCode",
+          "lastDurationMs",
+          "succeededAt",
+          "redeliveryCount",
+          "createdAt"
+        ]
+      },
+      "WebhookDeliveryListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "description": "Newest first",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WebhookDeliveryDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "BulkRedeliverWebhooksDto": {
+        "type": "object",
+        "properties": {
+          "since": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Deliveries created at or after this instant"
+          },
+          "statuses": {
+            "type": "array",
+            "description": "`failed` — every failed delivery (the default); `expired` — only those that expired undelivered",
+            "items": {
+              "type": "string",
+              "enum": [
+                "failed",
+                "expired"
+              ]
+            }
+          }
+        },
+        "required": [
+          "since"
+        ]
+      },
+      "WebhookBulkRedeliverResponse": {
+        "type": "object",
+        "properties": {
+          "redelivered": {
+            "type": "number",
+            "description": "Deliveries put back to pending (at most 1000)"
+          },
+          "remaining": {
+            "type": "number",
+            "description": "Matching failed deliveries still left — call again to continue"
+          }
+        },
+        "required": [
+          "redelivered",
+          "remaining"
+        ]
+      },
+      "WebhookDeliveryDetailDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "endpointId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "eventId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The webhook event id — the `webhook-id` header and the body’s `id`"
+          },
+          "eventType": {
+            "type": "string",
+            "enum": [
+              "receipt.recorded",
+              "order.dispatched"
+            ]
+          },
+          "subjectId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The receipt (GRN) id or the order id"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "sending",
+              "held",
+              "succeeded",
+              "failed"
+            ]
+          },
+          "attempts": {
+            "type": "number"
+          },
+          "nextAttemptAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "A pending delivery’s next try"
+          },
+          "lastAttemptAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time"
+          },
+          "lastStatusCode": {
+            "type": "number",
+            "nullable": true
+          },
+          "lastErrorCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "A bounded code (`http-500`, `timeout`, `expired`, …) — never a message"
+          },
+          "lastDurationMs": {
+            "type": "number",
+            "nullable": true
+          },
+          "succeededAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time"
+          },
+          "redeliveryCount": {
+            "type": "number"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "body": {
+            "type": "string",
+            "description": "The exact JSON body every attempt sends"
+          }
+        },
+        "required": [
+          "id",
+          "endpointId",
+          "eventId",
+          "eventType",
+          "subjectId",
+          "status",
+          "attempts",
+          "nextAttemptAt",
+          "lastAttemptAt",
+          "lastStatusCode",
+          "lastErrorCode",
+          "lastDurationMs",
+          "succeededAt",
+          "redeliveryCount",
+          "createdAt",
+          "body"
+        ]
+      },
+      "WebhookDeliveryDetailResponse": {
+        "type": "object",
+        "properties": {
+          "delivery": {
+            "$ref": "#/components/schemas/WebhookDeliveryDetailDto"
+          }
+        },
+        "required": [
+          "delivery"
+        ]
+      },
+      "WebhookRedeliverResponse": {
+        "type": "object",
+        "properties": {
+          "delivery": {
+            "$ref": "#/components/schemas/WebhookDeliveryDto"
+          }
+        },
+        "required": [
+          "delivery"
+        ]
       },
       "PartnerLinkDto": {
         "type": "object",
@@ -62424,6 +64427,97 @@
           "resolution"
         ]
       },
+      "WebhookDisabledSummaryDto": {
+        "type": "object",
+        "properties": {
+          "endpointId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "host": {
+            "type": "string",
+            "description": "The endpoint URL’s host only"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "failing",
+              "gone"
+            ],
+            "description": "`failing` — ten final failures over 24 hours; `gone` — the receiver answered 410"
+          }
+        },
+        "required": [
+          "endpointId",
+          "clientId",
+          "host",
+          "reason"
+        ]
+      },
+      "WebhookDisabledNotificationDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sourceId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The source occurrence’s own id (the pending adjustment, the over-receipt, the episode…)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The warehouse the source belongs to; null for a device op or a channel"
+          },
+          "raisedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the source raised it (the list orders by this, newest first)"
+          },
+          "resolvedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the source cleared; null while open"
+          },
+          "sourceType": {
+            "type": "string",
+            "enum": [
+              "webhook-disabled"
+            ]
+          },
+          "summary": {
+            "$ref": "#/components/schemas/WebhookDisabledSummaryDto"
+          },
+          "resolution": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "re-enabled",
+              "deleted",
+              "manually-disabled",
+              null
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "sourceId",
+          "warehouseId",
+          "raisedAt",
+          "resolvedAt",
+          "sourceType",
+          "summary",
+          "resolution"
+        ]
+      },
       "NotificationListResponse": {
         "type": "object",
         "properties": {
@@ -62467,6 +64561,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/LicenceExpiryNotificationDto"
+                },
+                {
+                  "$ref": "#/components/schemas/WebhookDisabledNotificationDto"
                 }
               ],
               "discriminator": {
@@ -62483,7 +64580,8 @@
                   "audit-export": "#/components/schemas/AuditExportNotificationDto",
                   "ledger-chain-break": "#/components/schemas/LedgerChainBreakNotificationDto",
                   "qc-receipt": "#/components/schemas/QcReceiptNotificationDto",
-                  "licence-expiry": "#/components/schemas/LicenceExpiryNotificationDto"
+                  "licence-expiry": "#/components/schemas/LicenceExpiryNotificationDto",
+                  "webhook-disabled": "#/components/schemas/WebhookDisabledNotificationDto"
                 }
               }
             }

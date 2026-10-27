@@ -20,6 +20,7 @@ import { ReplenishmentModule } from './modules/replenishment/replenishment.modul
 import { ReportingModule } from './modules/reporting/reporting.module';
 import { ReturnsModule } from './modules/returns/returns.module';
 import { TenancyModule } from './modules/tenancy/tenancy.module';
+import { ClientWebhooksModule } from './modules/client-webhooks/client-webhooks.module';
 import { JobsModule } from './jobs/jobs.module';
 
 /**
@@ -56,6 +57,8 @@ import { JobsModule } from './jobs/jobs.module';
     ReportingModule,
     // Story 13-1 — return authorizations (Epic 13's first module).
     ReturnsModule,
+    // Story 5-2a — client webhooks (the queue, the sender, the staff surface).
+    ClientWebhooksModule,
     JobsModule,
     ApiModule,
   ],

@@ -598,6 +598,38 @@ export class InboundFacade {
   }
 
   /**
+   * Story 5-2a (shared with 5-2b, decision 2) — PO id → code, in the
+   * caller's transaction (a client-facing receipt names its PO by code). An
+   * id with no PO row is absent from the map. Read-only.
+   */
+  async poCodesByIdsInTx(tx: TenantTx, tenantId: string, poIds: readonly string[]): Promise<Map<string, string>> {
+    const ids = [...new Set(poIds)].filter((id) => UUID_RE.test(id));
+    if (ids.length === 0) return new Map();
+    const rows = (await tx.execute(sql`
+      select po.id::text as "id", po.code as "code" from purchase_orders po
+      where po.tenant_id = ${tenantId}::uuid and po.id = any(${sql.param(ids)}::uuid[])
+    `)) as unknown as { id: string; code: string }[];
+    return new Map(rows.map((row) => [row.id, row.code]));
+  }
+
+  /**
+   * Story 5-2a (A24) — the lines of one GRN that QC on receipt placed on a
+   * hold: a `qc_holds` row of `kind = 'receipt'` naming the line (any status
+   * — the flag says the line went to QC, not that it is still there). The
+   * GRN snapshot carries only the count. Read-only.
+   */
+  async receiptQcHeldLineIdsInTx(tx: TenantTx, tenantId: string, grnId: string): Promise<Set<string>> {
+    if (!UUID_RE.test(grnId)) return new Set();
+    const rows = (await tx.execute(sql`
+      select distinct h.grn_line_id::text as "id"
+      from qc_holds h
+      join goods_receipt_lines l on l.tenant_id = h.tenant_id and l.id = h.grn_line_id
+      where h.tenant_id = ${tenantId}::uuid and h.kind = 'receipt' and l.grn_id = ${grnId}::uuid
+    `)) as unknown as { id: string }[];
+    return new Set(rows.map((row) => row.id));
+  }
+
+  /**
    * Story 21-4 — the `per_receipt_line` count: every GRN line of the
    * client's SKUs whose GRN was recorded in `[from, to)`, across warehouses
    * (`receiptLinesPredicate`). In the caller's transaction (billing's

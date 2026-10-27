@@ -34,7 +34,7 @@ export const LOOP_DEAD_SLACK_MS = 60_000;
 /** The smallest `WORKER_HEARTBEAT_STALE_MS` accepted (A3). */
 export const MIN_HEARTBEAT_STALE_MS = 60_000;
 
-/** The fourteen jobs (5-1a added email-sender), by the names `/health/worker` reports. */
+/** The sixteen jobs (5-1a added email-sender, 2-5a attachment-sweep, 5-2a webhook-sender), by the names `/health/worker` reports. */
 export const WORKER_JOBS = [
   'outbox-relay',
   'reconciliation',
@@ -52,6 +52,8 @@ export const WORKER_JOBS = [
   'email-sender',
   // Story 2-5a — the attachment retention sweep.
   'attachment-sweep',
+  // Story 5-2a — the client webhook sender.
+  'webhook-sender',
 ] as const;
 export type WorkerJob = (typeof WORKER_JOBS)[number];
 
@@ -82,6 +84,9 @@ export const DEFAULT_NO_PROGRESS_MS: Readonly<Record<WorkerJob, number>> = {
   'licence-expiry': 20 * MINUTE,
   'email-sender': 20 * MINUTE,
   'attachment-sweep': 20 * MINUTE,
+  // Story 5-2a (A8) — a tick's sends stop at its 60 s budget and beat per
+  // send; 2 minutes is above one budget plus one 30 s timeout.
+  'webhook-sender': 2 * MINUTE,
 };
 
 /** The heartbeat clock — assigned by tests (the `rateCardClock` precedent), never spied. */

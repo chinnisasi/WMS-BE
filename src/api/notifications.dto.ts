@@ -11,6 +11,7 @@ import {
   CHAIN_BREAK_DETECTORS,
   CHAIN_BREAK_KINDS,
   SOURCE_RESOLUTIONS,
+  WEBHOOK_AUTO_DISABLE_REASONS,
 } from '../modules/notifications/notification-sources';
 import { LICENCE_KINDS, type LicenceKind } from '../shared/primitives/licence';
 
@@ -117,6 +118,14 @@ export class LicenceExpirySummaryDto {
   @ApiProperty({ enum: ['upcoming', 'expired'] }) state!: 'upcoming' | 'expired';
 }
 
+/** Story 5-2a — one client webhook endpoint auto-disabled (owner-only; resolved by a re-enable, a delete, or a manual disable). */
+export class WebhookDisabledSummaryDto {
+  @ApiProperty({ format: 'uuid' }) endpointId!: string;
+  @ApiProperty({ format: 'uuid' }) clientId!: string;
+  @ApiProperty({ description: 'The endpoint URL’s host only' }) host!: string;
+  @ApiProperty({ enum: [...WEBHOOK_AUTO_DISABLE_REASONS], description: '`failing` — ten final failures over 24 hours; `gone` — the receiver answered 410' }) reason!: (typeof WEBHOOK_AUTO_DISABLE_REASONS)[number];
+}
+
 // ── entries ──────────────────────────────────────────────────────────────────
 
 abstract class NotificationEntryBaseDto {
@@ -203,6 +212,13 @@ export class LicenceExpiryNotificationDto extends NotificationEntryBaseDto {
   @ApiProperty({ type: String, nullable: true, enum: [...SOURCE_RESOLUTIONS['licence-expiry'], null] }) resolution!: (typeof SOURCE_RESOLUTIONS)['licence-expiry'][number] | null;
 }
 
+/** Story 5-2a — one entry per disable episode; never pushed. */
+export class WebhookDisabledNotificationDto extends NotificationEntryBaseDto {
+  @ApiProperty({ enum: ['webhook-disabled'] }) sourceType!: 'webhook-disabled';
+  @ApiProperty({ type: WebhookDisabledSummaryDto }) summary!: WebhookDisabledSummaryDto;
+  @ApiProperty({ type: String, nullable: true, enum: [...SOURCE_RESOLUTIONS['webhook-disabled'], null] }) resolution!: (typeof SOURCE_RESOLUTIONS)['webhook-disabled'][number] | null;
+}
+
 export const NOTIFICATION_ENTRY_DTOS = [
   StockAdjustmentNotificationDto,
   CountVarianceNotificationDto,
@@ -216,6 +232,7 @@ export const NOTIFICATION_ENTRY_DTOS = [
   LedgerChainBreakNotificationDto,
   QcReceiptNotificationDto,
   LicenceExpiryNotificationDto,
+  WebhookDisabledNotificationDto,
 ] as const;
 
 export type NotificationEntryDto = InstanceType<(typeof NOTIFICATION_ENTRY_DTOS)[number]>;
@@ -241,6 +258,7 @@ export class NotificationListResponse {
           'ledger-chain-break': getSchemaPath(LedgerChainBreakNotificationDto),
           'qc-receipt': getSchemaPath(QcReceiptNotificationDto),
           'licence-expiry': getSchemaPath(LicenceExpiryNotificationDto),
+          'webhook-disabled': getSchemaPath(WebhookDisabledNotificationDto),
         },
       },
     },

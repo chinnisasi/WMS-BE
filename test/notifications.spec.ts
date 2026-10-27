@@ -382,8 +382,11 @@ describe('notifications (e2e, story 9-2)', () => {
       // qc.manage-routed `qc-receipt`, in test/client-receiving-policy.spec.ts;
       // the twelfth (story 1-6c), the owner-only `licence-expiry`, in
       // test/licences.spec.ts (raise, supersede, resolve) and below (the
-      // vocabulary, resolutions and audience pins).
-      expect([...CASES.map((c) => c.sourceType), 'audit-export', 'ledger-chain-break', 'qc-receipt', 'licence-expiry']).toEqual([...NOTIFICATION_SOURCE_TYPES]);
+      // vocabulary, resolutions and audience pins); the thirteenth (story
+      // 5-2a), the owner-only `webhook-disabled`, in test/client-webhooks.spec.ts
+      // (raise on auto-disable, resolve on re-enable and manual disable) and
+      // below (its literals and audience).
+      expect([...CASES.map((c) => c.sourceType), 'audit-export', 'ledger-chain-break', 'qc-receipt', 'licence-expiry', 'webhook-disabled']).toEqual([...NOTIFICATION_SOURCE_TYPES]);
     });
 
     it('the subscriber listens for exactly the emitters’ event types (the new events pinned to their constants)', () => {
@@ -417,6 +420,16 @@ describe('notifications (e2e, story 9-2)', () => {
       expect(visibleSourceTypes('owner')).toEqual([...NOTIFICATION_SOURCE_TYPES]);
       // Story 1-6c — the licence warning goes to who renews or withdraws a licence (owner-only).
       expect(SOURCE_AUDIENCE['licence-expiry']).toEqual({ capability: 'licences.manage' });
+      // Story 5-2a — the webhook panel entry: owner-only (clients.manage), the four emitter literals.
+      expect(SOURCE_AUDIENCE['webhook-disabled']).toEqual({ capability: 'clients.manage' });
+      expect(NOTIFICATION_SOURCES['webhook-disabled'].raise.type).toBe('webhook_endpoint.disabled');
+      expect(NOTIFICATION_SOURCES['webhook-disabled'].resolves.map((r) => r.type)).toEqual([
+        'webhook_endpoint.enabled',
+        'webhook_endpoint.deleted',
+        'webhook_endpoint.manually_disabled',
+      ]);
+      expect(visibleSourceTypes('owner')).toContain('webhook-disabled');
+      expect(visibleSourceTypes('ops_manager')).not.toContain('webhook-disabled');
       expect(visibleSourceTypes('owner')).toContain('licence-expiry');
       // Story 1-2b — `qc-receipt` is routed by `qc.manage`, which the Ops Manager holds.
       expect(visibleSourceTypes('ops_manager')).toEqual(['over-receipt', 'rejected-op', 'reorder-breach', 'batch-alert', 'qc-hold', 'channel-sync', 'qc-receipt']);

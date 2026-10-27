@@ -981,6 +981,26 @@ export class CatalogFacade {
   }
 
   /**
+   * Story 5-2a (shared with 5-2b, decision 2) — the client-facing labels of
+   * each SKU: its code, name, base UoM and that unit's precision (a webhook
+   * or an email formats every quantity at it). In the caller's transaction;
+   * an id the catalog does not know is absent. Read-only.
+   */
+  async skuLabelsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    skuIds: readonly string[],
+  ): Promise<ReadonlyMap<string, { code: string; name: string; uom: string; uomPrecision: number }>> {
+    const distinct = [...new Set(skuIds)];
+    if (distinct.length === 0) return new Map();
+    const rows = await tx
+      .select({ id: skus.id, code: skus.code, name: skus.name, uom: skus.uom })
+      .from(skus)
+      .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, distinct)));
+    return new Map(rows.map((row) => [row.id, { code: row.code, name: row.name, uom: row.uom, uomPrecision: uomPrecision(row.uom) }]));
+  }
+
+  /**
    * Story 13-1 — the per-SKU facts the return authorization validates a line
    * against, inside the CALLER's transaction (the RMA create composes order
    * facts, these, the ledger and its own writes on ONE connection). Keyed by
