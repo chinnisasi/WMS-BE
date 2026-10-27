@@ -2010,9 +2010,12 @@ describe('architecture: rate cards are billing-module-owned (story 21-3)', () =>
     'clientInvoiceNoteLines',
     'clientInvoiceNoteSeries',
     'clientInvoiceNotePolicies',
+    // Story 5-5a — the ad-hoc charges and the self-approval policy.
+    'clientCharges',
+    'clientChargePolicies',
   ] as const;
   const RAW_BILLING_TABLES =
-    'rate_cards|rate_card_lines|storage_snapshots|storage_snapshot_progress|client_invoices|client_invoice_lines|client_invoice_series|client_invoice_notes|client_invoice_note_lines|client_invoice_note_series|client_invoice_note_policies';
+    'rate_cards|rate_card_lines|storage_snapshots|storage_snapshot_progress|client_invoices|client_invoice_lines|client_invoice_series|client_invoice_notes|client_invoice_note_lines|client_invoice_note_series|client_invoice_note_policies|client_charges|client_charge_policies';
   const billingRoot = join(SRC_ROOT, 'modules', 'billing');
   const billingFiles = files.filter((file) => file.path.startsWith(billingRoot));
 

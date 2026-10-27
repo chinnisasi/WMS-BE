@@ -22,7 +22,7 @@ import { CLIENT_ORDER_REF_RE, MAX_CLIENT_ORDER_REF_LENGTH, MAX_CONSIGNEE_LEGAL_N
 import { MAX_COD_AMOUNT_PAISE, ORDER_PRIORITIES, ORDER_TYPES, PORTAL_ORDER_PRIORITIES } from '../modules/outbound/order-urgency';
 import { ASN_STATUSES, MAX_ASN_CODE_LENGTH, MAX_ASN_LINES, type AsnStatus } from '../modules/inbound/asn.command';
 import { PO_STATUSES, type PoStatus } from '../modules/inbound/po.command';
-import { CHARGE_CODES, RATE_BASES } from '../modules/billing/rate-cards';
+import { INVOICE_LINE_BASES, INVOICE_LINE_CODES } from '../modules/billing/client-charges';
 import { AddressDto, SessionClientResponse, USER_STATUSES } from '../modules/tenancy/tenancy.dto';
 import { GSTIN_RE, gstinDtoTransform } from '../shared/primitives/gstin';
 import {
@@ -763,10 +763,10 @@ export class PortalInvoicePartyDto {
 export class PortalInvoiceLineDto {
   @ApiProperty({ example: '2026-09-01', description: 'IST date, inclusive' }) segmentFrom!: string;
   @ApiProperty({ example: '2026-09-30', description: 'IST date, inclusive' }) segmentTo!: string;
-  @ApiProperty({ enum: [...CHARGE_CODES] }) chargeCode!: string;
-  @ApiProperty({ enum: [...RATE_BASES] }) basis!: string;
-  @ApiProperty({ type: String, nullable: true }) uom!: string | null;
-  @ApiProperty({ description: 'A decimal string — base-unit-days for storage, a whole count otherwise' }) quantity!: string;
+  @ApiProperty({ enum: [...INVOICE_LINE_CODES] }) chargeCode!: string;
+  @ApiProperty({ enum: [...INVOICE_LINE_BASES] }) basis!: string;
+  @ApiProperty({ type: String, nullable: true, description: 'The base UoM of a storage line, the unit of an ad-hoc charge; null otherwise' }) uom!: string | null;
+  @ApiProperty({ description: 'A decimal string — base-unit-days for storage, units for an ad-hoc charge, a whole count otherwise' }) quantity!: string;
   @ApiProperty({ type: Number, nullable: true }) unitAmountPaise!: number | null;
   @ApiProperty({ type: Number, nullable: true }) amountPaise!: number | null;
   @ApiProperty() sac!: string;
@@ -774,6 +774,8 @@ export class PortalInvoiceLineDto {
   @ApiProperty() cgstPaise!: number;
   @ApiProperty() sgstPaise!: number;
   @ApiProperty() igstPaise!: number;
+  @ApiProperty({ required: false, description: 'Story 5-5a — present only on an ad-hoc charge or minimum-charge adjustment line: what the line is for, as printed' })
+  description?: string;
 }
 
 export class PortalInvoiceDetailResponse extends PortalInvoiceRowDto {
@@ -806,8 +808,8 @@ export class PortalInvoiceNotesResponse {
 }
 
 export class PortalNoteLineDto {
-  @ApiProperty({ enum: [...CHARGE_CODES] }) chargeCode!: string;
-  @ApiProperty({ enum: [...RATE_BASES] }) basis!: string;
+  @ApiProperty({ enum: [...INVOICE_LINE_CODES] }) chargeCode!: string;
+  @ApiProperty({ enum: [...INVOICE_LINE_BASES] }) basis!: string;
   @ApiProperty({ type: String, nullable: true }) uom!: string | null;
   @ApiProperty({ example: '2026-09-01', description: 'IST date, inclusive' }) segmentFrom!: string;
   @ApiProperty({ example: '2026-09-30', description: 'IST date, inclusive' }) segmentTo!: string;
@@ -817,6 +819,8 @@ export class PortalNoteLineDto {
   @ApiProperty() cgstPaise!: number;
   @ApiProperty() sgstPaise!: number;
   @ApiProperty() igstPaise!: number;
+  @ApiProperty({ required: false, description: 'Story 5-5a — the amended invoice line’s description, present only for an ad-hoc charge or minimum-charge adjustment line' })
+  description?: string;
 }
 
 export class PortalNoteDetailResponse extends PortalNoteRowDto {

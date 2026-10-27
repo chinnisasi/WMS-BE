@@ -13,7 +13,7 @@ import {
   type NoteStatus,
 } from '../modules/billing/client-invoice-notes';
 import { SUPPLY_TYPES } from '../modules/billing/client-invoices';
-import { CHARGE_CODES, RATE_BASES, type ChargeCode, type RateBasis } from '../modules/billing/rate-cards';
+import { INVOICE_LINE_BASES, INVOICE_LINE_CODES, type InvoiceLineBasis, type InvoiceLineCode } from '../modules/billing/client-charges';
 import { ClientInvoiceDto, ClientInvoicePartyDto, ClientInvoiceTotalsDto } from './client-invoices.dto';
 
 /**
@@ -90,8 +90,8 @@ export class NotePolicyDto {
 export class NoteLineDto {
   @ApiProperty({ format: 'uuid' }) id!: string;
   @ApiProperty({ format: 'uuid' }) invoiceLineId!: string;
-  @ApiProperty({ enum: [...CHARGE_CODES] }) chargeCode!: ChargeCode;
-  @ApiProperty({ enum: [...RATE_BASES] }) basis!: RateBasis;
+  @ApiProperty({ enum: [...INVOICE_LINE_CODES] }) chargeCode!: InvoiceLineCode;
+  @ApiProperty({ enum: [...INVOICE_LINE_BASES] }) basis!: InvoiceLineBasis;
   @ApiProperty({ type: String, nullable: true }) uom!: string | null;
   @ApiProperty({ example: '2026-09-01', description: 'IST date, inclusive (the invoice line’s segment)' }) segmentFrom!: string;
   @ApiProperty({ example: '2026-09-30', description: 'IST date, inclusive' }) segmentTo!: string;
@@ -104,6 +104,8 @@ export class NoteLineDto {
   @ApiProperty({ description: 'SGST/UTGST' }) sgstPaise!: number;
   @ApiProperty() igstPaise!: number;
   @ApiProperty({ type: String, nullable: true }) overrideReason!: string | null;
+  @ApiProperty({ required: false, description: 'Story 5-5a — the amended invoice line’s description, present only for an ad-hoc charge or minimum-charge adjustment line' })
+  description?: string;
 }
 
 export class NoteEntryDto {

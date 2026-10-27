@@ -5,6 +5,7 @@ import { InventoryModule } from '../inventory/inventory.module';
 import { OutboundModule } from '../outbound/outbound.module';
 import { InvoicingModule } from '../invoicing/invoicing.module';
 import { BillingFacade } from './billing.facade';
+import { ClientChargeService } from './client-charge.service';
 import { ClientInvoiceNoteService } from './client-invoice-notes';
 import { ClientInvoiceService } from './client-invoices';
 import { InvoiceRecordsService } from './invoice-records';
@@ -39,10 +40,25 @@ import { StorageSnapshotService } from './storage-snapshot';
  * lines, the C / D series and the maker/checker policy —
  * `ClientInvoiceNoteService`): the same two invoicing reads, and the outbox
  * (`OUTBOX_SINK`, SharedModule) for `client_invoice_note.issued | voided`.
+ *
+ * Story 5-5a adds contract billing (`client_charges`, `client_charge_policies`
+ * — `ClientChargeService`): ad-hoc charges billed as their own invoice lines,
+ * and the rate card's minimum monthly charge, topped up by a
+ * `minimum_adjustment` line; the outbox for `client_charge.pending |
+ * approved | rejected | cancelled`.
  */
 @Module({
   imports: [SharedModule, InventoryModule, InboundModule, OutboundModule, InvoicingModule],
-  providers: [RateCardCommand, BillingFacade, MeteringService, StorageSnapshotService, ClientInvoiceService, ClientInvoiceNoteService, InvoiceRecordsService],
-  exports: [RateCardCommand, BillingFacade, ClientInvoiceService, ClientInvoiceNoteService, InvoiceRecordsService],
+  providers: [
+    RateCardCommand,
+    BillingFacade,
+    MeteringService,
+    StorageSnapshotService,
+    ClientInvoiceService,
+    ClientInvoiceNoteService,
+    InvoiceRecordsService,
+    ClientChargeService,
+  ],
+  exports: [RateCardCommand, BillingFacade, ClientInvoiceService, ClientInvoiceNoteService, InvoiceRecordsService, ClientChargeService],
 })
 export class BillingModule {}

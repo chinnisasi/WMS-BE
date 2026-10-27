@@ -243,6 +243,17 @@ export const CAPABILITIES = [
   // refused at the read. Mirrored into wms-fe `src/lib/users.ts`
   // (CAPABILITIES + OPS_EXCLUDED_CAPABILITIES).
   'billing.invoice',
+  // Story 5-5a — record an AD-HOC CHARGE for a client (extra labour,
+  // relabelling, repacking, a re-slot, returns processing, overflow space)
+  // and withdraw one's own pending charge. OWNER + OPS MANAGER + ACCOUNTANT:
+  // the floor knows about extra work, the office bills it. A charge recorded
+  // by a `billing.invoice` holder within the tenant's self-approval limit is
+  // approved at record; anything else pends, and approve / reject / cancel
+  // of an approved charge need `billing.invoice` (a SECOND person approves a
+  // pending charge). Every member READS charges; a client-portal session is
+  // refused. Mirrored into wms-fe `src/lib/users.ts` (CAPABILITIES + the
+  // accountant grant — ops_manager is derived there).
+  'billing.charge',
   // Story 5-6a (A7) — the billing configuration: whether a credit note needs
   // a second person to issue and to void it (`PUT …/billing/note-policy`).
   // OWNER-ONLY (the `eway.configure` rationale: the person who sets the bar
@@ -447,6 +458,9 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'stock.adjust.request',    // Story 2-5a — damage photos: add, and remove/cancel (owner holds everything).
     'receipt.attach',
     'receipt.photo-remove',
+    // Story 5-5a — the floor records the extra work it did (its charges pend
+    // for a billing.invoice holder).
+    'billing.charge',
   ]),
   operator: new Set<Capability>([
     'putaway.execute',
@@ -487,7 +501,8 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
   // service price list; a tax document's rate override stays
   // `invoice.generate`). Everything else stays read-only.
   // Story 21-5: client invoices and the client tax details (finance work).
-  accountant: new Set<Capability>(['eway.manage', 'rates.manage', 'billing.invoice']),
+  // Story 5-5a: ad-hoc charges (finance work — the office bills the extras).
+  accountant: new Set<Capability>(['eway.manage', 'rates.manage', 'billing.invoice', 'billing.charge']),
   // Story 21-7 — the client-portal persona (decision 1): a client brand's
   // own user. Every operator route refuses its session at the guard (the
   // fence). 21-7 made the portal read-only and the set empty; story 21-7b

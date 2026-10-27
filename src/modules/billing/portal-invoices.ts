@@ -11,24 +11,9 @@ import type { ClientInvoiceParty, ClientInvoiceStatus, ClientInvoiceTotalsView }
 // Story 5-6a — type-only too (client-invoice-notes imports client-invoices by value).
 import type { NoteKind, NoteReason } from './client-invoice-notes';
 import { milliToDecimal } from './metering';
-import { CHARGE_CODES, type ChargeCode, type RateBasis } from './rate-cards';
-
-const chargeRank = (code: string): number => (CHARGE_CODES as readonly string[]).indexOf(code);
-
-/** The canonical line order — client-invoices.ts `compareLines`, restated (see the import note). */
-function compareLines(
-  a: { segmentFrom: string; chargeCode: string; uom: string | null },
-  b: { segmentFrom: string; chargeCode: string; uom: string | null },
-): number {
-  const from = Date.parse(a.segmentFrom) - Date.parse(b.segmentFrom);
-  if (from !== 0) return from;
-  const charge = chargeRank(a.chargeCode) - chargeRank(b.chargeCode);
-  if (charge !== 0) return charge;
-  if (a.uom === b.uom) return 0;
-  if (a.uom === null) return -1;
-  if (b.uom === null) return 1;
-  return a.uom < b.uom ? -1 : 1;
-}
+// Story 5-5a — the ONE canonical line order, from the pure vocabulary file
+// (it imports no billing service, so this value import closes no cycle).
+import { compareLines, type InvoiceLineBasis, type InvoiceLineCode } from './client-charges';
 
 /**
  * Story 21-7 — the client portal's invoice reads (decision 3: the invoice
@@ -80,8 +65,8 @@ export interface PortalInvoiceParty {
 export interface PortalInvoiceLine {
   readonly segmentFrom: string;
   readonly segmentTo: string;
-  readonly chargeCode: ChargeCode;
-  readonly basis: RateBasis;
+  readonly chargeCode: InvoiceLineCode;
+  readonly basis: InvoiceLineBasis;
   readonly uom: string | null;
   readonly quantity: string;
   readonly unitAmountPaise: number | null;
@@ -91,6 +76,12 @@ export interface PortalInvoiceLine {
   readonly cgstPaise: number;
   readonly sgstPaise: number;
   readonly igstPaise: number;
+  /**
+   * Story 5-5a — present only on an `adhoc` or `minimum_adjustment` line: the
+   * frozen printed description (never the charge's id, evidence note or
+   * actors — the portal sees a charge only as this line).
+   */
+  readonly description?: string;
 }
 
 export interface PortalInvoiceDetail extends PortalInvoiceRow {
@@ -227,6 +218,9 @@ export async function portalInvoiceInTx(
       cgstPaise: clientInvoiceLines.cgstPaise,
       sgstPaise: clientInvoiceLines.sgstPaise,
       igstPaise: clientInvoiceLines.igstPaise,
+      description: clientInvoiceLines.description,
+      // Selected for the canonical order ONLY (A16) — never put in the DTO.
+      adhocChargeId: clientInvoiceLines.adhocChargeId,
     })
     .from(clientInvoiceLines)
     .innerJoin(
@@ -240,10 +234,10 @@ export async function portalInvoiceInTx(
     .map((row) => ({
       segmentFrom: istDateOf(row.segmentFrom),
       segmentTo: addIsoDays(istDateOf(row.segmentTo), -1),
-      chargeCode: row.chargeCode as ChargeCode,
-      basis: row.basis as RateBasis,
+      chargeCode: row.chargeCode as InvoiceLineCode,
+      basis: row.basis as InvoiceLineBasis,
       uom: row.uom,
-      quantity: row.chargeCode === 'storage' ? milliToDecimal(BigInt(row.quantity)) : row.quantity,
+      quantity: row.chargeCode === 'storage' || row.chargeCode === 'adhoc' ? milliToDecimal(BigInt(row.quantity)) : row.quantity,
       unitAmountPaise: numberOrNull(row.unitAmountPaise),
       amountPaise: numberOrNull(row.amountPaise),
       sac: row.sacCode,
@@ -251,6 +245,7 @@ export async function portalInvoiceInTx(
       cgstPaise: Number(row.cgstPaise),
       sgstPaise: Number(row.sgstPaise),
       igstPaise: Number(row.igstPaise),
+      ...(row.description === null ? {} : { description: row.description }),
     }));
   return { ...toRow(invoice), party: toParty(invoice.party as ClientInvoiceParty), lines };
 }
@@ -278,8 +273,8 @@ export interface PortalNoteRow {
 }
 
 export interface PortalNoteLine {
-  readonly chargeCode: ChargeCode;
-  readonly basis: RateBasis;
+  readonly chargeCode: InvoiceLineCode;
+  readonly basis: InvoiceLineBasis;
   readonly uom: string | null;
   readonly segmentFrom: string;
   readonly segmentTo: string;
@@ -289,6 +284,8 @@ export interface PortalNoteLine {
   readonly cgstPaise: number;
   readonly sgstPaise: number;
   readonly igstPaise: number;
+  /** Story 5-5a — the amended invoice line's printed description, present only for an `adhoc` / `minimum_adjustment` line. */
+  readonly description?: string;
 }
 
 export interface PortalNoteDetail extends PortalNoteRow {
@@ -399,19 +396,32 @@ export async function portalInvoiceNoteInTx(
       cgstPaise: clientInvoiceNoteLines.cgstPaise,
       sgstPaise: clientInvoiceNoteLines.sgstPaise,
       igstPaise: clientInvoiceNoteLines.igstPaise,
+      // Story 5-5a — the amended invoice line's description and charge (the
+      // charge for the canonical order only, never in the DTO). The line is
+      // reached through the note's (stamped) invoice.
+      description: clientInvoiceLines.description,
+      adhocChargeId: clientInvoiceLines.adhocChargeId,
     })
     .from(clientInvoiceNoteLines)
     .innerJoin(
       clientInvoiceNotes,
       and(eq(clientInvoiceNotes.tenantId, clientInvoiceNoteLines.tenantId), eq(clientInvoiceNotes.id, clientInvoiceNoteLines.noteId)),
     )
+    .innerJoin(
+      clientInvoiceLines,
+      and(
+        eq(clientInvoiceLines.tenantId, clientInvoiceNoteLines.tenantId),
+        eq(clientInvoiceLines.id, clientInvoiceNoteLines.invoiceLineId),
+        eq(clientInvoiceLines.invoiceId, clientInvoiceNotes.invoiceId),
+      ),
+    )
     .where(and(eq(clientInvoiceNoteLines.tenantId, tenantId), eq(clientInvoiceNoteLines.noteId, note.id), noteScope(tenantId, clientId)));
   const lines = lineRows
     .map((row) => ({ ...row, segmentFrom: new Date(row.segmentFrom).toISOString(), segmentTo: new Date(row.segmentTo).toISOString() }))
     .sort(compareLines)
     .map((row) => ({
-      chargeCode: row.chargeCode as ChargeCode,
-      basis: row.basis as RateBasis,
+      chargeCode: row.chargeCode as InvoiceLineCode,
+      basis: row.basis as InvoiceLineBasis,
       uom: row.uom,
       // Segments map as the invoice lines do: IST dates, the end inclusive.
       segmentFrom: istDateOf(row.segmentFrom),
@@ -422,6 +432,7 @@ export async function portalInvoiceNoteInTx(
       cgstPaise: Number(row.cgstPaise),
       sgstPaise: Number(row.sgstPaise),
       igstPaise: Number(row.igstPaise),
+      ...(row.description === null ? {} : { description: row.description }),
     }));
   return {
     ...toNoteRow(note),

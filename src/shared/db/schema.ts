@@ -5590,6 +5590,12 @@ export const rateCardLines = pgTable(
     chargeCode: text('charge_code').notNull(),
     basis: text('basis').notNull(),
     amountPaise: bigint('amount_paise', { mode: 'number' }).notNull(),
+    /**
+     * Story 5-5a (A19) — on the `minimum_monthly` line only: what counts
+     * toward the floor, `all` (metered + ad-hoc) or `metered`. NULL on every
+     * other line (the `rate_card_lines_minimum_counts` CHECK, 0099).
+     */
+    minimumCounts: text('minimum_counts'),
   },
   (table) => [uniqueIndex('rate_card_lines_card_charge_unique').on(table.rateCardId, table.chargeCode)],
 );
@@ -5785,15 +5791,26 @@ export const clientInvoiceLines = pgTable(
     cgstPaise: bigint('cgst_paise', { mode: 'number' }).notNull(),
     sgstPaise: bigint('sgst_paise', { mode: 'number' }).notNull(),
     igstPaise: bigint('igst_paise', { mode: 'number' }).notNull(),
+    /**
+     * Story 5-5a — the printed description of an `adhoc` or
+     * `minimum_adjustment` line (frozen at compute); NULL on every metered
+     * line (the `client_invoice_lines_extra_kind` CHECK, 0099).
+     */
+    description: text('description'),
+    /** Story 5-5a — the `client_charges` row an `adhoc` line bills; NULL otherwise. */
+    adhocChargeId: uuid('adhoc_charge_id'),
   },
   (table) => [
     index('client_invoice_lines_tenant_invoice_idx').on(table.tenantId, table.invoiceId),
-    // One line per metered (segment, charge, uom) — handling lines carry no uom.
-    uniqueIndex('client_invoice_lines_invoice_segment_charge_uom_unique').on(
+    // One line per (segment, charge, uom, ad-hoc charge) — handling lines
+    // carry no uom; an ad-hoc line is keyed by its charge (story 5-5a, 0099
+    // replaced the 21-5 `…_invoice_segment_charge_uom_unique`).
+    uniqueIndex('client_invoice_lines_line_key_unique').on(
       table.invoiceId,
       table.segmentFrom,
       table.chargeCode,
       sql`coalesce(${table.uom}, '')`,
+      sql`coalesce(${table.adhocChargeId}::text, '')`,
     ),
   ],
 );
@@ -5981,6 +5998,90 @@ export const clientInvoiceNotePolicies = pgTable(
 );
 
 export type ClientInvoiceNotePolicy = typeof clientInvoiceNotePolicies.$inferSelect;
+
+/**
+ * Story 5-5a — an ad-hoc charge (contract billing): one billable event for
+ * one client in one warehouse on one IST day — extra labour, relabelling,
+ * repacking, a client-requested re-slot, returns processing, overflow space.
+ * Its figures are fixed when it is recorded (`amount_paise = round_half_up(
+ * quantity_milli × unit_rate_paise / 1000)`); it is never edited (a wrong
+ * charge is cancelled and recorded again). `pending → approved | rejected |
+ * cancelled`, `approved → cancelled`. An approved charge bills as its own
+ * `adhoc` line on the invoice of `(client, bill_month, supplier_gstin)` —
+ * `supplier_gstin` (the group key) and `bill_month` (the earliest open month
+ * at record) are frozen at record. The vocabularies live in
+ * `src/modules/billing/client-charges.ts`; the CHECKs, the transition guard
+ * and the operator-only RLS live ONLY in `drizzle/0099_contract_billing.sql`.
+ * No FKs (house rule).
+ */
+export const clientCharges = pgTable(
+  'client_charges',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    /** `warehouses.gstin ?? tenants.gstin` at record — the invoice group key (A8). */
+    supplierGstin: text('supplier_gstin'),
+    /** The IST date the work was done (the line's segment). */
+    chargeDate: date('charge_date', { mode: 'string' }).notNull(),
+    /** The first of the month whose invoice bills it (A4). */
+    billMonth: date('bill_month', { mode: 'string' }).notNull(),
+    category: text('category').notNull(),
+    description: text('description').notNull(),
+    sacCode: text('sac_code').notNull(),
+    unit: text('unit').notNull(),
+    quantityMilli: bigint('quantity_milli', { mode: 'number' }).notNull(),
+    unitRatePaise: bigint('unit_rate_paise', { mode: 'number' }).notNull(),
+    amountPaise: bigint('amount_paise', { mode: 'number' }).notNull(),
+    reference: text('reference'),
+    clientAuthorizationRef: text('client_authorization_ref'),
+    /** Internal only — never printed, never in the portal. */
+    evidenceNote: text('evidence_note'),
+    /** `pending` | `approved` | `rejected` | `cancelled`. */
+    status: text('status').notNull(),
+    recordedBy: uuid('recorded_by').notNull(),
+    recordedAt: timestamp('recorded_at', { withTimezone: true, mode: 'string' }).notNull(),
+    decidedBy: uuid('decided_by'),
+    decidedAt: timestamp('decided_at', { withTimezone: true, mode: 'string' }),
+    decisionNote: text('decision_note'),
+    cancelledBy: uuid('cancelled_by'),
+    cancelledAt: timestamp('cancelled_at', { withTimezone: true, mode: 'string' }),
+    cancelNote: text('cancel_note'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    index('client_charges_tenant_client_bill_month_idx').on(table.tenantId, table.clientId, table.billMonth),
+    index('client_charges_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
+    index('client_charges_tenant_client_created_at_id_idx').on(table.tenantId, table.clientId, table.createdAt, table.id),
+  ],
+);
+
+export type ClientCharge = typeof clientCharges.$inferSelect;
+
+/**
+ * Story 5-5a (A22) — the tenant's ad-hoc charge self-approval limit: a
+ * `billing.invoice` holder's own charge up to this amount is approved at
+ * record; above it (or by anyone else) it pends for a second person. A
+ * MISSING row means ₹10,000 (1,000,000 paise). One row per tenant.
+ */
+export const clientChargePolicies = pgTable(
+  'client_charge_policies',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    selfApproveLimitPaise: bigint('self_approve_limit_paise', { mode: 'number' }).notNull(),
+    updatedBy: uuid('updated_by').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [uniqueIndex('client_charge_policies_tenant_unique').on(table.tenantId)],
+);
+
+export type ClientChargePolicy = typeof clientChargePolicies.$inferSelect;
 
 /**
  * Story 9-2 — the notification panel's projection (notifications module,

@@ -62,6 +62,11 @@ export const AUDIT_TARGET_TYPES = [
   'catalog_import',
   'channel_connection',
   'client',
+  // Story 5-5a — an ad-hoc charge (`client_charge.recorded | approved |
+  // rejected | cancelled`) and the tenant's self-approval limit
+  // (`client_charge_policy.updated`).
+  'client_charge',
+  'client_charge_policy',
   'client_invoice',
   // Story 5-6a — a credit or debit note (`client_invoice_note.drafted |
   // discarded | issued | voided`) and the tenant's maker/checker switch
@@ -207,6 +212,13 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'client_invoice_note.issued', targetType: 'client_invoice_note' },
   { action: 'client_invoice_note.voided', targetType: 'client_invoice_note' },
   { action: 'client_invoice_note_policy.updated', targetType: 'client_invoice_note_policy' },
+  // Story 5-5a — ad-hoc charges (`ClientChargeService`): an approve-at-record
+  // writes ONE `client_charge.recorded` row (`changes.autoApproved`).
+  { action: 'client_charge.recorded', targetType: 'client_charge' },
+  { action: 'client_charge.approved', targetType: 'client_charge' },
+  { action: 'client_charge.rejected', targetType: 'client_charge' },
+  { action: 'client_charge.cancelled', targetType: 'client_charge' },
+  { action: 'client_charge_policy.updated', targetType: 'client_charge_policy' },
   // The ASN import (2026-10-17) — one row per import run, beside each created
   // ASN's own `asn.created` (all under the import's one key).
   { action: 'asn_import.executed', targetType: 'asn_import' },

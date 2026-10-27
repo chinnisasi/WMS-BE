@@ -938,7 +938,11 @@ describe('users, roles, and permission gating (e2e)', () => {
     // Story 5-6a grows it to 52: `billing.configure` — OWNER-ONLY, the
     // credit-note maker/checker switch (never the accountant, who drafts and
     // issues notes under `billing.invoice`).
-    expect([...CAPABILITIES]).toHaveLength(52);
+    // Story 5-5a grows it to 53: `billing.charge` — owner, ops_manager AND
+    // accountant record an ad-hoc charge (the floor knows the extra work,
+    // the office bills it); approving one stays `billing.invoice`.
+    expect([...CAPABILITIES]).toHaveLength(53);
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('billing.charge'))).toEqual(['owner', 'ops_manager', 'accountant']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('billing.configure'))).toEqual(['owner']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('receipt.attach'))).toEqual(['owner', 'ops_manager', 'operator']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('receipt.photo-remove'))).toEqual(['owner', 'ops_manager']);
@@ -969,7 +973,7 @@ describe('users, roles, and permission gating (e2e)', () => {
     expect(CAPABILITIES).toContain('eway.configure');
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('eway.manage'))).toEqual(['owner', 'ops_manager', 'accountant']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('eway.configure'))).toEqual(['owner']);
-    expect([...ROLE_CAPABILITIES.accountant]).toEqual(['eway.manage', 'rates.manage', 'billing.invoice']);
+    expect([...ROLE_CAPABILITIES.accountant]).toEqual(['eway.manage', 'rates.manage', 'billing.invoice', 'billing.charge']);
     expect(CAPABILITIES).toContain('invoice.generate');
     expect(ROLE_CAPABILITIES.owner.has('invoice.generate')).toBe(true);
     expect(ROLE_CAPABILITIES.ops_manager.has('invoice.generate')).toBe(true);

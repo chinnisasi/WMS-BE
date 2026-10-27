@@ -220,7 +220,7 @@ export class ClientInvoicesController {
   @ApiBearerAuth()
   @ApiOperation({
     summary:
-      "The dispute drill-down (21-5b): one keyset page of the records a client-invoice line's quantity was counted from — GRN lines, picks, orders at their first dispatch, or (day, warehouse) storage snapshots — on any status; the first page carries `summary {lineQuantity, recordsQuantity, reconciles}`",
+      "The dispute drill-down (21-5b): one keyset page of the records a client-invoice line's quantity was counted from — GRN lines, picks, orders at their first dispatch, (day, warehouse) storage snapshots, or (story 5-5a) an ad-hoc line's one charge — on any status; the first page carries `summary {lineQuantity, recordsQuantity, reconciles}`",
   })
   @ApiOkResponse({ type: ClientInvoiceLineRecordsResponse })
   @ApiResponse({ status: 400, ...problemJsonResponse('A malformed invoiceId or lineId, a limit outside 1–1,000 (validation-failed), or a malformed cursor (invalid-cursor)') })
@@ -230,7 +230,12 @@ export class ClientInvoicesController {
     status: 404,
     ...problemJsonResponse("No such invoice in this tenant, or no such line on it — a draft's line ids change when it is refreshed: reload (not-found)"),
   })
-  @ApiResponse({ status: 409, ...problemJsonResponse("The invoice's supplying GSTIN no longer maps to any warehouse (invoice-group-changed)") })
+  @ApiResponse({
+    status: 409,
+    ...problemJsonResponse(
+      "The invoice's supplying GSTIN no longer maps to any warehouse (invoice-group-changed), or the line is a minimum-charge adjustment — computed from the other lines, it has no records (line-not-drillable)",
+    ),
+  })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'invoiceId', format: 'uuid' })
   @ApiParam({ name: 'lineId', format: 'uuid' })
