@@ -6,7 +6,13 @@ import type { CatalogFacade } from '../catalog/catalog.facade';
 // Story 12-1 — the ONE conformance predicate (the temperature hierarchy),
 // shared with putaway, pick and the class-edit guards.
 import { storageClassSatisfies } from '../../shared/primitives/storage-class';
-import { isBatchExpiredAt } from '../../shared/primitives/batch-expiry';
+// Story 4-3a — THE allocation rule and THE allocatability predicate, shared
+// with the pick's batch re-derivation and the ATP hook (A6 pins the import).
+import {
+  isBatchAllocatableAt,
+  rankSlots,
+  type AllocationRule,
+} from '../../shared/primitives/batch-allocation';
 
 /**
  * Story 4.4 — "where else is this SKU?".
@@ -16,8 +22,9 @@ import { isBatchExpiredAt } from '../../shared/primitives/batch-expiry';
  * DESTRUCTIVELY (two order lines of the same SKU must not both claim the
  * same units). Calling it from the pick command would mean planning a wave to
  * re-plan one stop. So the part that is genuinely shared — how a SKU's
- * drawable units are laid out across pickable bins, in walk order, FEFO
- * within each bin — is extracted here as a PURE function over rows the
+ * drawable units are laid out across pickable bins and RANKED by the SKU's
+ * client allocation rule (story 4-3a: warehouse-wide, not per bin) — is
+ * extracted here as a PURE function over rows the
  * caller has already read, and both sides use it:
  *
  *   - `planSlices` builds the pool for every SKU on the wave, then consumes
@@ -32,11 +39,13 @@ import { isBatchExpiredAt } from '../../shared/primitives/batch-expiry';
  * planner would never have named.
  */
 
-/** One drawable unit-bucket of the walk: a (bin, batch) slot in walk order. */
+/** One drawable unit-bucket: a (bin, batch) slot, in the client rule's RANK order (4-3a). */
 export interface StockSlot {
   readonly binId: string;
   readonly binCode: string;
   readonly batchId: string | null;
+  /** The bin's position in walk order (`bins.code` ascending) — the ranking's tie-break. */
+  readonly walkRank: number;
   remaining: number;
 }
 
@@ -45,6 +54,14 @@ export interface PoolBatchIdentity {
   readonly id: string;
   readonly status: string;
   readonly expiryDate: string | null;
+  /** Story 4-3a — `batches.created_at`, the lot's first receipt: FIFO's anchor and FEFO's undated tie-break. */
+  readonly createdAt: string;
+}
+
+/** Story 4-3a — the allocation policy one SKU's slots are ranked and filtered by. */
+export interface PoolPolicy {
+  readonly allocationRule: AllocationRule;
+  readonly minDays: number | null;
 }
 
 export interface StockPoolInput {
@@ -66,17 +83,35 @@ export interface StockPoolInput {
    * replayed later is not re-judged against the replay instant.
    */
   readonly at: number;
+  /**
+   * Story 4-3a — each SKU's allocation policy (the wave: the SKU's client's
+   * live policy, read once; the re-plan: the short line's frozen values).
+   */
+  readonly policyOf: (skuId: string) => PoolPolicy;
+  /**
+   * Story 4-3a (A3) — the IST date the MINIMUM is judged on (the re-plan's
+   * one-day grace); absent → `at`'s own IST date (the wave plan). Expiry is
+   * always judged at `at`.
+   */
+  readonly minJudgedOn?: string;
 }
 
 /**
- * The per-SKU walk: (bin in code order) × (batch in FEFO order), with the
- * per-bin budget that keeps a divergent batch projection from over-planning.
+ * The per-SKU pool: every drawable (bin, batch) slot, RANKED by the SKU's
+ * client allocation rule (story 4-3a, `rankSlots`), with the per-bin budget
+ * that keeps a divergent batch projection from over-planning.
  *
- * Pure — no I/O, no clock, no `this`. Every rule it encodes was 4.2's:
- * a blocked or expired batch is never drawn (epic-2 retro a13, draw side);
- * FEFO is expiry ascending with no-expiry LAST; the plain projection row is
- * the ceiling for the WHOLE bin, not for each batch in it; and units the
- * batch fold cannot attribute are still pickable, with no batch suggestion.
+ * Pure — no I/O, no clock, no `this`. The rules:
+ *   - a batch that is not allocatable (`isBatchAllocatableAt`: blocked,
+ *     expired at `at`, or below the policy's minimum) is never drawn;
+ *   - the plain projection row is the ceiling for the WHOLE bin, not for each
+ *     batch in it — the budget is spent in the rule's order inside the bin;
+ *   - units the batch fold cannot attribute are still pickable, with no
+ *     batch suggestion (a batch-less slot);
+ *   - story 4-3a: the ranking is WAREHOUSE-WIDE (`fefo`: dated batches by
+ *     expiry, then undated by lot first received, then batch-less; `fifo`:
+ *     batches by lot first received, then batch-less; ties by walk rank,
+ *     then batch id). An untracked SKU's slots stay in walk order.
  */
 export function buildStockPool(input: StockPoolInput): Map<string, StockSlot[]> {
   const binCodes = new Map(input.binOrder.map((bin) => [bin.id, bin.code]));
@@ -89,22 +124,21 @@ export function buildStockPool(input: StockPoolInput): Map<string, StockSlot[]> 
   // the schema — `undefined` here means a caller forgot the projection.)
   const binClassById = new Map(input.binOrder.map((bin) => [bin.id, bin.storageClass]));
   const batchById = new Map(input.batchIdentities.map((batch) => [batch.id, batch]));
-  const drawableBatch = (batchId: string): boolean => {
-    const batch = batchById.get(batchId);
-    if (batch === undefined || batch.status !== 'active') {
-      // A blocked batch is never drawn (epic-2 retro a13, draw side); an
-      // identity the catalog does not know is not suggestible either.
-      return false;
-    }
-    // Story 3-3a (A3) — the ONE shared expiry predicate (the promise side's
-    // `unpromisableBatchUnits` reads it too, so promise and draw agree).
-    return !isBatchExpiredAt(batch.expiryDate, input.at);
-  };
-  const expiryOf = (batchId: string): string | null => batchById.get(batchId)?.expiryDate ?? null;
+  const factsOf = (batchId: string) => batchById.get(batchId);
 
   const pool = new Map<string, StockSlot[]>();
   for (const skuId of new Set(input.skuIds)) {
     const slots: StockSlot[] = [];
+    const policy = input.policyOf(skuId);
+    const drawableBatch = (batchId: string): boolean => {
+      const batch = batchById.get(batchId);
+      // An identity the catalog does not know is not suggestible.
+      if (batch === undefined) return false;
+      // Story 4-3a — the ONE shared predicate (status, 3-3a's expiry at `at`,
+      // and the minimum on `minJudgedOn`); the promise side's
+      // `unpromisableBatchUnits` reads it too, so promise and draw agree.
+      return isBatchAllocatableAt(batch, input.at, policy.minDays, input.minJudgedOn);
+    };
     const skuClass = input.skuClassById.get(skuId);
     const plainRows = input.stock
       .filter((row) => row.skuId === skuId && binRank.has(row.binId))
@@ -122,26 +156,25 @@ export function buildStockPool(input: StockPoolInput): Map<string, StockSlot[]> 
       .sort((a, b) => binRank.get(a.binId)! - binRank.get(b.binId)!);
     for (const row of plainRows) {
       const binCode = binCodes.get(row.binId)!;
+      const walkRank = binRank.get(row.binId)!;
       const batchRows = input.batchStock.filter(
         (batch) => batch.skuId === skuId && batch.binId === row.binId,
       );
       if (batchRows.length === 0) {
         // An untracked SKU (or a bin whose batch projection is empty): the
         // plain projection row IS the drawable quantity.
-        slots.push({ binId: row.binId, binCode, batchId: null, remaining: row.quantity });
+        slots.push({ binId: row.binId, binCode, batchId: null, walkRank, remaining: row.quantity });
         continue;
       }
-      const drawable = batchRows
-        .filter((batch) => drawableBatch(batch.batchId))
-        // FEFO: expiry ASC, nulls LAST (a batch without expiry draws last).
-        .sort((a, b) => {
-          const left = expiryOf(a.batchId);
-          const right = expiryOf(b.batchId);
-          if (left === right) return a.batchId < b.batchId ? -1 : a.batchId > b.batchId ? 1 : 0;
-          if (left === null) return 1;
-          if (right === null) return -1;
-          return left < right ? -1 : 1;
-        });
+      // The bin's allocatable batches in the RULE's order — the order the
+      // per-bin budget is spent in (story 4-3a; was in-bin FEFO).
+      const drawable = rankSlots(
+        batchRows
+          .filter((batch) => drawableBatch(batch.batchId))
+          .map((batch) => ({ ...batch, walkRank })),
+        policy.allocationRule,
+        factsOf,
+      );
       // What the batch projection accounts for in this bin — drawable or
       // not. Anything ABOVE it is batch-less stock the batch fold has not
       // (or cannot) attribute: it exists, it is pickable, and stranding it
@@ -155,13 +188,14 @@ export function buildStockPool(input: StockPoolInput): Map<string, StockSlot[]> 
         if (binBudget <= 0) break;
         const remaining = Math.min(batch.quantity, binBudget);
         binBudget -= remaining;
-        slots.push({ binId: row.binId, binCode, batchId: batch.batchId, remaining });
+        slots.push({ binId: row.binId, binCode, batchId: batch.batchId, walkRank, remaining });
       }
       if (uncovered > 0) {
-        slots.push({ binId: row.binId, binCode, batchId: null, remaining: uncovered });
+        slots.push({ binId: row.binId, binCode, batchId: null, walkRank, remaining: uncovered });
       }
     }
-    pool.set(skuId, slots);
+    // Story 4-3a — the warehouse-wide ranking (decision 4).
+    pool.set(skuId, rankSlots(slots, policy.allocationRule, factsOf));
   }
   return pool;
 }
@@ -197,13 +231,18 @@ export interface ReplanSlice {
   readonly binCode: string;
   readonly batchId: string | null;
   readonly qty: number;
+  /** Story 4-3a (A1) — the slice's position in the rule's rank order (the walk sort's last tie-break). */
+  readonly rankIndex: number;
 }
 
 /**
  * Where the remainder of a short-picked stop can be drawn instead (FR-15's
  * "within the same Picklist"): the SKU's drawable units in every OTHER
- * pickable bin of the warehouse, in walk order, FEFO within each bin, taken
- * until `need` is covered.
+ * pickable bin of the warehouse, in the allocation rule's rank order (story
+ * 4-3a: the short line's frozen rule and minimum, or the client's current
+ * policy for a legacy line), taken until `need` is covered. The slices come
+ * back in RANK order with their `rankIndex`; the caller re-sorts them into
+ * walk order before numbering the stops (A1).
  *
  * The short bin itself is excluded by id — it is the bin that just failed to
  * cover the draw, and re-planning the remainder back onto it would hand the
@@ -240,6 +279,11 @@ export async function findReplanSlices(
     readonly need: number;
     /** The pick's own business time: expiry is judged against it, not now. */
     readonly at: number;
+    /** Story 4-3a — the rule and minimum the new slices are planned (and stamped) with. */
+    readonly allocationRule: AllocationRule;
+    readonly minDays: number | null;
+    /** Story 4-3a (A3) — the IST date the minimum is judged on (the one-day grace). */
+    readonly minJudgedOn: string;
   },
 ): Promise<ReplanSlice[]> {
   if (scope.need <= 0) {
@@ -254,7 +298,8 @@ export async function findReplanSlices(
   const [stock, batchStock, batchIdentities, claimed, skuClasses] = await Promise.all([
     deps.inventory.stockByBinsInTx(tx, scope.tenantId, scope.warehouseId, [scope.skuId]),
     deps.inventory.batchOnHandByBinsInTx(tx, scope.tenantId, scope.warehouseId, [scope.skuId]),
-    deps.catalog.getBatchesForSkusInTx(tx, scope.tenantId, [scope.skuId]),
+    // Story 4-3a — the intake facts carry `createdAt` (FIFO's anchor).
+    deps.catalog.getBatchIntakesForSkusInTx(tx, scope.tenantId, [scope.skuId]),
     openClaimsInTx(
       tx,
       scope.tenantId,
@@ -272,11 +317,13 @@ export async function findReplanSlices(
     batchStock,
     batchIdentities,
     at: scope.at,
+    policyOf: () => ({ allocationRule: scope.allocationRule, minDays: scope.minDays }),
+    minJudgedOn: scope.minJudgedOn,
   });
   const slots = pool.get(scope.skuId) ?? [];
 
   // Spend the outstanding claims against each bin's slots FIRST, in the same
-  // FEFO order a pick would draw them: what is left is what is genuinely
+  // rank order a pick would draw them: what is left is what is genuinely
   // unspoken for. Claims can exceed a bin's live stock (a bin drained after
   // its wave was planned), which simply zeroes it — never a negative slot.
   for (const [binId, units] of claimed) {
@@ -297,7 +344,7 @@ export async function findReplanSlices(
     if (slot.remaining <= 0) continue;
     const take = Math.min(need, slot.remaining);
     need -= take;
-    slices.push({ binId: slot.binId, binCode: slot.binCode, batchId: slot.batchId, qty: take });
+    slices.push({ binId: slot.binId, binCode: slot.binCode, batchId: slot.batchId, qty: take, rankIndex: slices.length });
   }
   return slices;
 }

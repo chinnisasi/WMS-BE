@@ -659,6 +659,13 @@
       "when": 1792721524632,
       "tag": "0093_order_fields",
       "breakpoints": true
+    },
+    {
+      "idx": 94,
+      "version": "7",
+      "when": 1792787396829,
+      "tag": "0094_client_allocation_policy",
+      "breakpoints": true
     }
   ]
 }

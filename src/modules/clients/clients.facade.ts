@@ -4,7 +4,15 @@ import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
-import { MAX_CLIENT_LIST, clientContacts, clients, type ClientContactRole, type ClientStatus } from './clients.schema';
+import {
+  MAX_CLIENT_LIST,
+  clientContacts,
+  clients,
+  isAllocationRule,
+  type AllocationRule,
+  type ClientContactRole,
+  type ClientStatus,
+} from './clients.schema';
 import type { UserRole, UserStatus } from '../../shared/db/schema';
 import { getMemberPortalFactsIn } from '../tenancy/tenancy.service';
 import { addressFromColumns, type AddressSnapshot } from '../../shared/primitives/address';
@@ -39,6 +47,40 @@ export interface ClientSnapshot {
    * without it (every fresh read carries it).
    */
   readonly receivingPolicy?: ClientReceivingPolicy;
+  /**
+   * Story 4-3a — the client's outbound allocation policy. OPTIONAL on the
+   * type: a `ClientMutationSnapshot` stored before 4-3a replays without it
+   * (every fresh read carries it).
+   */
+  readonly allocationPolicy?: ClientAllocationPolicy;
+}
+
+/**
+ * Story 4-3a — how a client's stock is allocated to its customer orders: the
+ * rule (`fefo` | `fifo`) and the minimum remaining shelf life at dispatch
+ * (IST calendar days; null = none). Applied by the wave plan, the short-pick
+ * re-plan and the pick draw; the minimum also by ATP.
+ */
+export interface ClientAllocationPolicy {
+  readonly allocationRule: AllocationRule;
+  readonly minOutboundShelfLifeDays: number | null;
+}
+
+/** Story 4-3a — the policy every client starts with (and an unknown id reads). */
+export const DEFAULT_ALLOCATION_POLICY: ClientAllocationPolicy = {
+  allocationRule: 'fefo',
+  minOutboundShelfLifeDays: null,
+};
+
+/** Story 4-3a — the allocation columns of a client row (an unknown stored rule reads `fefo`, fail-safe to the default). */
+export function allocationPolicyOf(row: {
+  readonly allocationRule: string;
+  readonly minOutboundShelfLifeDays: number | null;
+}): ClientAllocationPolicy {
+  return {
+    allocationRule: isAllocationRule(row.allocationRule) ? row.allocationRule : 'fefo',
+    minOutboundShelfLifeDays: row.minOutboundShelfLifeDays,
+  };
 }
 
 /**
@@ -189,6 +231,7 @@ export function toClientSnapshot(row: typeof clients.$inferSelect): ClientSnapsh
       pincode: row.returnPincode,
     }),
     receivingPolicy: receivingPolicyOf(row),
+    allocationPolicy: allocationPolicyOf(row),
   };
 }
 
@@ -294,6 +337,26 @@ export class ClientsFacade {
         throw clientNotFound(clientId);
       }
       return receivingPolicyOf(row);
+    });
+  }
+
+  /**
+   * Story 4-3a (A12) — one client's allocation policy, 404 when the client is
+   * not this tenant's. A staff read (any operator session — never the
+   * portal); the api shell composes the panel's counts beside it.
+   */
+  async getAllocationPolicy(tenantId: string, clientId: string): Promise<ClientAllocationPolicy> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select({ allocationRule: clients.allocationRule, minOutboundShelfLifeDays: clients.minOutboundShelfLifeDays })
+        .from(clients)
+        .where(and(eq(clients.tenantId, tenantId), eq(clients.id, clientId)))
+        .limit(1);
+      const row = rows[0];
+      if (row === undefined) {
+        throw clientNotFound(clientId);
+      }
+      return allocationPolicyOf(row);
     });
   }
 
@@ -488,6 +551,35 @@ export async function receivingPoliciesInTx(
     .from(clients)
     .where(and(eq(clients.tenantId, tenantId), inArray(clients.id, distinct)));
   return new Map(rows.map((row) => [row.id, receivingPolicyOf(row)]));
+}
+
+/**
+ * Story 4-3a — the allocation policies of `clientIds` (id → policy). The
+ * `receivingPoliciesInTx` shape: a plain, UNLOCKED read on the caller's
+ * transaction — a plan reads the policy committed when it reads it, there is
+ * no serialisation against a policy edit. An unknown id maps to
+ * `DEFAULT_ALLOCATION_POLICY` (every requested id is present). The wave plan
+ * reads it ONCE for all its clients (A10).
+ */
+export async function allocationPoliciesInTx(
+  tx: TenantTx,
+  tenantId: string,
+  clientIds: readonly string[],
+): Promise<Map<string, ClientAllocationPolicy>> {
+  const distinct = [...new Set(clientIds)];
+  if (distinct.length === 0) {
+    return new Map();
+  }
+  const rows = await tx
+    .select({
+      id: clients.id,
+      allocationRule: clients.allocationRule,
+      minOutboundShelfLifeDays: clients.minOutboundShelfLifeDays,
+    })
+    .from(clients)
+    .where(and(eq(clients.tenantId, tenantId), inArray(clients.id, distinct)));
+  const found = new Map(rows.map((row) => [row.id, allocationPolicyOf(row)]));
+  return new Map(distinct.map((id) => [id, found.get(id) ?? DEFAULT_ALLOCATION_POLICY]));
 }
 
 /**

@@ -225,6 +225,8 @@ export const AUDIT_NEW_ACTIONS = [
   // reviewer), and QC on receipt: ONE row per receipt (or approved excess)
   // placed on holds and ONE per receipt released — each targeting the GRN.
   { action: 'client.receiving_policy_updated', targetType: 'client' },
+  // Story 4-3a — the outbound allocation policy (`ClientsCommand.updateAllocationPolicy`).
+  { action: 'client.allocation_policy_updated', targetType: 'client' },
   { action: 'goods_receipt.shelf_life_waived', targetType: 'goods_receipt' },
   { action: 'qc_hold.receipt_placed', targetType: 'goods_receipt' },
   { action: 'qc_hold.receipt_released', targetType: 'goods_receipt' },

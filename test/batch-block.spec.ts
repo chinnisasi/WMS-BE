@@ -540,8 +540,10 @@ describe('story 3-3a: batch block and unpromisable stock (e2e)', () => {
           skuClassById: new Map([[sku('BB-EXP'), 'ambient']]),
           stock: [{ skuId: sku('BB-EXP'), binId: binA, quantity: 5 * SCALE }],
           batchStock: [{ skuId: sku('BB-EXP'), binId: binA, batchId: id, quantity: 5 * SCALE }],
-          batchIdentities: [{ id, code: 'E-1', expiryDate: view.expiryDate, status: 'active', mfgDate: null }],
+          batchIdentities: [{ id, code: 'E-1', expiryDate: view.expiryDate, status: 'active', mfgDate: null, createdAt: new Date().toISOString() }],
           at,
+          // Story 4-3a — the pool ranks and filters by the SKU's policy (fefo, no minimum: the 3-3a draw).
+          policyOf: () => ({ allocationRule: 'fefo', minDays: null }),
         } as unknown as Parameters<typeof buildStockPool>[0]).get(sku('BB-EXP')) ?? []
       ).reduce((sum, slot) => sum + slot.remaining, 0) / SCALE;
     try {
@@ -645,7 +647,8 @@ describe('story 3-3a: batch block and unpromisable stock (e2e)', () => {
       );
     expect(refusal?.getStatus()).toBe(409);
     expect(refusal?.getResponse()).toMatchObject({ code: 'unavailable' });
-    expect(refusal?.getResponse().detail).toContain('(of which 10 in blocked/expired batches)');
+    // Story 4-3a (A15) re-words the clause to name the client minimum too.
+    expect(refusal?.getResponse().detail).toContain("(of which 10 in blocked or expired batches, or below the client's minimum remaining shelf life)");
     // Clearing still works.
     expect(await inventory.applyChannelBuffer({ tenantId, warehouseId: wh, skuId: sku('BB-BUF'), ownerId, targetMilli: 0 })).toMatchObject({ status: 'applied', targetMilli: 0 });
   });

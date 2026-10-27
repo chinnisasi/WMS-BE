@@ -95,8 +95,8 @@ function at(value: string | null): Date | null {
 
 const DAY_MS = 86_400_000;
 
-/** Whole IST calendar days from `fromInstant`'s IST date to `toInstant`'s (negative when `to` is earlier). */
-function istDaysBetween(fromInstant: string, toInstant: string): number {
+/** Whole IST calendar days (over INSTANTS — renamed 4-3a, A21, so it never shares a name with the date-taking `istDaysBetween`) from `fromInstant`'s IST date to `toInstant`'s (negative when `to` is earlier). */
+function istDaysBetweenInstants(fromInstant: string, toInstant: string): number {
   return Math.round((Date.parse(`${istDateOf(toInstant)}T00:00:00Z`) - Date.parse(`${istDateOf(fromInstant)}T00:00:00Z`)) / DAY_MS);
 }
 
@@ -509,9 +509,9 @@ const batchAgeing: RegisterDefinition = {
       batch?.code ?? null,
       at(batch?.mfgDate ?? null),
       at(batch?.expiryDate ?? null),
-      batch === undefined || batch.expiryDate === null ? null : istDaysBetween(now, batch.expiryDate),
+      batch === undefined || batch.expiryDate === null ? null : istDaysBetweenInstants(now, batch.expiryDate),
       at(batch?.createdAt ?? null),
-      batch === undefined ? null : istDaysBetween(batch.createdAt, now),
+      batch === undefined ? null : istDaysBetweenInstants(batch.createdAt, now),
       row.uom,
       row.quantity,
     ]);

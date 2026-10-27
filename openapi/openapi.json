@@ -25298,6 +25298,220 @@
         ]
       }
     },
+    "/tenants/{tenantId}/clients/{clientId}/allocation-policy": {
+      "get": {
+        "operationId": "ClientsController_getAllocationPolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientAllocationPolicyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed clientId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Reads a client's outbound allocation policy — the rule (fefo | fifo) and the minimum remaining shelf life at dispatch — plus how many of its SKUs are untracked and how many undated batches it has on hand (any staff session; never the portal). Story 4-3a",
+        "tags": [
+          "clients"
+        ]
+      },
+      "put": {
+        "operationId": "ClientsController_updateAllocationPolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateClientAllocationPolicyDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed clientId, or a field that breaks its rule — a rule outside fefo|fifo, a minimum outside 1-3650 whole days, or a missing key (validation-failed, naming the field)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks clients.manage — owner only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Replaces a client's outbound allocation policy whole (owner-only, clients.manage): the rule and the minimum remaining shelf life at dispatch, both required. Applies to waves generated after it and to ATP at once. Allowed on the self client and on a departed one. An unchanged policy is a no-op (nothing written or audited; the key is stored). Story 4-3a",
+        "tags": [
+          "clients"
+        ]
+      }
+    },
     "/tenants/{tenantId}/clients/{clientId}/contacts": {
       "get": {
         "operationId": "ClientsController_listContacts",
@@ -40066,7 +40280,7 @@
           "batchId": {
             "type": "string",
             "nullable": true,
-            "description": "Suggested batch (FEFO within the bin); null when the SKU carries no batch stock"
+            "description": "Suggested batch (ranked by the client's allocation rule, story 4-3a); null when the SKU carries no batch stock"
           },
           "reservationId": {
             "type": "string",
@@ -40115,6 +40329,40 @@
           "createdAt": {
             "type": "string",
             "description": "ISO-8601 UTC creation time"
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 4-3a — the suggested batch's code; null when none"
+          },
+          "batchExpiryDate": {
+            "type": "string",
+            "nullable": true,
+            "format": "date",
+            "description": "Story 4-3a — the suggested batch's expiry date (IST, YYYY-MM-DD); null when undated or none"
+          },
+          "batchReceivedOn": {
+            "type": "string",
+            "nullable": true,
+            "format": "date",
+            "description": "Story 4-3a — the IST date the suggested batch's LOT was first received in the tenant (batches.created_at — a lot received again keeps its first date); null when none"
+          },
+          "allocationRule": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "fefo",
+              "fifo",
+              null
+            ],
+            "description": "Story 4-3a — the allocation rule this line was planned under (frozen at generate); null on a line planned before 4-3a (drawn as fefo with no minimum)"
+          },
+          "minOutboundShelfLifeDays": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 3650,
+            "description": "Story 4-3a — the minimum remaining shelf life (IST days) this line was planned under (frozen); null when none"
           }
         },
         "required": [
@@ -42106,6 +42354,35 @@
             "nullable": true,
             "format": "date",
             "description": "Story 4-2a — the task's order ship-by date (IST, YYYY-MM-DD); null when none."
+          },
+          "batchExpiryDate": {
+            "type": "string",
+            "nullable": true,
+            "format": "date",
+            "description": "Story 4-3a — the suggested batch's expiry date (IST, YYYY-MM-DD); null when undated or none"
+          },
+          "batchReceivedOn": {
+            "type": "string",
+            "nullable": true,
+            "format": "date",
+            "description": "Story 4-3a — the IST date the suggested batch's LOT was first received in the tenant (batches.created_at — a lot received again keeps its first date); null when none"
+          },
+          "allocationRule": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "fefo",
+              "fifo",
+              null
+            ],
+            "description": "Story 4-3a — the allocation rule this line was planned under (frozen at generate); null on a line planned before 4-3a (drawn as fefo with no minimum)"
+          },
+          "minOutboundShelfLifeDays": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 3650,
+            "description": "Story 4-3a — the minimum remaining shelf life (IST days) this line was planned under (frozen); null when none"
           }
         },
         "required": [
@@ -51086,6 +51363,30 @@
           "minShelfLifeDays"
         ]
       },
+      "ClientAllocationPolicyDto": {
+        "type": "object",
+        "properties": {
+          "allocationRule": {
+            "type": "string",
+            "enum": [
+              "fefo",
+              "fifo"
+            ],
+            "description": "`fefo` — earliest expiry first (batches with no expiry: lot first received first); `fifo` — lot first received first. Untracked SKUs are drawn in bin walk order under either. Applies to waves generated after it is saved"
+          },
+          "minOutboundShelfLifeDays": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 3650,
+            "description": "The minimum remaining shelf life at dispatch, in IST calendar days: a batch with less left is never allocated to this client's orders, and is not promised (ATP). Limits DATED batches only — a batch with no expiry is never limited. null = none"
+          }
+        },
+        "required": [
+          "allocationRule",
+          "minOutboundShelfLifeDays"
+        ]
+      },
       "ClientDto": {
         "type": "object",
         "properties": {
@@ -51160,6 +51461,14 @@
             "allOf": [
               {
                 "$ref": "#/components/schemas/ClientReceivingPolicyDto"
+              }
+            ]
+          },
+          "allocationPolicy": {
+            "description": "Story 4-3a — the outbound allocation policy. Optional: a mutation answer stored before 4-3a replays without it; every fresh read carries it",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ClientAllocationPolicyDto"
               }
             ]
           }
@@ -51439,6 +51748,70 @@
           "qcOnReceipt",
           "expiryRequired",
           "minShelfLifeDays"
+        ]
+      },
+      "ClientAllocationPolicyResponse": {
+        "type": "object",
+        "properties": {
+          "allocationRule": {
+            "type": "string",
+            "enum": [
+              "fefo",
+              "fifo"
+            ],
+            "description": "`fefo` — earliest expiry first (batches with no expiry: lot first received first); `fifo` — lot first received first. Untracked SKUs are drawn in bin walk order under either. Applies to waves generated after it is saved"
+          },
+          "minOutboundShelfLifeDays": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 3650,
+            "description": "The minimum remaining shelf life at dispatch, in IST calendar days: a batch with less left is never allocated to this client's orders, and is not promised (ATP). Limits DATED batches only — a batch with no expiry is never limited. null = none"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "untrackedSkuCount": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How many of the client's SKUs are NOT batch-tracked (kits excluded) — they are drawn in bin walk order under either rule"
+          },
+          "undatedBatchesOnHand": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Distinct active batches of the client's SKUs with NO expiry date and stock on hand (outside the QC-hold, damaged, returns and in-transit system bins), across warehouses — the minimum cannot limit them"
+          }
+        },
+        "required": [
+          "allocationRule",
+          "minOutboundShelfLifeDays",
+          "clientId",
+          "untrackedSkuCount",
+          "undatedBatchesOnHand"
+        ]
+      },
+      "UpdateClientAllocationPolicyDto": {
+        "type": "object",
+        "properties": {
+          "allocationRule": {
+            "type": "string",
+            "enum": [
+              "fefo",
+              "fifo"
+            ]
+          },
+          "minOutboundShelfLifeDays": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 3650,
+            "description": "IST calendar days; null for none (required — send null explicitly)"
+          }
+        },
+        "required": [
+          "allocationRule",
+          "minOutboundShelfLifeDays"
         ]
       },
       "ClientContactDto": {

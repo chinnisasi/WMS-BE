@@ -8,7 +8,7 @@ import type { InvoiceDocument, StateCodeEntry } from './generator';
 import { isValidHsn, normalizeHsn } from './hsn';
 import { uqcFor } from './uqc';
 import { istDateOf } from './eway-threshold';
-import { isIsoDate } from '../../shared/primitives/time';
+import { isIsoDate, istDaysBetween } from '../../shared/primitives/time';
 
 /**
  * The NIC e-way bill object (story 8-2b) — PURE functions only. ONE builder
@@ -222,10 +222,8 @@ export function nicDate(isoDate: string): string {
   return `${d}/${m}/${y}`;
 }
 
-/** Whole IST calendar days from `fromDate` to `toDate` (both `YYYY-MM-DD`). */
-export function istDaysBetween(fromDate: string, toDate: string): number {
-  return Math.round((Date.parse(`${toDate}T00:00:00Z`) - Date.parse(`${fromDate}T00:00:00Z`)) / 86_400_000);
-}
+/** Whole IST calendar days from `fromDate` to `toDate` (both `YYYY-MM-DD`) — the shared primitive (4-3a, A21), re-exported. */
+export { istDaysBetween };
 
 /** An address state resolved from its TEXT alone (`gstin = null` — the actual state). */
 function actualStateOf(maps: StateCodeMaps, address: AddressSnapshot | null): string | null {

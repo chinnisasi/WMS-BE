@@ -27,7 +27,7 @@ import {
   signedQuantity,
 } from '../../shared/primitives/quantity';
 import { uomPrecision } from '../catalog/uom';
-import { assertUtcIso, nowIso } from '../../shared/primitives/time';
+import { assertUtcIso, canonicalInstant, istDateOf, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
@@ -51,6 +51,16 @@ import { ORDER_OWNER_TYPE, ORDER_RESERVATION_TTL_SECONDS } from './order.command
 import type { OrderStatus } from './order.command';
 import { orderPriorityRankSql, orderUrgencyOrderBy, type OrderPriority } from './order-urgency';
 import { isBatchExpiredAt } from '../../shared/primitives/batch-expiry';
+// Story 4-3a — THE allocation rule and THE allocatability predicate (A6).
+import {
+  effectiveLineRule,
+  isBatchAllocatableAt,
+  meetsMinimumShelfLife,
+  minimumJudgementDate,
+  rankSlots,
+  type AllocationRule,
+} from '../../shared/primitives/batch-allocation';
+import { allocationPoliciesInTx, getClientLabelsInTx } from '../clients/clients.facade';
 
 /**
  * The fixed short-pick reason enum (story 4.4): required on EVERY short pick,
@@ -273,6 +283,16 @@ export interface PickTask {
    */
   readonly orderPriority: OrderPriority;
   readonly orderShipByDate: string | null;
+  /**
+   * Story 4-3a — the handheld's allocation hint: the suggested batch's expiry
+   * and its lot's first receipt (IST dates), and the rule and minimum the line
+   * was planned under (frozen; null on a pre-4-3a line). Display only — the
+   * server re-derives the batch.
+   */
+  readonly batchExpiryDate: string | null;
+  readonly batchReceivedOn: string | null;
+  readonly allocationRule: AllocationRule | null;
+  readonly minOutboundShelfLifeDays: number | null;
 }
 
 /** The AD-14 taxonomy's two SUCCESS arms, plus "no conflict at all". */
@@ -499,6 +519,8 @@ export class PickCommandService {
           line: picklistLines,
           picklistStatus: picklists.status,
           picklistWarehouseId: picklists.warehouseId,
+          // Story 4-3a (A3) — the plan date the minimum's one-day grace keys on.
+          picklistCreatedAt: picklists.createdAt,
           waveStatus: waves.status,
         })
         .from(picklistLines)
@@ -958,7 +980,7 @@ export class PickCommandService {
         scaled.qty === 0
           ? { arms: [] as { batchId: string | null; qty: number }[] }
           : sku.batchTracked
-            ? await this.deriveBatchArms(tx, scaled, occurredAt)
+            ? await this.deriveBatchArms(tx, scaled, occurredAt, line, found.picklistCreatedAt)
             : { arms: [{ batchId: null, qty: scaled.qty }] };
       if ('drawable' in batchDraw) {
         // Cases 3 vs today: a bin that cannot cover the draw is `409
@@ -966,7 +988,21 @@ export class PickCommandService {
         // turns it into an alternate bin or a partial order, and the client
         // keeps the op), and the unchanged `422 insufficient-on-hand` when it
         // did not (which is also every pre-upgrade device's behaviour).
-        throw binCannotCover(epochMoved, drawBin.code, batchDraw.drawable, scaled.qty);
+        // Story 4-3a (A16) — the detail names the units the line's minimum
+        // excluded and the client (the label read on the refusal path only).
+        throw binCannotCover(
+          epochMoved,
+          drawBin.code,
+          batchDraw.drawable,
+          scaled.qty,
+          batchDraw.shelfLifeExcluded > 0 && batchDraw.minDays !== null
+            ? {
+                excludedMilli: batchDraw.shelfLifeExcluded,
+                minDays: batchDraw.minDays,
+                clientLabel: await this.skuClientLabelInTx(tx, command.tenantId, command.skuId),
+              }
+            : undefined,
+        );
       }
       const allocation = batchDraw.arms;
 
@@ -1232,6 +1268,14 @@ export class PickCommandService {
         // to promise away underneath it — the partial-order path is the
         // honest answer instead.
         if (replanReservationId !== null) {
+          // Story 4-3a (decision 7, A4) — the new slices are planned with the
+          // short line's FROZEN values; a legacy line (null rule) takes the
+          // client's CURRENT policy — they are new slices, planned now. The
+          // minimum is judged with the one-day grace (A3).
+          const replanPolicy =
+            line.allocationRule === null
+              ? await this.currentPolicyOfSkuInTx(tx, command.tenantId, command.skuId)
+              : { allocationRule: effectiveLineRule(line.allocationRule), minDays: line.minOutboundShelfLifeDays };
           const candidates = await findReplanSlices(
             tx,
             { inventory: this.inventory, catalog: this.catalog },
@@ -1242,6 +1286,12 @@ export class PickCommandService {
               excludeBinId: drawBin.id,
               need: shortfallQty,
               at: Date.parse(occurredAt),
+              allocationRule: replanPolicy.allocationRule,
+              minDays: replanPolicy.minDays,
+              minJudgedOn: minimumJudgementDate(
+                istDateOf(canonicalInstant(found.picklistCreatedAt)),
+                istDateOf(occurredAt),
+              ),
             },
           );
           replanned = await this.insertReplanSlices(tx, {
@@ -1250,6 +1300,7 @@ export class PickCommandService {
             siblings,
             reservationId: replanReservationId,
             candidates,
+            policy: replanPolicy,
           });
         }
       } else if (line.reservationId !== null) {
@@ -1471,6 +1522,8 @@ export class PickCommandService {
       readonly siblings: readonly { id: string; status: string; sliceSeq: number }[];
       readonly reservationId: string;
       readonly candidates: readonly ReplanSlice[];
+      /** Story 4-3a — the policy the slices were planned with, stamped on them. */
+      readonly policy: { readonly allocationRule: AllocationRule; readonly minDays: number | null };
     },
   ): Promise<ReplannedSliceSnapshot[]> {
     if (input.candidates.length === 0) {
@@ -1491,7 +1544,15 @@ export class PickCommandService {
       );
     let nextWalkSeq = (walkRows[0]?.maxWalkSeq ?? -1) + 1;
 
-    const rows = input.candidates.map((candidate) => ({
+    // Story 4-3a (A1) — the candidates arrive in RANK order; the stops are
+    // numbered in WALK order (bin code, bin id, then rank), so a re-plan
+    // across an earlier-expiry `B-01` and `A-01` still walks `A-01` first.
+    const walkOrdered = [...input.candidates].sort((a, b) => {
+      if (a.binCode !== b.binCode) return a.binCode < b.binCode ? -1 : 1;
+      if (a.binId !== b.binId) return a.binId < b.binId ? -1 : 1;
+      return a.rankIndex - b.rankIndex;
+    });
+    const rows = walkOrdered.map((candidate) => ({
       id: uuidv7(),
       tenantId: command.tenantId,
       picklistId: command.picklistId,
@@ -1509,6 +1570,8 @@ export class PickCommandService {
       sliceSeq: nextSliceSeq++,
       walkSeq: nextWalkSeq++,
       status: 'planned',
+      allocationRule: input.policy.allocationRule,
+      minOutboundShelfLifeDays: input.policy.minDays,
     }));
     await tx.insert(picklistLines).values(rows);
     return rows.map((row) => ({
@@ -1524,21 +1587,30 @@ export class PickCommandService {
   }
 
   /**
-   * The FEFO batch arms of one draw, RE-DERIVED in the bin the operator
-   * actually scanned (never the plan's bin): drawable batches only (a
-   * blocked batch is never drawn — epic-2 retro a13's draw side; an expired
-   * batch is never drawn), expiry ascending with no-expiry last, taking from
-   * each until the quantity is covered. A bin that cannot cover the line comes
-   * back as `{ drawable }` — the drawable unit count — and the CALLER picks
-   * the refusal (story 4.3b: re-plannable when the bin's epoch moved, the
-   * unchanged 422 when it did not).
+   * The batch arms of one draw, RE-DERIVED in the bin the operator actually
+   * scanned (never the plan's bin), under the line's FROZEN policy (story
+   * 4-3a, decision 7 — a legacy line draws as `fefo` with no minimum):
+   *   - only ALLOCATABLE batches (`isBatchAllocatableAt`): not blocked, not
+   *     expired at the op's `occurredAt`, and not below the line's minimum
+   *     judged on `max(plan date, pick date − 1)` (A3, the one-day grace);
+   *   - the slice's NAMED batch first, when it is in this bin and
+   *     allocatable (A2) — the batch the handheld named is the batch drawn;
+   *   - then the bin's other allocatable batches in the rule's rank order
+   *     (`rankSlots`), taking from each until the quantity is covered.
+   * A bin that cannot cover the line comes back as `{ drawable, … }` — the
+   * drawable unit count, plus the units the minimum alone excluded — and the
+   * CALLER picks the refusal (story 4.3b: re-plannable when the bin's epoch
+   * moved, the unchanged 422 when it did not).
    */
   private async deriveBatchArms(
     tx: TenantTx,
     command: RecordPickCommand,
     occurredAt: string,
+    line: PicklistLine,
+    planCreatedAt: string,
   ): Promise<
-    { arms: { batchId: string | null; qty: number }[] } | { drawable: number }
+    | { arms: { batchId: string | null; qty: number }[] }
+    | { drawable: number; shelfLifeExcluded: number; minDays: number | null }
   > {
     const [batchStock, identities] = await Promise.all([
       // Bin-scoped in SQL: this runs inside the command transaction while
@@ -1551,33 +1623,39 @@ export class PickCommandService {
         command.skuId,
         command.binId,
       ),
-      this.catalog.getBatchesForSkusInTx(tx, command.tenantId, [command.skuId]),
+      // Story 4-3a — the intake facts carry `createdAt` (FIFO's anchor).
+      this.catalog.getBatchIntakesForSkusInTx(tx, command.tenantId, [command.skuId]),
     ]);
     const byId = new Map(identities.map((batch) => [batch.id, batch]));
     // The draw's own business time decides expiry — a queued pick replayed
     // later must not be re-judged against the replay instant.
     const at = Date.parse(occurredAt);
-    const drawable = batchStock
-      .filter((row) => {
-        const batch = byId.get(row.batchId);
-        if (batch === undefined || batch.status !== 'active') return false;
-        // Story 3-3a (A3) — the ONE shared expiry predicate.
-        return !isBatchExpiredAt(batch.expiryDate, at);
-      })
-      .sort((a, b) => {
-        const left = byId.get(a.batchId)?.expiryDate ?? null;
-        const right = byId.get(b.batchId)?.expiryDate ?? null;
-        if (left === right) return a.batchId < b.batchId ? -1 : a.batchId > b.batchId ? 1 : 0;
-        if (left === null) return 1;
-        if (right === null) return -1;
-        return left < right ? -1 : 1;
-      });
+    const rule = effectiveLineRule(line.allocationRule);
+    const minDays = line.allocationRule === null ? null : line.minOutboundShelfLifeDays;
+    const minJudgedOn = minimumJudgementDate(istDateOf(canonicalInstant(planCreatedAt)), istDateOf(occurredAt));
+    const allocatable = (batchId: string): boolean => {
+      const batch = byId.get(batchId);
+      return batch !== undefined && isBatchAllocatableAt(batch, at, minDays, minJudgedOn);
+    };
+    const named =
+      line.batchId === null
+        ? undefined
+        : batchStock.find((row) => row.batchId === line.batchId && allocatable(row.batchId));
+    const ranked = rankSlots(
+      batchStock
+        .filter((row) => row !== named && allocatable(row.batchId))
+        .map((row) => ({ ...row, walkRank: 0 })),
+      rule,
+      (batchId) => byId.get(batchId),
+    );
+    const drawable = named === undefined ? ranked : [named, ...ranked];
 
     const arms: { batchId: string | null; qty: number }[] = [];
     let need = command.qty;
     for (const row of drawable) {
       if (need === 0) break;
       const take = Math.min(need, row.quantity);
+      if (take <= 0) continue;
       need -= take;
       arms.push({ batchId: row.batchId, qty: take });
     }
@@ -1585,9 +1663,34 @@ export class PickCommandService {
       // A shortfall is REPORTED, never thrown from here: story 4.3b's caller
       // decides between the re-plannable 409 and the unchanged 422 by whether
       // the bin's epoch moved, and that is not this helper's business.
-      return { drawable: command.qty - need };
+      // Story 4-3a (A16): the units the MINIMUM alone kept out (active, not
+      // expired, below the line's minimum), for the refusal's suffix.
+      const shelfLifeExcluded = batchStock.reduce((sum, row) => {
+        const batch = byId.get(row.batchId);
+        if (batch === undefined || batch.status !== 'active' || isBatchExpiredAt(batch.expiryDate, at)) return sum;
+        return meetsMinimumShelfLife(batch.expiryDate, at, minDays, minJudgedOn) ? sum : sum + row.quantity;
+      }, 0);
+      return { drawable: command.qty - need, shelfLifeExcluded, minDays };
     }
     return { arms };
+  }
+
+  /** Story 4-3a — the label of a SKU's client, for the A16 refusal suffix (refusal path only). */
+  private async skuClientLabelInTx(tx: TenantTx, tenantId: string, skuId: string): Promise<string> {
+    const clientId = (await this.catalog.skuClientIdsInTx(tx, tenantId, [skuId])).get(skuId);
+    if (clientId === undefined) return 'the client';
+    return (await getClientLabelsInTx(tx, tenantId, [clientId])).get(clientId) ?? clientId;
+  }
+
+  /** Story 4-3a (A4) — the SKU's client's CURRENT policy (a legacy line's re-plan). */
+  private async currentPolicyOfSkuInTx(
+    tx: TenantTx,
+    tenantId: string,
+    skuId: string,
+  ): Promise<{ allocationRule: AllocationRule; minDays: number | null }> {
+    const clientId = (await this.catalog.skuClientIdsInTx(tx, tenantId, [skuId])).get(skuId);
+    const policy = clientId === undefined ? undefined : (await allocationPoliciesInTx(tx, tenantId, [clientId])).get(clientId);
+    return { allocationRule: policy?.allocationRule ?? 'fefo', minDays: policy?.minOutboundShelfLifeDays ?? null };
   }
 
   /**
@@ -1717,6 +1820,8 @@ export class PickCommandService {
         qty: picklistLines.qty,
         sliceSeq: picklistLines.sliceSeq,
         walkSeq: picklistLines.walkSeq,
+        allocationRule: picklistLines.allocationRule,
+        minOutboundShelfLifeDays: picklistLines.minOutboundShelfLifeDays,
         kitParentSkuCode: parentSkus.code,
         orderPriority: taskOrders.priority,
         orderShipByDate: taskOrders.shipByDate,
@@ -1763,10 +1868,12 @@ export class PickCommandService {
         ? []
         : (
             await tx
-              .select({ id: batches.id, code: batches.code })
+              // Story 4-3a — plus the expiry and the lot's first receipt, for
+              // the handheld's allocation hint.
+              .select({ id: batches.id, code: batches.code, expiryDate: batches.expiryDate, createdAt: batches.createdAt })
               .from(batches)
               .where(and(eq(batches.tenantId, tenantId), inArray(batches.id, batchIds)))
-          ).map((batch) => [batch.id, batch.code] as const),
+          ).map((batch) => [batch.id, batch] as const),
     );
     // Distinct bin stops per picklist — the card's at-a-glance walk size.
     const stops = new Map<string, Set<string>>();
@@ -1785,7 +1892,9 @@ export class PickCommandService {
       warehouseId,
       rows.map((row) => row.binId!),
     );
-    return rows.map((row) => ({
+    return rows.map((row) => {
+      const batch = row.batchId === null ? undefined : batchCodes.get(row.batchId);
+      return {
       waveId: row.waveId,
       picklistId: row.picklistId,
       picklistLineId: row.picklistLineId,
@@ -1802,7 +1911,12 @@ export class PickCommandService {
       // on the card, so a null is a corrupt row, not a task.
       binCode: requireBinCode(row.binCode, row.picklistLineId),
       batchId: row.batchId,
-      batchCode: row.batchId === null ? null : (batchCodes.get(row.batchId) ?? null),
+      batchCode: batch?.code ?? null,
+      // Story 4-3a — the hint's facts (IST dates) and the line's frozen policy.
+      batchExpiryDate: batch === undefined || batch.expiryDate === null ? null : istDateOf(canonicalInstant(batch.expiryDate)),
+      batchReceivedOn: batch === undefined ? null : istDateOf(canonicalInstant(batch.createdAt)),
+      allocationRule: (row.allocationRule as AllocationRule | null) ?? null,
+      minOutboundShelfLifeDays: row.minOutboundShelfLifeDays,
       // Base units at the response edge (story 10.1).
       qty: fromMilli(row.qty),
       sliceSeq: row.sliceSeq,
@@ -1812,7 +1926,8 @@ export class PickCommandService {
       kitParentSkuCode: row.kitParentSkuCode,
       orderPriority: row.orderPriority as OrderPriority,
       orderShipByDate: row.orderShipByDate,
-    }));
+      };
+    });
   }
 }
 
@@ -1960,13 +2075,31 @@ export function insufficientOnHand(
   binCode: string,
   onHand: number,
   requested: number,
+  shelfLife?: ShelfLifeShortfall,
 ): ProblemException {
   return new ProblemException(
     'insufficient-on-hand',
     422,
     'Bin cannot cover this pick',
-    `Bin "${binCode}" holds ${fromMilli(onHand)} drawable unit(s) of this SKU; the pick draws ${fromMilli(requested)}. Nothing was recorded.`,
+    `Bin "${binCode}" holds ${fromMilli(onHand)} drawable unit(s) of this SKU${shelfLifeSuffix(shelfLife)}; the pick draws ${fromMilli(requested)}. Nothing was recorded.`,
   );
+}
+
+/**
+ * Story 4-3a (A16) — the units of the scanned bin the line's minimum
+ * remaining shelf life alone kept out of the draw, and whose minimum. The
+ * refusal's code, status and routing are unchanged; only its detail grows.
+ */
+export interface ShelfLifeShortfall {
+  /** Milli-units. */
+  readonly excludedMilli: number;
+  readonly minDays: number;
+  readonly clientLabel: string;
+}
+
+function shelfLifeSuffix(shelfLife: ShelfLifeShortfall | undefined): string {
+  if (shelfLife === undefined || shelfLife.excludedMilli <= 0) return '';
+  return ` — ${fromMilli(shelfLife.excludedMilli)} more are below client ${shelfLife.clientLabel}'s minimum remaining shelf life of ${shelfLife.minDays} days`;
 }
 
 /**
@@ -1983,12 +2116,13 @@ export function pickBinShort(
   binCode: string,
   onHand: number,
   requested: number,
+  shelfLife?: ShelfLifeShortfall,
 ): ProblemException {
   return new ProblemException(
     'pick-bin-short',
     409,
     'Bin moved on and is short for this pick',
-    `Bin "${binCode}" changed while this pick was queued and now holds ${fromMilli(onHand)} drawable unit(s) of this SKU; the pick draws ${fromMilli(requested)}. Nothing was recorded — the pick needs re-planning.`,
+    `Bin "${binCode}" changed while this pick was queued and now holds ${fromMilli(onHand)} drawable unit(s) of this SKU${shelfLifeSuffix(shelfLife)}; the pick draws ${fromMilli(requested)}. Nothing was recorded — the pick needs re-planning.`,
   );
 }
 
@@ -2095,10 +2229,11 @@ function binCannotCover(
   binCode: string,
   onHand: number,
   requested: number,
+  shelfLife?: ShelfLifeShortfall,
 ): ProblemException {
   return epochMoved
-    ? pickBinShort(binCode, onHand, requested)
-    : insufficientOnHand(binCode, onHand, requested);
+    ? pickBinShort(binCode, onHand, requested, shelfLife)
+    : insufficientOnHand(binCode, onHand, requested, shelfLife);
 }
 
 /** The blocked-bin rejection (FR-10): a blocked bin is unpickable. */

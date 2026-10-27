@@ -19,9 +19,13 @@ import {
   CLIENT_CONTACT_ROLES,
   CLIENT_NAME_MAX,
   CLIENT_STATUSES,
+  ALLOCATION_RULES,
+  MIN_OUTBOUND_SHELF_LIFE_DAYS_MAX,
+  MIN_OUTBOUND_SHELF_LIFE_DAYS_MIN,
   MIN_SHELF_LIFE_DAYS_MAX,
   MIN_SHELF_LIFE_DAYS_MIN,
   RECEIVING_TOLERANCE_BPS_MAX,
+  type AllocationRule,
   type ClientContactRole,
   type ClientStatus,
 } from '../modules/clients/clients.schema';
@@ -435,6 +439,70 @@ export class ClientReceivingPolicyResponse extends ClientReceivingPolicyDto {
   untrackedSkuCount!: number;
 }
 
+/** Story 4-3a — a client's outbound allocation policy. */
+export class ClientAllocationPolicyDto {
+  @ApiProperty({
+    enum: [...ALLOCATION_RULES],
+    description:
+      '`fefo` — earliest expiry first (batches with no expiry: lot first received first); `fifo` — lot first received first. Untracked SKUs are drawn in bin walk order under either. Applies to waves generated after it is saved',
+  })
+  allocationRule!: AllocationRule;
+
+  @ApiProperty({
+    type: 'integer',
+    nullable: true,
+    minimum: MIN_OUTBOUND_SHELF_LIFE_DAYS_MIN,
+    maximum: MIN_OUTBOUND_SHELF_LIFE_DAYS_MAX,
+    description:
+      'The minimum remaining shelf life at dispatch, in IST calendar days: a batch with less left is never allocated to this client\'s orders, and is not promised (ATP). Limits DATED batches only — a batch with no expiry is never limited. null = none',
+  })
+  minOutboundShelfLifeDays!: number | null;
+}
+
+/**
+ * Story 4-3a — `PUT …/clients/{c}/allocation-policy`: a FULL replace; BOTH
+ * keys are required (`null` is the explicit "no minimum", a missing key is a
+ * 400, A11). The command re-checks every rule behind the replay lookup and
+ * names the field in its 400.
+ */
+export class UpdateClientAllocationPolicyDto {
+  @ApiProperty({ enum: [...ALLOCATION_RULES] })
+  @IsIn([...ALLOCATION_RULES])
+  allocationRule!: AllocationRule;
+
+  @ApiProperty({
+    type: 'integer',
+    nullable: true,
+    minimum: MIN_OUTBOUND_SHELF_LIFE_DAYS_MIN,
+    maximum: MIN_OUTBOUND_SHELF_LIFE_DAYS_MAX,
+    description: 'IST calendar days; null for none (required — send null explicitly)',
+  })
+  @ValidateIf((_, value) => value !== null)
+  @IsInt()
+  minOutboundShelfLifeDays!: number | null;
+}
+
+/** Story 4-3a (A12) — `GET …/clients/{c}/allocation-policy`: the policy plus the panel's two notes. */
+export class ClientAllocationPolicyResponse extends ClientAllocationPolicyDto {
+  @ApiProperty({ format: 'uuid' })
+  clientId!: string;
+
+  @ApiProperty({
+    type: 'integer',
+    minimum: 0,
+    description: "How many of the client's SKUs are NOT batch-tracked (kits excluded) — they are drawn in bin walk order under either rule",
+  })
+  untrackedSkuCount!: number;
+
+  @ApiProperty({
+    type: 'integer',
+    minimum: 0,
+    description:
+      "Distinct active batches of the client's SKUs with NO expiry date and stock on hand (outside the QC-hold, damaged, returns and in-transit system bins), across warehouses — the minimum cannot limit them",
+  })
+  undatedBatchesOnHand!: number;
+}
+
 export class ClientDto {
   @ApiProperty({ format: 'uuid' })
   id!: string;
@@ -485,6 +553,14 @@ export class ClientDto {
       'Story 1-2b — the receiving policy. Optional: a mutation answer stored before 1-2b replays without it; every fresh read carries it',
   })
   receivingPolicy?: ClientReceivingPolicyDto;
+
+  @ApiProperty({
+    type: ClientAllocationPolicyDto,
+    required: false,
+    description:
+      'Story 4-3a — the outbound allocation policy. Optional: a mutation answer stored before 4-3a replays without it; every fresh read carries it',
+  })
+  allocationPolicy?: ClientAllocationPolicyDto;
 }
 
 export class ClientResponse {

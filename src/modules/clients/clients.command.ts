@@ -13,6 +13,11 @@ import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { getMemberRoleIn } from '../tenancy/tenancy.service';
 import {
+  ALLOCATION_RULES,
+  MIN_OUTBOUND_SHELF_LIFE_DAYS_MAX,
+  MIN_OUTBOUND_SHELF_LIFE_DAYS_MIN,
+  isAllocationRule,
+  type AllocationRule,
   CLIENT_CODE_RE,
   CLIENT_CONTACT_NAME_MAX,
   CLIENT_CONTACT_ROLES,
@@ -218,6 +223,15 @@ export interface UpdateReceivingPolicyCommand {
   readonly qcOnReceipt: boolean;
   readonly expiryRequired: boolean;
   readonly minShelfLifeDays: number | null;
+}
+
+/** Story 4-3a — the allocation policy PUT: a FULL replace, both keys required (A11). */
+export interface UpdateAllocationPolicyCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly clientId: string;
+  readonly allocationRule: string;
+  readonly minOutboundShelfLifeDays: number | null;
 }
 
 export interface AddClientContactCommand {
@@ -744,6 +758,69 @@ export class ClientsCommand {
   }
 
   /**
+   * Story 4-3a — a client's outbound allocation policy (`clients.manage`,
+   * owner-only). A FULL replace of the two fields, the `updateReceivingPolicy`
+   * skeleton: hash before the tx over the RAW body values (`arm:
+   * 'allocation-policy'`; no `?? null` — a missing key is a 400, A11) →
+   * authority → replay → lock the client `FOR NO KEY UPDATE` (404; the lock
+   * helper checks no status) → replay again under the lock → the shape rules
+   * behind the replay (400 `validation-failed` naming the field) → an
+   * unchanged policy is a no-op that STORES the key
+   * (`clients.allocationPolicy:unchanged`) → the write → audit
+   * `client.allocation_policy_updated` → the key LAST. Allowed on the self
+   * client and on a departed one (a policy is not work).
+   *
+   * It applies to waves generated AFTER it (picklist lines freeze the policy
+   * they were planned under) and to ATP at once (the minimum).
+   */
+  async updateAllocationPolicy(
+    command: UpdateAllocationPolicyCommand,
+    idempotencyKey: string,
+  ): Promise<ClientMutationSnapshot> {
+    const payloadHash = hashCommandPayload({
+      arm: 'allocation-policy',
+      tenantId: command.tenantId,
+      clientId: command.clientId,
+      allocationRule: command.allocationRule,
+      minOutboundShelfLifeDays: command.minOutboundShelfLifeDays,
+    });
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'clients.manage');
+      const replayed = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) {
+        return replayed;
+      }
+      const current = await this.lockClientForEdit(tx, command.tenantId, command.clientId);
+      const replayedUnderLock = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) {
+        return replayedUnderLock;
+      }
+      const valid = assertAllocationPolicy(command);
+      const changed =
+        valid.allocationRule !== current.allocationRule ||
+        valid.minOutboundShelfLifeDays !== current.minOutboundShelfLifeDays;
+      if (!changed) {
+        // A declared no-op (`clients.allocationPolicy:unchanged`): nothing
+        // written or audited, the key stored — a late retry after another
+        // edit replays this answer rather than reverting it.
+        const unchanged: ClientMutationSnapshot = { client: toClientSnapshot(current) };
+        await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, unchanged);
+        return unchanged;
+      }
+      const rows = await tx
+        .update(clients)
+        .set({ ...valid, updatedAt: nowIso() })
+        .where(and(eq(clients.tenantId, command.tenantId), eq(clients.id, current.id)))
+        .returning();
+      const snapshot: ClientMutationSnapshot = { client: toClientSnapshot(rows[0]!) };
+      await this.audit(tx, command.tenantId, command.actorUserId, 'client.allocation_policy_updated', current.id, idempotencyKey);
+      await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+      return snapshot;
+    });
+  }
+
+  /**
    * Story 1-2a — add a contact to a client (`clients.manage`). The house
    * skeleton: normalize + hash (`arm: 'contact-add'`) → authority → replay →
    * lock the client `FOR NO KEY UPDATE` (404) → replay again → the shape
@@ -1091,6 +1168,7 @@ export class ClientsCommand {
       | 'client.departed'
       | 'client.addresses_updated'
       | 'client.receiving_policy_updated'
+      | 'client.allocation_policy_updated'
       | 'client.contact_added'
       | 'client.contact_edited'
       | 'client.contact_removed',
@@ -1345,6 +1423,41 @@ export function assertReceivingPolicy(command: {
     expiryRequired: command.expiryRequired,
     minShelfLifeDays: days,
   };
+}
+
+/**
+ * Story 4-3a — the allocation policy's shape rules (the 0094 CHECKs, answered
+ * as a 400 `validation-failed` naming the field, behind the replay lookup):
+ * the rule one of `ALLOCATION_RULES`; the minimum null or a whole number of
+ * days 1–3650. A missing key (`undefined`) is refused like a wrong one.
+ */
+export function assertAllocationPolicy(command: {
+  readonly allocationRule: unknown;
+  readonly minOutboundShelfLifeDays: unknown;
+}): { allocationRule: AllocationRule; minOutboundShelfLifeDays: number | null } {
+  const invalid = (field: string, detail: string): ProblemException =>
+    new ProblemException('validation-failed', 400, 'Invalid allocation policy', detail, { field });
+  if (!isAllocationRule(command.allocationRule)) {
+    throw invalid(
+      'allocationRule',
+      `allocationRule must be one of ${JSON.stringify(ALLOCATION_RULES)} (got ${JSON.stringify(command.allocationRule ?? null)}).`,
+    );
+  }
+  const days = command.minOutboundShelfLifeDays;
+  if (days !== null) {
+    if (
+      typeof days !== 'number' ||
+      !Number.isInteger(days) ||
+      days < MIN_OUTBOUND_SHELF_LIFE_DAYS_MIN ||
+      days > MIN_OUTBOUND_SHELF_LIFE_DAYS_MAX
+    ) {
+      throw invalid(
+        'minOutboundShelfLifeDays',
+        `minOutboundShelfLifeDays must be null or a whole number of days from ${MIN_OUTBOUND_SHELF_LIFE_DAYS_MIN} to ${MIN_OUTBOUND_SHELF_LIFE_DAYS_MAX} (got ${days === undefined ? 'nothing' : JSON.stringify(days)}).`,
+      );
+    }
+  }
+  return { allocationRule: command.allocationRule, minOutboundShelfLifeDays: days };
 }
 
 function duplicateContactEmail(email: string): ProblemException {

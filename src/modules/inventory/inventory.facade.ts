@@ -109,6 +109,7 @@ export type {
 } from './reservation.service';
 /** Story 7.1 — the reservations owner type a channel's Safety Buffer rows carry. */
 export { BUFFER_OWNER_TYPE } from './reservation.service';
+import { undatedBatchesOnHandOfClientInTx } from './reservation.service';
 // Story 5-4: the variance-resolution approve arm rebuilds an adjustment
 // command from the variance row and runs it through the in-transaction seams
 // below — cross-module callers import the command/event types here, never
@@ -498,6 +499,15 @@ export class InventoryFacade {
     idempotencyKey: string,
   ): Promise<AdjustmentPolicySnapshot> {
     return this.adjustmentApproval.setAdjustmentPolicy(command, idempotencyKey);
+  }
+
+  /**
+   * Story 4-3a (A12) — the allocation panel's undated-batch count for one
+   * client (`undatedBatchesOnHandOfClientInTx`), in its own transaction: the
+   * api shell composes it beside the clients read.
+   */
+  async undatedBatchesOnHandOfClient(tenantId: string, clientId: string): Promise<number> {
+    return withTenantTransaction(this.db, tenantId, (tx) => undatedBatchesOnHandOfClientInTx(tx, tenantId, clientId));
   }
 
   /** GET …/inventory/adjustment-policies — null when no row exists (flow disabled). */

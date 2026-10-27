@@ -46,3 +46,18 @@ export const CLIENT_CONTACT_NAME_MAX = 120;
 export const RECEIVING_TOLERANCE_BPS_MAX = 10_000;
 export const MIN_SHELF_LIFE_DAYS_MIN = 1;
 export const MIN_SHELF_LIFE_DAYS_MAX = 3650;
+/**
+ * Story 4-3a — the outbound allocation policy's vocabulary and range, owned
+ * here (the client policy row) and defined once in the shared primitive the
+ * draw and promise sides read (`shared/primitives/batch-allocation.ts`).
+ * Mirrored by the 0094 CHECKs (`clients_allocation_rule_check`,
+ * `clients_min_outbound_shelf_life_range` and their `picklist_lines` twins),
+ * pinned by `test/allocation-rules.spec.ts`.
+ */
+export {
+  ALLOCATION_RULES,
+  MIN_OUTBOUND_SHELF_LIFE_DAYS_MAX,
+  MIN_OUTBOUND_SHELF_LIFE_DAYS_MIN,
+  isAllocationRule,
+  type AllocationRule,
+} from '../../shared/primitives/batch-allocation';
