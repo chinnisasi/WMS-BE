@@ -52,6 +52,7 @@ import {
   PortalStockPageResponse,
   PortalWarehouseListResponse,
 } from './portal.dto';
+import { PortalGoodsReceiptDetailDto, PortalGoodsReceiptListResponse } from '../modules/inbound/receipt-photo.dto';
 
 const PORTAL_401 = 'Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)';
 const PORTAL_403 =
@@ -375,6 +376,53 @@ export class PortalController {
     return { ...asn, lines: [...asn.lines] };
   }
 
+  // ── story 2-5a: the client's goods receipts (A4 — the minimal read 2.9 extends) ──
+
+  @Get(':tenantId/portal/inbound/goods-receipts')
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: "Story 2-5a — this client's goods receipts, newest first (keyset): what arrived, what was damaged or short, and how many damage photos" })
+  @ApiOkResponse({ type: PortalGoodsReceiptListResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse(PORTAL_PAGE_400) })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async goodsReceipts(
+    @Param('tenantId') tenantId: string,
+    @CurrentPortalSession() session: PortalSession,
+    @Query() query: PortalPageQuery,
+  ): Promise<PortalGoodsReceiptListResponse> {
+    assertOwnTenant(session, tenantId);
+    const page = await this.inbound.portalGoodsReceipts(tenantId, session.clientId, pageQuery(query));
+    return { items: page.items.map((item) => ({ ...item })), nextCursor: page.nextCursor };
+  }
+
+  @Get(':tenantId/portal/inbound/goods-receipts/:grnId')
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Story 2-5a — one of this client's goods receipts with its lines and their damage photos (short-lived presigned URLs); a photo the warehouse removed is a placeholder with no image",
+  })
+  @ApiOkResponse({ type: PortalGoodsReceiptDetailDto })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed grnId path parameter (validation-failed — it must be a uuid)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("No such goods receipt of this client — unknown, another client's, or unattributed (not-found)") })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'grnId', format: 'uuid' })
+  async goodsReceipt(
+    @Param('tenantId') tenantId: string,
+    @Param('grnId') grnId: string,
+    @CurrentPortalSession() session: PortalSession,
+  ): Promise<PortalGoodsReceiptDetailDto> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(grnId, 'grnId');
+    const grn = await this.inbound.portalGoodsReceipt(tenantId, session.clientId, grnId);
+    if (grn === null) throw notFound('Goods receipt', grnId);
+    return { ...grn, lines: grn.lines.map((line) => ({ ...line, photos: line.photos.map((photo) => ({ ...photo })) })) };
+  }
+
   @Get(':tenantId/portal/inbound/purchase-orders')
   @UseGuards(PortalSessionGuard)
   @ApiBearerAuth()
@@ -562,7 +610,7 @@ function assertOwnTenant(session: PortalSession, tenantId: string): void {
   }
 }
 
-function assertUuidParam(value: string, name: 'orderId' | 'asnId' | 'poId'): void {
+function assertUuidParam(value: string, name: 'orderId' | 'asnId' | 'poId' | 'grnId'): void {
   if (!UUID_RE.test(value)) {
     throw new ProblemException(
       'validation-failed',

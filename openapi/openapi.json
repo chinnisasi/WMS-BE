@@ -14503,6 +14503,565 @@
         ]
       }
     },
+    "/tenants/{tenantId}/receiving/receipt-photos": {
+      "post": {
+        "operationId": "ReceivingController_uploadReceiptPhoto",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the device token)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          },
+          {
+            "name": "x-op-operator",
+            "in": "header",
+            "description": "The capturing operator's user id — the photo is attributed to them, whoever is badged in now",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "capturedAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "The capture instant, ISO-8601 UTC ending in Z"
+                  },
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "The photo — JPEG, PNG or WebP, at most 10 MB and 8,000 px a side"
+                  }
+                },
+                "required": [
+                  "capturedAt",
+                  "file"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Stored (staged until its receipt binds it, or attached to the placeholder its receipt left) — the idempotency snapshot; no URL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReceiptPhotoUploadResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, x-op-operator, capturedAt or file, or too many parts (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing/invalid device token (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Unknown or revoked device (device-revoked), or the operator does not hold a floor role (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The ref is already stored with different bytes (attachment-ref-conflict), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Not a JPEG, PNG or WebP by its bytes — HEIC, SVG, GIF, PDF, an animated PNG or WebP (attachment-type-unsupported)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Over 10 MB (attachment-too-large), a malformed image or a side outside 1–8,000 px (attachment-content-invalid), or the key reused with a different photo (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "This device has 200 photos waiting for their receipts (attachment-staging-limit) — retried",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No file storage configured (file-storage-unavailable), the store failed (file-storage-failed), or too many uploads in flight (file-storage-busy) — retried",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 2-5a — uploads one handheld damage photo (receipt-photo.stage; the device credential + x-op-operator). Idempotency-Key = the photo ULID its receipt names in photoRefs. Sniffed by its bytes (JPEG, PNG or WebP only), metadata stripped, stored; bound to its receipt line in either order",
+        "tags": [
+          "receiving"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/goods-receipts/{grnId}/photos": {
+      "get": {
+        "operationId": "ReceivingController_listReceiptPhotos",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "grnId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReceiptPhotosResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed grnId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No goods receipt with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 2-5a — one goods receipt's damage photos (any staff role): every live photo in receipt order with a short-lived presigned URL, awaited placeholders, then at most the 50 newest removed (with who and why) and never-arrived ones",
+        "tags": [
+          "receiving"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/goods-receipts/{grnId}/lines/{lineId}/photos": {
+      "post": {
+        "operationId": "ReceivingController_addReceiptPhoto",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "grnId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "lineId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "The photo — JPEG, PNG or WebP, at most 10 MB and 8,000 px a side"
+                  }
+                },
+                "required": [
+                  "file"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The attached photo (the idempotency snapshot — no URL; read the list for one)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReceiptPhotoResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, grnId, lineId or file, or too many parts (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks receipt.attach (role-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such line on this goods receipt in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The line holds 10 photos or the receipt 50 (attachment-limit-reached), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Not a JPEG, PNG or WebP by its bytes (attachment-type-unsupported) — a HEIC photo says so",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Over 10 MB (attachment-too-large), a malformed image or a side outside 1–8,000 px (attachment-content-invalid), or the key reused with a different photo (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No file storage configured (file-storage-unavailable), the store failed (file-storage-failed), or too many uploads in flight (file-storage-busy)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 2-5a — adds a damage photo to one goods-receipt line from the web (receipt.attach). Sniffed by its bytes (JPEG, PNG or WebP), metadata stripped, stored and attached at once",
+        "tags": [
+          "receiving"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/goods-receipts/{grnId}/photos/{attachmentId}/remove": {
+      "post": {
+        "operationId": "ReceivingController_removeReceiptPhoto",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "grnId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "attachmentId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemoveReceiptPhotoDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The removed photo (a matching Idempotency-Key replays it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReceiptPhotoResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, grnId or attachmentId, or a reason outside 1–200 characters (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks receipt.photo-remove (role-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such photo on this goods receipt (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The photo is already removed, or never arrived (attachment-not-attached), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 2-5a — removes a damage photo (soft — the record and its audit stay; the bytes are deleted after ATTACHMENT_PURGE_DAYS), or cancels an awaited one (receipt.photo-remove — owner and ops manager)",
+        "tags": [
+          "receiving"
+        ]
+      }
+    },
     "/tenants/{tenantId}/receiving/gate-ins": {
       "post": {
         "operationId": "GateInController_create",
@@ -23963,6 +24522,7 @@
               "type": "string",
               "enum": [
                 "advance_shipment_notice",
+                "attachment",
                 "asn_import",
                 "audit_export",
                 "batch",
@@ -29846,6 +30406,181 @@
         ]
       }
     },
+    "/tenants/{tenantId}/portal/inbound/goods-receipts": {
+      "get": {
+        "operationId": "PortalController_goodsReceipts",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from a previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalGoodsReceiptListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed cursor (invalid-cursor), a limit outside 1–100 or a status outside its vocabulary (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 2-5a — this client's goods receipts, newest first (keyset): what arrived, what was damaged or short, and how many damage photos",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/inbound/goods-receipts/{grnId}": {
+      "get": {
+        "operationId": "PortalController_goodsReceipt",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "grnId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalGoodsReceiptDetailDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed grnId path parameter (validation-failed — it must be a uuid)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such goods receipt of this client — unknown, another client's, or unattributed (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 2-5a — one of this client's goods receipts with its lines and their damage photos (short-lived presigned URLs); a photo the warehouse removed is a placeholder with no image",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
     "/tenants/{tenantId}/portal/inbound/purchase-orders": {
       "get": {
         "operationId": "PortalController_purchaseOrders",
@@ -35521,7 +36256,8 @@
               "grn.licence-refused",
               "gate-in.unload",
               "stock.move",
-              "stock.adjust"
+              "stock.adjust",
+              "receipt-photo.stage"
             ]
           },
           "classification": {
@@ -35676,7 +36412,8 @@
               "grn.licence-refused",
               "gate-in.unload",
               "stock.move",
-              "stock.adjust"
+              "stock.adjust",
+              "receipt-photo.stage"
             ]
           },
           "classification": {
@@ -41064,6 +41801,14 @@
             "items": {
               "type": "number"
             }
+          },
+          "photoRefs": {
+            "maxItems": 10,
+            "description": "Story 2-5a — the line's damage photos, by the ULID the handheld minted at capture (each photo's own upload op's Idempotency-Key), in capture order. At most 10 per line and 50 per receipt, unique across the receipt. A photo uploaded first is attached by this receipt; one that arrives later fills the placeholder this receipt leaves. A ref that is unknown to this device, or already bound, is skipped — never a refusal. Omit when the line has none (an empty array means the same)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         },
         "required": [
@@ -42930,6 +43675,36 @@
           "documents"
         ]
       },
+      "CatalogReceiptPhotosDto": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "False under FILE_STORE=none — the handheld hides its Photo button"
+          },
+          "maxPerLine": {
+            "type": "number",
+            "description": "The live photos one receipt line may carry (attached + awaited)",
+            "example": 10
+          },
+          "maxPerReceipt": {
+            "type": "number",
+            "description": "The live photos one receipt may carry",
+            "example": 50
+          },
+          "maxBytes": {
+            "type": "number",
+            "description": "The largest photo upload, in bytes",
+            "example": 10485760
+          }
+        },
+        "required": [
+          "enabled",
+          "maxPerLine",
+          "maxPerReceipt",
+          "maxBytes"
+        ]
+      },
       "CatalogMoveReasonDto": {
         "type": "object",
         "properties": {
@@ -43110,6 +43885,14 @@
               ]
             }
           },
+          "receiptPhotos": {
+            "description": "Story 2-5a (additive): damage photos on a receipt line — whether storage is on (the Photo button's gate) and the caps the draft must respect. An older server omits it, and the handheld then offers no Photo",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CatalogReceiptPhotosDto"
+              }
+            ]
+          },
           "moveReasons": {
             "description": "Story 3-1 (additive): the bin-to-bin move's reason vocabulary, in order — the handheld's reason chips. A reason with noteRequired needs a note (up to 200 characters). An older server omits it, and the handheld then offers no Move stock",
             "type": "array",
@@ -43143,6 +43926,7 @@
           "openGateIns",
           "receiptDamageReasons",
           "receiptShortReasons",
+          "receiptPhotos",
           "moveReasons",
           "adjustReasons"
         ]
@@ -43249,6 +44033,11 @@
             "minimum": 0,
             "description": "Story 2-4a — the units short against the supplier's documents across all lines (recorded only); 0 when none"
           },
+          "photoCount": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 2-5a — the receipt's attached damage photos across all lines; 0 when none"
+          },
           "createdAt": {
             "type": "string",
             "description": "Row creation time (the keyset cursor field), ISO-8601 UTC"
@@ -43270,6 +44059,7 @@
           "appliedUnits",
           "damagedUnits",
           "shortUnits",
+          "photoCount",
           "createdAt"
         ]
       },
@@ -43359,6 +44149,16 @@
               "other"
             ],
             "description": "Present only beside shortQty"
+          },
+          "photoCount": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 2-5a — the line's attached damage photos"
+          },
+          "pendingPhotoCount": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 2-5a — the line's photos the receipt named that have not arrived yet (awaited)"
           }
         },
         "required": [
@@ -43369,7 +44169,9 @@
           "batchId",
           "batchCode",
           "qty",
-          "appliedQty"
+          "appliedQty",
+          "photoCount",
+          "pendingPhotoCount"
         ]
       },
       "GoodsReceiptLinesResponse": {
@@ -44106,6 +44908,274 @@
           "qcHold",
           "arms",
           "inspection"
+        ]
+      },
+      "ReceiptPhotoUploadResponse": {
+        "type": "object",
+        "properties": {
+          "ref": {
+            "type": "string",
+            "description": "The photo's ULID — its Idempotency-Key and the ref its receipt names"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "staged",
+              "attached",
+              "removed"
+            ],
+            "description": "`staged`: stored, waiting for its receipt; `attached`: it filled the placeholder its receipt left; `removed`: the same bytes were already stored and removed since (a late duplicate)"
+          }
+        },
+        "required": [
+          "ref",
+          "status"
+        ]
+      },
+      "ReceiptPhotoViewDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "grnLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The goods-receipt line it is evidence for"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "awaited",
+              "attached",
+              "removed",
+              "expired"
+            ]
+          },
+          "contentType": {
+            "type": "string",
+            "enum": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              null
+            ],
+            "nullable": true,
+            "description": "Null while awaited, and on a cancelled placeholder"
+          },
+          "byteSize": {
+            "type": "number",
+            "nullable": true,
+            "description": "The stored (metadata-stripped) size in bytes"
+          },
+          "width": {
+            "type": "number",
+            "nullable": true
+          },
+          "height": {
+            "type": "number",
+            "nullable": true
+          },
+          "capturedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "The device's capture time (clamped to [now − 60 d, now + 10 min]); null for a web photo"
+          },
+          "uploadedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "When the server received the bytes; null while awaited"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "handheld",
+              "web"
+            ]
+          },
+          "removedAt": {
+            "type": "string",
+            "description": "Present on a removed photo"
+          },
+          "lineNo": {
+            "type": "number",
+            "minimum": 1,
+            "description": "The line's position in the receipt (1-based, receipt order)"
+          },
+          "fileName": {
+            "type": "string",
+            "description": "A server-built ASCII file name, `<grnCode>-L<lineNo>-<k>.<ext>`"
+          },
+          "url": {
+            "type": "string",
+            "nullable": true,
+            "description": "A short-lived presigned GET URL; null when the photo holds no bytes (awaited, expired, removed), or storage is off"
+          },
+          "urlExpiresAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "When `url` stops working (≤ ATTACHMENT_URL_TTL_SECONDS) — refetch the list after it"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "Row creation time"
+          },
+          "removedBy": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Present on a removed photo"
+          },
+          "removedByName": {
+            "type": "string",
+            "description": "The remover's name, when known"
+          },
+          "removedReason": {
+            "type": "string",
+            "description": "Present on a removed photo (1–200 characters)"
+          }
+        },
+        "required": [
+          "id",
+          "grnLineId",
+          "status",
+          "contentType",
+          "byteSize",
+          "width",
+          "height",
+          "capturedAt",
+          "uploadedAt",
+          "source",
+          "lineNo",
+          "fileName",
+          "url",
+          "urlExpiresAt",
+          "createdAt"
+        ]
+      },
+      "ReceiptPhotosResponse": {
+        "type": "object",
+        "properties": {
+          "storageEnabled": {
+            "type": "boolean",
+            "description": "False under FILE_STORE=none — no URLs, and adding a photo answers 503"
+          },
+          "photos": {
+            "description": "Every live photo (attached + awaited) in receipt order, then at most the 50 newest removed/expired",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReceiptPhotoViewDto"
+            }
+          }
+        },
+        "required": [
+          "storageEnabled",
+          "photos"
+        ]
+      },
+      "ReceiptPhotoDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "grnLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The goods-receipt line it is evidence for"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "awaited",
+              "attached",
+              "removed",
+              "expired"
+            ]
+          },
+          "contentType": {
+            "type": "string",
+            "enum": [
+              "image/jpeg",
+              "image/png",
+              "image/webp",
+              null
+            ],
+            "nullable": true,
+            "description": "Null while awaited, and on a cancelled placeholder"
+          },
+          "byteSize": {
+            "type": "number",
+            "nullable": true,
+            "description": "The stored (metadata-stripped) size in bytes"
+          },
+          "width": {
+            "type": "number",
+            "nullable": true
+          },
+          "height": {
+            "type": "number",
+            "nullable": true
+          },
+          "capturedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "The device's capture time (clamped to [now − 60 d, now + 10 min]); null for a web photo"
+          },
+          "uploadedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "When the server received the bytes; null while awaited"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "handheld",
+              "web"
+            ]
+          },
+          "removedAt": {
+            "type": "string",
+            "description": "Present on a removed photo"
+          }
+        },
+        "required": [
+          "id",
+          "grnLineId",
+          "status",
+          "contentType",
+          "byteSize",
+          "width",
+          "height",
+          "capturedAt",
+          "uploadedAt",
+          "source"
+        ]
+      },
+      "ReceiptPhotoResponse": {
+        "type": "object",
+        "properties": {
+          "attachment": {
+            "$ref": "#/components/schemas/ReceiptPhotoDto"
+          }
+        },
+        "required": [
+          "attachment"
+        ]
+      },
+      "RemoveReceiptPhotoDto": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "Why the photo is removed (or the placeholder cancelled) — kept on the record; trimmed, then 1–200 characters"
+          }
+        },
+        "required": [
+          "reason"
         ]
       },
       "GateInDocumentInputDto": {
@@ -50984,6 +52054,7 @@
             "type": "string",
             "enum": [
               "advance_shipment_notice",
+              "attachment",
               "asn_import",
               "audit_export",
               "batch",
@@ -51078,6 +52149,7 @@
             "type": "string",
             "enum": [
               "advance_shipment_notice",
+              "attachment",
               "asn_import",
               "audit_export",
               "batch",
@@ -54811,6 +55883,258 @@
           "lineCount",
           "announcedTotal",
           "receivedTotal",
+          "createdAt",
+          "lines"
+        ]
+      },
+      "PortalGoodsReceiptRowDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "warehouseName": {
+            "type": "string"
+          },
+          "poCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The purchase order received against, when any"
+          },
+          "asnCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The advance shipment notice received against, when any"
+          },
+          "lineCount": {
+            "type": "number"
+          },
+          "receivedTotal": {
+            "type": "number",
+            "description": "Good units across the lines (base units, indicative across UoMs)"
+          },
+          "damagedTotal": {
+            "type": "number",
+            "description": "Damaged units across the lines"
+          },
+          "shortTotal": {
+            "type": "number",
+            "description": "Short units across the lines"
+          },
+          "photoCount": {
+            "type": "number",
+            "description": "Attached damage photos across the lines"
+          },
+          "receivedAt": {
+            "type": "string",
+            "description": "When the goods were received (the device time)"
+          },
+          "createdAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "warehouseName",
+          "poCode",
+          "asnCode",
+          "lineCount",
+          "receivedTotal",
+          "damagedTotal",
+          "shortTotal",
+          "photoCount",
+          "receivedAt",
+          "createdAt"
+        ]
+      },
+      "PortalGoodsReceiptListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalGoodsReceiptRowDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "PortalReceiptPhotoDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "attached",
+              "removed"
+            ],
+            "description": "`removed`: shown as \"Removed by the warehouse\" — no image, no reason"
+          },
+          "url": {
+            "type": "string",
+            "nullable": true
+          },
+          "urlExpiresAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "width": {
+            "type": "number",
+            "nullable": true
+          },
+          "height": {
+            "type": "number",
+            "nullable": true
+          },
+          "capturedAt": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "url",
+          "urlExpiresAt",
+          "width",
+          "height",
+          "capturedAt"
+        ]
+      },
+      "PortalGoodsReceiptLineDto": {
+        "type": "object",
+        "properties": {
+          "lineNo": {
+            "type": "number",
+            "minimum": 1
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Good units"
+          },
+          "damagedQty": {
+            "type": "number"
+          },
+          "damageReasonCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "shortQty": {
+            "type": "number"
+          },
+          "shortReasonCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "photos": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalReceiptPhotoDto"
+            }
+          }
+        },
+        "required": [
+          "lineNo",
+          "skuCode",
+          "skuName",
+          "qty",
+          "damagedQty",
+          "damageReasonCode",
+          "shortQty",
+          "shortReasonCode",
+          "photos"
+        ]
+      },
+      "PortalGoodsReceiptDetailDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "warehouseName": {
+            "type": "string"
+          },
+          "poCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The purchase order received against, when any"
+          },
+          "asnCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The advance shipment notice received against, when any"
+          },
+          "lineCount": {
+            "type": "number"
+          },
+          "receivedTotal": {
+            "type": "number",
+            "description": "Good units across the lines (base units, indicative across UoMs)"
+          },
+          "damagedTotal": {
+            "type": "number",
+            "description": "Damaged units across the lines"
+          },
+          "shortTotal": {
+            "type": "number",
+            "description": "Short units across the lines"
+          },
+          "photoCount": {
+            "type": "number",
+            "description": "Attached damage photos across the lines"
+          },
+          "receivedAt": {
+            "type": "string",
+            "description": "When the goods were received (the device time)"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalGoodsReceiptLineDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "warehouseName",
+          "poCode",
+          "asnCode",
+          "lineCount",
+          "receivedTotal",
+          "damagedTotal",
+          "shortTotal",
+          "photoCount",
+          "receivedAt",
           "createdAt",
           "lines"
         ]

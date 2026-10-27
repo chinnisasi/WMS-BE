@@ -31,6 +31,8 @@ import { purgeAuthCounters } from '../modules/tenancy/auth-attempts';
 import { purgeSecondFactorState } from '../modules/tenancy/second-factor';
 import { ComplianceModule } from '../modules/compliance/compliance.module';
 import { MailModule } from '../modules/mail/mail.module';
+import { AttachmentsModule } from '../modules/attachments/attachments.module';
+import { AttachmentsFacade, UPLOADING_MAX_AGE_MS } from '../modules/attachments/attachments.facade';
 import {
   EMAIL_FINAL_STATUSES,
   EMAIL_PENDING_EXPIRY_MS,
@@ -1965,6 +1967,110 @@ export class LicenceExpiryWorker implements OnApplicationBootstrap, BeforeApplic
   }
 }
 
+/** `ATTACHMENT_SWEEP_POLL_MS` (story 2-5a): the attachment retention sweep's poll; unset/`0` = OFF (recommended `600000`). */
+export function parseAttachmentSweepPollMs(raw: string | undefined): number {
+  return parsePollMs('ATTACHMENT_SWEEP_POLL_MS', raw);
+}
+
+/**
+ * Story 2-5a (A10, A11, A22) — the attachment retention sweep. Discovers the
+ * tenants with sweepable rows on the read-only BYPASSRLS `AUTH_DATABASE`
+ * (the `AuditExportWorker` shape — the `attachments_sweep_discovery_idx
+ * (status, created_at)` index), then one `AttachmentsFacade.sweep` per
+ * tenant in its own try/catch; every write stays in the module's tenant
+ * transactions. Safe in two worker processes: every arm claims `FOR UPDATE
+ * SKIP LOCKED` and transitions conditionally (a two-sweeper test pins it).
+ */
+@Injectable()
+export class AttachmentSweepWorker implements OnApplicationBootstrap, BeforeApplicationShutdown, OnApplicationShutdown {
+  private readonly logger = new Logger('AttachmentSweepWorker');
+  private readonly pollMs: number;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private running = false;
+  private readonly ticks = new InFlightTick();
+
+  constructor(
+    @Inject(AUTH_DATABASE) private readonly authDb: Database,
+    @Inject(AttachmentsFacade) private readonly attachments: AttachmentsFacade,
+  ) {
+    this.pollMs = parseAttachmentSweepPollMs(process.env.ATTACHMENT_SWEEP_POLL_MS);
+  }
+
+  onApplicationBootstrap(): void {
+    if (this.pollMs === 0) {
+      return; // env-gated off
+    }
+    this.logger.log(`Attachment sweep started (poll every ${this.pollMs}ms)`);
+    this.ticks.track('attachment-sweep', this.pollMs);
+    this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
+    this.timer.unref?.();
+  }
+
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (!(await this.ticks.settle())) {
+      this.logger.warn('A tick was still running at the shutdown drain deadline');
+    }
+  }
+
+  onApplicationShutdown(): void {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  /** One cycle; returns the tenants it swept. */
+  async tick(now: Date = new Date()): Promise<string[]> {
+    if (this.running) {
+      return []; // shed: one cycle at a time in this process
+    }
+    this.running = true;
+    try {
+      const purgeCutoff = new Date(now.getTime() - this.attachments.purgeDays * 86_400_000).toISOString();
+      const uploadingCutoff = new Date(now.getTime() - UPLOADING_MAX_AGE_MS).toISOString();
+      const tenants = (await this.authDb.execute(sql`
+        select distinct tenant_id as "tenantId"
+        from attachments
+        where (status = 'uploading' and created_at < ${uploadingCutoff})
+           or (status in ('staged', 'awaited') and created_at < ${purgeCutoff})
+           or (status = 'discarded' and purged_at is null)
+           or (status = 'removed' and purged_at is null and object_key is not null and removed_at < ${purgeCutoff})
+        order by tenant_id asc
+      `)) as unknown as { tenantId: string }[];
+      const swept: string[] = [];
+      for (const { tenantId } of tenants) {
+        this.ticks.beat();
+        try {
+          const summary = await this.attachments.sweep(tenantId, now);
+          const touched =
+            summary.discardedUploading + summary.discardedStaged + summary.expired + summary.purged + summary.deleteFailures;
+          if (touched > 0) {
+            this.logger.log(
+              `attachment sweep (tenant ${tenantId}): ${summary.discardedUploading} reservations and ${summary.discardedStaged} unbound photos discarded, ` +
+                `${summary.expired} expired, ${summary.purged} purged, ${summary.deleteFailures} delete failures, ${summary.keptReferenced} kept for review`,
+            );
+          }
+          swept.push(tenantId);
+        } catch (error) {
+          this.logger.error(
+            `Attachment sweep failed for tenant ${tenantId} — retried next tick: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      return swept;
+    } catch (error) {
+      this.logger.error(`Attachment sweep cycle failed: ${error instanceof Error ? error.message : String(error)}`);
+      return [];
+    } finally {
+      this.running = false;
+    }
+  }
+}
+
 @Module({
   imports: [
     SharedModule,
@@ -1982,6 +2088,8 @@ export class LicenceExpiryWorker implements OnApplicationBootstrap, BeforeApplic
     ComplianceModule,
     // Story 5-1a — the email sender (mail).
     MailModule,
+    // Story 2-5a — the attachment retention sweep (attachments).
+    AttachmentsModule,
   ],
   providers: [
     OutboxRelayWorker,
@@ -2007,6 +2115,8 @@ export class LicenceExpiryWorker implements OnApplicationBootstrap, BeforeApplic
     LicenceExpiryWorker,
     // Story 5-1a — the email sender (env-gated OFF by default).
     EmailSenderWorker,
+    // Story 2-5a — the attachment retention sweep (env-gated OFF by default).
+    AttachmentSweepWorker,
     // Story 6-2c (A10): the worker role's health-only listener (idle in the api role).
     WorkerHealthServer,
   ],

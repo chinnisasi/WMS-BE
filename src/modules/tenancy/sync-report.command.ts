@@ -132,7 +132,15 @@ export type RejectedOpType =
   // through the one submission path (`AdjustmentSubmission`) under the op's
   // device and operator — an operator's request therefore re-pends for the
   // owner (A3); or Discard.
-  | 'stock.adjust';
+  | 'stock.adjust'
+  // Story 2-5a — the handheld's damage-photo upload, refused on replay (not
+  // an image the server accepts, a ref already used with other bytes, a
+  // role that lost the floor, or storage off for 7 days). DEVICE-UPLOADED;
+  // Discard ONLY: the photo file is gone from the device once the op is
+  // rejected, so there is nothing to re-apply — the receipt itself was never
+  // affected (add a photo on the web if one is needed). Excluded from
+  // `ApplicableOpType`, so tenancy never imports the photo command.
+  | 'receipt-photo.stage';
 
 export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'grn.submit',
@@ -150,6 +158,7 @@ export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'gate-in.unload',
   'stock.move',
   'stock.adjust',
+  'receipt-photo.stage',
 ];
 
 /**
@@ -222,6 +231,9 @@ export const REJECTED_OP_DECISIONS_BY_TYPE: Readonly<Record<RejectedOpType, read
   // needs `adjustments.approve`), or Discard. No recount: the remedy for a
   // stock disagreement is the adjustment itself.
   'stock.adjust': ['apply', 'discard'],
+  // Story 2-5a — a refused damage photo: Discard only (the device deleted the
+  // file when the op was rejected; the receipt was never affected).
+  'receipt-photo.stage': ['discard'],
 };
 
 /** Story 1-6d — the 403 an Apply on a `grn.licence-refused` row answers without `licences.manage`. */
@@ -233,7 +245,7 @@ export const RESOLVE_NOTE_MAX = 500;
 /** The op types the apply arm can re-execute (every type admitting `apply`). */
 type ApplicableOpType = Exclude<
   RejectedOpType,
-  'return.receive' | 'grn.lines-refused' | 'grn.inactive-sku-received' | 'gate-in.unload'
+  'return.receive' | 'grn.lines-refused' | 'grn.inactive-sku-received' | 'gate-in.unload' | 'receipt-photo.stage'
 >;
 
 function isApplicableOpType(opType: RejectedOpType): opType is ApplicableOpType {
@@ -484,6 +496,16 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
     ['clientId', 'uuid'],
     ['lines', 'array'],
     ['refusals', 'array'],
+  ],
+  // Story 2-5a (A19) — the handheld's photo op as it enqueued it: the photo's
+  // ref, its capture time, the receipt op it belongs to and the line index.
+  // No bytes (the row stays far under the 32 KB cap). Any strings: a
+  // malformed one must still reach the queue to be discarded.
+  'receipt-photo.stage': [
+    ['ref', 'string'],
+    ['capturedAt', 'string'],
+    ['grnOpId', 'string'],
+    ['lineIndex', 'number'],
   ],
 };
 

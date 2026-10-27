@@ -50,6 +50,8 @@ export const WORKER_JOBS = [
   'session-purge',
   'licence-expiry',
   'email-sender',
+  // Story 2-5a — the attachment retention sweep.
+  'attachment-sweep',
 ] as const;
 export type WorkerJob = (typeof WORKER_JOBS)[number];
 
@@ -79,6 +81,7 @@ export const DEFAULT_NO_PROGRESS_MS: Readonly<Record<WorkerJob, number>> = {
   'session-purge': 20 * MINUTE,
   'licence-expiry': 20 * MINUTE,
   'email-sender': 20 * MINUTE,
+  'attachment-sweep': 20 * MINUTE,
 };
 
 /** The heartbeat clock — assigned by tests (the `rateCardClock` precedent), never spied. */

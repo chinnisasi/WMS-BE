@@ -12,8 +12,13 @@ import { UUID_RE } from '../../shared/primitives/ids';
 import { fullPrecisionInstant } from '../../shared/primitives/time';
 import { fromMilli } from '../../shared/primitives/quantity';
 import { PORTAL_PAGE_DEFAULT_LIMIT } from '../../shared/primitives/portal-page';
+import { AttachmentsFacade } from '../attachments/attachments.facade';
+import { receiptPhotoFileNames } from './receipt-photo.command';
 import {
   portalAsnInTx,
+  portalGoodsReceiptInTx,
+  portalGoodsReceiptsInTx,
+  type PortalGoodsReceiptRow,
   portalAsnsInTx,
   portalPurchaseOrderInTx,
   portalPurchaseOrdersInTx,
@@ -133,6 +138,29 @@ function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
   }
 }
 
+/** Story 2-5a — the portal receipt detail (an exact key allowlist; `PortalGoodsReceiptDetailDto`). */
+export interface PortalGoodsReceiptDetail extends PortalGoodsReceiptRow {
+  readonly lines: readonly {
+    readonly lineNo: number;
+    readonly skuCode: string;
+    readonly skuName: string;
+    readonly qty: number;
+    readonly damagedQty: number;
+    readonly damageReasonCode: string | null;
+    readonly shortQty: number;
+    readonly shortReasonCode: string | null;
+    readonly photos: readonly {
+      readonly id: string;
+      readonly status: 'attached' | 'removed';
+      readonly url: string | null;
+      readonly urlExpiresAt: string | null;
+      readonly width: number | null;
+      readonly height: number | null;
+      readonly capturedAt: string | null;
+    }[];
+  }[];
+}
+
 /**
  * The inbound module's public surface (Story 3.1): the PO lifecycle —
  * commands ride through the module's command services, reads through here.
@@ -148,6 +176,8 @@ export class InboundFacade {
     @Inject(AsnCommand) private readonly asnCommand: AsnCommand,
     // The ASN import (2026-10-17) — many ASNs from one CSV/XLSX file.
     @Inject(AsnImportCommand) private readonly asnImportCommand: AsnImportCommand,
+    // Story 2-5a — the portal receipt detail presigns its photos.
+    @Inject(AttachmentsFacade) private readonly attachments: AttachmentsFacade,
   ) {}
 
   // ── story 21-7: the client portal's inbound reads ─────────────────────────
@@ -192,6 +222,92 @@ export class InboundFacade {
 
   async portalPurchaseOrder(tenantId: string, clientId: string, poId: string): Promise<PortalPurchaseOrderDetail | null> {
     return withTenantTransaction(this.db, tenantId, (tx) => portalPurchaseOrderInTx(tx, tenantId, clientId, poId), { clientId });
+  }
+
+  // ── story 2-5a: the client portal's goods receipts (A4) ───────────────────
+  // The same two layers. `goods_receipt_notes` RLS is tenant-only, so the
+  // explicit predicates in `portal-inbound.ts` carry the isolation; the stamp
+  // is the second layer over `skus`, `attachments` and the documents.
+
+  async portalGoodsReceipts(
+    tenantId: string,
+    clientId: string,
+    query: { readonly cursor?: string; readonly limit?: number } = {},
+  ): Promise<Page<PortalGoodsReceiptRow>> {
+    const limit = query.limit ?? PORTAL_PAGE_DEFAULT_LIMIT;
+    const before = query.cursor === undefined ? null : decodeCursorSafe(query.cursor);
+    return withTenantTransaction(this.db, tenantId, (tx) => portalGoodsReceiptsInTx(tx, tenantId, clientId, { before, limit }), {
+      clientId,
+    });
+  }
+
+  /**
+   * One of the client's receipts with its lines and photos: the stamped read
+   * first, then the presign (after the read transaction, A4). An attached
+   * photo carries a short-lived URL; a removed one is a placeholder — no
+   * URL, no reason, no remover. The response is rebuilt key by key.
+   */
+  async portalGoodsReceipt(tenantId: string, clientId: string, grnId: string): Promise<PortalGoodsReceiptDetail | null> {
+    const read = await withTenantTransaction(this.db, tenantId, (tx) => portalGoodsReceiptInTx(tx, tenantId, clientId, grnId), {
+      clientId,
+    });
+    if (read === null) return null;
+    const lineNos = new Map(read.lines.map((line) => [line.id, line.lineNo]));
+    const fileNames = receiptPhotoFileNames(
+      read.code,
+      lineNos,
+      read.photos.map((photo) => ({ id: photo.id, ownerId: photo.grnLineId, createdAt: photo.createdAt, contentType: photo.contentType })),
+    );
+    const photosByLine = new Map<string, PortalGoodsReceiptDetail['lines'][number]['photos'][number][]>();
+    const signedUrls = await Promise.all(
+      read.photos.map((photo) =>
+        photo.status === 'attached'
+          ? this.attachments.presign(
+              { id: photo.id, objectKey: photo.objectKey, contentType: photo.contentType, purgedAt: photo.purgedAt },
+              fileNames.get(photo.id)!,
+            )
+          : Promise.resolve(null),
+      ),
+    );
+    for (const [index, photo] of read.photos.entries()) {
+      const signed = signedUrls[index]!;
+      const list = photosByLine.get(photo.grnLineId) ?? [];
+      list.push({
+        id: photo.id,
+        status: photo.status,
+        url: signed?.url ?? null,
+        urlExpiresAt: signed?.expiresAt ?? null,
+        width: photo.status === 'attached' ? photo.width : null,
+        height: photo.status === 'attached' ? photo.height : null,
+        capturedAt: photo.status === 'attached' ? photo.capturedAt : null,
+      });
+      photosByLine.set(photo.grnLineId, list);
+    }
+    return {
+      id: read.id,
+      code: read.code,
+      warehouseName: read.warehouseName,
+      poCode: read.poCode,
+      asnCode: read.asnCode,
+      lineCount: read.lineCount,
+      receivedTotal: read.receivedTotal,
+      damagedTotal: read.damagedTotal,
+      shortTotal: read.shortTotal,
+      photoCount: read.photoCount,
+      receivedAt: read.receivedAt,
+      createdAt: read.createdAt,
+      lines: read.lines.map((line) => ({
+        lineNo: line.lineNo,
+        skuCode: line.skuCode,
+        skuName: line.skuName,
+        qty: line.qty,
+        damagedQty: line.damagedQty,
+        damageReasonCode: line.damageReasonCode,
+        shortQty: line.shortQty,
+        shortReasonCode: line.shortReasonCode,
+        photos: photosByLine.get(line.id) ?? [],
+      })),
+    };
   }
 
   // ── story 21-6: advance shipment notices ──────────────────────────────────

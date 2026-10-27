@@ -410,6 +410,9 @@ describe('story 1-2a: the client master record', () => {
       expect(opTypes.filter((type) => !(SKU_NAMING_OP_TYPES as readonly string[]).includes(type)).sort()).toEqual([
         'excursion.record',
         'gate-in.unload',
+        // Story 2-5a — a refused damage photo names no SKU (its payload is the
+        // photo's ref and the receipt op it belongs to).
+        'receipt-photo.stage',
         'transfer.confirm',
       ]);
     });

@@ -932,7 +932,12 @@ describe('users, roles, and permission gating (e2e)', () => {
     // owner: owner (everything), ops_manager (listed — the FE derives it as
     // "all minus excluded") and operator; never the accountant or a client.
     // The operator never holds `stock.adjust` itself.
-    expect([...CAPABILITIES]).toHaveLength(49);
+    // Story 2-5a grows it to 51: `receipt.attach` (owner, ops_manager,
+    // operator — the dock adds a damage photo) and `receipt.photo-remove`
+    // (owner, ops_manager — evidence is removed by a manager).
+    expect([...CAPABILITIES]).toHaveLength(51);
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('receipt.attach'))).toEqual(['owner', 'ops_manager', 'operator']);
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('receipt.photo-remove'))).toEqual(['owner', 'ops_manager']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('stock.adjust.request'))).toEqual(['owner', 'ops_manager', 'operator']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('stock.adjust'))).toEqual(['owner', 'ops_manager']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('stock.move'))).toEqual(['owner', 'ops_manager', 'operator']);

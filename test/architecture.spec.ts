@@ -1067,6 +1067,51 @@ describe('architecture: clients are clients-module-owned (story 21-1)', () => {
   });
 
   /**
+   * Story 2-5a — the attachments module's boundary. Its records seam
+   * (`attachment-records.ts`) imports only drizzle-orm and shared/ (§7h), so
+   * inbound's receipt command and `grn.submit`'s claim import it without a
+   * module graph; the module imports no sibling; outside it, only the
+   * facade, the module and the seam may be imported; and `attachments` is
+   * written only under `src/modules/attachments`.
+   */
+  it('story 2-5a: the attachments seam imports only drizzle-orm and shared/, the module imports no sibling, and only it writes attachments', () => {
+    const seam = readFileSync(join(SRC_ROOT, 'modules', 'attachments', 'attachment-records.ts'), 'utf8');
+    expect(seam).toMatch(/export async function claimRefsInTx\(/);
+    expect(seam).toMatch(/export async function finalizeDeviceUploadInTx\(/);
+    const seamOffenders = [...seam.matchAll(/from '([^']+)'/g)]
+      .map((match) => match[1]!)
+      .filter((target) => target !== 'drizzle-orm' && !target.startsWith('../../shared/'));
+    expect(seamOffenders).toEqual([]);
+
+    const attachmentsDir = join(SRC_ROOT, 'modules', 'attachments');
+    const inside = files.filter((file) => file.path.startsWith(attachmentsDir));
+    expect(inside.length).toBeGreaterThanOrEqual(5);
+    const siblingImports = inside.flatMap((file) =>
+      [...file.source.matchAll(/from '(\.\.\/[^']+)'/g)]
+        .map((match) => match[1]!)
+        .filter((target) => !target.startsWith('../../shared/'))
+        .map((target) => `${file.path}: ${target}`),
+    );
+    expect(siblingImports).toEqual([]);
+
+    const reach = /from '(?:\.\.\/)+(?:modules\/)?attachments\/(?!(?:attachments\.facade|attachments\.module|attachment-records)')[^']+'/;
+    const reachers = files.filter((file) => !file.path.startsWith(attachmentsDir) && reach.test(file.source)).map((file) => file.path);
+    expect(reachers).toEqual([]);
+    expect(reach.test("from '../attachments/file-store'")).toBe(true); // the detector bites
+    expect(reach.test("from '../attachments/attachments.facade'")).toBe(false);
+
+    const writers = files
+      .filter((file) => drizzleWriteOn('attachments').test(file.source) || rawWriteOn('attachments').test(file.source))
+      .map((file) => file.path.slice(SRC_ROOT.length + 1))
+      .sort();
+    expect(writers).toEqual(['modules/attachments/attachment-records.ts', 'modules/attachments/attachments.facade.ts']);
+    // Meaningful: both consumers import the seam directly.
+    for (const file of ['receiving.command.ts', 'receipt-photo.command.ts']) {
+      expect(readFileSync(join(SRC_ROOT, 'modules', 'inbound', file), 'utf8')).toContain(`from '../attachments/attachment-records'`);
+    }
+  });
+
+  /**
    * Story 1-2a — "no new work": every path that creates work for a client
    * runs the one gate, `assertClientTakesWorkInTx`. A path that dropped it
    * would let a departed client take new work silently.
@@ -2321,7 +2366,7 @@ describe('architecture: the client portal (story 21-7)', () => {
   const PORTAL_READS: readonly { file: string; methods: readonly string[] }[] = [
     { file: join(SRC_ROOT, 'modules', 'inventory', 'inventory.facade.ts'), methods: ['portalStock'] },
     { file: join(SRC_ROOT, 'modules', 'outbound', 'outbound.facade.ts'), methods: ['portalOrders', 'portalOrder'] },
-    { file: join(SRC_ROOT, 'modules', 'inbound', 'inbound.facade.ts'), methods: ['portalAsns', 'portalAsn', 'portalPurchaseOrders', 'portalPurchaseOrder'] },
+    { file: join(SRC_ROOT, 'modules', 'inbound', 'inbound.facade.ts'), methods: ['portalAsns', 'portalAsn', 'portalPurchaseOrders', 'portalPurchaseOrder', 'portalGoodsReceipts', 'portalGoodsReceipt'] },
     { file: join(SRC_ROOT, 'modules', 'billing', 'billing.facade.ts'), methods: ['portalInvoices', 'portalInvoice'] },
     { file: join(SRC_ROOT, 'modules', 'clients', 'clients.facade.ts'), methods: ['portalMeIn'] },
     // Story 21-7b — the announce form's two reads.
@@ -2368,6 +2413,9 @@ describe('architecture: the client portal (story 21-7)', () => {
         'portalAsn',
         'portalPurchaseOrders',
         'portalPurchaseOrder',
+        // Story 2-5a — the client's goods receipts and their damage photos.
+        'portalGoodsReceipts',
+        'portalGoodsReceipt',
         'portalInvoices',
         'portalInvoice',
         'portalMe',

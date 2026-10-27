@@ -38,6 +38,21 @@ import { OPEN_ASN_STATUSES, asnLineSnapshot, type AsnLineSnapshot } from './asn.
 import { partnerNamesInTx, type VendorSnapshotV1 } from '../partners/partners.facade';
 import { gateInLabelsInTx, openGateInsInTx, type OpenGateInView } from './gate-in.read';
 import { gateInClock } from './gate-in.command';
+import { AttachmentsFacade, MAX_IMAGE_BYTES } from '../attachments/attachments.facade';
+import {
+  ReceiptPhotoCommand,
+  type DeviceUploadCommand,
+  type DeviceUploadSnapshot,
+  type ReceiptPhotoList,
+  type ReceiptPhotoSnapshot,
+  type RemoveCommand,
+  type WebAddCommand,
+} from './receipt-photo.command';
+import {
+  photoCountsByParentInTx,
+  RECEIPT_PHOTOS_MAX_PER_LINE,
+  RECEIPT_PHOTOS_MAX_PER_RECEIPT,
+} from '../attachments/attachment-records';
 import { DAMAGE_REASON_CODES, SHORT_REASON_CODES } from './receipt-condition';
 
 /** One GRN header row of the GRN-list read (line counts + unit sums ride along). */
@@ -69,6 +84,8 @@ export interface GoodsReceiptEntry {
   readonly damagedUnits: number;
   /** Story 2-4a — short units across the lines (base units; 0 when none). */
   readonly shortUnits: number;
+  /** Story 2-5a — attached damage photos across the lines. */
+  readonly photoCount: number;
 }
 
 /**
@@ -89,6 +106,9 @@ export interface GoodsReceiptLineEntry {
   readonly damageReasonCode?: string;
   readonly shortQty?: number;
   readonly shortReasonCode?: string;
+  /** Story 2-5a — attached damage photos, and those the receipt named that have not arrived. */
+  readonly photoCount: number;
+  readonly pendingPhotoCount: number;
 }
 
 export interface ListGoodsReceiptsQuery {
@@ -237,6 +257,13 @@ export interface CatalogSnapshot {
   /** Story 2-4a (additive): the damage and short reason vocabularies — the device's gate on its controls. */
   readonly receiptDamageReasons: readonly string[];
   readonly receiptShortReasons: readonly string[];
+  /** Story 2-5a (additive): damage photos — storage on, and the draft's caps. */
+  readonly receiptPhotos: {
+    readonly enabled: boolean;
+    readonly maxPerLine: number;
+    readonly maxPerReceipt: number;
+    readonly maxBytes: number;
+  };
 }
 
 export const DEFAULT_RECEIVING_PAGE_SIZE = 50;
@@ -286,7 +313,33 @@ export class ReceivingFacade {
     // module's own tables, bins + putaway tasks through the putaway facade.
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
     @Inject(PutawayFacade) private readonly putaway: PutawayFacade,
+    // Story 2-5a — the snapshot's `receiptPhotos.enabled` (the store's mode).
+    @Inject(AttachmentsFacade) private readonly attachments: AttachmentsFacade,
+    // Story 2-5a — damage photos (this module's own command).
+    @Inject(ReceiptPhotoCommand) private readonly photos: ReceiptPhotoCommand,
   ) {}
+
+  // ── story 2-5a: damage photos on a receipt line ───────────────────────────
+
+  /** The handheld's photo upload (`receipt-photo.stage`; device credential + `x-op-operator`). */
+  async uploadReceiptPhoto(command: DeviceUploadCommand, ref: string): Promise<DeviceUploadSnapshot> {
+    return this.photos.uploadFromDevice(command, ref);
+  }
+
+  /** The web's add (`receipt.attach`). */
+  async addReceiptPhoto(command: WebAddCommand, idempotencyKey: string): Promise<ReceiptPhotoSnapshot> {
+    return this.photos.addOnWeb(command, idempotencyKey);
+  }
+
+  /** Remove, or cancel a placeholder (`receipt.photo-remove`). */
+  async removeReceiptPhoto(command: RemoveCommand, idempotencyKey: string): Promise<ReceiptPhotoSnapshot> {
+    return this.photos.remove(command, idempotencyKey);
+  }
+
+  /** One receipt's photos with presigned URLs (any staff role). */
+  async listReceiptPhotos(tenantId: string, grnId: string): Promise<ReceiptPhotoList> {
+    return this.photos.listForGrn(tenantId, grnId);
+  }
 
   /** `grn.submit` — the device-authenticated whole-GRN command. */
   async submitGoodsReceipt(
@@ -444,6 +497,8 @@ export class ReceivingFacade {
         tenantId,
         rows.map((row) => row.gateInId).filter((id): id is string => id !== null),
       );
+      // Story 2-5a — the page's attached photo counts, one read.
+      const photoCounts = await photoCountsByParentInTx(tx, tenantId, ids);
       const items = rows.map((full) => {
         // `createdAtText` is the cursor-only projection — never in the body.
         const { createdAtText, asnId, asnCode, clientId, gateInId, ...row } = full;
@@ -467,6 +522,7 @@ export class ReceivingFacade {
         appliedUnits: fromMilli(Number(aggregates.get(row.id)?.appliedUnits ?? 0)),
         damagedUnits: fromMilli(Number(aggregates.get(row.id)?.damagedUnits ?? 0)),
         shortUnits: fromMilli(Number(aggregates.get(row.id)?.shortUnits ?? 0)),
+        photoCount: photoCounts.get(row.id)?.photoCount ?? 0,
         occurredAt: canonicalInstant(row.occurredAt),
         recordedAt: canonicalInstant(row.recordedAt),
         createdAt: canonicalInstant(row.createdAt),
@@ -521,6 +577,7 @@ export class ReceivingFacade {
         tenantId,
         [...new Set(rows.map((row) => row.batchId).filter((id): id is string => id !== null))],
       );
+      const photos = (await photoCountsByParentInTx(tx, tenantId, [grnId])).get(grnId)?.byLine;
       return rows.map((row) => ({
         id: row.id,
         skuId: row.skuId,
@@ -535,6 +592,8 @@ export class ReceivingFacade {
         ...(row.damagedQty > 0 && row.damageReasonCode !== null ? { damageReasonCode: row.damageReasonCode } : {}),
         ...(row.shortQty > 0 ? { shortQty: fromMilli(row.shortQty) } : {}),
         ...(row.shortQty > 0 && row.shortReasonCode !== null ? { shortReasonCode: row.shortReasonCode } : {}),
+        photoCount: photos?.get(row.id)?.photoCount ?? 0,
+        pendingPhotoCount: photos?.get(row.id)?.pendingPhotoCount ?? 0,
       }));
     });
   }
@@ -752,6 +811,13 @@ export class ReceivingFacade {
         // Story 2-4a — the vocabularies; their presence is the device's gate.
         receiptDamageReasons: [...DAMAGE_REASON_CODES],
         receiptShortReasons: [...SHORT_REASON_CODES],
+        // Story 2-5a — damage photos: on only when a file store is configured.
+        receiptPhotos: {
+          enabled: this.attachments.storageEnabled,
+          maxPerLine: RECEIPT_PHOTOS_MAX_PER_LINE,
+          maxPerReceipt: RECEIPT_PHOTOS_MAX_PER_RECEIPT,
+          maxBytes: MAX_IMAGE_BYTES,
+        },
       };
     });
   }

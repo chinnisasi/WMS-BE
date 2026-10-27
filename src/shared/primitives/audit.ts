@@ -43,6 +43,9 @@ export const SYSTEM_ACTOR_ID = '01900000-0000-7000-8000-000000000000';
  */
 export const AUDIT_TARGET_TYPES = [
   'advance_shipment_notice',
+  // Story 2-5a — a stored (or awaited) file: a damage photo on a receipt line
+  // (`receipt_photo.uploaded | attached | added | removed | purged`).
+  'attachment',
   // The ASN import (2026-10-17) — one file's run (`asn_import.executed`;
   // each ASN it created also writes its own `asn.created` row).
   'asn_import',
@@ -269,4 +272,17 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'gate_in.unload_started', targetType: 'gate_in' },
   { action: 'gate_in.unload_ended', targetType: 'gate_in' },
   { action: 'gate_in.gated_out', targetType: 'gate_in' },
+  // Story 2-5a (A25) — damage photos. `uploaded`: the handheld's upload
+  // (actor the op's operator, reference the upload's key); `attached`: the
+  // receipt's claim binding a staged photo (reference the GRN's key) or a
+  // late upload filling an awaited placeholder (the upload's key);
+  // `added` / `removed`: the web. `ref-skipped` targets the GRN: a stale or
+  // foreign ref the receipt named and did not bind. The sweep's
+  // `receipt_photo.purged` is an unkeyed system row (`SYSTEM_ACTOR_ID`),
+  // outside this list.
+  { action: 'receipt_photo.uploaded', targetType: 'attachment' },
+  { action: 'receipt_photo.attached', targetType: 'attachment' },
+  { action: 'receipt_photo.added', targetType: 'attachment' },
+  { action: 'receipt_photo.removed', targetType: 'attachment' },
+  { action: 'receipt_photo.ref-skipped', targetType: 'goods_receipt' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

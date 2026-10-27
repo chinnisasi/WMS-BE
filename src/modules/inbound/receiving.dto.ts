@@ -35,6 +35,7 @@ import {
 } from '../catalog/handling-unit';
 import { MAX_HANDLING_UNITS_PER_GRN_LINE, REJECTED_GRN_LINE_CODES, UNMATCHED_LINE_REASONS } from './receiving.command';
 import { DAMAGE_REASON_CODES, SHORT_REASON_CODES } from './receipt-condition';
+import { RECEIPT_PHOTOS_MAX_PER_LINE } from '../attachments/attachment-records';
 import { ADJUSTMENT_REASON_CODES } from '../inventory/inventory.facade';
 // Story 3.5 (additive): the snapshot's putaway decision fields reuse the
 // putaway module's DTOs (one shape on every surface).
@@ -200,6 +201,20 @@ export class GrnLineInputDto {
   @Min(1, { each: true })
   @Max(MAX_HANDLING_UNIT_WEIGHT_GRAMS, { each: true })
   weightsGrams?: number[] | null;
+
+  @ApiProperty({
+    required: false,
+    type: [String],
+    maxItems: RECEIPT_PHOTOS_MAX_PER_LINE,
+    description:
+      "Story 2-5a — the line's damage photos, by the ULID the handheld minted at capture (each photo's own upload op's Idempotency-Key), in capture order. At most 10 per line and 50 per receipt, unique across the receipt. A photo uploaded first is attached by this receipt; one that arrives later fills the placeholder this receipt leaves. A ref that is unknown to this device, or already bound, is skipped — never a refusal. Omit when the line has none (an empty array means the same)",
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(RECEIPT_PHOTOS_MAX_PER_LINE)
+  @IsString({ each: true })
+  @Matches(/^[0-9A-HJKMNP-TV-Z]{26}$/, { each: true, message: 'each photoRefs entry must be a 26-character ULID' })
+  photoRefs?: string[];
 }
 
 /** POST /tenants/{tenantId}/receiving/goods-receipts body (device session). */
@@ -677,6 +692,9 @@ export class GoodsReceiptEntryDto {
   @ApiProperty({ minimum: 0, description: "Story 2-4a — the units short against the supplier's documents across all lines (recorded only); 0 when none" })
   shortUnits!: number;
 
+  @ApiProperty({ minimum: 0, description: "Story 2-5a — the receipt's attached damage photos across all lines; 0 when none" })
+  photoCount!: number;
+
   @ApiProperty({ description: 'Row creation time (the keyset cursor field), ISO-8601 UTC' })
   createdAt!: string;
 }
@@ -776,6 +794,27 @@ export class GoodsReceiptLineEntryDto {
 
   @ApiProperty({ required: false, enum: [...SHORT_REASON_CODES], description: 'Present only beside shortQty' })
   shortReasonCode?: string;
+
+  @ApiProperty({ minimum: 0, description: "Story 2-5a — the line's attached damage photos" })
+  photoCount!: number;
+
+  @ApiProperty({ minimum: 0, description: "Story 2-5a — the line's photos the receipt named that have not arrived yet (awaited)" })
+  pendingPhotoCount!: number;
+}
+
+/** Story 2-5a — the device snapshot's damage-photo arm. */
+export class CatalogReceiptPhotosDto {
+  @ApiProperty({ description: 'False under FILE_STORE=none — the handheld hides its Photo button' })
+  enabled!: boolean;
+
+  @ApiProperty({ description: 'The live photos one receipt line may carry (attached + awaited)', example: 10 })
+  maxPerLine!: number;
+
+  @ApiProperty({ description: 'The live photos one receipt may carry', example: 50 })
+  maxPerReceipt!: number;
+
+  @ApiProperty({ description: 'The largest photo upload, in bytes', example: 10485760 })
+  maxBytes!: number;
 }
 
 /** Story 2-4a — GET …/receiving/goods-receipts/{grnId}/lines response. */
@@ -1507,6 +1546,13 @@ export class CatalogSnapshotResponse {
     description: 'Story 2-4a (additive): the short reason vocabulary — the Short control\'s gate, as receiptDamageReasons',
   })
   receiptShortReasons!: readonly string[];
+
+  @ApiProperty({
+    type: CatalogReceiptPhotosDto,
+    description:
+      "Story 2-5a (additive): damage photos on a receipt line — whether storage is on (the Photo button's gate) and the caps the draft must respect. An older server omits it, and the handheld then offers no Photo",
+  })
+  receiptPhotos!: CatalogReceiptPhotosDto;
 
   @ApiProperty({
     type: [CatalogMoveReasonDto],
