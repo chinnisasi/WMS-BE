@@ -2526,8 +2526,35 @@ describe('architecture: the client portal (story 21-7)', () => {
     { file: join(SRC_ROOT, 'modules', 'inbound', 'asn.command.ts'), methods: ['announce'] },
     // Story 4-1a — the portal order (its phases run through the shared order
     // pipeline; the stamped transaction opener is built in this method).
-    { file: join(SRC_ROOT, 'modules', 'outbound', 'order.command.ts'), methods: ['placePortalOrder'] },
+    // Story 4-1c — retargeted to `portalOrderPlan`: the surface's stamped
+    // transaction opener is built there now (`placePortalOrder` and
+    // `checkPortalOrder` are plan + pipeline, opening nothing themselves —
+    // pinned below).
+    { file: join(SRC_ROOT, 'modules', 'outbound', 'order.command.ts'), methods: ['portalOrderPlan'] },
+    // Story 4-1c — the portal order import's own transactions (A, B and the
+    // per-order key probe) go through its stamped opener.
+    { file: join(SRC_ROOT, 'modules', 'outbound', 'order-import.command.ts'), methods: ['importPortalOrders'] },
   ];
+
+  /**
+   * A (private or public, async or not, possibly generic) class member's body,
+   * to the next member — story 4-1c (A11): `bodyOf` does not see a non-async
+   * `private` member such as `portalOrderPlan`.
+   */
+  function memberBodyOf(source: string, name: string): string | null {
+    const start = new RegExp(`\\n {2}(?:private |public )?(?:async )?${name}(?:<[^>]*>)?\\(`).exec(source);
+    if (start === null) return null;
+    const rest = source.slice(start.index + 1);
+    const end = /\n {2}(?:async |\/\*\*|private |public )/.exec(rest.slice(1));
+    return end === null ? rest : rest.slice(0, end.index + 1);
+  }
+
+  /**
+   * Story 4-1c — a portal write ENTRY whose stamped transaction opener lives in
+   * a plan method (entry → plan). The entry is listed through its plan; the
+   * 4-1a test below pins that the entry calls the plan and opens nothing itself.
+   */
+  const PORTAL_WRITE_PLANS: Readonly<Record<string, string>> = { placePortalOrder: 'portalOrderPlan' };
 
   function stampsCommandClient(body: string): boolean {
     return /withTenantTransaction\(/.test(body) && /\{\s*clientId:\s*command\.clientId\s*,?\s*\}\s*,?\s*\)/.test(body);
@@ -2538,7 +2565,7 @@ describe('architecture: the client portal (story 21-7)', () => {
     for (const { file, methods } of PORTAL_WRITES) {
       const source = readFileSync(file, 'utf8');
       for (const method of methods) {
-        const body = bodyOf(source, method);
+        const body = bodyOf(source, method) ?? memberBodyOf(source, method);
         if (body === null) offenders.push(`${file}: no ${method}`);
         else if (!stampsCommandClient(body)) offenders.push(`${file}: ${method} does not stamp { clientId: command.clientId }`);
       }
@@ -2548,23 +2575,24 @@ describe('architecture: the client portal (story 21-7)', () => {
 
   it('story 4-1a: placePortalOrder opens no unstamped transaction itself — its one unstamped read is the documented licence seam', () => {
     const source = readFileSync(join(SRC_ROOT, 'modules', 'outbound', 'order.command.ts'), 'utf8');
-    const body = bodyOf(source, 'placePortalOrder')!;
+    const memberBody = (name: string): string | null => memberBodyOf(source, name);
+    // Story 4-1c (A11) — the portal surface is built in `portalOrderPlan`:
+    // every transaction IT opens is stamped with the SESSION's client…
+    const body = memberBody('portalOrderPlan')!;
     expect(body).not.toBeNull();
-    // Every transaction the method opens is stamped with the SESSION's client…
     const opened = body.match(/withTenantTransaction\(/g) ?? [];
     const stamped = body.match(/\{\s*clientId:\s*command\.clientId\s*\}\s*\)/g) ?? [];
     expect(opened.length).toBeGreaterThanOrEqual(1);
     expect(stamped.length).toBe(opened.length);
+    // …`placePortalOrder` and `checkPortalOrder` are plan + pipeline and open none themselves…
+    for (const entry of ['placePortalOrder', 'checkPortalOrder']) {
+      const entryBody = memberBody(entry);
+      expect(entryBody).not.toBeNull();
+      expect(entryBody).toContain('this.portalOrderPlan(command)');
+      expect(entryBody).not.toMatch(/withTenantTransaction\(/);
+    }
     // …the shared pipeline opens transactions only through the surface…
-    /** A (private, possibly generic) class member's body, to the next member. */
-    const memberBody = (name: string): string | null => {
-      const start = new RegExp(`\\n {2}(?:private |public )?async ${name}(?:<[^>]*>)?\\(`).exec(source);
-      if (start === null) return null;
-      const rest = source.slice(start.index + 1);
-      const end = /\n {2}(?:async |\/\*\*|private |public )/.exec(rest.slice(1));
-      return end === null ? rest : rest.slice(0, end.index + 1);
-    };
-    for (const phase of ['placeOrder', 'preflightPhase', 'grantPhase', 'writePhase']) {
+    for (const phase of ['placeOrder', 'preflightPhase', 'grantPhase', 'writePhase', 'checkPlan']) {
       const phaseBody = memberBody(phase);
       expect(phaseBody).not.toBeNull();
       expect(phaseBody).not.toMatch(/withTenantTransaction\(/);
@@ -2603,6 +2631,28 @@ describe('architecture: the client portal (story 21-7)', () => {
     expect(stampsCommandClient(bodyOf(wrongClient, 'announce')!)).toBe(false);
     // The real command is found by name (a rename would empty the scan).
     expect(bodyOf(readFileSync(PORTAL_WRITES[0]!.file, 'utf8'), 'announce')).not.toBeNull();
+    // Story 4-1c (A11) — a SYNC private member: `bodyOf` misses it, `memberBodyOf` reads it (stamped and not).
+    const syncStamped = `
+  private portalThingPlan(command: PlaceThingCommand): Plan {
+    return { transaction: (fn) => withTenantTransaction(this.db, command.tenantId, fn, { clientId: command.clientId }) };
+  }
+
+  private other(): void {}
+`;
+    const syncUnstamped = `
+  private portalThingPlan(command: PlaceThingCommand): Plan {
+    return { transaction: (fn) => withTenantTransaction(this.db, command.tenantId, fn) };
+  }
+`;
+    expect(bodyOf(syncStamped, 'portalThingPlan')).toBeNull();
+    expect(stampsCommandClient(memberBodyOf(syncStamped, 'portalThingPlan')!)).toBe(true);
+    expect(memberBodyOf(syncStamped, 'portalThingPlan')).not.toContain('other()');
+    expect(stampsCommandClient(memberBodyOf(syncUnstamped, 'portalThingPlan')!)).toBe(false);
+    // Both real story-4-1c entries are found.
+    for (const { file, methods } of PORTAL_WRITES) {
+      const source = readFileSync(file, 'utf8');
+      for (const method of methods) expect(bodyOf(source, method) ?? memberBodyOf(source, method)).not.toBeNull();
+    }
   });
 
   it('the stamp detector bites (the test is meaningful)', () => {
@@ -2721,6 +2771,14 @@ describe('architecture: the client portal (story 21-7)', () => {
       target: 'placePortalOrder',
       via: { member: 'orderCommand', className: 'OrderCommandService' },
       statement: 'return this.orderCommand.placePortalOrder(command, idempotencyKey);',
+    },
+    // Story 4-1c — the portal order import: the stamp lives in the command.
+    {
+      field: 'outbound',
+      method: 'importPortalOrders',
+      target: 'importPortalOrders',
+      via: { member: 'orderImport', className: 'OrderImportCommand' },
+      statement: 'return this.orderImport.importPortalOrders(command, idempotencyKey);',
     },
   ];
 
@@ -2906,7 +2964,8 @@ describe('architecture: the client portal (story 21-7)', () => {
     for (const { field, method, target, via, statement } of PORTAL_DELEGATIONS) {
       const facadeFile = fileOfClass.get(PORTAL_CONTROLLER_FIELDS[field]!)!;
       const source = readFileSync(facadeFile, 'utf8');
-      const targetFiles = listedTargets.get(target) ?? [];
+      // Story 4-1c — an entry whose stamp moved into its plan is listed by the plan.
+      const targetFiles = listedTargets.get(PORTAL_WRITE_PLANS[target] ?? target) ?? [];
       if (via === undefined) {
         // A function of the facade's own file, listed against that file.
         if (!targetFiles.includes(facadeFile)) offenders.push(`${field}.${method} → ${target}: not listed for ${facadeFile}`);

@@ -1,8 +1,12 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, Res, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, Res, UploadedFile, UseFilters, UseGuards, UseInterceptors } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+// The global `Express.Multer.File` type (FileInterceptor's upload) lives in @types/multer.
+import type {} from 'multer';
 import type { Response } from 'express';
 import {
   ApiBearerAuth,
   ApiBody,
+  ApiConsumes,
   ApiExtraModels,
   ApiHeaders,
   ApiOkResponse,
@@ -12,6 +16,8 @@ import {
   ApiResponse,
   ApiTags,
 } from '@nestjs/swagger';
+import { MAX_SHEET_UPLOAD_BYTES } from '../shared/import/sheet-reader';
+import { SheetUploadFilter } from '../shared/import/upload-filter';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
 import { ProblemException } from '../shared/problem-details/problem.exception';
@@ -50,12 +56,14 @@ import {
   PortalAsnsQuery,
   PortalCreateAsnDto,
   PortalCreateOrderDto,
+  PortalImportOrdersDto,
   PortalInvoiceDetailResponse,
   PortalInvoiceNotesResponse,
   PortalNoteDetailResponse,
   PortalInvoicePageResponse,
   PortalMeResponse,
   PortalOrderDetailResponse,
+  PortalOrderImportResponseDto,
   PortalOrderPageResponse,
   PortalOrdersQuery,
   PortalPageQuery,
@@ -262,6 +270,119 @@ export class PortalController {
       ...(placed.priority === undefined ? {} : { priority: placed.priority }),
       ...(placed.shipByDate === undefined ? {} : { shipByDate: placed.shipByDate }),
       ...(placed.codAmountPaise === undefined ? {} : { codAmountPaise: placed.codAmountPaise }),
+    };
+  }
+
+  /**
+   * Story 4-1c — the portal order import: this client's orders from one
+   * CSV/XLSX file (no `client` or `rate` column — the client is the
+   * session's). `dryRun=true` is Check file (200, nothing written, no key);
+   * otherwise Import (201 when complete; 200 with `complete: false` when the
+   * 15 s budget stopped it). The literal `order-imports` segment shares no
+   * prefix with `orders/:orderId`.
+   */
+  @Post(':tenantId/portal/order-imports')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(PortalSessionGuard)
+  @UseFilters(SheetUploadFilter)
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: MAX_SHEET_UPLOAD_BYTES } }))
+  @ApiBearerAuth()
+  @ApiConsumes('multipart/form-data')
+  @ApiOperation({
+    summary:
+      "Imports this client's orders from a CSV/XLSX file (orders.place) — one row per order line, grouped by order_ref; each order is placed exactly as Place order would (your own active SKUs, every line reserved in full or that order is refused), and an order with any bad row is refused whole. dryRun=true checks the file and writes nothing (it cannot promise stock). ≤ 2,000 rows, ≤ 200 orders, ≤ 200 lines per order, ≤ 5 MB",
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        file: {
+          type: 'string',
+          format: 'binary',
+          description:
+            'CSV or XLSX — header row required (sku, quantity, order_ref, ship_to_name, ship_to_phone, ship_to_line1, ship_to_city, ship_to_state, ship_to_pincode; optional warehouse, ship_to_line2, consignee_gstin, consignee_legal_name, order_type, priority, ship_by, cod_amount; other columns ignored)',
+        },
+        warehouseId: { type: 'string', format: 'uuid', description: 'The warehouse every order is placed into' },
+        dryRun: { type: 'string', enum: ['true', 'false'], description: '`true`: Check file — nothing written, no Idempotency-Key needed' },
+      },
+      required: ['file', 'warehouseId'],
+    },
+  })
+  @ApiHeaders([
+    {
+      name: 'Idempotency-Key',
+      required: false,
+      description: 'Client-generated ULID key — required for an import, ignored on a dry run; a retry of an unfinished import with the same file places only the orders still missing',
+      schema: { type: 'string', minLength: 26, maxLength: 26, pattern: '^[0-9A-HJKMNP-TV-Z]{26}$' },
+    },
+  ])
+  @ApiResponse({ status: HttpStatus.CREATED, type: PortalOrderImportResponseDto, description: 'Import, complete: the placed orders and every refused row (the stored replay)' })
+  @ApiResponse({ status: HttpStatus.OK, type: PortalOrderImportResponseDto, description: 'Check file (dryRun=true) — nothing written; or an Import the time budget stopped (complete: false)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key on an import, no file, a malformed warehouseId or dryRun (validation-failed), a file that cannot be read (file-unreadable), or a header without a required column (missing-columns)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(`${PORTAL_403}; or the user may not place orders for this client (role-denied)`) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("The warehouse is not the tenant's (not-found)") })
+  @ApiResponse({ status: 409, ...problemJsonResponse('This import is still running under the same Idempotency-Key (import-in-progress), or a concurrent import with the same key committed first (conflict)') })
+  @ApiResponse({ status: 415, ...problemJsonResponse('Not a .csv/.xlsx file (unsupported-file-type)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('More than 5 MB, 2,000 data rows or 200 orders (import-too-large), or the Idempotency-Key reused with a different file or warehouse (idempotency-key-reuse)') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('The stock reservation store is unreachable (reservation-store-unavailable) — Import again with the same file to finish without duplicates') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async importOrders(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentPortalSession() session: PortalSession,
+    @UploadedFile() file: Express.Multer.File | undefined,
+    @Body() dto: PortalImportOrdersDto,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<PortalOrderImportResponseDto> {
+    assertOwnTenant(session, tenantId);
+    const dryRun = dto.dryRun === true;
+    const key = dryRun ? null : parseRequiredIdempotencyKey(idempotencyKey);
+    if (!file) {
+      throw new ProblemException('validation-failed', 400, 'Import file is required', 'Attach a .csv or .xlsx file in the "file" multipart field.');
+    }
+    const response = await this.outbound.importPortalOrders(
+      {
+        tenantId,
+        // The session's client (the guard's re-read) — never the body's.
+        clientId: session.clientId,
+        actorUserId: session.userId,
+        warehouseId: dto.warehouseId,
+        dryRun,
+        file: { name: file.originalname, mimetype: file.mimetype, buffer: file.buffer, size: file.size },
+      },
+      key,
+    );
+    if (dryRun || !response.complete) {
+      res.status(HttpStatus.OK);
+    }
+    // An exact key allowlist, rebuilt key by key (§7e).
+    return {
+      importId: response.importId,
+      dryRun: response.dryRun,
+      warehouseId: response.warehouseId,
+      fileSha256: response.fileSha256,
+      rowCount: response.rowCount,
+      orderCount: response.orderCount,
+      acceptedCount: response.acceptedCount,
+      refusedCount: response.refusedCount,
+      complete: response.complete,
+      notAttemptedCount: response.notAttemptedCount,
+      orders: response.orders.map((order) => ({
+        orderId: order.orderId,
+        clientOrderRef: order.clientOrderRef,
+        lineCount: order.lineCount,
+        firstRow: order.firstRow,
+        replayed: order.replayed,
+      })),
+      errors: response.errors.map((error) => ({
+        rowNumber: error.rowNumber,
+        orderRef: error.orderRef,
+        code: error.code,
+        detail: error.detail,
+        sku: error.sku,
+        quantity: error.quantity,
+      })),
     };
   }
 

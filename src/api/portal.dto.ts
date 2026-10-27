@@ -4,6 +4,7 @@ import {
   ArrayMaxSize,
   ArrayMinSize,
   IsArray,
+  IsBoolean,
   IsIn,
   IsInt,
   IsNumber,
@@ -28,11 +29,13 @@ import { GSTIN_RE, gstinDtoTransform } from '../shared/primitives/gstin';
 import {
   COD_AMOUNT_DOC,
   MAX_ORDER_LINES,
+  OrderImportRowErrorDto,
   ORDER_PRIORITY_DOC,
   ORDER_TYPE_DOC,
   SHIP_BY_DATE_DOC,
 } from '../modules/outbound/outbound.dto';
 import { MAX_EXTERNAL_ID_LENGTH } from '../shared/primitives/ids';
+import { BooleanFlag } from '../shared/primitives/instant-range';
 
 /** Story 4-1a — the portal order's line ceiling IS the staff order's (`CreateOrderDto`), never a copy. */
 const MAX_PORTAL_ORDER_LINES = MAX_ORDER_LINES;
@@ -830,4 +833,81 @@ export class PortalNoteDetailResponse extends PortalNoteRowDto {
   @ApiProperty({ enum: [...SUPPLY_TYPES] }) supplyType!: string;
   @ApiProperty({ type: PortalInvoicePartyDto }) party!: PortalInvoicePartyDto;
   @ApiProperty({ type: [PortalNoteLineDto] }) lines!: PortalNoteLineDto[];
+}
+
+// ── story 4-1c: the portal order import ───────────────────────────────────────
+
+/** `POST portal/order-imports` multipart fields (beside the `file`). The client is the session's — never a field. */
+export class PortalImportOrdersDto {
+  @ApiProperty({ format: 'uuid', description: 'The warehouse every order of the file is placed into' })
+  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value))
+  @IsUUID()
+  warehouseId!: string;
+
+  @ApiProperty({
+    required: false,
+    enum: ['true', 'false'],
+    description: '`true`: Check file — every order through the place-order rules, nothing written (no Idempotency-Key needed). Omitted or `false`: Import',
+  })
+  @IsOptional()
+  @BooleanFlag()
+  @IsBoolean()
+  dryRun?: boolean;
+}
+
+/** One order the portal import placed — or, on a dry run, found ready. An exact key allowlist: no client, no stock facts. */
+export class PortalOrderImportOrderDto {
+  @ApiProperty({ type: String, format: 'uuid', nullable: true, description: 'The placed order; null on a dry run' })
+  orderId!: string | null;
+
+  @ApiProperty({ example: 'SO-1042', description: 'Your order number (the order_ref cell, trimmed)' })
+  clientOrderRef!: string;
+
+  @ApiProperty({ example: 3, description: 'Lines on the order' })
+  lineCount!: number;
+
+  @ApiProperty({ example: 2, description: 'The spreadsheet row of the order’s first line' })
+  firstRow!: number;
+
+  @ApiProperty({ description: 'True when an earlier run of the same import placed this order (it replayed)' })
+  replayed!: boolean;
+}
+
+/** `POST portal/order-imports` — the result (and, for a complete import, the stored replay). */
+export class PortalOrderImportResponseDto {
+  @ApiProperty({ type: String, format: 'uuid', nullable: true, description: 'The import; null on a dry run and on an incomplete run' })
+  importId!: string | null;
+
+  @ApiProperty()
+  dryRun!: boolean;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ description: 'SHA-256 of the uploaded file (hex)' })
+  fileSha256!: string;
+
+  @ApiProperty({ description: 'Data rows read (blank rows not counted)' })
+  rowCount!: number;
+
+  @ApiProperty({ description: 'Orders the file describes' })
+  orderCount!: number;
+
+  @ApiProperty({ description: 'Orders placed — on a dry run, ready to place' })
+  acceptedCount!: number;
+
+  @ApiProperty({ description: 'Orders refused whole (an order with any bad row)' })
+  refusedCount!: number;
+
+  @ApiProperty({ description: 'False when the 15-second budget stopped the run before every order was tried — Import again with the same file to finish' })
+  complete!: boolean;
+
+  @ApiProperty({ description: 'Orders the run did not reach (0 when complete)' })
+  notAttemptedCount!: number;
+
+  @ApiProperty({ type: [PortalOrderImportOrderDto] })
+  orders!: PortalOrderImportOrderDto[];
+
+  @ApiProperty({ type: [OrderImportRowErrorDto], description: 'Every refused row, in sheet order' })
+  errors!: OrderImportRowErrorDto[];
 }

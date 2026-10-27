@@ -101,6 +101,10 @@ export const AUDIT_TARGET_TYPES = [
   'ledger_event',
   'manifest',
   'order',
+  // Story 4-1c — one order-import file's run (`order_import.executed`; each
+  // order it created also writes its own `order.created` row under its
+  // derived key).
+  'order_import',
   'over_receipt',
   // Story 1-3 — a business partner (`partner.created | updated | deactivated
   // | reactivated`) and one of its client links (`partner.linked |
@@ -231,6 +235,10 @@ export const AUDIT_NEW_ACTIONS = [
   // The ASN import (2026-10-17) — one row per import run, beside each created
   // ASN's own `asn.created` (all under the import's one key).
   { action: 'asn_import.executed', targetType: 'asn_import' },
+  // Story 4-1c — one row per complete order-import run (staff or portal; the
+  // actor is the importing user, a client user on the portal), beside each
+  // created order's own `order.created` under its derived key.
+  { action: 'order_import.executed', targetType: 'order_import' },
   // Story 3-1 — the bin-to-bin move (`MoveCommand.moveStock`); the actor is
   // the operator, also on a review Apply.
   { action: 'stock.moved', targetType: 'bin_move' },

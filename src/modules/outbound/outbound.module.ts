@@ -13,6 +13,8 @@ import { ManifestCommandService } from './manifest.command';
 import { RateService } from './rate.service';
 import { WAVE_CLOCK, SystemWaveClock } from './wave.clock';
 import { OutboundFacade } from './outbound.facade';
+import { OrderImportCommand } from './order-import.command';
+import { ValkeyModule } from '../../shared/valkey/valkey.module';
 
 /**
  * Outbound module (Story 4.1): the order aggregate and its state machine —
@@ -86,8 +88,10 @@ import { OutboundFacade } from './outbound.facade';
 // sync-report apply arm), closing a catalog → tenancy → outbound → catalog
 // cycle through compliance too; the decorator must not touch the loading
 // binding eagerly (the catalog↔tenancy pattern).
+// Story 4-1c — `ValkeyModule` for the order import's per-key lease (the one
+// shared atomic-decision client; outbound carries no counter of its own).
 @Module({
-  imports: [SharedModule, InventoryModule, forwardRef(() => CatalogModule), CarriersModule],
+  imports: [SharedModule, InventoryModule, forwardRef(() => CatalogModule), CarriersModule, ValkeyModule],
   providers: [
     OrderCommandService,
     WaveCommandService,
@@ -97,6 +101,7 @@ import { OutboundFacade } from './outbound.facade';
     ShipmentCommandService,
     ManifestCommandService,
     RateService,
+    OrderImportCommand,
     { provide: WAVE_CLOCK, useClass: SystemWaveClock },
     OutboundFacade,
   ],

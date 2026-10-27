@@ -367,6 +367,13 @@ export interface SkuByCode {
   readonly uom: string;
   readonly uomPrecision: number;
   readonly isKit: boolean;
+  /**
+   * Story 4-1c — the SKU's status (additive; the ASN import ignores it). The
+   * portal order import keeps only `active` non-kit SKUs (the `portal/skus`
+   * population); the staff import hands an inactive SKU to the create, which
+   * sells it down.
+   */
+  readonly status: SkuStatus;
 }
 
 @Injectable()
@@ -1061,30 +1068,23 @@ export class CatalogFacade {
     tenantId: string,
     codes: readonly string[],
   ): Promise<ReadonlyMap<string, readonly SkuByCode[]>> {
-    const distinct = [...new Set(codes)].filter((code) => code !== '');
-    if (distinct.length === 0) {
-      return new Map();
-    }
-    const rows = await tx
-      .select({ id: skus.id, code: skus.code, clientId: skus.clientId, uom: skus.uom })
-      .from(skus)
-      .where(and(eq(skus.tenantId, tenantId), inArray(skus.code, distinct)))
-      .orderBy(skus.code, skus.clientId);
-    const kits = new Set(await getKitSkuIdsInTx(tx, tenantId, rows.map((row) => row.id)));
-    const byCode = new Map<string, SkuByCode[]>();
-    for (const row of rows) {
-      const list = byCode.get(row.code) ?? [];
-      list.push({
-        id: row.id,
-        code: row.code,
-        clientId: row.clientId,
-        uom: row.uom,
-        uomPrecision: uomPrecision(row.uom),
-        isKit: kits.has(row.id),
-      });
-      byCode.set(row.code, list);
-    }
-    return byCode;
+    return skusByCodesInTx(tx, tenantId, null, codes);
+  }
+
+  /**
+   * Story 4-1c (A10) — `getSkusByCodesInTx` for ONE client: the same read
+   * with an explicit `client_id = $client` predicate. The portal order
+   * import runs it in its client-stamped transaction, so the client's codes
+   * resolve through both layers (the predicate and the `skus` policy) — a
+   * code another client holds is simply absent.
+   */
+  async getClientSkusByCodesInTx(
+    tx: TenantTx,
+    tenantId: string,
+    clientId: string,
+    codes: readonly string[],
+  ): Promise<ReadonlyMap<string, readonly SkuByCode[]>> {
+    return skusByCodesInTx(tx, tenantId, clientId, codes);
   }
 
   /**
@@ -1585,4 +1585,44 @@ export class CatalogFacade {
       );
     }
   }
+}
+
+/** The by-code SKU read behind `getSkusByCodesInTx` (every holder) and `getClientSkusByCodesInTx` (one client's). */
+async function skusByCodesInTx(
+  tx: TenantTx,
+  tenantId: string,
+  clientId: string | null,
+  codes: readonly string[],
+): Promise<ReadonlyMap<string, readonly SkuByCode[]>> {
+  const distinct = [...new Set(codes)].filter((code) => code !== '');
+  if (distinct.length === 0) {
+    return new Map();
+  }
+  const rows = await tx
+    .select({ id: skus.id, code: skus.code, clientId: skus.clientId, uom: skus.uom, status: skus.status })
+    .from(skus)
+    .where(
+      and(
+        eq(skus.tenantId, tenantId),
+        ...(clientId === null ? [] : [eq(skus.clientId, clientId)]),
+        inArray(skus.code, distinct),
+      ),
+    )
+    .orderBy(skus.code, skus.clientId);
+  const kits = new Set(await getKitSkuIdsInTx(tx, tenantId, rows.map((row) => row.id)));
+  const byCode = new Map<string, SkuByCode[]>();
+  for (const row of rows) {
+    const list = byCode.get(row.code) ?? [];
+    list.push({
+      id: row.id,
+      code: row.code,
+      clientId: row.clientId,
+      uom: row.uom,
+      uomPrecision: uomPrecision(row.uom),
+      isKit: kits.has(row.id),
+      status: row.status as SkuStatus,
+    });
+    byCode.set(row.code, list);
+  }
+  return byCode;
 }

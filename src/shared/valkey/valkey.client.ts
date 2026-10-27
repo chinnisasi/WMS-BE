@@ -13,11 +13,27 @@ export type ReleaseReply = [applied: 0 | 1, rest: string];
 /** Script command names as registered on the client (fixed key counts). */
 const GRANT_COMMAND = 'wmsResGrant';
 const RELEASE_COMMAND = 'wmsResRelease';
+const LEASE_RELEASE_COMMAND = 'wmsLeaseRelease';
+
+/**
+ * Story 4-1c (A1) — the import lease's compare-and-delete: the key is deleted
+ * only while it still holds the caller's token, so a run whose lease expired
+ * (and was re-taken by another run) can never free that other run's lease.
+ * Replies 1 when it deleted, 0 otherwise.
+ */
+export const LEASE_RELEASE_SCRIPT = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`;
 
 /**
  * The shared Valkey client (story 2.3, AD-2): one lazy ioredis connection
- * carrying ONLY atomic-decision state (reserved counters + their ready
- * markers). Boot-validated like the database (`db.ts`): the URL requirement
+ * carrying atomic-decision state (reserved counters + their ready markers)
+ * and short import leases (story 4-1c: one run per order-import key at a
+ * time — `acquireLease` / `releaseLease`). Boot-validated like the database
+ * (`db.ts`): the URL requirement
  * fails loudly at first use — a deployment that reaches a reservation path
  * without `VALKEY_URL` gets a named error, never a silent downgrade — while
  * the app shell (OpenAPI export, contract tests) still boots without Valkey,
@@ -63,6 +79,7 @@ export class ValkeyClient implements OnApplicationShutdown {
     // — there is no ad-hoc EVAL anywhere else in the codebase.
     client.defineCommand(GRANT_COMMAND, { numberOfKeys: 2, lua: RESERVATION_GRANT_SCRIPT });
     client.defineCommand(RELEASE_COMMAND, { numberOfKeys: 1, lua: RESERVATION_RELEASE_SCRIPT });
+    client.defineCommand(LEASE_RELEASE_COMMAND, { numberOfKeys: 1, lua: LEASE_RELEASE_SCRIPT });
     this.client = client;
     return client;
   }
@@ -164,6 +181,27 @@ export class ValkeyClient implements OnApplicationShutdown {
   /** Disarms the ready marker — grants fail closed while it is down. */
   async disarmReady(readyKey: string): Promise<void> {
     await this.redis().del(readyKey);
+  }
+
+  /**
+   * Story 4-1c (A1) — takes a short lease: `SET key token NX PX ttlMs`. True
+   * when this caller now holds it; false when another holder does. Rejects
+   * when Valkey is unreachable (the caller fails closed).
+   */
+  async acquireLease(key: string, token: string, ttlMs: number): Promise<boolean> {
+    if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) {
+      throw new Error(`Lease TTL must be a positive integer of milliseconds: ${ttlMs}`);
+    }
+    return (await this.redis().set(key, token, 'PX', ttlMs, 'NX')) === 'OK';
+  }
+
+  /**
+   * Story 4-1c (A1) — frees the lease only while it still holds `token`
+   * (`LEASE_RELEASE_SCRIPT`). True when this call deleted it.
+   */
+  async releaseLease(key: string, token: string): Promise<boolean> {
+    const client = this.redis() as unknown as Record<string, (...args: string[]) => Promise<number>>;
+    return (await client[LEASE_RELEASE_COMMAND]!(key, token)) === 1;
   }
 
   /**

@@ -60,6 +60,13 @@ import { orderUrgencyOrderBy, type OrderPriority, type OrderType } from './order
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
 import { OrderCommandService } from './order.command';
+import { OrderImportCommand } from './order-import.command';
+import type {
+  ImportOrdersCommand,
+  ImportPortalOrdersCommand,
+  OrderImportResponse,
+  PortalOrderImportResponse,
+} from './order-import.command';
 import type {
   CancelOrderCommand,
   CreateOrderCommand,
@@ -463,6 +470,8 @@ export class OutboundFacade {
     @Inject(ShipmentCommandService) private readonly shipmentCommand: ShipmentCommandService,
     @Inject(ManifestCommandService) private readonly manifestCommand: ManifestCommandService,
     @Inject(RateService) private readonly rateService: RateService,
+    // Story 4-1c — the order import (both surfaces).
+    @Inject(OrderImportCommand) private readonly orderImport: OrderImportCommand,
   ) {}
 
   /**
@@ -557,6 +566,24 @@ export class OutboundFacade {
    */
   async placePortalOrder(command: PlacePortalOrderCommand, idempotencyKey: string): Promise<PortalPlacedOrder> {
     return this.orderCommand.placePortalOrder(command, idempotencyKey);
+  }
+
+  /**
+   * Story 4-1c — `POST …/outbound/order-imports`: many orders from one
+   * CSV/XLSX file, each created through `createOrder` under a key derived
+   * from the import's (Check file when `dryRun`).
+   */
+  async importOrders(command: ImportOrdersCommand, idempotencyKey: string | null): Promise<OrderImportResponse> {
+    return this.orderImport.importOrders(command, idempotencyKey);
+  }
+
+  /**
+   * Story 4-1c — `POST portal/order-imports`: the client portal's import. A
+   * one-statement delegation (pinned in test/architecture.spec.ts,
+   * deliberately not `portal*`-named): the client stamp lives in the command.
+   */
+  async importPortalOrders(command: ImportPortalOrdersCommand, idempotencyKey: string | null): Promise<PortalOrderImportResponse> {
+    return this.orderImport.importPortalOrders(command, idempotencyKey);
   }
 
   /** `POST .../outbound/orders/{id}/cancel` — releases every open hold. */

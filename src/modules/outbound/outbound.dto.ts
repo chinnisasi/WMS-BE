@@ -31,6 +31,7 @@ import {
   ORDER_STATUSES,
 } from './order.command';
 import { MAX_COD_AMOUNT_PAISE, ORDER_PRIORITIES, ORDER_TYPES } from './order-urgency';
+import { ORDER_IMPORT_ROW_ERROR_CODES, type OrderImportRowErrorCode } from './order-import.parse';
 import { MAX_EXTERNAL_ID_LENGTH } from '../../shared/primitives/ids';
 import { AddressDto } from '../tenancy/tenancy.dto';
 import { SHORT_PICK_REASON_CODES } from './pick.command';
@@ -2201,4 +2202,115 @@ export class PicklistLineListResponse {
 
   @ApiProperty({ type: String, nullable: true })
   nextCursor!: string | null;
+}
+
+// ── story 4-1c: the order import ──────────────────────────────────────────────
+
+/** `POST …/outbound/order-imports` multipart fields (beside the `file`). */
+export class ImportOrdersDto {
+  @ApiProperty({ format: 'uuid', description: 'The warehouse every order of the file is for (the Orders page’s selected warehouse)' })
+  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value))
+  @IsUUID()
+  warehouseId!: string;
+
+  @ApiProperty({
+    required: false,
+    enum: ['true', 'false'],
+    description: '`true`: Check file — every order through the create’s rules, nothing written (no Idempotency-Key needed). Omitted or `false`: Import',
+  })
+  @IsOptional()
+  @BooleanFlag()
+  @IsBoolean()
+  dryRun?: boolean;
+}
+
+/** One refused row of an order import. */
+export class OrderImportRowErrorDto {
+  @ApiProperty({ example: 7, description: 'The spreadsheet row — the header is row 1' })
+  rowNumber!: number;
+
+  @ApiProperty({ type: String, nullable: true, example: 'SO-1042', description: 'The row’s order_ref (trimmed); null when blank' })
+  orderRef!: string | null;
+
+  @ApiProperty({
+    enum: [...ORDER_IMPORT_ROW_ERROR_CODES],
+    description:
+      'Why the row (and with it its whole order) was refused — the file’s rules, the create’s own refusal passed through with its detail (an order’s refusal sits on its first row), order-changed-since-first-run, or order-refused (any other code, named in the detail)',
+  })
+  code!: OrderImportRowErrorCode;
+
+  @ApiProperty({ example: 'No SKU with code "GLOW-SERUM-X" exists in this tenant.' })
+  detail!: string;
+
+  @ApiProperty({ type: String, nullable: true, example: 'GLOW-SERUM-X', description: 'The row’s sku cell as written; null when blank' })
+  sku!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, example: '12', description: 'The row’s quantity cell as written; null when blank' })
+  quantity!: string | null;
+}
+
+/** One order the import created — or, on a dry run, found ready. */
+export class OrderImportOrderDto {
+  @ApiProperty({ type: String, format: 'uuid', nullable: true, description: 'The created order; null on a dry run' })
+  orderId!: string | null;
+
+  @ApiProperty({ example: 'SO-1042', description: 'The client order number (the order_ref cell, trimmed)' })
+  clientOrderRef!: string;
+
+  @ApiProperty({ example: 3, description: 'Top-level lines (a kit line counts once)' })
+  lineCount!: number;
+
+  @ApiProperty({ example: 2, description: 'The spreadsheet row of the order’s first line' })
+  firstRow!: number;
+
+  @ApiProperty({ description: 'True when an earlier run of the same import created this order (it replayed)' })
+  replayed!: boolean;
+
+  @ApiProperty({ format: 'uuid' })
+  clientId!: string;
+
+  @ApiProperty({ example: 'ACME', description: 'The client as people read it (the tenant’s own: "<name> (your company)")' })
+  clientLabel!: string;
+
+  @ApiProperty({ type: Number, nullable: true, example: 1, description: 'Top-level lines left backordered (a kit counts once); null on a dry run' })
+  backorderedLineCount!: number | null;
+}
+
+/** `POST …/outbound/order-imports` — the result (and, for a complete import, the idempotency snapshot). */
+export class OrderImportResponseDto {
+  @ApiProperty({ type: String, format: 'uuid', nullable: true, description: 'The import (its audit row’s target); null on a dry run and on an incomplete run' })
+  importId!: string | null;
+
+  @ApiProperty()
+  dryRun!: boolean;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ description: 'SHA-256 of the uploaded file (hex) — with the warehouse, the import’s idempotency fingerprint' })
+  fileSha256!: string;
+
+  @ApiProperty({ description: 'Data rows read (blank rows not counted)' })
+  rowCount!: number;
+
+  @ApiProperty({ description: 'Orders the file describes' })
+  orderCount!: number;
+
+  @ApiProperty({ description: 'Orders created — on a dry run, ready to create' })
+  acceptedCount!: number;
+
+  @ApiProperty({ description: 'Orders refused whole (an order with any bad row)' })
+  refusedCount!: number;
+
+  @ApiProperty({ description: 'False when the 15-second budget stopped the run before every order was tried (answered 200, nothing stored) — Import again with the same file to finish' })
+  complete!: boolean;
+
+  @ApiProperty({ description: 'Orders the run did not reach (0 when complete)' })
+  notAttemptedCount!: number;
+
+  @ApiProperty({ type: [OrderImportOrderDto] })
+  orders!: OrderImportOrderDto[];
+
+  @ApiProperty({ type: [OrderImportRowErrorDto], description: 'Every refused row, in sheet order' })
+  errors!: OrderImportRowErrorDto[];
 }
