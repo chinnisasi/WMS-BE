@@ -40,6 +40,8 @@ import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import type { LedgerReferenceDoc } from '../inventory/inventory.facade';
 import { CatalogFacade } from '../catalog/catalog.facade';
+// Story 3-7a — the open-live-recall seam (a free-function file, guide §7h).
+import { openLiveRecallLinesForBatchesInTx } from '../recalls/open-recall-lines';
 import { findReplanSlices, type ReplanSlice } from './replan';
 // Story 12-1 — the ONE conformance predicate + the draw refusal factory,
 // shared with putaway, the pool filter, merge and the class-edit guards.
@@ -842,6 +844,45 @@ export class PickCommandService {
           `SKU "${sku.code}" is catch-weight tracked — every quantity is a count of physical cases, ` +
             `and ${fromMilli(scaled.qty)} is not a whole number of them.`,
         );
+      }
+
+      // ── story 3-7a (A13): no draw from a bin holding a recalled lot ──────
+      // The pick payload names no batch, and FEFO re-derivation is a ledger
+      // fiction: the operator physically grabs units, and a recalled lot
+      // beside a good one in the same bin cannot be told apart by an
+      // unscanned draw. So a bin holding ANY on-hand of a batch on an OPEN
+      // LIVE recall refuses the pick outright — never re-derived onto the
+      // other lot. The remedy: move the recalled units out (a move of a
+      // blocked batch is allowed, 3-3a A11), then pick. Behind the replay,
+      // after the bin-row lock: the bin's batches of this SKU are locked
+      // `FOR KEY SHARE` (id order) before the seam is asked, so a recall
+      // opening concurrently either committed first (seen here) or waits
+      // for this pick. Lock order bin row → batch key-share → serials →
+      // warehouse (guide §1, A15). A zero-unit short pick draws nothing and
+      // is not refused (the operator is reporting the bin).
+      if (sku.batchTracked && scaled.qty > 0) {
+        const binBatchIds = [
+          ...new Set(
+            (await this.inventory.batchOnHandForBinInTx(tx, command.tenantId, command.warehouseId, command.skuId, drawBin.id)).map(
+              (entry) => entry.batchId,
+            ),
+          ),
+        ];
+        await this.catalog.keyShareLockBatchesInTx(tx, command.tenantId, binBatchIds);
+        const recalled = await openLiveRecallLinesForBatchesInTx(tx, command.tenantId, binBatchIds);
+        if (recalled.length > 0) {
+          const facts = await this.catalog.batchFactsByIdsInTx(tx, command.tenantId, recalled.map((line) => line.batchId));
+          const batchCodes = [...new Set(recalled.map((line) => facts.get(line.batchId)?.code ?? line.batchId))].sort();
+          const recallCodes = [...new Set(recalled.map((line) => line.recallCode))].sort();
+          throw new ProblemException(
+            'recalled-lot-in-bin',
+            409,
+            'Recalled lot in this bin',
+            `Bin "${drawBin.code}" holds lot ${batchCodes.join(', ')} of SKU "${sku.code}" under recall ${recallCodes.join(', ')} — ` +
+              'a pick here cannot tell the recalled units from good ones. Move the recalled units out of the bin, then pick.',
+            { binCode: drawBin.code, batchCodes, recallCodes },
+          );
+        }
       }
 
       // ── the serial arm (serial-tracked SKUs, the putaway mirror) ────────

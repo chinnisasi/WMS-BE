@@ -54,6 +54,8 @@ import { ValkeyModule } from '../shared/valkey/valkey.module';
 import { ReadinessService } from './readiness.service';
 import { ClientWebhooksController } from './client-webhooks.controller';
 import { ClientWebhooksModule } from '../modules/client-webhooks/client-webhooks.module';
+import { RecallsController } from './recalls.controller';
+import { RecallsModule } from '../modules/recalls/recalls.module';
 
 /**
  * api shell: the only HTTP surface of the monolith. Story 1.1 exposes
@@ -93,7 +95,7 @@ import { ClientWebhooksModule } from '../modules/client-webhooks/client-webhooks
   // Story 21-7 — SharedModule: Nest instantiates a route guard in the
   // CONTROLLER's module, so `PortalSessionGuard`'s DATABASE dependency must
   // resolve here too.
-  imports: [SharedModule, ValkeyModule, InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule, ClientsModule, BillingModule, NotificationsModule, ReturnsModule, PartnersModule, ClientWebhooksModule],
+  imports: [SharedModule, ValkeyModule, InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule, ClientsModule, BillingModule, NotificationsModule, ReturnsModule, PartnersModule, ClientWebhooksModule, RecallsModule],
   controllers: [
     HealthController,
     EchoController,
@@ -168,6 +170,10 @@ import { ClientWebhooksModule } from '../modules/client-webhooks/client-webhooks
     // Story 9-2 — the notification panel (list, the bell's status, the
     // opened mark): `NotificationsModule` exports `NotificationsFacade` only.
     NotificationsController,
+    // Story 3-7a — the batch recall (open / add / close through
+    // `RecallsFacade`, qc.manage; the reads and the report through
+    // `ReportingFacade`).
+    RecallsController,
     // Story 13-1 — return authorizations (create, cancel, the returnable
     // read, list, detail): `ReturnsModule` exports `ReturnsFacade` only.
     ReturnsController,

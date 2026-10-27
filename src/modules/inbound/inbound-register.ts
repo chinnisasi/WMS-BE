@@ -200,3 +200,45 @@ export async function grnCodesByIdsInTx(tx: TenantTx, tenantId: string, grnIds: 
   `)) as unknown as { id: string; code: string }[];
   return new Map(rows.map((row) => [row.id, row.code]));
 }
+
+/** Story 3-7a — one goods receipt's facts as a recall's `received` rows print them. */
+export interface GrnTraceFacts {
+  readonly grnId: string;
+  readonly grnCode: string;
+  readonly warehouseId: string;
+  /** The PO's frozen vendor (`vendor_snapshot` legal name, else name); null on an ASN or a blind receipt (A12). */
+  readonly vendorName: string | null;
+  /** The document received against — `PO <code>`, `ASN <code>` or `blind <reason>`. */
+  readonly document: string;
+}
+
+/** Story 3-7a — these GRNs' trace facts, ONE statement (the inbound register's vendor and document rules). */
+export async function grnTraceFactsByIdsInTx(tx: TenantTx, tenantId: string, grnIds: readonly string[]): Promise<Map<string, GrnTraceFacts>> {
+  const ids = [...new Set(grnIds)].filter((id) => UUID_RE.test(id)).map((id) => id.toLowerCase());
+  if (ids.length === 0) return new Map();
+  await rearmTxDeadline(tx);
+  const rows = (await tx.execute(sql`
+    select g.id::text as "grnId", g.code as "grnCode", g.warehouse_id::text as "warehouseId",
+           coalesce(po.vendor_snapshot ->> 'legalName', po.vendor_snapshot ->> 'name') as "vendorName",
+           case when po.code is not null then 'PO ' || po.code
+                when asn.asn_code is not null then 'ASN ' || asn.asn_code
+                else 'blind ' || coalesce(g.blind_reason_code, '') end as "document"
+    from goods_receipt_notes g
+    left join purchase_orders po on po.tenant_id = g.tenant_id and po.id = g.po_id
+    left join advance_shipment_notices asn on asn.tenant_id = g.tenant_id and asn.id = g.asn_id
+    where g.tenant_id = ${tenantId}::uuid and g.id = any(${sql.param(ids)}::uuid[])
+  `)) as unknown as GrnTraceFacts[];
+  return new Map(rows.map((row) => [row.grnId, row]));
+}
+
+/** Story 3-7a — the damage reason code of these GRN lines (a recall's `received_damaged` rows), one statement. */
+export async function grnLineDamageReasonsByIdsInTx(tx: TenantTx, tenantId: string, lineIds: readonly string[]): Promise<Map<string, string>> {
+  const ids = [...new Set(lineIds)].filter((id) => UUID_RE.test(id)).map((id) => id.toLowerCase());
+  if (ids.length === 0) return new Map();
+  await rearmTxDeadline(tx);
+  const rows = (await tx.execute(sql`
+    select l.id::text as "id", l.damage_reason_code as "reason" from goods_receipt_lines l
+    where l.tenant_id = ${tenantId}::uuid and l.id = any(${sql.param(ids)}::uuid[]) and l.damage_reason_code is not null
+  `)) as unknown as { id: string; reason: string }[];
+  return new Map(rows.map((row) => [row.id, row.reason]));
+}

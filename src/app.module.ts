@@ -21,6 +21,7 @@ import { ReportingModule } from './modules/reporting/reporting.module';
 import { ReturnsModule } from './modules/returns/returns.module';
 import { TenancyModule } from './modules/tenancy/tenancy.module';
 import { ClientWebhooksModule } from './modules/client-webhooks/client-webhooks.module';
+import { RecallsModule } from './modules/recalls/recalls.module';
 import { JobsModule } from './jobs/jobs.module';
 
 /**
@@ -54,6 +55,8 @@ import { JobsModule } from './jobs/jobs.module';
     NotificationsModule,
     // Story 5-1a — the email queue and its sender.
     MailModule,
+    // Story 3-7a — the batch recall (before reporting, which reads it).
+    RecallsModule,
     ReportingModule,
     // Story 13-1 — return authorizations (Epic 13's first module).
     ReturnsModule,

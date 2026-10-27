@@ -728,7 +728,7 @@ describe('story 1-2a: the client master record', () => {
       expect((await sql`select status from clients where id = ${trioId}`)[0]!.status).toBe('active');
     });
 
-    it('every blocker kind bites: a client with every kind (5-5a: eleven, with unbilled-charges) is refused naming every one, in order', async () => {
+    it('every blocker kind bites: a client with every kind (5-5a: eleven, with unbilled-charges; 3-7a: twelve, with open-recalls) is refused naming every one, in order', async () => {
       const windId = await createClient('WIND');
       await importCsv(['WIND-A,Wind A,pcs,1800,,,', 'WIND-B,Wind B,pcs,1800,,,'], windId).expect(201);
       await refreshSkus();
@@ -769,6 +769,10 @@ describe('story 1-2a: the client master record', () => {
       // Decision 9 — a channel mapping of its SKU.
       await sql`insert into channel_mappings (id, tenant_id, integration_id, external_ref, sku_id)
         values (${uuidv7()}, ${tenantId}, ${await shopifyIntegration()}, 'EXT-WIND', ${sku('WIND-A')})`;
+      // Story 3-7a (A16) — an open LIVE recall of its goods (a mock one beside it never blocks).
+      await sql`insert into batch_recalls (id, tenant_id, client_id, code, mode, status, reason_note, opened_at, opened_by)
+        values (${uuidv7()}, ${tenantId}, ${windId}, 'RCL-900001', 'live', 'open', 'probe recall', now(), ${ownerUserId}),
+               (${uuidv7()}, ${tenantId}, ${windId}, 'RCL-900002', 'mock', 'open', 'probe drill', now(), ${ownerUserId})`;
 
       const res = await setStatus(windId, 'departed');
       expectProblem(res, 409, 'client-not-wound-down');
@@ -777,6 +781,7 @@ describe('story 1-2a: the client master record', () => {
       expect(blockers.find((b) => b.kind === 'open-purchase-orders')).toEqual({ kind: 'open-purchase-orders', count: 1, codes: ['PO-WIND-1'] });
       expect(blockers.find((b) => b.kind === 'open-asns')).toEqual({ kind: 'open-asns', count: 1, codes: ['ASN-WIND-1'] });
       expect(blockers.find((b) => b.kind === 'open-rmas')).toEqual({ kind: 'open-rmas', count: 1, codes: ['RMA-WIND-1'] });
+      expect(blockers.find((b) => b.kind === 'open-recalls')).toEqual({ kind: 'open-recalls', count: 1, codes: ['RCL-900001'] });
       expect(blockers.find((b) => b.kind === 'unsettled-invoices')).toEqual({ kind: 'unsettled-invoices', count: 1, codes: ['2026-09'] });
       expect(blockers.find((b) => b.kind === 'open-counts')).toEqual({ kind: 'open-counts', count: 1 });
       expect(blockers.find((b) => b.kind === 'open-review-items')).toEqual({ kind: 'open-review-items', count: 1 });

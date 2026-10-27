@@ -44,6 +44,50 @@ import {
 } from './batch-block.command';
 export { BATCH_BLOCK_NOTE_MAX, BATCH_BLOCK_REASONS } from './batch-block.command';
 export type { BatchBlockReason, BatchBlockSnapshot, BatchLifecycleView } from './batch-block.command';
+import type { ApplyBatchBlockInput, ApplyBatchUnblockInput } from './batch-block';
+export type { ApplyBatchBlockInput, ApplyBatchUnblockInput } from './batch-block';
+import { LOT_CODE_NORM_SQL, lotCodeNormOf } from '../../shared/primitives/lot-code';
+import type { Batch } from '../../shared/db/schema';
+
+/** Story 3-7a (A9) — one recall candidate: a batch of the client's SKU whose normalised code matched. */
+export interface BatchCandidateRow {
+  readonly batchId: string;
+  readonly code: string;
+  readonly skuId: string;
+  readonly skuCode: string;
+  readonly skuName: string;
+  readonly uom: string;
+  readonly status: string;
+  readonly blockedReason: string | null;
+  readonly mfgDate: string | null;
+  readonly expiryDate: string | null;
+  readonly match: 'exact' | 'normalised';
+}
+
+/**
+ * The candidates statement itself — exported so the EXPLAIN test plans the
+ * REAL query (guide §9). `batches` is the only relation in the outer scope,
+ * so the bare `"code"` of `LOT_CODE_NORM_SQL` resolves to it; the SKU facts
+ * come from a lateral join on the SKU's own columns.
+ */
+export function batchCandidatesQuery(tenantId: string, clientId: string, code: string, limit: number) {
+  return sql`
+    select b.id::text as "batchId", b.code as "code", k.sku_id as "skuId", k.sku_code as "skuCode", k.sku_name as "skuName",
+           k.uom as "uom", b.status as "status", b.blocked_reason as "blockedReason",
+           b.mfg_date::text as "mfgDate", b.expiry_date::text as "expiryDate"
+    from (
+      select * from batches
+      where tenant_id = ${tenantId}::uuid and ${LOT_CODE_NORM_SQL} = ${lotCodeNormOf(code)}
+    ) b
+    join lateral (
+      select s.id::text as sku_id, s.code as sku_code, s.name as sku_name, s.uom as uom
+      from skus s
+      where s.tenant_id = b.tenant_id and s.id = b.sku_id and s.client_id = ${clientId}::uuid
+    ) k on true
+    order by k.sku_code collate "C", b.code collate "C", b.id
+    limit ${limit}::int
+  `;
+}
 import type { KitCompositionLine } from './kit.store';
 import { portalSkusInTx, type PortalSkuRow } from './portal-skus';
 import type { Page } from '../../shared/primitives/pagination';
@@ -376,6 +420,93 @@ export class CatalogFacade {
       if (rows[0] === undefined) return null;
       return (await batchLifecycleViewsInTx(tx, tenantId, rows))[0]!;
     });
+  }
+
+  // ── story 3-7a: the seams a batch recall composes (A1, A3, A9) ───────────
+
+  /** Block one locked, active batch in the caller's transaction (3-3a's write, reason `recall`). */
+  async blockBatchInTx(tx: TenantTx, input: ApplyBatchBlockInput): Promise<Batch> {
+    return this.batchBlock.blockInTx(tx, input);
+  }
+
+  /** Unblock one locked, blocked batch in the caller's transaction (a recall's release on close). */
+  async unblockBatchInTx(tx: TenantTx, input: ApplyBatchUnblockInput): Promise<Batch> {
+    return this.batchBlock.unblockInTx(tx, input);
+  }
+
+  /**
+   * Lock these batch rows `FOR UPDATE`, ordered by id (one family, sorted —
+   * guide §1), and answer the rows found (a missing id is simply absent; the
+   * caller names it in its 404). Lock only — no status judgement (the
+   * `loadOpenPo` lesson): the recall commands re-run their replay after it.
+   */
+  async lockBatchesForUpdateInTx(tx: TenantTx, tenantId: string, batchIds: readonly string[]): Promise<Batch[]> {
+    const ids = [...new Set(batchIds)].filter((id) => UUID_RE.test(id)).map((id) => id.toLowerCase()).sort();
+    if (ids.length === 0) return [];
+    return tx
+      .select()
+      .from(batches)
+      .where(and(eq(batches.tenantId, tenantId), inArray(batches.id, ids)))
+      .orderBy(batches.id)
+      .for('update');
+  }
+
+  /**
+   * Story 3-7a (A3) — `FOR KEY SHARE` on these batch rows, ordered by id,
+   * with NO status filter. It conflicts with the `FOR UPDATE` every block and
+   * recall command takes, and not with receiving's `FOR NO KEY UPDATE`
+   * expiry write — so a dispatch (or a pick) and a recall serialise: the one
+   * that commits first is the one the other sees.
+   */
+  async keyShareLockBatchesInTx(tx: TenantTx, tenantId: string, batchIds: readonly string[]): Promise<void> {
+    const ids = [...new Set(batchIds)].filter((id) => UUID_RE.test(id)).map((id) => id.toLowerCase()).sort();
+    if (ids.length === 0) return;
+    await tx
+      .select({ id: batches.id })
+      .from(batches)
+      .where(and(eq(batches.tenantId, tenantId), inArray(batches.id, ids)))
+      .orderBy(batches.id)
+      .for('key share');
+  }
+
+  /** Story 3-7a — the lifecycle views of these batches (the recall detail's lot status), id-keyed. */
+  async batchViewsByIdsInTx(tx: TenantTx, tenantId: string, batchIds: readonly string[]): Promise<Map<string, BatchLifecycleView>> {
+    const ids = [...new Set(batchIds)].filter((id) => UUID_RE.test(id));
+    if (ids.length === 0) return new Map();
+    await rearmTxDeadline(tx);
+    const rows = await tx
+      .select()
+      .from(batches)
+      .where(and(eq(batches.tenantId, tenantId), inArray(batches.id, ids)));
+    return new Map((await batchLifecycleViewsInTx(tx, tenantId, rows)).map((view) => [view.id, view]));
+  }
+
+  /**
+   * Story 3-7a (A9) — the recall candidates: every batch of one CLIENT's SKUs
+   * whose NORMALISED code equals the input's (`LOT_CODE_NORM_SQL` — the
+   * `batches_tenant_code_norm_idx` expression, stated verbatim so the planner
+   * uses it). `exact` when the stored code equals the trimmed input, else
+   * `normalised` ("similar code — check the label"). The client predicate is
+   * the SKU's own `client_id` (batches carry none). At most `limit` rows,
+   * ordered SKU code then batch code. The statement is exported for its
+   * EXPLAIN (`batchCandidatesQuery`).
+   */
+  async batchesByNormalisedCodeInTx(
+    tx: TenantTx,
+    tenantId: string,
+    clientId: string,
+    code: string,
+    limit: number,
+  ): Promise<BatchCandidateRow[]> {
+    await rearmTxDeadline(tx);
+    const rows = (await tx.execute(batchCandidatesQuery(tenantId, clientId, code, limit))) as unknown as Omit<BatchCandidateRow, 'match'>[];
+    const exact = code.trim();
+    return rows.map((row) => ({
+      ...row,
+      mfgDate: row.mfgDate === null ? null : new Date(row.mfgDate).toISOString(),
+      expiryDate: row.expiryDate === null ? null : new Date(row.expiryDate).toISOString(),
+      match: row.code === exact ? 'exact' : 'normalised',
+    }));
   }
 
   // ── story 21-7b: the client portal's SKU list (the announce form) ─────────

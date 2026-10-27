@@ -32,6 +32,8 @@ import { QC_RECEIPT_PLACED_EVENT, QcCommand } from './qc.command';
 // Story 1-6d — licence enforcement: compliance's FREE functions (never its
 // Nest module — compliance forward-references inbound, so it would cycle).
 import { licenceCoverageInTx, licenceEnforcedInTx, type LicenceParty } from '../compliance/licence-enforcement';
+// Story 3-7a — the open-live-recall seam (a free-function file, guide §7h).
+import { openLiveRecallLinesForBatchesInTx } from '../recalls/open-recall-lines';
 import { missingLicencePhrase, needsOf, type LicenceHolder, type LicenceNeed } from '../../shared/primitives/licence';
 import {
   MAX_QUANTITY_MILLI,
@@ -620,6 +622,13 @@ export interface GoodsReceiptSnapshot {
      * held (serial-tracked or catch-weight — PENDING); present only when > 0.
      */
     readonly qcSkippedLines?: number;
+    /**
+     * Story 3-7a (A14) — the booked lots that sit on an OPEN LIVE recall
+     * (receiving into a recalled lot is allowed; the lot stays blocked and
+     * the handheld says "keep it apart"). Present only when there is one,
+     * and optional because a snapshot stored before 3-7a lacks it (§9).
+     */
+    readonly recalledLots?: readonly { readonly batchId: string; readonly batchCode: string; readonly recallCode: string }[];
   };
 }
 
@@ -2387,6 +2396,19 @@ export class ReceivingCommand {
         }
       }
 
+      // ── story 3-7a (A14): booked lots under an open live recall ─────────
+      // Through the seam (a free-function file — guide §7h), behind the
+      // replay: a replay re-serves the stored snapshot as it was.
+      const bookedBatches = new Map<string, string>();
+      for (const entry of settled) {
+        if (entry.batchId !== null && entry.batchCode !== null) bookedBatches.set(entry.batchId, entry.batchCode);
+      }
+      const recalledLots = (await openLiveRecallLinesForBatchesInTx(tx, command.tenantId, [...bookedBatches.keys()])).map((line) => ({
+        batchId: line.batchId,
+        batchCode: bookedBatches.get(line.batchId)!,
+        recallCode: line.recallCode,
+      }));
+
       // ── the snapshot (the outbox payload and idempotency replay carry it) ─
       const snapshot: GoodsReceiptSnapshot = {
         goodsReceipt: {
@@ -2454,6 +2476,7 @@ export class ReceivingCommand {
           ...(inactiveSkuReviewOpId === null ? {} : { inactiveSkuReviewOpId }),
           ...(qcHeld.length === 0 ? {} : { qcHeldLines: qcHeld.length }),
           ...(qcSkippedLines === 0 ? {} : { qcSkippedLines }),
+          ...(recalledLots.length === 0 ? {} : { recalledLots }),
         },
       };
 

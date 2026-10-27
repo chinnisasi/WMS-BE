@@ -18,6 +18,8 @@ export const WIND_DOWN_BLOCKER_KINDS = [
   'pending-over-receipts',
   'open-orders',
   'open-rmas',
+  // Story 3-7a (A16) — open LIVE recalls of its goods (a mock never blocks).
+  'open-recalls',
   'pending-adjustments',
   'open-counts',
   'open-review-items',

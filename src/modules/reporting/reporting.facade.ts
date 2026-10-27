@@ -10,6 +10,32 @@ import { CatalogFacade } from '../catalog/catalog.facade';
 import { InboundFacade } from '../inbound/inbound.facade';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import { OutboundFacade } from '../outbound/outbound.facade';
+import { RecallsFacade, type RecallMode, type RecallStatus } from '../recalls/recalls.facade';
+import { decodeCursor, encodeCursor } from '../../shared/primitives/pagination';
+import { prepareRecallInTx, RECALL_TRACE_PAGE, type PreparedRecall, type RecallSurface, type RecallTraceSources } from './recall-trace';
+import {
+  buildRecallXlsxInTx,
+  invalidRecallQuery,
+  portalRecallDetailView,
+  RECALL_READ_DEADLINE_MS,
+  RECALL_REPORT_DEADLINE_MS,
+  RECALL_XLSX_MAX_ROWS,
+  recallBinsPage,
+  recallCandidatesInTx,
+  recallDetailView,
+  recallNotFound,
+  recallReceiptsPageInTx,
+  recallShipmentsPageInTx,
+  streamRecallCsvInTx,
+  type PortalRecallDetailView,
+  type RecallBinEntry,
+  type RecallCandidateView,
+  type RecallDetailView,
+  type RecallReceiptEntry,
+  type RecallReportFormat,
+  type RecallReportSink,
+  type RecallShipmentEntry,
+} from './recall-reads';
 import { rearmTxDeadline, setTxDeadline } from '../../shared/db/tx-deadline';
 import { buildCsv } from '../../shared/export/csv';
 import { buildXlsx } from '../../shared/export/xlsx';
@@ -88,6 +114,66 @@ export {
   referenceSummary,
 } from './registers';
 export { AUDIT_ACTION_PREFIX_RE, AUDIT_DEFAULT_LIMIT, AUDIT_MAX_LIMIT, AUDIT_STATEMENT_TIMEOUT_MS } from './audit';
+// Story 3-7a — the batch recall's reads and report.
+export { RECALL_FORMATS, RECALL_READ_DEADLINE_MS, RECALL_REPORT_DEADLINE_MS, RECALL_XLSX_MAX_ROWS } from './recall-reads';
+export type {
+  PortalRecallDetailView,
+  RecallBinEntry,
+  RecallCandidateView,
+  RecallDetailView,
+  RecallLotView,
+  RecallPlannedPickView,
+  RecallReceiptEntry,
+  RecallReportFormat,
+  RecallReportSink,
+  RecallShipmentEntry,
+} from './recall-reads';
+export type { RecallHeldOrderEntry, RecallOnHandEntry } from './recall-trace';
+export { RECALL_REPORT_COLUMNS, RECALL_REPORT_SECTIONS, CONSIGNEE_CONTACTS_NOTE } from './recall-trace';
+
+/** Story 3-7a — one row of the staff recall list. */
+export interface RecallListEntry {
+  readonly id: string;
+  readonly code: string;
+  readonly clientId: string;
+  readonly clientCode: string;
+  readonly mode: RecallMode;
+  readonly status: RecallStatus;
+  readonly reasonNote: string;
+  readonly externalRef: string | null;
+  readonly openedAt: string;
+  readonly closedAt: string | null;
+  readonly lotCount: number;
+}
+
+/** Story 3-7a — one row of the portal recall list (an exact allowlist — A11). */
+export interface PortalRecallListEntry {
+  readonly id: string;
+  readonly code: string;
+  readonly mode: RecallMode;
+  readonly status: RecallStatus;
+  readonly externalRef: string | null;
+  readonly openedAt: string;
+  readonly closedAt: string | null;
+  readonly lotCount: number;
+}
+
+export interface RecallListQuery {
+  readonly clientId?: string | undefined;
+  readonly status?: RecallStatus | undefined;
+  readonly mode?: RecallMode | undefined;
+  readonly externalRef?: string | undefined;
+  readonly code?: string | undefined;
+  readonly cursor?: string | undefined;
+  readonly limit?: number | undefined;
+}
+
+/** Story 3-7a — the recall report's process-wide slots: one staff, one portal (A10). */
+const RECALL_REPORT_SLOTS = new RegisterSlots(1);
+const PORTAL_RECALL_REPORT_SLOTS = new RegisterSlots(1);
+
+/** The repeatable-read, read-only shape every recall read opens. */
+const RECALL_READ_TX = { isolationLevel: 'repeatable read', accessMode: 'read only' } as const;
 
 /** Story 21-8 — the service report's query: an inclusive IST date period, optionally one warehouse. */
 export interface ServiceReportQuery {
@@ -262,6 +348,19 @@ export class ReportingFacade {
   registerMaxRows = REGISTER_MAX_ROWS;
   registerRead: (ctx: RegisterContext) => Promise<ExportCell[][]> = (ctx) => REGISTERS[ctx.name].read(ctx);
 
+  /**
+   * Story 3-7a (A10) — the recall report's own slot pools (separate from the
+   * registers'), its whole-read deadlines, the XLSX cap and the walk's page:
+   * plain fields so a suite can hold a slot, shrink a budget or a page
+   * without a second production code path.
+   */
+  recallReportSlots: RegisterSlots = RECALL_REPORT_SLOTS;
+  portalRecallReportSlots: RegisterSlots = PORTAL_RECALL_REPORT_SLOTS;
+  recallReportDeadlineMs = RECALL_REPORT_DEADLINE_MS;
+  recallReadDeadlineMs = RECALL_READ_DEADLINE_MS;
+  recallXlsxMaxRows = RECALL_XLSX_MAX_ROWS;
+  recallTracePageSize = RECALL_TRACE_PAGE;
+
   constructor(
     @Inject(DATABASE) private readonly db: Database,
     // Story 5-3a — the registers read their rows through the OWNING modules'
@@ -270,7 +369,282 @@ export class ReportingFacade {
     @Inject(InboundFacade) private readonly inbound: InboundFacade,
     @Inject(OutboundFacade) private readonly outbound: OutboundFacade,
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
+    // Story 3-7a — the recall document and its ONE figures definition.
+    @Inject(RecallsFacade) private readonly recalls: RecallsFacade,
   ) {}
+
+  // ── story 3-7a: the batch recall's reads and report ─────────────────────
+  // Member-open reads (any staff role — the batch reads and registers'
+  // rule, 5-3a decision 7); the commands are `qc.manage` (RecallsFacade).
+  // Each read is ONE `REPEATABLE READ, READ ONLY` transaction under a
+  // whole-read deadline re-armed before every statement, so every figure and
+  // the rows it sums come from one snapshot (B19); a timeout is 503
+  // `report-unavailable`, nothing partial.
+
+  private recallSources(): RecallTraceSources {
+    return { recalls: this.recalls, catalog: this.catalog, inventory: this.inventory, outbound: this.outbound, inbound: this.inbound };
+  }
+
+  /** Arm the whole-read deadline on a recall read's transaction. */
+  private async armRecallDeadline(tx: TenantTx, deadlineMs: number): Promise<void> {
+    setTxDeadline(tx, Date.now() + deadlineMs);
+    await rearmTxDeadline(tx);
+  }
+
+  /** A statement timeout anywhere in a recall read is 503 `report-unavailable`. */
+  private async recallTimed<T>(run: () => Promise<T>, budgetMs: number): Promise<T> {
+    try {
+      return await run();
+    } catch (err) {
+      if (isStatementTimeout(err)) {
+        throw new ProblemException(
+          'report-unavailable',
+          503,
+          'Report unavailable',
+          `The recall read did not finish within ${budgetMs / 1000} s — try again in a moment.`,
+        );
+      }
+      throw err;
+    }
+  }
+
+  private async preparedOrNotFound(tx: TenantTx, tenantId: string, recallId: string, surface: RecallSurface, clientId: string | null, now: Date): Promise<PreparedRecall> {
+    const prepared = await prepareRecallInTx(tx, this.recallSources(), tenantId, recallId, surface, clientId, now);
+    if (prepared === null) throw recallNotFound(recallId);
+    return prepared;
+  }
+
+  /** `GET …/inventory/recalls/candidates` — one client's batches whose normalised lot code matches (A9). */
+  async recallCandidates(tenantId: string, clientId: string, code: string): Promise<{ normalisedCode: string; items: RecallCandidateView[] }> {
+    return this.recallTimed(
+      () =>
+        withTenantTransaction(
+          this.db,
+          tenantId,
+          async (tx) => {
+            await this.armRecallDeadline(tx, this.recallReadDeadlineMs);
+            return recallCandidatesInTx(tx, this.recallSources(), tenantId, clientId.toLowerCase(), code);
+          },
+          RECALL_READ_TX,
+        ),
+      this.recallReadDeadlineMs,
+    );
+  }
+
+  /** `GET …/inventory/recalls` — the staff list, newest first, filterable by client, status, mode and brand reference. */
+  async recallList(tenantId: string, query: RecallListQuery): Promise<Page<RecallListEntry>> {
+    const limit = query.limit ?? 50;
+    const after = recallCursor(query.cursor);
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await this.recalls.listRecallsInTx(tx, tenantId, {
+        clientId: query.clientId?.toLowerCase(),
+        status: query.status,
+        mode: query.mode,
+        externalRef: query.externalRef,
+        code: query.code,
+        after,
+        limit: limit + 1,
+      });
+      const codes = await getClientsInTx(tx, tenantId, rows.map((row) => row.clientId));
+      const kept = rows.slice(0, limit);
+      const last = kept.at(-1);
+      return {
+        items: kept.map((row) => ({
+          id: row.id,
+          code: row.code,
+          clientId: row.clientId,
+          clientCode: codes.get(row.clientId)?.code ?? row.clientId,
+          mode: row.mode,
+          status: row.status,
+          reasonNote: row.reasonNote,
+          externalRef: row.externalRef,
+          openedAt: row.openedAt,
+          closedAt: row.closedAt,
+          lotCount: row.lotCount,
+        })),
+        nextCursor: rows.length > limit && last !== undefined ? encodeCursor({ createdAt: last.createdAtText, id: last.id }) : null,
+      };
+    });
+  }
+
+  /** `GET …/inventory/recalls/{recallId}` — the staff detail: lots and live figures, where it sits, who holds it (404 unknown). */
+  async recallDetail(tenantId: string, recallId: string, now: Date = new Date()): Promise<RecallDetailView> {
+    return this.recallTimed(
+      () =>
+        withTenantTransaction(
+          this.db,
+          tenantId,
+          async (tx) => {
+            await this.armRecallDeadline(tx, this.recallReadDeadlineMs);
+            return recallDetailView(await this.preparedOrNotFound(tx, tenantId, recallId, 'staff', null, now));
+          },
+          RECALL_READ_TX,
+        ),
+      this.recallReadDeadlineMs,
+    );
+  }
+
+  /** `GET …/inventory/recalls/{recallId}/bins` — the paged bin list (staff only). */
+  async recallBins(tenantId: string, recallId: string, cursor: string | undefined, limit: number): Promise<Page<RecallBinEntry>> {
+    return this.recallTimed(
+      () =>
+        withTenantTransaction(
+          this.db,
+          tenantId,
+          async (tx) => {
+            await this.armRecallDeadline(tx, this.recallReadDeadlineMs);
+            return recallBinsPage(await this.preparedOrNotFound(tx, tenantId, recallId, 'staff', null, new Date()), cursor, limit);
+          },
+          RECALL_READ_TX,
+        ),
+      this.recallReadDeadlineMs,
+    );
+  }
+
+  /** `GET …/inventory/recalls/{recallId}/shipments` — every dispatched slice of the lots, paged. */
+  async recallShipments(tenantId: string, recallId: string, cursor: string | undefined, limit: number): Promise<Page<RecallShipmentEntry>> {
+    return this.recallTimed(
+      () =>
+        withTenantTransaction(
+          this.db,
+          tenantId,
+          async (tx) => {
+            await this.armRecallDeadline(tx, this.recallReadDeadlineMs);
+            const prepared = await this.preparedOrNotFound(tx, tenantId, recallId, 'staff', null, new Date());
+            return recallShipmentsPageInTx(tx, this.recallSources(), prepared, cursor, limit);
+          },
+          RECALL_READ_TX,
+        ),
+      this.recallReadDeadlineMs,
+    );
+  }
+
+  /** `GET …/inventory/recalls/{recallId}/receipts` — every receipt of the lots, paged. */
+  async recallReceipts(tenantId: string, recallId: string, cursor: string | undefined, limit: number): Promise<Page<RecallReceiptEntry>> {
+    return this.recallTimed(
+      () =>
+        withTenantTransaction(
+          this.db,
+          tenantId,
+          async (tx) => {
+            await this.armRecallDeadline(tx, this.recallReadDeadlineMs);
+            const prepared = await this.preparedOrNotFound(tx, tenantId, recallId, 'staff', null, new Date());
+            return recallReceiptsPageInTx(tx, this.recallSources(), prepared, cursor, limit);
+          },
+          RECALL_READ_TX,
+        ),
+      this.recallReadDeadlineMs,
+    );
+  }
+
+  /**
+   * `GET …/inventory/recalls/{recallId}/report` — the client recall report
+   * (A10), staff surface. Order: a slot (503 before anything reads) → ONE
+   * repeatable-read transaction under the report deadline → the recall
+   * (404) → the CSV streams through `sink` (`begin` — the download audit and
+   * the headers — runs before the first byte), or the XLSX is built whole
+   * (422 past the cap) and then handed to `begin` and written.
+   */
+  async recallReport(tenantId: string, recallId: string, format: RecallReportFormat, sink: RecallReportSink, now: Date = new Date()): Promise<void> {
+    if (!this.recallReportSlots.tryAcquire()) throw recallReportBusy();
+    try {
+      await this.recallTimed(
+        () =>
+          withTenantTransaction(
+            this.db,
+            tenantId,
+            async (tx) => {
+              await this.armRecallDeadline(tx, this.recallReportDeadlineMs);
+              const prepared = await this.preparedOrNotFound(tx, tenantId, recallId, 'staff', null, now);
+              await this.writeRecallReport(tx, prepared, format, sink);
+            },
+            RECALL_READ_TX,
+          ),
+        this.recallReportDeadlineMs,
+      );
+    } finally {
+      this.recallReportSlots.release();
+    }
+  }
+
+  private async writeRecallReport(tx: TenantTx, prepared: PreparedRecall, format: RecallReportFormat, sink: RecallReportSink): Promise<void> {
+    if (format === 'csv') {
+      await streamRecallCsvInTx(tx, this.recallSources(), prepared, sink, this.recallTracePageSize);
+      return;
+    }
+    const file = await buildRecallXlsxInTx(tx, this.recallSources(), prepared, this.recallXlsxMaxRows, this.recallTracePageSize);
+    await sink.begin({ filename: file.filename, contentType: XLSX_CONTENT_TYPE, rowCount: file.rowCount, length: file.body.length });
+    await sink.write(file.body);
+  }
+
+  /** `GET …/portal/recalls` — the client's own recalls, newest first (two layers: the stamp and the client predicate). */
+  async portalRecalls(tenantId: string, clientId: string, query: { readonly cursor?: string; readonly limit?: number } = {}): Promise<Page<PortalRecallListEntry>> {
+    const limit = query.limit ?? 50;
+    const after = recallCursor(query.cursor);
+    return withTenantTransaction(
+      this.db,
+      tenantId,
+      async (tx) => {
+        const rows = await this.recalls.listRecallsInTx(tx, tenantId, { clientId, after, limit: limit + 1 });
+        const kept = rows.slice(0, limit);
+        const last = kept.at(-1);
+        return {
+          items: kept.map((row) => ({
+            id: row.id,
+            code: row.code,
+            mode: row.mode,
+            status: row.status,
+            externalRef: row.externalRef,
+            openedAt: row.openedAt,
+            closedAt: row.closedAt,
+            lotCount: row.lotCount,
+          })),
+          nextCursor: rows.length > limit && last !== undefined ? encodeCursor({ createdAt: last.createdAtText, id: last.id }) : null,
+        };
+      },
+      { clientId },
+    );
+  }
+
+  /** `GET …/portal/recalls/{recallId}` — the client's own recall (A11 keys exactly; another client's is the same 404). */
+  async portalRecall(tenantId: string, clientId: string, recallId: string, now: Date = new Date()): Promise<PortalRecallDetailView> {
+    return this.recallTimed(
+      () =>
+        withTenantTransaction(
+          this.db,
+          tenantId,
+          async (tx) => {
+            await this.armRecallDeadline(tx, this.recallReadDeadlineMs);
+            return portalRecallDetailView(await this.preparedOrNotFound(tx, tenantId, recallId, 'portal', clientId, now));
+          },
+          { ...RECALL_READ_TX, clientId },
+        ),
+      this.recallReadDeadlineMs,
+    );
+  }
+
+  /** `GET …/portal/recalls/{recallId}/report` — the same report, portal surface (no planned picks; its own slot). */
+  async portalRecallReport(tenantId: string, clientId: string, recallId: string, format: RecallReportFormat, sink: RecallReportSink, now: Date = new Date()): Promise<void> {
+    if (!this.portalRecallReportSlots.tryAcquire()) throw recallReportBusy();
+    try {
+      await this.recallTimed(
+        () =>
+          withTenantTransaction(
+            this.db,
+            tenantId,
+            async (tx) => {
+              await this.armRecallDeadline(tx, this.recallReportDeadlineMs);
+              const prepared = await this.preparedOrNotFound(tx, tenantId, recallId, 'portal', clientId, now);
+              await this.writeRecallReport(tx, prepared, format, sink);
+            },
+            { ...RECALL_READ_TX, clientId },
+          ),
+        this.recallReportDeadlineMs,
+      );
+    } finally {
+      this.portalRecallReportSlots.release();
+    }
+  }
 
   /**
    * Story 5-3a — one operational register as a file. Every refusal is thrown
@@ -598,3 +972,20 @@ export class ReportingFacade {
     });
   }
 }
+
+/** Story 3-7a — a full recall report pool is 503 before anything reads (A10). */
+function recallReportBusy(): ProblemException {
+  return new ProblemException('report-unavailable', 503, 'Report unavailable', 'A recall report is already being prepared — try again in a moment.');
+}
+
+/** A recall list cursor (`(created_at, id)` — full precision), 400 `invalid-cursor` when malformed. */
+function recallCursor(cursor: string | undefined): { createdAt: string; id: string } | undefined {
+  if (cursor === undefined) return undefined;
+  try {
+    return decodeCursor(cursor);
+  } catch {
+    throw new ProblemException('invalid-cursor', 400, 'Invalid cursor', 'The cursor is not one this list issued.');
+  }
+}
+
+export { invalidRecallQuery };

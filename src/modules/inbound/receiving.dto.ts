@@ -635,6 +635,14 @@ export class GoodsReceiptDto {
       'Story 1-2b — how many booked lines of a QC-on-receipt client were NOT held because the SKU is serial-tracked or catch-weight; present only when > 0',
   })
   qcSkippedLines?: number;
+
+  @ApiProperty({
+    required: false,
+    type: () => [GoodsReceiptRecalledLotDto],
+    description:
+      'Story 3-7a — the booked lots that sit on an open live recall: the receipt is booked and the lot stays blocked — keep the units apart. Present only when there is one',
+  })
+  recalledLots?: readonly GoodsReceiptRecalledLotDto[];
 }
 
 /**
@@ -880,6 +888,21 @@ export class GoodsReceiptLineEntryDto {
 
   @ApiProperty({ required: false, enum: ['serial-tracked'], description: "Story 2-6a — QC on receipt was skipped for this serial line (it booked unheld; derived: serial rows, no receipt hold, and the receipt's client has QC on receipt NOW)" })
   qcSkipped?: 'serial-tracked';
+
+  @ApiProperty({ required: false, example: 'RCL-000001', description: "Story 3-7a — the OPEN LIVE recall naming this line's lot (the lot stays blocked — keep the units apart); present only when one does" })
+  recallCode?: string;
+}
+
+/** Story 3-7a (A14) — a booked lot that sits on an open live recall. */
+export class GoodsReceiptRecalledLotDto {
+  @ApiProperty({ format: 'uuid' })
+  batchId!: string;
+
+  @ApiProperty()
+  batchCode!: string;
+
+  @ApiProperty({ example: 'RCL-000001' })
+  recallCode!: string;
 }
 
 /** Story 2-6a — one captured serial of a GRN line as the web reads it. */

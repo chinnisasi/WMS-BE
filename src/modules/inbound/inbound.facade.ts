@@ -30,12 +30,15 @@ import {
 import type { VendorSnapshotV1 } from '../partners/partners.facade';
 import {
   grnCodesByIdsInTx as grnCodesByIdsInTxImpl,
+  grnTraceFactsByIdsInTx as grnTraceFactsByIdsInTxImpl,
+  grnLineDamageReasonsByIdsInTx as grnLineDamageReasonsByIdsInTxImpl,
+  type GrnTraceFacts,
   inboundRegisterInTx as inboundRegisterInTxImpl,
   type InboundRegisterRow,
   type InboundRegisterScope,
 } from './inbound-register';
 // Story 5-3a — the register row shapes cross the seam here (reporting reads them).
-export type { InboundRegisterRow, InboundRegisterScope } from './inbound-register';
+export type { GrnTraceFacts, InboundRegisterRow, InboundRegisterScope } from './inbound-register';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant, getMemberClientIdIn } from '../tenancy/tenancy.service';
 import { AsnCommand, asnPortalRefused, readAsnInTx } from './asn.command';
@@ -595,6 +598,16 @@ export class InboundFacade {
   /** GRN id → code (the ledger register's reference summary names GRNs by code). */
   async grnCodesByIdsInTx(tx: TenantTx, tenantId: string, grnIds: readonly string[]): Promise<Map<string, string>> {
     return grnCodesByIdsInTxImpl(tx, tenantId, grnIds);
+  }
+
+  /** Story 3-7a — the damage reason code of these GRN lines (a recall's `received_damaged` rows). */
+  async grnLineDamageReasonsByIdsInTx(tx: TenantTx, tenantId: string, lineIds: readonly string[]): Promise<Map<string, string>> {
+    return grnLineDamageReasonsByIdsInTxImpl(tx, tenantId, lineIds);
+  }
+
+  /** Story 3-7a — these GRNs' code, warehouse, vendor and document (a recall's `received` rows), one statement. */
+  async grnTraceFactsByIdsInTx(tx: TenantTx, tenantId: string, grnIds: readonly string[]): Promise<Map<string, GrnTraceFacts>> {
+    return grnTraceFactsByIdsInTxImpl(tx, tenantId, grnIds);
   }
 
   /**

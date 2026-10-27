@@ -4,6 +4,7 @@ import { CatalogModule } from '../catalog/catalog.module';
 import { InboundModule } from '../inbound/inbound.module';
 import { InventoryModule } from '../inventory/inventory.module';
 import { OutboundModule } from '../outbound/outbound.module';
+import { RecallsModule } from '../recalls/recalls.module';
 import { ReportingFacade } from './reporting.facade';
 
 /**
@@ -19,9 +20,12 @@ import { ReportingFacade } from './reporting.facade';
  * they read through the owning modules' facades, so this module imports
  * inventory, inbound, outbound and catalog (nothing imports reporting back,
  * so no forward reference is needed).
+ *
+ * Story 3-7a — the batch recall's detail, trace and report read the recall
+ * document through `RecallsFacade` (recalls imports nothing back).
  */
 @Module({
-  imports: [SharedModule, InventoryModule, InboundModule, OutboundModule, CatalogModule],
+  imports: [SharedModule, InventoryModule, InboundModule, OutboundModule, CatalogModule, RecallsModule],
   providers: [ReportingFacade],
   exports: [ReportingFacade],
 })

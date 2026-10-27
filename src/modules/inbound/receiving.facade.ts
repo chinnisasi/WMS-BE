@@ -1,4 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common';
+// Story 3-7a — the open-live-recall seam (a free-function file, guide §7h).
+import { openLiveRecallLinesForBatchesInTx } from '../recalls/open-recall-lines';
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
@@ -119,6 +121,8 @@ export interface GoodsReceiptLineEntry {
    * unreadable units, and the QC-on-receipt skip.
    */
   readonly serials?: readonly { readonly serial: string; readonly state: 'applied' | 'pending' | 'rejected'; readonly afterWriteOff?: true }[];
+  /** Story 3-7a (A14) — the open live recall naming the line's lot; present only when one does. */
+  readonly recallCode?: string;
   readonly unreadableSerialQty?: number;
   readonly qcSkipped?: 'serial-tracked';
 }
@@ -595,6 +599,17 @@ export class ReceivingFacade {
         tenantId,
         [...new Set(rows.map((row) => row.batchId).filter((id): id is string => id !== null))],
       );
+      // Story 3-7a (A14) — a line whose lot sits on an OPEN LIVE recall
+      // carries the recall's code (the web shows it as a badge).
+      const recallByBatch = new Map(
+        (
+          await openLiveRecallLinesForBatchesInTx(
+            tx,
+            tenantId,
+            rows.map((row) => row.batchId).filter((id): id is string => id !== null),
+          )
+        ).map((line) => [line.batchId, line.recallCode]),
+      );
       const photos = (await photoCountsByParentInTx(tx, tenantId, [grnId])).get(grnId)?.byLine;
       // ── story 2-6a: the captured serials (A19) and the QC skip (A22) ────
       const serialRows = await tx
@@ -663,6 +678,7 @@ export class ReceivingFacade {
         ...(serialLineIds.includes(row.id) && !heldLineIds.has(row.id) && qcClients.get(row.skuClientId)?.qcOnReceipt === true
           ? { qcSkipped: 'serial-tracked' as const }
           : {}),
+        ...(row.batchId !== null && recallByBatch.has(row.batchId) ? { recallCode: recallByBatch.get(row.batchId)! } : {}),
       }));
     });
   }
