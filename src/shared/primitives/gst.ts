@@ -285,3 +285,33 @@ export function formatServiceInvoiceNo(supplierGstin: string, fyLabel: string, s
     fyLabel,
   );
 }
+
+/** Story 5-6a — the two note kinds and the series letter each numbers in. */
+export type ServiceNoteKind = 'credit' | 'debit';
+export const SERVICE_NOTE_SERIES_LETTER: Readonly<Record<ServiceNoteKind, string>> = { credit: 'C', debit: 'D' };
+/** A note's sequence is six digits — the `client_invoice_notes_numbered` CHECK (A12). */
+export const SERVICE_NOTE_SEQ_MAX = 999_999;
+
+/**
+ * The SERVICES credit / debit note number (story 5-6a, decision 8): a note
+ * against a client services invoice numbers in its OWN series per supplying
+ * GSTIN, per kind, per FY of the note's issue — `29/C2627/000001` and
+ * `29/D2627/000001` (15 characters; Rule 53(1A)(c) allows ≤ 16, in one or
+ * more series). The letter keeps the series apart from the services invoice
+ * series (`S`) and the goods series (no letter); goods notes (5-6c) will take
+ * `GC` / `GD` (16 characters). Same prefix rule as `formatInvoiceNo` (the
+ * GSTIN's own two characters). Unlike the invoice formats a 7th digit is
+ * refused: sequence 1,000,000 throws `note series exhausted` (A12), which the
+ * command answers as 409 `note-series-exhausted`.
+ */
+export function formatServiceNoteNo(supplierGstin: string, kind: ServiceNoteKind, fyLabel: string, seq: number): string {
+  assertNumberParts('service note number', supplierGstin, fyLabel, seq);
+  const letter = SERVICE_NOTE_SERIES_LETTER[kind];
+  if (letter === undefined) throw new ArithmeticOverflowError(`service note number: unknown note kind "${String(kind)}"`);
+  if (seq > SERVICE_NOTE_SEQ_MAX) {
+    throw new ArithmeticOverflowError(
+      `note series exhausted: the ${kind} note series for ${supplierGstin} ${fyLabel} has used all ${SERVICE_NOTE_SEQ_MAX} numbers`,
+    );
+  }
+  return assertNumberLength(`${supplierGstin.slice(0, 2)}/${letter}${fyLabel.slice(3)}/${String(seq).padStart(6, '0')}`, supplierGstin, fyLabel);
+}

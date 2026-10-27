@@ -24536,6 +24536,8 @@
                 "channel_connection",
                 "client",
                 "client_invoice",
+                "client_invoice_note",
+                "client_invoice_note_policy",
                 "count_task",
                 "count_variance",
                 "count_variance_policy",
@@ -29597,7 +29599,7 @@
             }
           },
           "409": {
-            "description": "Only an issued or disputed invoice can be voided (invoice-transition-invalid), or a concurrent request (conflict)",
+            "description": "Only an issued or disputed invoice can be voided (invoice-transition-invalid), it has issued credit or debit notes — void them first (invoice-has-notes), or a concurrent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -29622,7 +29624,973 @@
             "bearer": []
           }
         ],
-        "summary": "Voids an issued or disputed invoice (billing.invoice) — a note is required. The void keeps its number; the next prepare for its month and GSTIN drafts a replacement naming it",
+        "summary": "Voids an issued or disputed invoice (billing.invoice) — a note is required. The void keeps its number; the next prepare for its month and GSTIN drafts a replacement naming it. Refused while the invoice has an issued credit or debit note; its draft notes are discarded with it",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-invoices/{invoiceId}/notes": {
+      "post": {
+        "operationId": "ClientInvoiceNotesController_create",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "invoiceId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateNoteDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The draft note",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NoteResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed invoiceId, a kind or reason outside its vocabulary, a blank or over-long reasonNote, 0 or more than 100 lines, a duplicate line, an amount that is not a positive whole number, settlesDispute on a debit, or an overrideReason on a credit (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks billing.invoice — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such invoice in this tenant, or a line that is not on it (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A draft or void invoice (invoice-not-noteable), a debit on a disputed or settled invoice (invoice-not-debitable), settlesDispute on an invoice that is not disputed (invoice-not-disputed), a credit past its s.34(2) date (credit-note-time-barred), a credit over what the invoice line still holds — the `lines` member names each (credit-exceeds-invoice), a debit over its invoice line without an override reason (debit-needs-override), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Drafts a credit or debit note against an issued client invoice (billing.invoice): lines name invoice lines and carry the taxable delta; the tax is the original line’s",
+        "tags": [
+          "billing"
+        ]
+      },
+      "get": {
+        "operationId": "ClientInvoiceNotesController_notesOfInvoice",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "invoiceId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvoiceNotesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed invoiceId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — a user with a client (role-denied): this is an operator surface",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client invoice with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The credit and debit notes of one client invoice (drafts included), and the document value after its issued notes",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-invoice-notes": {
+      "get": {
+        "operationId": "ClientInvoiceNotesController_register",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "gstin",
+            "required": false,
+            "in": "query",
+            "description": "The supplying GSTIN — required",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "First IST date (inclusive) — required",
+            "schema": {
+              "example": "2027-05-01",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "Last IST date (inclusive) — required; at most 366 days",
+            "schema": {
+              "example": "2027-05-31",
+              "type": "string"
+            }
+          },
+          {
+            "name": "kind",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "credit",
+                "debit"
+              ]
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "issued",
+                "void"
+              ]
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from a previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 500,
+              "default": 100,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NoteRegisterResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A missing or malformed gstin, from or to, a window over 366 days or inverted, a kind or status outside its vocabulary, a limit outside 1–500 (validation-failed), or a malformed cursor (invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — a user with a client (role-denied): this is an operator surface",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The notes register (GSTR-1 CDNR fields): one supplying GSTIN’s issued and void notes over inclusive IST dates, one row per (note, GST rate), oldest first (keyset). JSON only — the web writes the CSV",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-invoice-notes/{noteId}": {
+      "get": {
+        "operationId": "ClientInvoiceNotesController_get",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "noteId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NoteResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed noteId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — a user with a client (role-denied): this is an operator surface",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No note with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One credit or debit note: its lines, the copied party, the original invoice’s number and date, and a credit’s last day to issue",
+        "tags": [
+          "billing"
+        ]
+      },
+      "delete": {
+        "operationId": "ClientInvoiceNotesController_discard",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "noteId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Discarded (a replay under the same key answers 204 too)"
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed noteId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks billing.invoice — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No note with this id — including one already discarded under another key (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The note is not a draft (note-not-draft), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Discards a draft note (billing.invoice). An issued note is never deleted — void it",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-invoice-notes/{noteId}/issue": {
+      "post": {
+        "operationId": "ClientInvoiceNotesController_issue",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "noteId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueNoteResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed noteId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks billing.invoice — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No note with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not a draft (note-not-draft), the invoice can no longer take it (invoice-not-noteable, invoice-not-debitable, invoice-not-disputed), the creator issuing a credit under the second-approver policy (note-needs-second-approver), past the s.34(2) date (credit-note-time-barred), another credit issued since the draft (credit-exceeds-invoice — `lines` — or note-figures-changed), an e-invoicing GSTIN with a registered client (einvoice-required), the series exhausted (note-series-exhausted), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Issues a draft note (billing.invoice): re-checked under the invoice lock, numbered in its own C / D series (FY of the issue) and frozen; a settling credit moves the disputed invoice to settled in the same transaction",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-invoice-notes/{noteId}/void": {
+      "post": {
+        "operationId": "ClientInvoiceNotesController_void",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "noteId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VoidNoteDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NoteResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed noteId, or a blank or over-long voidNote (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks billing.invoice — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No note with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not issued (note-not-issued), a credit that settled a dispute (note-settles-dispute), past the GSTR-1 due date of its month — the 12th of the next month, IST (note-period-closed), its issuer voiding a credit under the second-approver policy (note-needs-second-approver), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Voids an issued note (billing.invoice) — a note is required. The void keeps its number and frees its cap",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/billing/note-policy": {
+      "get": {
+        "operationId": "ClientInvoiceNotesController_getPolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotePolicyResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — a user with a client (role-denied): this is an operator surface",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Whether a credit note needs a second person to issue and void it (no setting = required)",
+        "tags": [
+          "billing"
+        ]
+      },
+      "put": {
+        "operationId": "ClientInvoiceNotesController_putPolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NotePolicyDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotePolicyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or requireSecondApprover not a boolean (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks billing.configure — owner only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Sets whether a credit note needs a second person (billing.configure — owner only). Audited",
         "tags": [
           "billing"
         ]
@@ -31383,6 +32351,160 @@
           }
         ],
         "summary": "One issued invoice of this client: the frozen party and its lines (no drill-down, no rate card)",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/invoices/{invoiceId}/notes": {
+      "get": {
+        "operationId": "PortalController_invoiceNotes",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "invoiceId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalInvoiceNotesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such invoice of this client — unknown, malformed, a draft, or another client's (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 5-6a — the issued and void credit and debit notes of one of this client's invoices, and the document value after the issued ones",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/invoice-notes/{noteId}": {
+      "get": {
+        "operationId": "PortalController_invoiceNote",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "noteId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalNoteDetailResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such note of this client — unknown, malformed, a draft, or another client's (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 5-6a — one issued or void credit or debit note of this client: the frozen party, the original invoice and the lines",
         "tags": [
           "portal"
         ]
@@ -52808,6 +53930,8 @@
               "channel_connection",
               "client",
               "client_invoice",
+              "client_invoice_note",
+              "client_invoice_note_policy",
               "count_task",
               "count_variance",
               "count_variance_policy",
@@ -52904,6 +54028,8 @@
               "channel_connection",
               "client",
               "client_invoice",
+              "client_invoice_note",
+              "client_invoice_note_policy",
               "count_task",
               "count_variance",
               "count_variance_policy",
@@ -55842,6 +56968,680 @@
           }
         }
       },
+      "NoteLineRequestDto": {
+        "type": "object",
+        "properties": {
+          "invoiceLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "A line of the invoice the note amends (one note line per invoice line)"
+          },
+          "amountPaise": {
+            "type": "number",
+            "description": "The taxable delta, positive integer paise (the kind gives the sign)",
+            "minimum": 1
+          },
+          "overrideReason": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "A DEBIT line above its invoice line’s taxable value needs a reason (409 debit-needs-override without one); refused on a credit"
+          }
+        },
+        "required": [
+          "invoiceLineId",
+          "amountPaise"
+        ]
+      },
+      "CreateNoteDto": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "credit",
+              "debit"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "deficiency-in-service",
+              "post-supply-discount",
+              "excess-billed",
+              "short-billed"
+            ],
+            "description": "credit: deficiency-in-service | post-supply-discount | excess-billed; debit: short-billed"
+          },
+          "reasonNote": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Why — 1–500 characters. Printed on the note the client receives"
+          },
+          "settlesDispute": {
+            "type": "boolean",
+            "description": "A credit note that settles the invoice’s dispute when issued (the invoice must be disputed). Never on a debit"
+          },
+          "lines": {
+            "minItems": 1,
+            "maxItems": 100,
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NoteLineRequestDto"
+            }
+          }
+        },
+        "required": [
+          "kind",
+          "reason",
+          "reasonNote",
+          "lines"
+        ]
+      },
+      "NoteLineDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "invoiceLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "chargeCode": {
+            "type": "string",
+            "enum": [
+              "storage",
+              "inbound_handling",
+              "pick",
+              "outbound_handling"
+            ]
+          },
+          "basis": {
+            "type": "string",
+            "enum": [
+              "per_thousand_units_per_day",
+              "per_receipt_line",
+              "per_pick",
+              "per_order"
+            ]
+          },
+          "uom": {
+            "type": "string",
+            "nullable": true
+          },
+          "segmentFrom": {
+            "type": "string",
+            "example": "2026-09-01",
+            "description": "IST date, inclusive (the invoice line’s segment)"
+          },
+          "segmentTo": {
+            "type": "string",
+            "example": "2026-09-30",
+            "description": "IST date, inclusive"
+          },
+          "sac": {
+            "type": "string",
+            "example": "996729"
+          },
+          "gstBps": {
+            "type": "number",
+            "example": 1800
+          },
+          "placeOfSupply": {
+            "type": "string"
+          },
+          "supplyType": {
+            "type": "string",
+            "enum": [
+              "intra",
+              "inter"
+            ]
+          },
+          "amountPaise": {
+            "type": "number",
+            "description": "Taxable value, positive integer paise"
+          },
+          "cgstPaise": {
+            "type": "number"
+          },
+          "sgstPaise": {
+            "type": "number",
+            "description": "SGST/UTGST"
+          },
+          "igstPaise": {
+            "type": "number"
+          },
+          "overrideReason": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "id",
+          "invoiceLineId",
+          "chargeCode",
+          "basis",
+          "uom",
+          "segmentFrom",
+          "segmentTo",
+          "sac",
+          "gstBps",
+          "placeOfSupply",
+          "supplyType",
+          "amountPaise",
+          "cgstPaise",
+          "sgstPaise",
+          "igstPaise",
+          "overrideReason"
+        ]
+      },
+      "NoteDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "invoiceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "credit",
+              "debit"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "issued",
+              "void"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "deficiency-in-service",
+              "post-supply-discount",
+              "excess-billed",
+              "short-billed"
+            ]
+          },
+          "reasonNote": {
+            "type": "string"
+          },
+          "settlesDispute": {
+            "type": "boolean"
+          },
+          "noteNo": {
+            "type": "string",
+            "nullable": true,
+            "example": "29/C2627/000001"
+          },
+          "fyLabel": {
+            "type": "string",
+            "nullable": true,
+            "example": "FY-2627"
+          },
+          "supplierGstin": {
+            "type": "string"
+          },
+          "placeOfSupply": {
+            "type": "string"
+          },
+          "supplyType": {
+            "type": "string",
+            "enum": [
+              "intra",
+              "inter"
+            ]
+          },
+          "totals": {
+            "description": "Positive magnitudes, integer paise; a credit subtracts, a debit adds",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ClientInvoiceTotalsDto"
+              }
+            ]
+          },
+          "issuedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "issuedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "voidNote": {
+            "type": "string",
+            "nullable": true
+          },
+          "voidedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "voidedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "createdBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "invoiceNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "invoiceIssuedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "ISO-8601 UTC"
+          },
+          "creditDeadline": {
+            "type": "string",
+            "nullable": true,
+            "example": "2027-11-30",
+            "description": "A credit’s last IST day to issue (CGST Act s.34(2)); null for a debit"
+          },
+          "party": {
+            "description": "The invoice’s frozen party, copied verbatim",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ClientInvoicePartyDto"
+              }
+            ]
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NoteLineDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "invoiceId",
+          "clientId",
+          "kind",
+          "status",
+          "reason",
+          "reasonNote",
+          "settlesDispute",
+          "noteNo",
+          "fyLabel",
+          "supplierGstin",
+          "placeOfSupply",
+          "supplyType",
+          "totals",
+          "issuedAt",
+          "issuedBy",
+          "voidNote",
+          "voidedAt",
+          "voidedBy",
+          "createdBy",
+          "createdAt",
+          "invoiceNo",
+          "invoiceIssuedAt",
+          "creditDeadline",
+          "party",
+          "lines"
+        ]
+      },
+      "NoteResponse": {
+        "type": "object",
+        "properties": {
+          "note": {
+            "$ref": "#/components/schemas/NoteDto"
+          }
+        },
+        "required": [
+          "note"
+        ]
+      },
+      "NoteEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "invoiceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "credit",
+              "debit"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "issued",
+              "void"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "deficiency-in-service",
+              "post-supply-discount",
+              "excess-billed",
+              "short-billed"
+            ]
+          },
+          "reasonNote": {
+            "type": "string"
+          },
+          "settlesDispute": {
+            "type": "boolean"
+          },
+          "noteNo": {
+            "type": "string",
+            "nullable": true,
+            "example": "29/C2627/000001"
+          },
+          "fyLabel": {
+            "type": "string",
+            "nullable": true,
+            "example": "FY-2627"
+          },
+          "supplierGstin": {
+            "type": "string"
+          },
+          "placeOfSupply": {
+            "type": "string"
+          },
+          "supplyType": {
+            "type": "string",
+            "enum": [
+              "intra",
+              "inter"
+            ]
+          },
+          "totals": {
+            "description": "Positive magnitudes, integer paise; a credit subtracts, a debit adds",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ClientInvoiceTotalsDto"
+              }
+            ]
+          },
+          "issuedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "issuedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "voidNote": {
+            "type": "string",
+            "nullable": true
+          },
+          "voidedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "voidedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "createdBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "createdAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "invoiceId",
+          "clientId",
+          "kind",
+          "status",
+          "reason",
+          "reasonNote",
+          "settlesDispute",
+          "noteNo",
+          "fyLabel",
+          "supplierGstin",
+          "placeOfSupply",
+          "supplyType",
+          "totals",
+          "issuedAt",
+          "issuedBy",
+          "voidNote",
+          "voidedAt",
+          "voidedBy",
+          "createdBy",
+          "createdAt"
+        ]
+      },
+      "InvoiceNotesResponse": {
+        "type": "object",
+        "properties": {
+          "notes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NoteEntryDto"
+            }
+          },
+          "netDocument": {
+            "description": "The invoice after its ISSUED notes (− credits, + debits). The document value, not an outstanding balance",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ClientInvoiceTotalsDto"
+              }
+            ]
+          },
+          "netDocumentPayable": {
+            "type": "number",
+            "description": "`netDocument.payable`"
+          }
+        },
+        "required": [
+          "notes",
+          "netDocument",
+          "netDocumentPayable"
+        ]
+      },
+      "NoteRegisterRowDto": {
+        "type": "object",
+        "properties": {
+          "noteId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "noteNo": {
+            "type": "string",
+            "example": "29/C2627/000001"
+          },
+          "noteDate": {
+            "type": "string",
+            "example": "2027-05-20",
+            "description": "The note’s IST date"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "credit",
+              "debit"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "issued",
+              "void"
+            ]
+          },
+          "voided": {
+            "type": "boolean"
+          },
+          "recipientGstin": {
+            "type": "string",
+            "nullable": true
+          },
+          "recipientName": {
+            "type": "string"
+          },
+          "placeOfSupply": {
+            "type": "string"
+          },
+          "supplyType": {
+            "type": "string",
+            "enum": [
+              "intra",
+              "inter"
+            ]
+          },
+          "invoiceNo": {
+            "type": "string"
+          },
+          "invoiceDate": {
+            "type": "string",
+            "description": "The original invoice’s IST date"
+          },
+          "gstBps": {
+            "type": "number"
+          },
+          "taxablePaise": {
+            "type": "number"
+          },
+          "igstPaise": {
+            "type": "number"
+          },
+          "cgstPaise": {
+            "type": "number"
+          },
+          "sgstPaise": {
+            "type": "number"
+          },
+          "noteValuePaise": {
+            "type": "number",
+            "description": "The whole note’s payable value (repeated on each of its rate rows)"
+          }
+        },
+        "required": [
+          "noteId",
+          "noteNo",
+          "noteDate",
+          "kind",
+          "status",
+          "voided",
+          "recipientGstin",
+          "recipientName",
+          "placeOfSupply",
+          "supplyType",
+          "invoiceNo",
+          "invoiceDate",
+          "gstBps",
+          "taxablePaise",
+          "igstPaise",
+          "cgstPaise",
+          "sgstPaise",
+          "noteValuePaise"
+        ]
+      },
+      "NoteRegisterResponse": {
+        "type": "object",
+        "properties": {
+          "rows": {
+            "description": "One row per (note, GST rate), oldest first",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NoteRegisterRowDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "rows",
+          "nextCursor"
+        ]
+      },
+      "IssueNoteResponse": {
+        "type": "object",
+        "properties": {
+          "note": {
+            "$ref": "#/components/schemas/NoteDto"
+          },
+          "invoice": {
+            "description": "The invoice, present when the note settled its dispute",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ClientInvoiceDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "note"
+        ]
+      },
+      "VoidNoteDto": {
+        "type": "object",
+        "properties": {
+          "voidNote": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Why the note is voided — required, 1–500 characters"
+          }
+        },
+        "required": [
+          "voidNote"
+        ]
+      },
+      "NotePolicyResponse": {
+        "type": "object",
+        "properties": {
+          "requireSecondApprover": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "requireSecondApprover"
+        ]
+      },
+      "NotePolicyDto": {
+        "type": "object",
+        "properties": {
+          "requireSecondApprover": {
+            "type": "boolean",
+            "description": "Whether a credit note needs a second person to issue it (and another to void it). A tenant with no setting requires one"
+          }
+        },
+        "required": [
+          "requireSecondApprover"
+        ]
+      },
       "PortalUserDto": {
         "type": "object",
         "properties": {
@@ -57842,6 +59642,269 @@
           "placeOfSupply",
           "supplyType",
           "totals",
+          "party",
+          "lines"
+        ]
+      },
+      "PortalNoteRowDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "credit",
+              "debit"
+            ]
+          },
+          "noteNo": {
+            "type": "string",
+            "example": "29/C2627/000001"
+          },
+          "fyLabel": {
+            "type": "string",
+            "example": "FY-2627"
+          },
+          "issuedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "issued",
+              "void"
+            ],
+            "description": "Never draft — a portal sees issued documents only"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "deficiency-in-service",
+              "post-supply-discount",
+              "excess-billed",
+              "short-billed"
+            ]
+          },
+          "reasonNote": {
+            "type": "string",
+            "description": "Why — as printed on the note"
+          },
+          "totals": {
+            "description": "Positive magnitudes, integer paise; a credit subtracts, a debit adds",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PortalInvoiceTotalsDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "noteNo",
+          "fyLabel",
+          "issuedAt",
+          "status",
+          "reason",
+          "reasonNote",
+          "totals"
+        ]
+      },
+      "PortalInvoiceNotesResponse": {
+        "type": "object",
+        "properties": {
+          "notes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalNoteRowDto"
+            }
+          },
+          "netDocument": {
+            "description": "The invoice after its issued notes — the document value, not a balance due",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PortalInvoiceTotalsDto"
+              }
+            ]
+          },
+          "netDocumentPayable": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "notes",
+          "netDocument",
+          "netDocumentPayable"
+        ]
+      },
+      "PortalNoteLineDto": {
+        "type": "object",
+        "properties": {
+          "chargeCode": {
+            "type": "string",
+            "enum": [
+              "storage",
+              "inbound_handling",
+              "pick",
+              "outbound_handling"
+            ]
+          },
+          "basis": {
+            "type": "string",
+            "enum": [
+              "per_thousand_units_per_day",
+              "per_receipt_line",
+              "per_pick",
+              "per_order"
+            ]
+          },
+          "uom": {
+            "type": "string",
+            "nullable": true
+          },
+          "segmentFrom": {
+            "type": "string",
+            "example": "2026-09-01",
+            "description": "IST date, inclusive"
+          },
+          "segmentTo": {
+            "type": "string",
+            "example": "2026-09-30",
+            "description": "IST date, inclusive"
+          },
+          "sac": {
+            "type": "string"
+          },
+          "gstBps": {
+            "type": "number"
+          },
+          "amountPaise": {
+            "type": "number"
+          },
+          "cgstPaise": {
+            "type": "number"
+          },
+          "sgstPaise": {
+            "type": "number"
+          },
+          "igstPaise": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "chargeCode",
+          "basis",
+          "uom",
+          "segmentFrom",
+          "segmentTo",
+          "sac",
+          "gstBps",
+          "amountPaise",
+          "cgstPaise",
+          "sgstPaise",
+          "igstPaise"
+        ]
+      },
+      "PortalNoteDetailResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "credit",
+              "debit"
+            ]
+          },
+          "noteNo": {
+            "type": "string",
+            "example": "29/C2627/000001"
+          },
+          "fyLabel": {
+            "type": "string",
+            "example": "FY-2627"
+          },
+          "issuedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "issued",
+              "void"
+            ],
+            "description": "Never draft — a portal sees issued documents only"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "deficiency-in-service",
+              "post-supply-discount",
+              "excess-billed",
+              "short-billed"
+            ]
+          },
+          "reasonNote": {
+            "type": "string",
+            "description": "Why — as printed on the note"
+          },
+          "totals": {
+            "description": "Positive magnitudes, integer paise; a credit subtracts, a debit adds",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PortalInvoiceTotalsDto"
+              }
+            ]
+          },
+          "invoiceNo": {
+            "type": "string"
+          },
+          "invoiceIssuedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "placeOfSupply": {
+            "type": "string"
+          },
+          "supplyType": {
+            "type": "string",
+            "enum": [
+              "intra",
+              "inter"
+            ]
+          },
+          "party": {
+            "$ref": "#/components/schemas/PortalInvoicePartyDto"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalNoteLineDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "noteNo",
+          "fyLabel",
+          "issuedAt",
+          "status",
+          "reason",
+          "reasonNote",
+          "totals",
+          "invoiceNo",
+          "invoiceIssuedAt",
+          "placeOfSupply",
+          "supplyType",
           "party",
           "lines"
         ]

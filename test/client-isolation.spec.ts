@@ -97,6 +97,8 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
   let rateCardAId: string;
   /** Story 21-5 — per client: an ISSUED September invoice and a DRAFT October one. */
   const invoiceIds = new Map<string, { issued: string; draft: string }>();
+  /** Story 5-6a — per client: an ISSUED credit note, a VOID one and a DRAFT one on its issued invoice. */
+  const noteIds = new Map<string, { issued: string; voided: string; draft: string }>();
   /** Story 21-6 — per client: one announced ASN. */
   const asnIds = new Map<string, string>();
 
@@ -237,6 +239,39 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
     }
     await sql`insert into client_invoice_series (id, tenant_id, supplier_gstin, fy_label, last_seq)
       values (${uuidv7()}, ${tenantId}, '29ABCDE1234F1Z5', 'FY-2627', 2)`;
+
+    // Story 5-6a — per client, three ₹1.00 credit notes on its ISSUED invoice
+    // (each born a draft through the 0098 trigger, issued by a second person):
+    // one issued, one issued then voided, one left a draft. Plus the note
+    // series and the maker/checker policy row (operator-only tables).
+    const checkerId = uuidv7();
+    for (const clientId of [clientA, clientB]) {
+      const invoiceId = invoiceIds.get(clientId)!.issued;
+      const lineId = ((await sql`select id from client_invoice_lines where invoice_id = ${invoiceId}`) as unknown as { id: string }[])[0]!.id;
+      const ids = { issued: uuidv7(), voided: uuidv7(), draft: uuidv7() };
+      noteIds.set(clientId, ids);
+      let seq = clientId === clientA ? 0 : 10;
+      for (const id of [ids.issued, ids.voided, ids.draft]) {
+        await sql`insert into client_invoice_notes (id, tenant_id, client_id, invoice_id, kind, supplier_gstin, place_of_supply, supply_type,
+            reason, reason_note, subtotal_paise, cgst_paise, sgst_paise, igst_paise, tax_paise, total_paise, round_off_paise, payable_paise, party, created_by)
+          select ${id}, tenant_id, client_id, id, 'credit', supplier_gstin, place_of_supply, supply_type, 'excess-billed', 'probe',
+            100, 9, 9, 0, 18, 118, 0, 118, party, ${actorId}
+          from client_invoices where id = ${invoiceId}`;
+        await sql`insert into client_invoice_note_lines (id, tenant_id, note_id, invoice_line_id, charge_code, basis, uom, segment_from, segment_to,
+            sac_code, gst_bps, place_of_supply, supply_type, amount_paise, cgst_paise, sgst_paise, igst_paise)
+          select ${uuidv7()}, tenant_id, ${id}, id, charge_code, basis, uom, segment_from, segment_to, sac_code, gst_bps, place_of_supply, supply_type, 100, 9, 9, 0
+          from client_invoice_lines where id = ${lineId}`;
+        if (id === ids.draft) continue;
+        seq += 1;
+        await sql`update client_invoice_notes set status = 'issued', note_no = ${'29/C2627/' + String(seq).padStart(6, '0')}, fy_label = 'FY-2627',
+            series_seq = ${seq}, issued_at = now(), issued_by = ${checkerId} where id = ${id}`;
+      }
+      await sql`update client_invoice_notes set status = 'void', void_note = 'probe', voided_at = now(), voided_by = ${actorId} where id = ${ids.voided}`;
+    }
+    await sql`insert into client_invoice_note_series (id, tenant_id, supplier_gstin, kind, fy_label, last_seq)
+      values (${uuidv7()}, ${tenantId}, '29ABCDE1234F1Z5', 'credit', 'FY-2627', 12)`;
+    await sql`insert into client_invoice_note_policies (id, tenant_id, require_second_approver, updated_by)
+      values (${uuidv7()}, ${tenantId}, true, ${actorId})`;
 
     // The INHERITED rows: stock and batch rows carry no client_id — their
     // isolation rides the SKU join, which the skus policy now filters.
@@ -848,6 +883,64 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       await expectCount((t) => t`select count(*)::int as n from ${t('client_invoices')} where tenant_id = ${tenantId} and status_note is null`, 4);
     });
 
+    it('credit and debit notes (5-6a): a portal session reads its own ISSUED and VOID notes and their lines — never a draft, never the sibling’s — and writes nothing; the series and policy are operator-only', async () => {
+      const own = noteIds.get(clientA)!;
+      const sibling = noteIds.get(clientB)!;
+      const rows = (await portal((tx) => tx`select id from client_invoice_notes where tenant_id = ${tenantId} order by id`)) as unknown as { id: string }[];
+      expect(rows.map((row) => row.id).sort()).toEqual([own.issued, own.voided].sort());
+      expect(await portal((tx) => tx`select id from client_invoice_notes where id = ${own.draft}`)).toHaveLength(0);
+      expect(await portal((tx) => tx`select id from client_invoice_notes where id = ${sibling.issued}`)).toHaveLength(0);
+      // Lines INHERIT the note's visibility.
+      const lines = (await portal((tx) => tx`select note_id from client_invoice_note_lines where tenant_id = ${tenantId}`)) as unknown as { note_id: string }[];
+      expect(lines.map((row) => row.note_id).sort()).toEqual([own.issued, own.voided].sort());
+      // Operator-only tables.
+      expect(countOf(await portal((tx) => tx`select count(*)::int as n from client_invoice_note_series where tenant_id = ${tenantId}`))).toBe(0);
+      expect(countOf(await portal((tx) => tx`select count(*)::int as n from client_invoice_note_policies where tenant_id = ${tenantId}`))).toBe(0);
+      // The operator sees every note (drafts included), line, series and policy row.
+      expect(countOf(await operator((tx) => tx`select count(*)::int as n from client_invoice_notes where tenant_id = ${tenantId}`))).toBe(6);
+      expect(countOf(await operator((tx) => tx`select count(*)::int as n from client_invoice_note_lines where tenant_id = ${tenantId}`))).toBe(6);
+      expect(countOf(await operator((tx) => tx`select count(*)::int as n from client_invoice_note_series where tenant_id = ${tenantId}`))).toBe(1);
+      expect(countOf(await operator((tx) => tx`select count(*)::int as n from client_invoice_note_policies where tenant_id = ${tenantId}`))).toBe(1);
+      expect(await operator((tx) => tx`select id from client_invoice_notes where id = ${own.draft}`)).toHaveLength(1);
+      // No tenant variable: nothing (the fail-closed idiom).
+      for (const table of ['client_invoice_notes', 'client_invoice_note_lines', 'client_invoice_note_series', 'client_invoice_note_policies']) {
+        expect(countOf(await probe.unsafe(`select count(*)::int as n from ${table} where tenant_id = '${tenantId}'::uuid`))).toBe(0);
+      }
+
+      // Writes. An own-client note INSERT under the portal stamp is refused by
+      // the INSERT arm first (P0001 — the invoice is invisible to FOR SHARE
+      // under the portal: fail closed), before the operator-only WITH CHECK.
+      const insertNote = (clientId: string) => (tx: postgres.TransactionSql<Record<string, unknown>>) =>
+        tx`insert into client_invoice_notes (id, tenant_id, client_id, invoice_id, kind, supplier_gstin, place_of_supply, supply_type,
+            reason, reason_note, subtotal_paise, cgst_paise, sgst_paise, igst_paise, tax_paise, total_paise, round_off_paise, payable_paise, party, created_by)
+          values (${uuidv7()}, ${tenantId}, ${clientId}, ${invoiceIds.get(clientA)!.issued}, 'credit', '29ABCDE1234F1Z5', '29', 'intra',
+            'excess-billed', 'probe', 1, 0, 0, 0, 0, 1, 0, 1, '{"seed": true}'::jsonb, ${uuidv7()})`;
+      await expect(portal(insertNote(clientA))).rejects.toMatchObject({ code: 'P0001' });
+      // A19: an operator-shaped insert whose client_id is not the invoice's is refused by the trigger.
+      await expect(operator(insertNote(clientB))).rejects.toMatchObject({ code: 'P0001' });
+      // A positive control: the same insert with the invoice's own client passes for an operator.
+      const control = uuidv7();
+      await operator((tx) =>
+        tx`insert into client_invoice_notes (id, tenant_id, client_id, invoice_id, kind, supplier_gstin, place_of_supply, supply_type,
+            reason, reason_note, subtotal_paise, cgst_paise, sgst_paise, igst_paise, tax_paise, total_paise, round_off_paise, payable_paise, party, created_by)
+          values (${control}, ${tenantId}, ${clientA}, ${invoiceIds.get(clientA)!.issued}, 'credit', '29ABCDE1234F1Z5', '29', 'intra',
+            'excess-billed', 'probe', 1, 0, 0, 0, 0, 1, 0, 1, '{"seed": true}'::jsonb, ${uuidv7()})`,
+      );
+      await sql`delete from client_invoice_notes where id = ${control}`;
+      // Series and policy inserts under the portal stamp: 42501 (no trigger there).
+      await expect(
+        portal((tx) => tx`insert into client_invoice_note_series (id, tenant_id, supplier_gstin, kind, fy_label, last_seq) values (${uuidv7()}, ${tenantId}, '29ABCDE1234F1Z5', 'debit', 'FY-2627', 0)`),
+      ).rejects.toMatchObject({ code: '42501' });
+      await expect(
+        portal((tx) => tx`insert into client_invoice_note_policies (id, tenant_id, require_second_approver, updated_by) values (${uuidv7()}, ${uuidv7()}, false, ${uuidv7()})`),
+      ).rejects.toMatchObject({ code: '42501' });
+      // UPDATE / DELETE of its own visible rows bind nothing.
+      expect(await portal((tx) => tx`update client_invoice_notes set updated_at = now() where client_id = ${clientA} returning id`)).toHaveLength(0);
+      expect(await portal((tx) => tx`delete from client_invoice_note_lines where note_id = ${own.issued} returning id`)).toHaveLength(0);
+      expect(await portal((tx) => tx`update client_invoice_note_policies set require_second_approver = false returning id`)).toHaveLength(0);
+      await expectCount((t) => t`select count(*)::int as n from ${t('client_invoice_notes')} where tenant_id = ${tenantId}`, 6);
+    });
+
     it('the UPDATE and DELETE arms bind too: a portal session cannot re-stamp its row to the sibling, and deletes ZERO of the sibling’s rows', async () => {
       // UPDATE arm (WITH CHECK on skus): the session's own row is visible
       // (USING passes) but may not be MOVED to the sibling's client.
@@ -1044,7 +1137,16 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // return_hold_settlements_tenant_isolation (0097, client-bound on both
       // arms — the return_receipts shape; the portal returns read reaches
       // them under the client stamp).
-      expect(policies).toHaveLength(128);
+      // Story 5-6a: + ten (0098) — client_invoice_notes and
+      // client_invoice_note_lines in the 0062 invoice shape (a FOR SELECT
+      // read with the client clause and `status <> 'draft'` / inheriting
+      // through the parent, plus operator-only INSERT, UPDATE and DELETE),
+      // and one operator-only tenant policy each for
+      // client_invoice_note_series and client_invoice_note_policies.
+      expect(policies).toHaveLength(138);
+      const noteRead = policies.find((row) => row.policyname === 'client_invoice_notes_tenant_isolation')!;
+      expect(noteRead.qual).toContain("status <> 'draft'");
+      expect(policies.find((row) => row.policyname === 'client_invoice_note_lines_tenant_isolation')!.qual).toContain('client_invoice_notes');
       for (const name of ['return_dispositions_tenant_isolation', 'return_hold_settlements_tenant_isolation']) {
         const policy = policies.find((row) => row.policyname === name)!;
         expect(policy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");

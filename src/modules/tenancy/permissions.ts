@@ -243,6 +243,13 @@ export const CAPABILITIES = [
   // refused at the read. Mirrored into wms-fe `src/lib/users.ts`
   // (CAPABILITIES + OPS_EXCLUDED_CAPABILITIES).
   'billing.invoice',
+  // Story 5-6a (A7) — the billing configuration: whether a credit note needs
+  // a second person to issue and to void it (`PUT …/billing/note-policy`).
+  // OWNER-ONLY (the `eway.configure` rationale: the person who sets the bar
+  // for money leaving the business). The policy READ stays open to any
+  // member. Mirrored into wms-fe `src/lib/users.ts` (CAPABILITIES +
+  // OWNER_ONLY_CAPABILITIES).
+  'billing.configure',
   // Story 21-6 — advance shipment notices: create, amend, close (short) and
   // cancel an ASN. Owner + Ops Manager, the same holders as `po.manage` — an
   // ASN is the PO's mirror, an inbound document the floor receives against.

@@ -42,6 +42,8 @@ import {
   PortalCreateAsnDto,
   PortalCreateOrderDto,
   PortalInvoiceDetailResponse,
+  PortalInvoiceNotesResponse,
+  PortalNoteDetailResponse,
   PortalInvoicePageResponse,
   PortalMeResponse,
   PortalOrderDetailResponse,
@@ -654,6 +656,50 @@ export class PortalController {
     const invoice = await this.billing.portalInvoice(tenantId, session.clientId, invoiceId);
     if (invoice === null) throw notFound('Client invoice', invoiceId);
     return { ...invoice, lines: [...invoice.lines] };
+  }
+
+  @Get(':tenantId/portal/invoices/:invoiceId/notes')
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: "Story 5-6a — the issued and void credit and debit notes of one of this client's invoices, and the document value after the issued ones" })
+  @ApiOkResponse({ type: PortalInvoiceNotesResponse })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("No such invoice of this client — unknown, malformed, a draft, or another client's (not-found)") })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'invoiceId', format: 'uuid' })
+  async invoiceNotes(
+    @Param('tenantId') tenantId: string,
+    @Param('invoiceId') invoiceId: string,
+    @CurrentPortalSession() session: PortalSession,
+  ): Promise<PortalInvoiceNotesResponse> {
+    assertOwnTenant(session, tenantId);
+    if (!UUID_RE.test(invoiceId)) throw notFound('Client invoice', invoiceId);
+    const notes = await this.billing.portalInvoiceNotes(tenantId, session.clientId, invoiceId);
+    if (notes === null) throw notFound('Client invoice', invoiceId);
+    return { notes: notes.notes.map((note) => ({ ...note, totals: { ...note.totals } })), netDocument: { ...notes.netDocument }, netDocumentPayable: notes.netDocumentPayable };
+  }
+
+  @Get(':tenantId/portal/invoice-notes/:noteId')
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Story 5-6a — one issued or void credit or debit note of this client: the frozen party, the original invoice and the lines' })
+  @ApiOkResponse({ type: PortalNoteDetailResponse })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("No such note of this client — unknown, malformed, a draft, or another client's (not-found)") })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'noteId', format: 'uuid' })
+  async invoiceNote(
+    @Param('tenantId') tenantId: string,
+    @Param('noteId') noteId: string,
+    @CurrentPortalSession() session: PortalSession,
+  ): Promise<PortalNoteDetailResponse> {
+    assertOwnTenant(session, tenantId);
+    if (!UUID_RE.test(noteId)) throw notFound('Credit or debit note', noteId);
+    const note = await this.billing.portalInvoiceNote(tenantId, session.clientId, noteId);
+    if (note === null) throw notFound('Credit or debit note', noteId);
+    return { ...note, totals: { ...note.totals }, lines: note.lines.map((line) => ({ ...line })) };
   }
 }
 

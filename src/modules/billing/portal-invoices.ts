@@ -1,5 +1,5 @@
-import { and, desc, eq, ne, sql } from 'drizzle-orm';
-import { clientInvoiceLines, clientInvoices, type ClientInvoice } from '../../shared/db/schema';
+import { and, asc, desc, eq, ne, sql } from 'drizzle-orm';
+import { clientInvoiceLines, clientInvoiceNoteLines, clientInvoiceNotes, clientInvoices, type ClientInvoice, type ClientInvoiceNote } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { CursorPayload, Page } from '../../shared/primitives/pagination';
 import { portalPageByCreatedAt } from '../../shared/primitives/portal-page';
@@ -8,6 +8,8 @@ import { addIsoDays, istDateOf } from '../../shared/primitives/time';
 // cycle (client-invoices → metering → billing.facade → here) whose load
 // order decides whether a Nest `@Inject` token is defined.
 import type { ClientInvoiceParty, ClientInvoiceStatus, ClientInvoiceTotalsView } from './client-invoices';
+// Story 5-6a — type-only too (client-invoice-notes imports client-invoices by value).
+import type { NoteKind, NoteReason } from './client-invoice-notes';
 import { milliToDecimal } from './metering';
 import { CHARGE_CODES, type ChargeCode, type RateBasis } from './rate-cards';
 
@@ -251,4 +253,183 @@ export async function portalInvoiceInTx(
       igstPaise: Number(row.igstPaise),
     }));
   return { ...toRow(invoice), party: toParty(invoice.party as ClientInvoiceParty), lines };
+}
+
+// ── story 5-6a — the client portal's credit and debit notes ─────────────────
+// Two layers, as the invoice reads: the facade stamps `{ clientId }` (the 0098
+// policy hides other clients' notes AND drafts) and every query carries
+// `client_id = $client` and `status <> 'draft'` on the notes table; lines are
+// reached only through their (stamped) note. An exact allowlist — never
+// `voidNote`, `settlesDispute`, `overrideReason`, actor ids, `clientId`, the
+// top-level `supplierGstin` or line ids.
+
+export type PortalNoteStatus = 'issued' | 'void';
+
+export interface PortalNoteRow {
+  readonly id: string;
+  readonly kind: NoteKind;
+  readonly noteNo: string;
+  readonly fyLabel: string;
+  readonly issuedAt: string;
+  readonly status: PortalNoteStatus;
+  readonly reason: NoteReason;
+  readonly reasonNote: string;
+  readonly totals: ClientInvoiceTotalsView;
+}
+
+export interface PortalNoteLine {
+  readonly chargeCode: ChargeCode;
+  readonly basis: RateBasis;
+  readonly uom: string | null;
+  readonly segmentFrom: string;
+  readonly segmentTo: string;
+  readonly sac: string;
+  readonly gstBps: number;
+  readonly amountPaise: number;
+  readonly cgstPaise: number;
+  readonly sgstPaise: number;
+  readonly igstPaise: number;
+}
+
+export interface PortalNoteDetail extends PortalNoteRow {
+  readonly invoiceNo: string;
+  readonly invoiceIssuedAt: string;
+  readonly placeOfSupply: string;
+  readonly supplyType: string;
+  readonly party: PortalInvoiceParty;
+  readonly lines: readonly PortalNoteLine[];
+}
+
+export interface PortalInvoiceNotes {
+  readonly notes: readonly PortalNoteRow[];
+  readonly netDocument: ClientInvoiceTotalsView;
+  readonly netDocumentPayable: number;
+}
+
+function noteScope(tenantId: string, clientId: string) {
+  return and(eq(clientInvoiceNotes.tenantId, tenantId), eq(clientInvoiceNotes.clientId, clientId), ne(clientInvoiceNotes.status, 'draft'));
+}
+
+function noteTotals(row: ClientInvoiceNote): ClientInvoiceTotalsView {
+  return {
+    subtotal: Number(row.subtotalPaise),
+    cgst: Number(row.cgstPaise),
+    sgst: Number(row.sgstPaise),
+    igst: Number(row.igstPaise),
+    tax: Number(row.taxPaise),
+    roundOff: Number(row.roundOffPaise),
+    payable: Number(row.payablePaise),
+  };
+}
+
+function toNoteRow(row: ClientInvoiceNote): PortalNoteRow {
+  return {
+    id: row.id,
+    kind: row.kind as NoteKind,
+    noteNo: issuedFact(row.noteNo, 'note_no', row.id),
+    fyLabel: issuedFact(row.fyLabel, 'fy_label', row.id),
+    issuedAt: new Date(issuedFact(row.issuedAt, 'issued_at', row.id)).toISOString(),
+    status: row.status as PortalNoteStatus,
+    reason: row.reason as NoteReason,
+    reasonNote: row.reasonNote,
+    totals: noteTotals(row),
+  };
+}
+
+/**
+ * The notes of one of the client's own non-draft invoices and the document
+ * value after its ISSUED notes (credits subtract, debits add). An invisible
+ * invoice — unknown, another client's or a draft — is null (404), never an
+ * empty 200.
+ */
+export async function portalInvoiceNotesInTx(
+  tx: TenantTx,
+  tenantId: string,
+  clientId: string,
+  invoiceId: string,
+): Promise<PortalInvoiceNotes | null> {
+  const invoices = await tx
+    .select()
+    .from(clientInvoices)
+    .where(and(clientScope(tenantId, clientId), eq(clientInvoices.id, invoiceId)))
+    .limit(1);
+  const invoice = invoices[0];
+  if (invoice === undefined) return null;
+  const rows = await tx
+    .select()
+    .from(clientInvoiceNotes)
+    .where(and(noteScope(tenantId, clientId), eq(clientInvoiceNotes.invoiceId, invoice.id)))
+    .orderBy(asc(clientInvoiceNotes.issuedAt), asc(clientInvoiceNotes.id));
+  const notes = rows.map(toNoteRow);
+  const net = { ...toRow(invoice).totals };
+  for (const note of notes) {
+    if (note.status !== 'issued') continue;
+    const sign = note.kind === 'credit' ? -1 : 1;
+    for (const key of ['subtotal', 'cgst', 'sgst', 'igst', 'tax', 'roundOff', 'payable'] as const) net[key] += sign * note.totals[key];
+  }
+  return { notes, netDocument: net, netDocumentPayable: net.payable };
+}
+
+/** One of the client's own non-draft notes, or null (unknown, another client's, or a draft → 404). */
+export async function portalInvoiceNoteInTx(
+  tx: TenantTx,
+  tenantId: string,
+  clientId: string,
+  noteId: string,
+): Promise<PortalNoteDetail | null> {
+  const rows = await tx
+    .select({ note: clientInvoiceNotes, invoiceNo: clientInvoices.invoiceNo, invoiceIssuedAt: clientInvoices.issuedAt })
+    .from(clientInvoiceNotes)
+    .innerJoin(clientInvoices, and(eq(clientInvoices.tenantId, clientInvoiceNotes.tenantId), eq(clientInvoices.id, clientInvoiceNotes.invoiceId)))
+    .where(and(noteScope(tenantId, clientId), eq(clientInvoiceNotes.id, noteId), clientScope(tenantId, clientId)))
+    .limit(1);
+  const found = rows[0];
+  if (found === undefined) return null;
+  const note = found.note;
+  const lineRows = await tx
+    .select({
+      chargeCode: clientInvoiceNoteLines.chargeCode,
+      basis: clientInvoiceNoteLines.basis,
+      uom: clientInvoiceNoteLines.uom,
+      segmentFrom: clientInvoiceNoteLines.segmentFrom,
+      segmentTo: clientInvoiceNoteLines.segmentTo,
+      sacCode: clientInvoiceNoteLines.sacCode,
+      gstBps: clientInvoiceNoteLines.gstBps,
+      amountPaise: clientInvoiceNoteLines.amountPaise,
+      cgstPaise: clientInvoiceNoteLines.cgstPaise,
+      sgstPaise: clientInvoiceNoteLines.sgstPaise,
+      igstPaise: clientInvoiceNoteLines.igstPaise,
+    })
+    .from(clientInvoiceNoteLines)
+    .innerJoin(
+      clientInvoiceNotes,
+      and(eq(clientInvoiceNotes.tenantId, clientInvoiceNoteLines.tenantId), eq(clientInvoiceNotes.id, clientInvoiceNoteLines.noteId)),
+    )
+    .where(and(eq(clientInvoiceNoteLines.tenantId, tenantId), eq(clientInvoiceNoteLines.noteId, note.id), noteScope(tenantId, clientId)));
+  const lines = lineRows
+    .map((row) => ({ ...row, segmentFrom: new Date(row.segmentFrom).toISOString(), segmentTo: new Date(row.segmentTo).toISOString() }))
+    .sort(compareLines)
+    .map((row) => ({
+      chargeCode: row.chargeCode as ChargeCode,
+      basis: row.basis as RateBasis,
+      uom: row.uom,
+      // Segments map as the invoice lines do: IST dates, the end inclusive.
+      segmentFrom: istDateOf(row.segmentFrom),
+      segmentTo: addIsoDays(istDateOf(row.segmentTo), -1),
+      sac: row.sacCode,
+      gstBps: row.gstBps,
+      amountPaise: Number(row.amountPaise),
+      cgstPaise: Number(row.cgstPaise),
+      sgstPaise: Number(row.sgstPaise),
+      igstPaise: Number(row.igstPaise),
+    }));
+  return {
+    ...toNoteRow(note),
+    invoiceNo: issuedFact(found.invoiceNo, 'invoice_no', note.invoiceId),
+    invoiceIssuedAt: new Date(issuedFact(found.invoiceIssuedAt, 'issued_at', note.invoiceId)).toISOString(),
+    placeOfSupply: note.placeOfSupply,
+    supplyType: note.supplyType,
+    party: toParty(note.party as ClientInvoiceParty),
+    lines,
+  };
 }

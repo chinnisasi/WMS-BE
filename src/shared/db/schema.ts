@@ -5826,6 +5826,163 @@ export const clientInvoiceSeries = pgTable(
 export type ClientInvoiceSeries = typeof clientInvoiceSeries.$inferSelect;
 
 /**
+ * Story 5-6a — a GST credit or debit note (CGST Act s.34) against exactly one
+ * issued, disputed or settled client services invoice. draft → issued
+ * (numbered from its own C / D series, frozen) → void. The header copies the
+ * invoice's supplying GSTIN, place of supply, supply type and frozen `party`
+ * verbatim; every stored amount is a positive magnitude (the kind gives the
+ * sign). The vocabularies live in `src/modules/billing/client-invoice-notes.ts`;
+ * the CHECKs, the freeze / cap / maker-checker triggers and the RLS policies
+ * live ONLY in `drizzle/0098_client_invoice_notes.sql`. No FKs (house rule).
+ */
+export const clientInvoiceNotes = pgTable(
+  'client_invoice_notes',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    invoiceId: uuid('invoice_id').notNull(),
+    /** `credit` | `debit`. */
+    kind: text('kind').notNull(),
+    /** `draft` | `issued` | `void`. */
+    status: text('status').notNull().default('draft'),
+    supplierGstin: text('supplier_gstin').notNull(),
+    placeOfSupply: text('place_of_supply').notNull(),
+    supplyType: text('supply_type').notNull(),
+    reason: text('reason').notNull(),
+    /** Printed on the client's copy (A3). */
+    reasonNote: text('reason_note').notNull(),
+    /** A credit that settles the invoice's dispute at issue (A2). */
+    settlesDispute: boolean('settles_dispute').notNull().default(false),
+    noteNo: text('note_no'),
+    /** The FY of the note's own issue instant (A10). */
+    fyLabel: text('fy_label'),
+    seriesSeq: integer('series_seq'),
+    subtotalPaise: bigint('subtotal_paise', { mode: 'number' }).notNull(),
+    cgstPaise: bigint('cgst_paise', { mode: 'number' }).notNull(),
+    sgstPaise: bigint('sgst_paise', { mode: 'number' }).notNull(),
+    igstPaise: bigint('igst_paise', { mode: 'number' }).notNull(),
+    taxPaise: bigint('tax_paise', { mode: 'number' }).notNull(),
+    totalPaise: bigint('total_paise', { mode: 'number' }).notNull(),
+    /** Not a rupee rounding (A8): non-zero only on the credit that exhausts the invoice, or a clamped one. */
+    roundOffPaise: bigint('round_off_paise', { mode: 'number' }).notNull(),
+    payablePaise: bigint('payable_paise', { mode: 'number' }).notNull(),
+    /** The invoice's frozen party, copied verbatim at create. */
+    party: jsonb('party').notNull(),
+    issuedAt: timestamp('issued_at', { withTimezone: true, mode: 'string' }),
+    issuedBy: uuid('issued_by'),
+    voidNote: text('void_note'),
+    voidedAt: timestamp('voided_at', { withTimezone: true, mode: 'string' }),
+    voidedBy: uuid('voided_by'),
+    createdBy: uuid('created_by').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('client_invoice_notes_tenant_gstin_note_no_unique')
+      .on(table.tenantId, table.supplierGstin, table.noteNo)
+      .where(sql`note_no is not null`),
+    index('client_invoice_notes_tenant_invoice_idx').on(table.tenantId, table.invoiceId),
+    index('client_invoice_notes_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
+    index('client_invoice_notes_tenant_client_created_at_id_idx').on(table.tenantId, table.clientId, table.createdAt, table.id),
+    // The notes register (A15): keyset on (supplier_gstin, issued_at, id).
+    index('client_invoice_notes_tenant_gstin_issued_at_id_idx')
+      .on(table.tenantId, table.supplierGstin, table.issuedAt, table.id)
+      .where(sql`issued_at is not null`),
+  ],
+);
+
+export type ClientInvoiceNote = typeof clientInvoiceNotes.$inferSelect;
+
+/**
+ * Story 5-6a — one line of a note: the taxable delta against ONE invoice
+ * line, which it copies (charge, basis, uom, segment, SAC, rate, place of
+ * supply, supply type — the lines trigger checks every one). No quantity
+ * (Rule 53(1A)(h) asks for the taxable value, rate and tax).
+ */
+export const clientInvoiceNoteLines = pgTable(
+  'client_invoice_note_lines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    noteId: uuid('note_id').notNull(),
+    invoiceLineId: uuid('invoice_line_id').notNull(),
+    chargeCode: text('charge_code').notNull(),
+    basis: text('basis').notNull(),
+    uom: text('uom'),
+    segmentFrom: timestamp('segment_from', { withTimezone: true, mode: 'string' }).notNull(),
+    segmentTo: timestamp('segment_to', { withTimezone: true, mode: 'string' }).notNull(),
+    sacCode: text('sac_code').notNull(),
+    gstBps: integer('gst_bps').notNull(),
+    placeOfSupply: text('place_of_supply').notNull(),
+    supplyType: text('supply_type').notNull(),
+    amountPaise: bigint('amount_paise', { mode: 'number' }).notNull(),
+    cgstPaise: bigint('cgst_paise', { mode: 'number' }).notNull(),
+    sgstPaise: bigint('sgst_paise', { mode: 'number' }).notNull(),
+    igstPaise: bigint('igst_paise', { mode: 'number' }).notNull(),
+    /** A9 — why a debit exceeds its invoice line's taxable value. */
+    overrideReason: text('override_reason'),
+  },
+  (table) => [
+    uniqueIndex('client_invoice_note_lines_note_invoice_line_unique').on(table.noteId, table.invoiceLineId),
+    index('client_invoice_note_lines_tenant_note_idx').on(table.tenantId, table.noteId),
+    index('client_invoice_note_lines_tenant_invoice_line_idx').on(table.tenantId, table.invoiceLineId),
+  ],
+);
+
+export type ClientInvoiceNoteLine = typeof clientInvoiceNoteLines.$inferSelect;
+
+/**
+ * Story 5-6a — the note series: one row per (tenant, supplying GSTIN, kind,
+ * FY of the note's issue), `last_seq` advanced only under the row's FOR
+ * UPDATE — gap-free, never interleaved with the services or goods invoice
+ * series. `29/C2627/000001`, `29/D2627/000001`.
+ */
+export const clientInvoiceNoteSeries = pgTable(
+  'client_invoice_note_series',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    supplierGstin: text('supplier_gstin').notNull(),
+    kind: text('kind').notNull(),
+    fyLabel: text('fy_label').notNull(),
+    lastSeq: integer('last_seq').notNull().default(0),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('client_invoice_note_series_tenant_gstin_kind_fy_unique').on(table.tenantId, table.supplierGstin, table.kind, table.fyLabel),
+  ],
+);
+
+export type ClientInvoiceNoteSeries = typeof clientInvoiceNoteSeries.$inferSelect;
+
+/**
+ * Story 5-6a (A7) — the tenant's credit-note maker/checker setting, one row
+ * per tenant (the `stockAdjustmentPolicies` precedent). A MISSING row means
+ * a second approver is REQUIRED. Written by the owner-only `billing.configure`.
+ */
+export const clientInvoiceNotePolicies = pgTable(
+  'client_invoice_note_policies',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    requireSecondApprover: boolean('require_second_approver').notNull().default(true),
+    updatedBy: uuid('updated_by').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [uniqueIndex('client_invoice_note_policies_tenant_unique').on(table.tenantId)],
+);
+
+export type ClientInvoiceNotePolicy = typeof clientInvoiceNotePolicies.$inferSelect;
+
+/**
  * Story 9-2 — the notification panel's projection (notifications module,
  * module-exclusive writes). One row per source occurrence: the unique
  * `(tenant_id, source_type, source_id)` is the idempotency of every

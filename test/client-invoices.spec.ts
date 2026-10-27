@@ -297,6 +297,12 @@ describe('story 21-5: client invoices', () => {
       expect(flagged.contentHash).not.toBe(base.contentHash);
     });
 
+    it('5-6a golden G1: the content hash of draftInput() is the literal captured on the 4-7a base, before notes existed', () => {
+      // Captured before any 5-6a change (spec Tasks, G1). Credit and debit
+      // notes never change the invoice's content-hash convention.
+      expect(computeClientInvoiceDraft(draftInput()).contentHash).toBe('5e97cb9cf4619b50a0339c6bbb4e92b575ac93d2aecd12b7db29e156b96ca81c');
+    });
+
     it('supplierGroups: every warehouse in exactly one group, keyed by its GSTIN, else the tenant’s; the null group last', () => {
       const facts = {
         tenantName: 'T',
@@ -1526,6 +1532,75 @@ describe('story 21-5: client invoices', () => {
         expect(disputed.body.invoice.statusNote).toBe('😀'.repeat(500));
         const settled = await act(beta27.id, 'settle', {}).expect(200);
         expect(settled.body.invoice).toMatchObject({ status: 'settled', statusNote: null });
+      });
+    });
+
+    // ── story 5-6a — the goldens: notes never change an invoice's bytes ────
+    describe('5-6a goldens G2–G5: an invoice’s reads and stored snapshots are byte-identical after credit and debit notes', () => {
+      it('GET client-invoices/{id}, the list page, the portal read, and the stored issue and dispute snapshots do not move', async () => {
+        const acmeId = (
+          await sql<{ id: string }[]>`select id from client_invoices where tenant_id = ${tenantId} and client_id = ${client('ACME')} and supplier_gstin = ${T29} and status = 'issued'`
+        )[0]!.id;
+        const portalEmail = `portal-${ulid().toLowerCase()}@brand.example`;
+        const invited = await http()
+          .post(`${API}/${tenantId}/users`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ email: portalEmail, role: 'client', clientId: client('ACME') })
+          .expect(201);
+        await http().post(`${API}/${tenantId}/accept-invite`).set(KEY_HEADER, ulid()).send({ token: invited.body.inviteToken as string, password: 'correct-horse-battery' }).expect(200);
+        const acmePortal = (await mintSignIn(app, { email: portalEmail, password: 'correct-horse-battery' })).body.accessToken as string;
+
+        const g2 = async () => (await getInvoice(acmeId).expect(200)).text;
+        const g4 = async () => (await http().get(`${API}/${tenantId}/portal/invoices/${acmeId}`).set('Authorization', `Bearer ${acmePortal}`).expect(200)).text;
+        const g5 = async () => (await http().get(`${API}/${tenantId}/client-invoices?clientId=${client('ACME')}`).set('Authorization', `Bearer ${opsToken}`).expect(200)).text;
+        const snapshot = async (outcomeOrStatus: string) =>
+          (
+            await sql<{ s: string }[]>`
+              select response_snapshot::text as s from idempotency_keys
+              where tenant_id = ${tenantId} and response_snapshot -> 'invoice' ->> 'id' = ${acmeId}
+                and (response_snapshot ->> 'outcome' = ${outcomeOrStatus} or (response_snapshot ->> 'outcome' is null and response_snapshot -> 'invoice' ->> 'status' = ${outcomeOrStatus}))
+              order by created_at`
+          ).map((row) => row.s);
+
+        const before = { g2: await g2(), g4: await g4(), g5: await g5(), issue: await snapshot('issued') };
+        expect(before.issue).toHaveLength(1);
+        // The literal shape of the operator invoice read (captured on the 4-7a base, before notes existed).
+        const body = JSON.parse(before.g2) as { invoice: Record<string, unknown> & { lines: Record<string, unknown>[] } };
+        expect(Object.keys(body.invoice).sort()).toEqual(
+          ['clientId', 'createdAt', 'fyLabel', 'gaps', 'id', 'invoiceNo', 'issuedAt', 'lines', 'party', 'periodEnd', 'periodStart', 'placeOfSupply', 'replacesInvoiceId', 'status', 'statusNote', 'supplierGstin', 'supplyType', 'totals', 'warnings'],
+        );
+        expect(Object.keys(body.invoice.lines[0]!).sort()).toEqual(
+          ['amountPaise', 'basis', 'cgstPaise', 'chargeCode', 'gstBps', 'id', 'igstPaise', 'placeOfSupply', 'quantity', 'rateCardId', 'sac', 'segmentFrom', 'segmentTo', 'sgstPaise', 'supplyType', 'unitAmountPaise', 'uom'],
+        );
+        const lineId = body.invoice.lines[0]!.id as string;
+
+        const note = (kind: 'credit' | 'debit') =>
+          http()
+            .post(`${API}/${tenantId}/client-invoices/${acmeId}/notes`)
+            .set('Authorization', `Bearer ${accountantToken}`)
+            .set(KEY_HEADER, ulid())
+            .send({ kind, reason: kind === 'credit' ? 'excess-billed' : 'short-billed', reasonNote: 'Golden check', lines: [{ invoiceLineId: lineId, amountPaise: 100 }] })
+            .expect(201);
+        const issueNote = (id: string) =>
+          http().post(`${API}/${tenantId}/client-invoice-notes/${id}/issue`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid()).send({}).expect(200);
+        await issueNote((await note('credit')).body.note.id as string);
+        await issueNote((await note('debit')).body.note.id as string);
+
+        expect(await g2()).toBe(before.g2);
+        expect(await g4()).toBe(before.g4);
+        expect(await g5()).toBe(before.g5);
+        expect(await snapshot('issued')).toEqual(before.issue);
+
+        // A dispute's stored snapshot, then a further credit on the disputed invoice: still byte-identical.
+        await act(acmeId, 'dispute', { note: 'Golden dispute' }).expect(200);
+        const dispute = await snapshot('disputed');
+        expect(dispute).toHaveLength(1);
+        const disputedRead = await g2();
+        await issueNote((await note('credit')).body.note.id as string);
+        expect(await snapshot('disputed')).toEqual(dispute);
+        expect(await snapshot('issued')).toEqual(before.issue);
+        expect(await g2()).toBe(disputedRead);
       });
     });
 

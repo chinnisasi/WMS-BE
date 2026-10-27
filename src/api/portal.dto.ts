@@ -783,3 +783,47 @@ export class PortalInvoiceDetailResponse extends PortalInvoiceRowDto {
   @ApiProperty({ type: [PortalInvoiceLineDto] })
   lines!: PortalInvoiceLineDto[];
 }
+
+// ── story 5-6a — credit and debit notes ─────────────────────────────────────
+
+export class PortalNoteRowDto {
+  @ApiProperty({ format: 'uuid' }) id!: string;
+  @ApiProperty({ enum: ['credit', 'debit'] }) kind!: string;
+  @ApiProperty({ example: '29/C2627/000001' }) noteNo!: string;
+  @ApiProperty({ example: 'FY-2627' }) fyLabel!: string;
+  @ApiProperty({ description: 'ISO-8601 UTC' }) issuedAt!: string;
+  @ApiProperty({ enum: ['issued', 'void'], description: 'Never draft — a portal sees issued documents only' }) status!: string;
+  @ApiProperty({ enum: ['deficiency-in-service', 'post-supply-discount', 'excess-billed', 'short-billed'] }) reason!: string;
+  @ApiProperty({ description: 'Why — as printed on the note' }) reasonNote!: string;
+  @ApiProperty({ type: PortalInvoiceTotalsDto, description: 'Positive magnitudes, integer paise; a credit subtracts, a debit adds' }) totals!: PortalInvoiceTotalsDto;
+}
+
+export class PortalInvoiceNotesResponse {
+  @ApiProperty({ type: [PortalNoteRowDto] }) notes!: PortalNoteRowDto[];
+  @ApiProperty({ type: PortalInvoiceTotalsDto, description: 'The invoice after its issued notes — the document value, not a balance due' })
+  netDocument!: PortalInvoiceTotalsDto;
+  @ApiProperty() netDocumentPayable!: number;
+}
+
+export class PortalNoteLineDto {
+  @ApiProperty({ enum: [...CHARGE_CODES] }) chargeCode!: string;
+  @ApiProperty({ enum: [...RATE_BASES] }) basis!: string;
+  @ApiProperty({ type: String, nullable: true }) uom!: string | null;
+  @ApiProperty({ example: '2026-09-01', description: 'IST date, inclusive' }) segmentFrom!: string;
+  @ApiProperty({ example: '2026-09-30', description: 'IST date, inclusive' }) segmentTo!: string;
+  @ApiProperty() sac!: string;
+  @ApiProperty() gstBps!: number;
+  @ApiProperty() amountPaise!: number;
+  @ApiProperty() cgstPaise!: number;
+  @ApiProperty() sgstPaise!: number;
+  @ApiProperty() igstPaise!: number;
+}
+
+export class PortalNoteDetailResponse extends PortalNoteRowDto {
+  @ApiProperty() invoiceNo!: string;
+  @ApiProperty({ description: 'ISO-8601 UTC' }) invoiceIssuedAt!: string;
+  @ApiProperty() placeOfSupply!: string;
+  @ApiProperty({ enum: [...SUPPLY_TYPES] }) supplyType!: string;
+  @ApiProperty({ type: PortalInvoicePartyDto }) party!: PortalInvoicePartyDto;
+  @ApiProperty({ type: [PortalNoteLineDto] }) lines!: PortalNoteLineDto[];
+}

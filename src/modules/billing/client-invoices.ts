@@ -1,11 +1,13 @@
 import { createHash } from 'node:crypto';
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, desc, eq, ne, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
   auditEvents,
   clientInvoiceLines,
+  clientInvoiceNoteLines,
+  clientInvoiceNotes,
   clientInvoiceSeries,
   clientInvoices,
   idempotencyKeys,
@@ -757,6 +759,11 @@ async function linesOfInTx(tx: TenantTx, tenantId: string, invoiceId: string): P
     }));
 }
 
+/** The invoice view (story 5-6a exports it: a dispute-settling note's issue answers the settled invoice in this shape). */
+export async function clientInvoiceViewInTx(tx: TenantTx, row: ClientInvoice): Promise<ClientInvoiceView> {
+  return viewOfInTx(tx, row);
+}
+
 async function viewOfInTx(tx: TenantTx, row: ClientInvoice): Promise<ClientInvoiceView> {
   const entry: { -readonly [K in keyof ClientInvoiceEntryView]?: ClientInvoiceEntryView[K] } = { ...toEntryView(row) };
   delete entry.gapCount;
@@ -1074,7 +1081,7 @@ export class ClientInvoiceService {
     await withTenantTransaction(this.db, command.tenantId, async (tx) => {
       assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'billing.invoice');
       if ((await this.replay(tx, command.tenantId, idempotencyKey, payloadHash)) !== null) return;
-      const row = await this.lockInvoiceInTx(tx, command.tenantId, command.invoiceId);
+      const row = await lockInvoiceInTx(tx, command.tenantId, command.invoiceId);
       if ((await this.replay(tx, command.tenantId, idempotencyKey, payloadHash)) !== null) return;
       if (row.status !== 'draft') throw invoiceNotDraft(row);
 
@@ -1102,7 +1109,7 @@ export class ClientInvoiceService {
       assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'billing.invoice');
       const replayed = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
       if (replayed !== null) return replayed as ClientInvoiceMutationResult;
-      const row = await this.lockInvoiceInTx(tx, command.tenantId, command.invoiceId);
+      const row = await lockInvoiceInTx(tx, command.tenantId, command.invoiceId);
       const replayedUnderLock = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
       if (replayedUnderLock !== null) return replayedUnderLock as ClientInvoiceMutationResult;
 
@@ -1114,6 +1121,23 @@ export class ClientInvoiceService {
           'Not an allowed invoice transition',
           `Invoice ${row.invoiceNo ?? row.id} is ${from} — it cannot become ${target}. Allowed: issued → disputed, settled or void; disputed → settled or void.`,
         );
+      }
+      // Story 5-6a (A13): a settle goes through the one settle path the
+      // credit-note issue shares — the update, the stamps and the audit row.
+      if (target === 'settled') {
+        const settled = await settleInTx(tx, row, note, command.actorUserId, note === null ? idempotencyKey : `note: ${note} (key ${idempotencyKey})`);
+        const settledResult: ClientInvoiceMutationResult = { invoice: await viewOfInTx(tx, settled) };
+        await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, settledResult);
+        return settledResult;
+      }
+      // Story 5-6a (A4): an invoice with an ISSUED credit or debit note is
+      // never voided — void the notes first (the
+      // `client_invoices_void_needs_no_notes` trigger is the backstop). A void
+      // that passes discards the invoice's DRAFT notes in the same
+      // transaction, each audited.
+      if (target === 'void') {
+        await assertNoIssuedNotesInTx(tx, row);
+        await discardDraftNotesInTx(tx, row, command.actorUserId, idempotencyKey);
       }
       const now = nowIso();
       const updated = await tx
@@ -1130,8 +1154,8 @@ export class ClientInvoiceService {
         .where(and(eq(clientInvoices.tenantId, command.tenantId), eq(clientInvoices.id, row.id), eq(clientInvoices.status, from)))
         .returning();
       const result: ClientInvoiceMutationResult = { invoice: await viewOfInTx(tx, updated[0]!) };
-      const action: AuditAction =
-        target === 'disputed' ? 'client_invoice.disputed' : target === 'settled' ? 'client_invoice.settled' : 'client_invoice.voided';
+      // (A settle returned above, through `settleInTx`.)
+      const action: AuditAction = target === 'disputed' ? 'client_invoice.disputed' : 'client_invoice.voided';
       await this.audit(tx, command, action, row.id, note === null ? idempotencyKey : `note: ${note} (key ${idempotencyKey})`);
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, result);
       return result;
@@ -1417,21 +1441,8 @@ export class ClientInvoiceService {
       .limit(1);
     if (found[0] === undefined) throw clientInvoiceNotFound(invoiceId);
     await lockClientInTx(tx, tenantId, found[0].clientId);
-    const row = await this.lockInvoiceInTx(tx, tenantId, invoiceId);
+    const row = await lockInvoiceInTx(tx, tenantId, invoiceId);
     return { row, client: await getClientInTx(tx, tenantId, row.clientId) };
-  }
-
-  private async lockInvoiceInTx(tx: TenantTx, tenantId: string, invoiceId: string): Promise<ClientInvoice> {
-    if (!UUID_RE.test(invoiceId)) throw clientInvoiceNotFound(invoiceId);
-    const rows = await tx
-      .select()
-      .from(clientInvoices)
-      .where(and(eq(clientInvoices.tenantId, tenantId), eq(clientInvoices.id, invoiceId)))
-      .orderBy(asc(clientInvoices.id))
-      .limit(1)
-      .for('update');
-    if (rows[0] === undefined) throw clientInvoiceNotFound(invoiceId);
-    return rows[0];
   }
 
   private async replay(tx: TenantTx, tenantId: string, idempotencyKey: string, payloadHash: string): Promise<unknown> {
@@ -1486,6 +1497,106 @@ export class ClientInvoiceService {
       throw err;
     }
   }
+}
+
+// ── story 5-6a: the seams the credit/debit notes share (A13) ──────────────
+
+/**
+ * Lock one client invoice row (`FOR UPDATE`), 404 when absent — a lock, and
+ * nothing else (IMPLEMENTATION-GUIDE §1: a lock helper never checks status,
+ * so the replay under the lock can sit between it and the guards). Shared by
+ * the invoice transitions and `ClientInvoiceNoteService` (lock order:
+ * invoice row → note row → series).
+ */
+export async function lockInvoiceInTx(tx: TenantTx, tenantId: string, invoiceId: string): Promise<ClientInvoice> {
+  if (!UUID_RE.test(invoiceId)) throw clientInvoiceNotFound(invoiceId);
+  const rows = await tx
+    .select()
+    .from(clientInvoices)
+    .where(and(eq(clientInvoices.tenantId, tenantId), eq(clientInvoices.id, invoiceId)))
+    .orderBy(asc(clientInvoices.id))
+    .limit(1)
+    .for('update');
+  if (rows[0] === undefined) throw clientInvoiceNotFound(invoiceId);
+  return rows[0];
+}
+
+/**
+ * Settle a LOCKED issued or disputed invoice: the status, its own note (or
+ * none — a settle never inherits the dispute's reason), the stamps, and the
+ * `client_invoice.settled` audit row with the caller's reference (the
+ * composite `note: … (key …)` when there is a note). `transition`'s settle
+ * and a dispute-settling credit note's issue both come here.
+ */
+export async function settleInTx(
+  tx: TenantTx,
+  row: ClientInvoice,
+  note: string | null,
+  actorUserId: string,
+  auditReference: string,
+): Promise<ClientInvoice> {
+  const now = nowIso();
+  const updated = await tx
+    .update(clientInvoices)
+    .set({ status: 'settled', statusNote: note, statusChangedAt: now, statusChangedBy: actorUserId, updatedAt: now })
+    .where(and(eq(clientInvoices.tenantId, row.tenantId), eq(clientInvoices.id, row.id), eq(clientInvoices.status, row.status)))
+    .returning();
+  if (updated[0] === undefined) throw new Error(`settleInTx: invoice ${row.id} was not ${row.status} under its lock`);
+  await tx.insert(auditEvents).values({
+    id: uuidv7(),
+    tenantId: row.tenantId,
+    actorUserId,
+    action: 'client_invoice.settled',
+    targetType: 'client_invoice',
+    targetId: row.id,
+    reference: auditReference,
+    occurredAt: nowIso(),
+  });
+  return updated[0];
+}
+
+/** Story 5-6a (A4) — 409 `invoice-has-notes` while the invoice has an issued note. */
+async function assertNoIssuedNotesInTx(tx: TenantTx, row: ClientInvoice): Promise<void> {
+  const issued = await tx
+    .select({ noteNo: clientInvoiceNotes.noteNo })
+    .from(clientInvoiceNotes)
+    .where(and(eq(clientInvoiceNotes.tenantId, row.tenantId), eq(clientInvoiceNotes.invoiceId, row.id), eq(clientInvoiceNotes.status, 'issued')))
+    .orderBy(asc(clientInvoiceNotes.noteNo));
+  if (issued.length > 0) {
+    throw new ProblemException(
+      'invoice-has-notes',
+      409,
+      'The invoice has issued credit or debit notes',
+      `Invoice ${row.invoiceNo ?? row.id} has issued notes (${issued.map((note) => note.noteNo).join(', ')}) — void its notes first.`,
+    );
+  }
+}
+
+/** Story 5-6a (A4) — a void discards the invoice's DRAFT notes (lines, then rows), each audited. */
+async function discardDraftNotesInTx(tx: TenantTx, row: ClientInvoice, actorUserId: string, idempotencyKey: string): Promise<void> {
+  const drafts = await tx
+    .select({ id: clientInvoiceNotes.id })
+    .from(clientInvoiceNotes)
+    .where(and(eq(clientInvoiceNotes.tenantId, row.tenantId), eq(clientInvoiceNotes.invoiceId, row.id), eq(clientInvoiceNotes.status, 'draft')))
+    .orderBy(asc(clientInvoiceNotes.id))
+    .for('update');
+  if (drafts.length === 0) return;
+  const ids = drafts.map((draft) => draft.id);
+  await tx.delete(clientInvoiceNoteLines).where(and(eq(clientInvoiceNoteLines.tenantId, row.tenantId), inArray(clientInvoiceNoteLines.noteId, ids)));
+  await tx.delete(clientInvoiceNotes).where(and(eq(clientInvoiceNotes.tenantId, row.tenantId), inArray(clientInvoiceNotes.id, ids)));
+  await tx.insert(auditEvents).values(
+    ids.map((id) => ({
+      id: uuidv7(),
+      tenantId: row.tenantId,
+      actorUserId,
+      action: 'client_invoice_note.discarded',
+      targetType: 'client_invoice_note',
+      targetId: id,
+      reference: idempotencyKey,
+      changes: {},
+      occurredAt: nowIso(),
+    })),
+  );
 }
 
 /** The tenant's own client is never invoiced (409 `client-not-billable`). */
