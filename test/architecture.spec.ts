@@ -2005,9 +2005,14 @@ describe('architecture: rate cards are billing-module-owned (story 21-3)', () =>
     'clientInvoices',
     'clientInvoiceLines',
     'clientInvoiceSeries',
+    // Story 5-6a — the credit / debit notes, their lines, the C / D series and the maker/checker policy.
+    'clientInvoiceNotes',
+    'clientInvoiceNoteLines',
+    'clientInvoiceNoteSeries',
+    'clientInvoiceNotePolicies',
   ] as const;
   const RAW_BILLING_TABLES =
-    'rate_cards|rate_card_lines|storage_snapshots|storage_snapshot_progress|client_invoices|client_invoice_lines|client_invoice_series';
+    'rate_cards|rate_card_lines|storage_snapshots|storage_snapshot_progress|client_invoices|client_invoice_lines|client_invoice_series|client_invoice_notes|client_invoice_note_lines|client_invoice_note_series|client_invoice_note_policies';
   const billingRoot = join(SRC_ROOT, 'modules', 'billing');
   const billingFiles = files.filter((file) => file.path.startsWith(billingRoot));
 
@@ -2060,7 +2065,7 @@ describe('architecture: rate cards are billing-module-owned (story 21-3)', () =>
     const schemaFile = join(SRC_ROOT, 'shared', 'db', 'schema.ts');
     const offenders = files
       .filter((file) => !file.path.startsWith(billingRoot) && file.path !== schemaFile)
-      .filter((file) => /\b(rateCards|rateCardLines|storageSnapshots|storageSnapshotProgress|clientInvoices|clientInvoiceLines|clientInvoiceSeries)\b/.test(file.source))
+      .filter((file) => /\b(rateCards|rateCardLines|storageSnapshots|storageSnapshotProgress|clientInvoices|clientInvoiceLines|clientInvoiceSeries|clientInvoiceNotes|clientInvoiceNoteLines|clientInvoiceNoteSeries|clientInvoiceNotePolicies)\b/.test(file.source))
       .map((file) => file.path);
     expect(offenders).toEqual([]);
     const publicVocabulary = readFileSync(join(billingRoot, 'rate-cards.ts'), 'utf8');
@@ -2420,7 +2425,7 @@ describe('architecture: the client portal (story 21-7)', () => {
     { file: join(SRC_ROOT, 'modules', 'inventory', 'inventory.facade.ts'), methods: ['portalStock'] },
     { file: join(SRC_ROOT, 'modules', 'outbound', 'outbound.facade.ts'), methods: ['portalOrders', 'portalOrder'] },
     { file: join(SRC_ROOT, 'modules', 'inbound', 'inbound.facade.ts'), methods: ['portalAsns', 'portalAsn', 'portalPurchaseOrders', 'portalPurchaseOrder', 'portalGoodsReceipts', 'portalGoodsReceipt'] },
-    { file: join(SRC_ROOT, 'modules', 'billing', 'billing.facade.ts'), methods: ['portalInvoices', 'portalInvoice'] },
+    { file: join(SRC_ROOT, 'modules', 'billing', 'billing.facade.ts'), methods: ['portalInvoices', 'portalInvoice', 'portalInvoiceNotes', 'portalInvoiceNote'] },
     { file: join(SRC_ROOT, 'modules', 'clients', 'clients.facade.ts'), methods: ['portalMeIn'] },
     // Story 21-7b — the announce form's two reads.
     { file: join(SRC_ROOT, 'modules', 'catalog', 'catalog.facade.ts'), methods: ['portalSkus'] },
@@ -2473,6 +2478,9 @@ describe('architecture: the client portal (story 21-7)', () => {
         'portalGoodsReceipt',
         'portalInvoices',
         'portalInvoice',
+        // Story 5-6a — an invoice's credit and debit notes, and one note.
+        'portalInvoiceNotes',
+        'portalInvoiceNote',
         'portalMe',
         'portalSkus',
         'portalWarehouses',

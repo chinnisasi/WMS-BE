@@ -438,7 +438,7 @@ export class ClientInvoicesController {
   @ApiBearerAuth()
   @ApiOperation({
     summary:
-      'Voids an issued or disputed invoice (billing.invoice) — a note is required. The void keeps its number; the next prepare for its month and GSTIN drafts a replacement naming it',
+      'Voids an issued or disputed invoice (billing.invoice) — a note is required. The void keeps its number; the next prepare for its month and GSTIN drafts a replacement naming it. Refused while the invoice has an issued credit or debit note; its draft notes are discarded with it',
   })
   @ApiBody({ type: ClientInvoiceNoteDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
@@ -447,7 +447,7 @@ export class ClientInvoicesController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse(MUTATION_403) })
   @ApiResponse({ status: 404, ...problemJsonResponse('No client invoice with this id exists in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('Only an issued or disputed invoice can be voided (invoice-transition-invalid), or a concurrent request (conflict)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Only an issued or disputed invoice can be voided (invoice-transition-invalid), it has issued credit or debit notes — void them first (invoice-has-notes), or a concurrent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'invoiceId', format: 'uuid' })

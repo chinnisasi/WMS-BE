@@ -63,6 +63,11 @@ export const AUDIT_TARGET_TYPES = [
   'channel_connection',
   'client',
   'client_invoice',
+  // Story 5-6a — a credit or debit note (`client_invoice_note.drafted |
+  // discarded | issued | voided`) and the tenant's maker/checker switch
+  // (`client_invoice_note_policy.updated`).
+  'client_invoice_note',
+  'client_invoice_note_policy',
   'count_task',
   'count_variance',
   'count_variance_policy',
@@ -195,6 +200,13 @@ export const AUDIT_NEW_ACTIONS = [
   // Story 4-7a — the disposition commands (`ReturnDispositionCommand`, web
   // and handheld): one row per command, the first disposition its target.
   { action: 'return_disposition.recorded', targetType: 'return_disposition' },
+  // Story 5-6a — credit and debit notes (`ClientInvoiceNoteService`); a void
+  // of the invoice discards its draft notes under the void's key.
+  { action: 'client_invoice_note.drafted', targetType: 'client_invoice_note' },
+  { action: 'client_invoice_note.discarded', targetType: 'client_invoice_note' },
+  { action: 'client_invoice_note.issued', targetType: 'client_invoice_note' },
+  { action: 'client_invoice_note.voided', targetType: 'client_invoice_note' },
+  { action: 'client_invoice_note_policy.updated', targetType: 'client_invoice_note_policy' },
   // The ASN import (2026-10-17) — one row per import run, beside each created
   // ASN's own `asn.created` (all under the import's one key).
   { action: 'asn_import.executed', targetType: 'asn_import' },

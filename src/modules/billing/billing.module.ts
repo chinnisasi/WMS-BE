@@ -5,6 +5,7 @@ import { InventoryModule } from '../inventory/inventory.module';
 import { OutboundModule } from '../outbound/outbound.module';
 import { InvoicingModule } from '../invoicing/invoicing.module';
 import { BillingFacade } from './billing.facade';
+import { ClientInvoiceNoteService } from './client-invoice-notes';
 import { ClientInvoiceService } from './client-invoices';
 import { InvoiceRecordsService } from './invoice-records';
 import { MeteringService } from './metering';
@@ -33,10 +34,15 @@ import { StorageSnapshotService } from './storage-snapshot';
  * records through the inbound, outbound and inventory facades' row reads
  * (beside their counts, on the same predicates), the actors' emails through
  * tenancy's in-tx seam, and its own storage snapshots.
+ *
+ * Story 5-6a adds credit and debit notes (`client_invoice_notes`, their
+ * lines, the C / D series and the maker/checker policy —
+ * `ClientInvoiceNoteService`): the same two invoicing reads, and the outbox
+ * (`OUTBOX_SINK`, SharedModule) for `client_invoice_note.issued | voided`.
  */
 @Module({
   imports: [SharedModule, InventoryModule, InboundModule, OutboundModule, InvoicingModule],
-  providers: [RateCardCommand, BillingFacade, MeteringService, StorageSnapshotService, ClientInvoiceService, InvoiceRecordsService],
-  exports: [RateCardCommand, BillingFacade, ClientInvoiceService, InvoiceRecordsService],
+  providers: [RateCardCommand, BillingFacade, MeteringService, StorageSnapshotService, ClientInvoiceService, ClientInvoiceNoteService, InvoiceRecordsService],
+  exports: [RateCardCommand, BillingFacade, ClientInvoiceService, ClientInvoiceNoteService, InvoiceRecordsService],
 })
 export class BillingModule {}

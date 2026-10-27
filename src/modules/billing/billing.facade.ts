@@ -15,9 +15,18 @@ import { MAX_DRAFT_LIST, sortLines, type ChargeCode, type RateBasis, type RateCa
 import { decodeCursor, type Page } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { PORTAL_PAGE_DEFAULT_LIMIT } from '../../shared/primitives/portal-page';
-import { portalInvoiceInTx, portalInvoicesInTx, type PortalInvoiceDetail, type PortalInvoiceRow } from './portal-invoices';
+import {
+  portalInvoiceInTx,
+  portalInvoiceNoteInTx,
+  portalInvoiceNotesInTx,
+  portalInvoicesInTx,
+  type PortalInvoiceDetail,
+  type PortalInvoiceNotes,
+  type PortalInvoiceRow,
+  type PortalNoteDetail,
+} from './portal-invoices';
 
-export type { PortalInvoiceDetail, PortalInvoiceLine, PortalInvoiceParty, PortalInvoiceRow } from './portal-invoices';
+export type { PortalInvoiceDetail, PortalInvoiceLine, PortalInvoiceNotes, PortalInvoiceParty, PortalInvoiceRow, PortalNoteDetail, PortalNoteLine, PortalNoteRow } from './portal-invoices';
 
 const PORTAL_CURSOR_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 
@@ -184,6 +193,20 @@ export class BillingFacade {
   /** One non-draft invoice of this client, or null (unknown, another client's, or a draft → 404). */
   async portalInvoice(tenantId: string, clientId: string, invoiceId: string): Promise<PortalInvoiceDetail | null> {
     return withTenantTransaction(this.db, tenantId, (tx) => portalInvoiceInTx(tx, tenantId, clientId, invoiceId), { clientId });
+  }
+
+  /**
+   * Story 5-6a — the credit and debit notes of one of this client's non-draft
+   * invoices, with the document value after them; null (404) when the invoice
+   * is unknown, another client's or a draft — never an empty 200.
+   */
+  async portalInvoiceNotes(tenantId: string, clientId: string, invoiceId: string): Promise<PortalInvoiceNotes | null> {
+    return withTenantTransaction(this.db, tenantId, (tx) => portalInvoiceNotesInTx(tx, tenantId, clientId, invoiceId), { clientId });
+  }
+
+  /** Story 5-6a — one issued or void note of this client, or null (unknown, another client's, or a draft → 404). */
+  async portalInvoiceNote(tenantId: string, clientId: string, noteId: string): Promise<PortalNoteDetail | null> {
+    return withTenantTransaction(this.db, tenantId, (tx) => portalInvoiceNoteInTx(tx, tenantId, clientId, noteId), { clientId });
   }
 
   /**
