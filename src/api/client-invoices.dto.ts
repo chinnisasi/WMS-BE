@@ -11,7 +11,16 @@ import {
   type ClientInvoiceStatus,
   type ClientInvoiceWarningCode,
 } from '../modules/billing/client-invoices';
-import { CHARGE_CODES, RATE_BASES, type ChargeCode, type RateBasis } from '../modules/billing/rate-cards';
+import {
+  CLIENT_CHARGE_CATEGORIES,
+  CLIENT_CHARGE_STATUSES,
+  INVOICE_LINE_BASES,
+  INVOICE_LINE_CODES,
+  type ClientChargeCategory,
+  type ClientChargeStatus,
+  type InvoiceLineBasis,
+  type InvoiceLineCode,
+} from '../modules/billing/client-charges';
 import { LINE_RECORD_KINDS, type LineRecordKind } from '../modules/billing/invoice-records';
 
 /**
@@ -69,6 +78,9 @@ export class ClientInvoiceGapDto {
 
   @ApiProperty({ required: false, description: 'The IST date the line’s rate-card segment starts (line-scoped gaps)' })
   segmentFrom?: string;
+
+  @ApiProperty({ required: false, description: 'Story 5-5a — `adhoc-charge-pending` only: how many ad-hoc charges of this month await approval' })
+  count?: number;
 }
 
 export class ClientInvoiceWarningDto {
@@ -142,16 +154,16 @@ export class ClientInvoiceLineDto {
   @ApiProperty({ example: '2026-09-30', description: 'Last IST date of the segment (inclusive)' })
   segmentTo!: string;
 
-  @ApiProperty({ enum: [...CHARGE_CODES] })
-  chargeCode!: ChargeCode;
+  @ApiProperty({ enum: [...INVOICE_LINE_CODES], description: 'The four metered charges; story 5-5a adds `adhoc` (an approved ad-hoc charge) and `minimum_adjustment` (the top-up to the minimum monthly charge)' })
+  chargeCode!: InvoiceLineCode;
 
-  @ApiProperty({ enum: [...RATE_BASES] })
-  basis!: RateBasis;
+  @ApiProperty({ enum: [...INVOICE_LINE_BASES] })
+  basis!: InvoiceLineBasis;
 
-  @ApiProperty({ type: String, nullable: true, description: 'The base UoM of a storage line; null for handling' })
+  @ApiProperty({ type: String, nullable: true, description: 'The base UoM of a storage line, the unit of an ad-hoc charge; null otherwise' })
   uom!: string | null;
 
-  @ApiProperty({ example: '1234.567', description: 'A decimal string: base-unit-days for storage (up to three decimals), a whole count otherwise' })
+  @ApiProperty({ example: '1234.567', description: 'A decimal string: base-unit-days for storage and units for an ad-hoc charge (up to three decimals), a whole count otherwise (1 on the minimum adjustment)' })
   quantity!: string;
 
   @ApiProperty({ type: Number, nullable: true, description: 'Integer paise per unit of the basis (null: unpriced, a draft only)' })
@@ -175,6 +187,12 @@ export class ClientInvoiceLineDto {
   @ApiProperty() cgstPaise!: number;
   @ApiProperty({ description: 'SGST/UTGST' }) sgstPaise!: number;
   @ApiProperty() igstPaise!: number;
+
+  @ApiProperty({ required: false, description: 'Story 5-5a — present only on an `adhoc` or `minimum_adjustment` line: the printed description' })
+  description?: string;
+
+  @ApiProperty({ required: false, format: 'uuid', description: 'Story 5-5a — present only on an `adhoc` line: the ad-hoc charge it bills' })
+  adhocChargeId?: string;
 }
 
 class ClientInvoiceCommonDto {
@@ -310,9 +328,31 @@ export class StorageDayRecordDto {
   @ApiProperty({ example: '300', description: 'On hand at the end of the IST day, base units — a decimal string' }) onHand!: string;
 }
 
-export const LINE_RECORD_DTOS = [ReceiptLineRecordDto, PickRecordDto, OrderRecordDto, StorageDayRecordDto] as const;
+export class AdhocChargeRecordDto {
+  @ApiProperty({ enum: ['adhoc-charge'] }) kind!: 'adhoc-charge';
+  @ApiProperty({ format: 'uuid', description: 'The ad-hoc charge' }) id!: string;
+  @ApiProperty({ format: 'uuid' }) chargeId!: string;
+  @ApiProperty({ example: '2026-10-05', description: 'The IST date of the work' }) chargeDate!: string;
+  @ApiProperty({ format: 'uuid' }) warehouseId!: string;
+  @ApiProperty() warehouseCode!: string;
+  @ApiProperty({ enum: [...CLIENT_CHARGE_CATEGORIES] }) category!: ClientChargeCategory;
+  @ApiProperty() description!: string;
+  @ApiProperty() unit!: string;
+  @ApiProperty({ example: '2.5', description: 'Units of `unit`, a decimal string (up to three places)' }) quantity!: string;
+  @ApiProperty() unitRatePaise!: number;
+  @ApiProperty() amountPaise!: number;
+  @ApiProperty({ type: String, nullable: true }) reference!: string | null;
+  @ApiProperty({ type: String, nullable: true, description: "The client's authorisation (PO, email, work order)" }) clientAuthorizationRef!: string | null;
+  @ApiProperty({ enum: [...CLIENT_CHARGE_STATUSES] }) status!: ClientChargeStatus;
+  @ApiProperty({ format: 'uuid', description: 'Who recorded the charge' }) recordedBy!: string;
+  @ApiProperty({ type: String, nullable: true }) recordedByEmail!: string | null;
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'Who approved (or rejected) it' }) decidedBy!: string | null;
+  @ApiProperty({ type: String, nullable: true }) decidedByEmail!: string | null;
+}
 
-export type LineRecordDto = ReceiptLineRecordDto | PickRecordDto | OrderRecordDto | StorageDayRecordDto;
+export const LINE_RECORD_DTOS = [ReceiptLineRecordDto, PickRecordDto, OrderRecordDto, StorageDayRecordDto, AdhocChargeRecordDto] as const;
+
+export type LineRecordDto = ReceiptLineRecordDto | PickRecordDto | OrderRecordDto | StorageDayRecordDto | AdhocChargeRecordDto;
 
 export class LineRecordsSummaryDto {
   @ApiProperty({ example: '412', description: "The line's quantity as the line view states it (storage base-unit-days, a whole count otherwise)" })
@@ -346,6 +386,7 @@ export class ClientInvoiceLineRecordsResponse {
           pick: getSchemaPath(PickRecordDto),
           order: getSchemaPath(OrderRecordDto),
           'storage-day': getSchemaPath(StorageDayRecordDto),
+          'adhoc-charge': getSchemaPath(AdhocChargeRecordDto),
         },
       },
     },

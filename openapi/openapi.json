@@ -24535,6 +24535,8 @@
                 "catalog_import",
                 "channel_connection",
                 "client",
+                "client_charge",
+                "client_charge_policy",
                 "client_invoice",
                 "client_invoice_note",
                 "client_invoice_note_policy",
@@ -25489,7 +25491,7 @@
             }
           },
           "409": {
-            "description": "A departed client asked to be suspended — it can only be reactivated (client-not-active); a departure while work remains (client-not-wound-down — `blockers: [{kind, count, codes?}]` lists every blocker: stock, open-purchase-orders, open-asns, pending-over-receipts, open-orders, open-rmas, pending-adjustments, open-counts, open-review-items, unsettled-invoices); or a concurrent request with the same Idempotency-Key (conflict)",
+            "description": "A departed client asked to be suspended — it can only be reactivated (client-not-active); a departure while work remains (client-not-wound-down — `blockers: [{kind, count, codes?}]` lists every blocker: stock, open-purchase-orders, open-asns, pending-over-receipts, open-orders, open-rmas, pending-adjustments, open-counts, open-review-items, unsettled-invoices, unbilled-charges — story 5-5a, channel-mappings); or a concurrent request with the same Idempotency-Key (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -28858,7 +28860,7 @@
             }
           },
           "409": {
-            "description": "The invoice's supplying GSTIN no longer maps to any warehouse (invoice-group-changed)",
+            "description": "The invoice's supplying GSTIN no longer maps to any warehouse (invoice-group-changed), or the line is a minimum-charge adjustment — computed from the other lines, it has no records (line-not-drillable)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -28873,7 +28875,7 @@
             "bearer": []
           }
         ],
-        "summary": "The dispute drill-down (21-5b): one keyset page of the records a client-invoice line's quantity was counted from — GRN lines, picks, orders at their first dispatch, or (day, warehouse) storage snapshots — on any status; the first page carries `summary {lineQuantity, recordsQuantity, reconciles}`",
+        "summary": "The dispute drill-down (21-5b): one keyset page of the records a client-invoice line's quantity was counted from — GRN lines, picks, orders at their first dispatch, (day, warehouse) storage snapshots, or (story 5-5a) an ad-hoc line's one charge — on any status; the first page carries `summary {lineQuantity, recordsQuantity, reconciles}`",
         "tags": [
           "billing"
         ]
@@ -30591,6 +30593,884 @@
           }
         ],
         "summary": "Sets whether a credit note needs a second person (billing.configure — owner only). Audited",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-charges": {
+      "post": {
+        "operationId": "ClientChargesController_record",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordClientChargeDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The charge and any non-blocking warnings",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecordClientChargeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed clientId or warehouseId, a category, unit or SAC outside its vocabulary (an `other` charge without one of the four services SACs, or a SAC on any other category), a blank or over-long description / reference / clientAuthorizationRef / evidenceNote, a malformed or out-of-range quantity, a rate outside ₹0.01 .. ₹1 lakh, an amount that rounds to ₹0.00 or passes ₹1 crore, or a chargeDate in the future or before 1 April of the previous financial year (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks billing.charge — owner, ops manager and accountant (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such client, or no such warehouse, in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The tenant's own client (client-not-billable), a suspended or departed client (client-not-active), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Records an ad-hoc charge (billing.charge): one billable event for one client in one warehouse on one IST day, its figures fixed. Approved at record when the recorder holds billing.invoice and it is within the self-approval limit; otherwise pending. It bills on the first open month’s invoice of its GSTIN",
+        "tags": [
+          "billing"
+        ]
+      },
+      "get": {
+        "operationId": "ClientChargesController_list",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "approved",
+                "rejected",
+                "cancelled"
+              ]
+            }
+          },
+          {
+            "name": "month",
+            "required": false,
+            "in": "query",
+            "description": "The billing month (YYYY-MM) — the invoice month that bills the charge",
+            "schema": {
+              "example": "2026-10",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from a previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientChargeListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed clientId, warehouseId, status, month or limit (validation-failed), or a malformed cursor (invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — a user with a client (role-denied): this is an operator surface",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The ad-hoc charges, newest first (keyset), filtered by client, warehouse, status and billing month; each with the invoice that bills it",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-charges/{chargeId}": {
+      "get": {
+        "operationId": "ClientChargesController_get",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "chargeId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientChargeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed chargeId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — a user with a client (role-denied): this is an operator surface",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No ad-hoc charge with this id exists in this tenant (charge-not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One ad-hoc charge, with the invoice that bills it",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-charges/{chargeId}/approve": {
+      "post": {
+        "operationId": "ClientChargesController_approve",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "chargeId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientChargeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed chargeId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks billing.invoice — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No ad-hoc charge with this id exists in this tenant (charge-not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "You recorded it (charge-needs-second-approver); The charge is not pending (charge-not-pending), its billing month is already invoiced under its GSTIN (charge-period-invoiced), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Approves a pending ad-hoc charge (billing.invoice) — a second person: never the member who recorded it",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-charges/{chargeId}/reject": {
+      "post": {
+        "operationId": "ClientChargesController_reject",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "chargeId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChargeNoteDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientChargeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed chargeId, or a missing or over-long note (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks billing.invoice — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No ad-hoc charge with this id exists in this tenant (charge-not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The charge is not pending (charge-not-pending), its billing month is already invoiced under its GSTIN (charge-period-invoiced), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Rejects a pending ad-hoc charge with a note (billing.invoice) — it never bills",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-charges/{chargeId}/cancel": {
+      "post": {
+        "operationId": "ClientChargesController_cancel",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "chargeId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChargeNoteDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientChargeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed chargeId, or a missing or over-long note (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant, or another member’s pending charge / an approved charge without billing.invoice (permission-denied), or the caller lacks billing.charge (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No ad-hoc charge with this id exists in this tenant (charge-not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The charge is rejected or already cancelled (charge-not-cancellable), it is billed on an issued, disputed or settled invoice or its billing month is invoiced (charge-period-invoiced), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Cancels an ad-hoc charge with a note (billing.charge): a pending charge by its recorder or a billing.invoice holder, an approved one by a billing.invoice holder — never once it is billed on an issued invoice",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-charge-policy": {
+      "get": {
+        "operationId": "ClientChargesController_getPolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChargePolicyResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — a user with a client (role-denied): this is an operator surface",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The ad-hoc charge self-approval limit (no setting = ₹10,000)",
+        "tags": [
+          "billing"
+        ]
+      },
+      "put": {
+        "operationId": "ClientChargesController_putPolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChargePolicyDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChargePolicyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a limit outside ₹0 .. ₹1 crore (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks billing.invoice — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Sets the ad-hoc charge self-approval limit (billing.invoice — owner and accountant). Audited",
         "tags": [
           "billing"
         ]
@@ -53929,6 +54809,8 @@
               "catalog_import",
               "channel_connection",
               "client",
+              "client_charge",
+              "client_charge_policy",
               "client_invoice",
               "client_invoice_note",
               "client_invoice_note_policy",
@@ -54027,6 +54909,8 @@
               "catalog_import",
               "channel_connection",
               "client",
+              "client_charge",
+              "client_charge_policy",
               "client_invoice",
               "client_invoice_note",
               "client_invoice_note_policy",
@@ -55396,7 +56280,8 @@
               "storage",
               "inbound_handling",
               "pick",
-              "outbound_handling"
+              "outbound_handling",
+              "minimum_monthly"
             ]
           },
           "basis": {
@@ -55405,12 +56290,21 @@
               "per_thousand_units_per_day",
               "per_receipt_line",
               "per_pick",
-              "per_order"
+              "per_order",
+              "per_month"
             ]
           },
           "amountPaise": {
             "type": "number",
-            "description": "Integer paise per unit of the basis, GST-exclusive"
+            "description": "Integer paise per unit of the basis, GST-exclusive (the minimum: per month)"
+          },
+          "minimumCounts": {
+            "type": "string",
+            "enum": [
+              "all",
+              "metered"
+            ],
+            "description": "Story 5-5a — present on the minimum_monthly line only"
           }
         },
         "required": [
@@ -55560,9 +56454,10 @@
               "storage",
               "inbound_handling",
               "pick",
-              "outbound_handling"
+              "outbound_handling",
+              "minimum_monthly"
             ],
-            "description": "The charge this line prices — each at most once per card"
+            "description": "The charge this line prices — each at most once per card. Story 5-5a: `minimum_monthly` is the minimum monthly charge (per invoice — one per GSTIN)"
           },
           "basis": {
             "type": "string",
@@ -55570,16 +56465,25 @@
               "per_thousand_units_per_day",
               "per_receipt_line",
               "per_pick",
-              "per_order"
+              "per_order",
+              "per_month"
             ],
-            "description": "The basis — fixed per charge: storage ↔ per_thousand_units_per_day (₹ per 1,000 SKU base units per day), inbound_handling ↔ per_receipt_line, pick ↔ per_pick, outbound_handling ↔ per_order"
+            "description": "The basis — fixed per charge: storage ↔ per_thousand_units_per_day (₹ per 1,000 SKU base units per day), inbound_handling ↔ per_receipt_line, pick ↔ per_pick, outbound_handling ↔ per_order, minimum_monthly ↔ per_month"
           },
           "amountPaise": {
             "type": "number",
             "minimum": 0,
-            "maximum": 10000000,
+            "maximum": 1000000000,
             "example": 330,
-            "description": "Integer paise per unit of the basis, GST-exclusive (₹0 is billed at zero; ₹1 lakh cap)"
+            "description": "Integer paise per unit of the basis, GST-exclusive. A metered rate is ₹0 .. ₹1 lakh (₹0 is billed at zero); the minimum_monthly line ₹0.01 .. ₹1 crore (the per-code bound is the command’s — 400 validation-failed)"
+          },
+          "minimumCounts": {
+            "type": "string",
+            "enum": [
+              "all",
+              "metered"
+            ],
+            "description": "Story 5-5a — on the minimum_monthly line only: what counts toward the floor — `all` (metered + ad-hoc charges, the default) or `metered`"
           }
         },
         "required": [
@@ -55592,8 +56496,8 @@
         "type": "object",
         "properties": {
           "lines": {
-            "maxItems": 4,
-            "description": "The charges this card prices — any subset of the four. A charge with no line is not billed. A draft may have none; activation needs at least one",
+            "maxItems": 5,
+            "description": "The charges this card prices — any subset of the four metered charges, plus an optional minimum monthly charge. A charge with no line is not billed. A draft may have none; activation needs at least one",
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/RateCardLineDto"
@@ -55619,8 +56523,8 @@
         "type": "object",
         "properties": {
           "lines": {
-            "maxItems": 4,
-            "description": "The charges this card prices — any subset of the four. A charge with no line is not billed. A draft may have none; activation needs at least one",
+            "maxItems": 5,
+            "description": "The charges this card prices — any subset of the four metered charges, plus an optional minimum monthly charge. A charge with no line is not billed. A draft may have none; activation needs at least one",
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/RateCardLineDto"
@@ -56104,6 +57008,126 @@
           "onHand"
         ]
       },
+      "AdhocChargeRecordDto": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "adhoc-charge"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The ad-hoc charge"
+          },
+          "chargeId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "chargeDate": {
+            "type": "string",
+            "example": "2026-10-05",
+            "description": "The IST date of the work"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseCode": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "extra_labour",
+              "special_handling",
+              "returns_processing",
+              "relabelling",
+              "repacking",
+              "re_slotting",
+              "extra_storage",
+              "other"
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "unit": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "string",
+            "example": "2.5",
+            "description": "Units of `unit`, a decimal string (up to three places)"
+          },
+          "unitRatePaise": {
+            "type": "number"
+          },
+          "amountPaise": {
+            "type": "number"
+          },
+          "reference": {
+            "type": "string",
+            "nullable": true
+          },
+          "clientAuthorizationRef": {
+            "type": "string",
+            "nullable": true,
+            "description": "The client's authorisation (PO, email, work order)"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "approved",
+              "rejected",
+              "cancelled"
+            ]
+          },
+          "recordedBy": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Who recorded the charge"
+          },
+          "recordedByEmail": {
+            "type": "string",
+            "nullable": true
+          },
+          "decidedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Who approved (or rejected) it"
+          },
+          "decidedByEmail": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "kind",
+          "id",
+          "chargeId",
+          "chargeDate",
+          "warehouseId",
+          "warehouseCode",
+          "category",
+          "description",
+          "unit",
+          "quantity",
+          "unitRatePaise",
+          "amountPaise",
+          "reference",
+          "clientAuthorizationRef",
+          "status",
+          "recordedBy",
+          "recordedByEmail",
+          "decidedBy",
+          "decidedByEmail"
+        ]
+      },
       "PrepareClientInvoicesDto": {
         "type": "object",
         "properties": {
@@ -56168,6 +57192,8 @@
               "client-billing-address-missing",
               "storage-not-complete",
               "line-unpriced",
+              "adhoc-charge-pending",
+              "minimum-charge-pending",
               "einvoice-required"
             ]
           },
@@ -56181,6 +57207,10 @@
           "segmentFrom": {
             "type": "string",
             "description": "The IST date the line’s rate-card segment starts (line-scoped gaps)"
+          },
+          "count": {
+            "type": "number",
+            "description": "Story 5-5a — `adhoc-charge-pending` only: how many ad-hoc charges of this month await approval"
           }
         },
         "required": [
@@ -56194,7 +57224,9 @@
           "code": {
             "type": "string",
             "enum": [
-              "supplier-state-differs"
+              "supplier-state-differs",
+              "minimum-not-applied-multi-gstin",
+              "minimum-from-charges-only"
             ]
           },
           "detail": {
@@ -56395,8 +57427,11 @@
               "storage",
               "inbound_handling",
               "pick",
-              "outbound_handling"
-            ]
+              "outbound_handling",
+              "adhoc",
+              "minimum_adjustment"
+            ],
+            "description": "The four metered charges; story 5-5a adds `adhoc` (an approved ad-hoc charge) and `minimum_adjustment` (the top-up to the minimum monthly charge)"
           },
           "basis": {
             "type": "string",
@@ -56404,18 +57439,20 @@
               "per_thousand_units_per_day",
               "per_receipt_line",
               "per_pick",
-              "per_order"
+              "per_order",
+              "per_unit",
+              "per_invoice"
             ]
           },
           "uom": {
             "type": "string",
             "nullable": true,
-            "description": "The base UoM of a storage line; null for handling"
+            "description": "The base UoM of a storage line, the unit of an ad-hoc charge; null otherwise"
           },
           "quantity": {
             "type": "string",
             "example": "1234.567",
-            "description": "A decimal string: base-unit-days for storage (up to three decimals), a whole count otherwise"
+            "description": "A decimal string: base-unit-days for storage and units for an ad-hoc charge (up to three decimals), a whole count otherwise (1 on the minimum adjustment)"
           },
           "unitAmountPaise": {
             "type": "number",
@@ -56459,6 +57496,15 @@
           },
           "igstPaise": {
             "type": "number"
+          },
+          "description": {
+            "type": "string",
+            "description": "Story 5-5a — present only on an `adhoc` or `minimum_adjustment` line: the printed description"
+          },
+          "adhocChargeId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 5-5a — present only on an `adhoc` line: the ad-hoc charge it bills"
           }
         },
         "required": [
@@ -56800,7 +57846,8 @@
               "receipt-line",
               "pick",
               "order",
-              "storage-day"
+              "storage-day",
+              "adhoc-charge"
             ],
             "description": "The kind of every record on this line"
           },
@@ -56838,6 +57885,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/StorageDayRecordDto"
+                },
+                {
+                  "$ref": "#/components/schemas/AdhocChargeRecordDto"
                 }
               ],
               "discriminator": {
@@ -56846,7 +57896,8 @@
                   "receipt-line": "#/components/schemas/ReceiptLineRecordDto",
                   "pick": "#/components/schemas/PickRecordDto",
                   "order": "#/components/schemas/OrderRecordDto",
-                  "storage-day": "#/components/schemas/StorageDayRecordDto"
+                  "storage-day": "#/components/schemas/StorageDayRecordDto",
+                  "adhoc-charge": "#/components/schemas/AdhocChargeRecordDto"
                 }
               }
             }
@@ -57054,7 +58105,9 @@
               "storage",
               "inbound_handling",
               "pick",
-              "outbound_handling"
+              "outbound_handling",
+              "adhoc",
+              "minimum_adjustment"
             ]
           },
           "basis": {
@@ -57063,7 +58116,9 @@
               "per_thousand_units_per_day",
               "per_receipt_line",
               "per_pick",
-              "per_order"
+              "per_order",
+              "per_unit",
+              "per_invoice"
             ]
           },
           "uom": {
@@ -57115,6 +58170,10 @@
           "overrideReason": {
             "type": "string",
             "nullable": true
+          },
+          "description": {
+            "type": "string",
+            "description": "Story 5-5a — the amended invoice line’s description, present only for an ad-hoc charge or minimum-charge adjustment line"
           }
         },
         "required": [
@@ -57640,6 +58699,430 @@
         },
         "required": [
           "requireSecondApprover"
+        ]
+      },
+      "RecordClientChargeDto": {
+        "type": "object",
+        "properties": {
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The client brand billed (never the tenant’s own client — 409 client-not-billable)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The warehouse the work was done in — it decides the supplying GSTIN (the invoice group)"
+          },
+          "chargeDate": {
+            "type": "string",
+            "example": "2026-10-05",
+            "description": "The IST date of the work: today or earlier, back to 1 April of the previous financial year (400 outside). More than 30 days back answers 201 with `charge-late`"
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "extra_labour",
+              "special_handling",
+              "returns_processing",
+              "relabelling",
+              "repacking",
+              "re_slotting",
+              "extra_storage",
+              "other"
+            ],
+            "description": "Each category fixes its SAC; `other` chooses one (sacCode)"
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "What was done — 1–200 characters, printed on the invoice line"
+          },
+          "sacCode": {
+            "type": "string",
+            "enum": [
+              "996729",
+              "996719",
+              "998540",
+              "998599"
+            ],
+            "description": "REQUIRED for `other` (one of the four services SACs); refused on any other category"
+          },
+          "unit": {
+            "type": "string",
+            "enum": [
+              "each",
+              "hour",
+              "day",
+              "carton",
+              "pallet",
+              "order",
+              "shipment",
+              "container",
+              "kg",
+              "lot"
+            ]
+          },
+          "quantity": {
+            "type": "string",
+            "example": "2.5",
+            "description": "A decimal string, > 0, at most three decimal places, ≤ 10,000 (\"2.5\" and \"2.50\" are the same request)"
+          },
+          "unitRatePaise": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 10000000,
+            "example": 35000,
+            "description": "Integer paise per unit, GST-exclusive (₹0.01 .. ₹1 lakh). The amount is quantity × rate rounded half up once; ₹0.00 is refused, the cap is ₹1 crore"
+          },
+          "reference": {
+            "type": "string",
+            "maxLength": 100,
+            "description": "An order ref, GRN or ASN code — free text, printed (\" · Ref …\")"
+          },
+          "clientAuthorizationRef": {
+            "type": "string",
+            "maxLength": 100,
+            "description": "The client's authorisation for the work — a PO, email or work-order reference; printed (\" · Client auth …\") and shown in the drill"
+          },
+          "evidenceNote": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Internal only — never printed, never shown in the portal"
+          }
+        },
+        "required": [
+          "clientId",
+          "warehouseId",
+          "chargeDate",
+          "category",
+          "description",
+          "unit",
+          "quantity",
+          "unitRatePaise"
+        ]
+      },
+      "ClientChargeBillingDto": {
+        "type": "object",
+        "properties": {
+          "invoiceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "invoiceNo": {
+            "type": "string",
+            "nullable": true,
+            "description": "The invoice number; null while it is a draft"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "issued",
+              "disputed",
+              "settled"
+            ]
+          }
+        },
+        "required": [
+          "invoiceId",
+          "invoiceNo",
+          "status"
+        ]
+      },
+      "ClientChargeDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "supplierGstin": {
+            "type": "string",
+            "nullable": true,
+            "description": "The supplying GSTIN frozen at record — the invoice group key"
+          },
+          "chargeDate": {
+            "type": "string",
+            "example": "2026-10-05",
+            "description": "The IST date of the work"
+          },
+          "billMonth": {
+            "type": "string",
+            "example": "2026-10-01",
+            "description": "The first of the month whose invoice bills it — later than the service month when that month was already invoiced"
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "extra_labour",
+              "special_handling",
+              "returns_processing",
+              "relabelling",
+              "repacking",
+              "re_slotting",
+              "extra_storage",
+              "other"
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "sacCode": {
+            "type": "string",
+            "example": "996719"
+          },
+          "unit": {
+            "type": "string",
+            "enum": [
+              "each",
+              "hour",
+              "day",
+              "carton",
+              "pallet",
+              "order",
+              "shipment",
+              "container",
+              "kg",
+              "lot"
+            ]
+          },
+          "quantity": {
+            "type": "string",
+            "example": "2.5",
+            "description": "Units of `unit`, a decimal string (up to three places)"
+          },
+          "unitRatePaise": {
+            "type": "number"
+          },
+          "amountPaise": {
+            "type": "number",
+            "description": "quantity × rate, rounded half up once — integer paise, GST-exclusive"
+          },
+          "reference": {
+            "type": "string",
+            "nullable": true
+          },
+          "clientAuthorizationRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "evidenceNote": {
+            "type": "string",
+            "nullable": true,
+            "description": "Internal only"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "approved",
+              "rejected",
+              "cancelled"
+            ]
+          },
+          "recordedBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "recordedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "decidedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Who approved or rejected it (the recorder when approved at record)"
+          },
+          "decidedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "decisionNote": {
+            "type": "string",
+            "nullable": true,
+            "description": "A rejection’s reason"
+          },
+          "cancelledBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "cancelledAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "cancelNote": {
+            "type": "string",
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "billing": {
+            "nullable": true,
+            "description": "The latest non-void invoice with a line billing this charge, or null",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ClientChargeBillingDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "clientId",
+          "warehouseId",
+          "supplierGstin",
+          "chargeDate",
+          "billMonth",
+          "category",
+          "description",
+          "sacCode",
+          "unit",
+          "quantity",
+          "unitRatePaise",
+          "amountPaise",
+          "reference",
+          "clientAuthorizationRef",
+          "evidenceNote",
+          "status",
+          "recordedBy",
+          "recordedAt",
+          "decidedBy",
+          "decidedAt",
+          "decisionNote",
+          "cancelledBy",
+          "cancelledAt",
+          "cancelNote",
+          "createdAt",
+          "billing"
+        ]
+      },
+      "ClientChargeWarningDto": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "charge-late",
+              "charge-billed-later",
+              "charge-may-bring-minimum",
+              "charge-disables-minimum"
+            ]
+          },
+          "detail": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "detail"
+        ]
+      },
+      "RecordClientChargeResponse": {
+        "type": "object",
+        "properties": {
+          "charge": {
+            "$ref": "#/components/schemas/ClientChargeDto"
+          },
+          "warnings": {
+            "description": "Non-blocking: charge-late, charge-billed-later, charge-may-bring-minimum, charge-disables-minimum",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientChargeWarningDto"
+            }
+          }
+        },
+        "required": [
+          "charge",
+          "warnings"
+        ]
+      },
+      "ClientChargeListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientChargeDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "ClientChargeResponse": {
+        "type": "object",
+        "properties": {
+          "charge": {
+            "$ref": "#/components/schemas/ClientChargeDto"
+          }
+        },
+        "required": [
+          "charge"
+        ]
+      },
+      "ChargeNoteDto": {
+        "type": "object",
+        "properties": {
+          "note": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Why — required, 1–500 characters"
+          }
+        },
+        "required": [
+          "note"
+        ]
+      },
+      "ChargePolicyResponse": {
+        "type": "object",
+        "properties": {
+          "selfApproveLimitPaise": {
+            "type": "number",
+            "description": "Integer paise"
+          },
+          "isDefault": {
+            "type": "boolean",
+            "description": "No setting stored — the ₹10,000 default applies"
+          }
+        },
+        "required": [
+          "selfApproveLimitPaise",
+          "isDefault"
+        ]
+      },
+      "ChargePolicyDto": {
+        "type": "object",
+        "properties": {
+          "selfApproveLimitPaise": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1000000000,
+            "example": 1000000,
+            "description": "A billing.invoice holder’s own charge up to this amount (integer paise, ₹0 .. ₹1 crore) is approved at record; above it, it pends for a second person"
+          }
+        },
+        "required": [
+          "selfApproveLimitPaise"
         ]
       },
       "PortalUserDto": {
@@ -59498,7 +60981,9 @@
               "storage",
               "inbound_handling",
               "pick",
-              "outbound_handling"
+              "outbound_handling",
+              "adhoc",
+              "minimum_adjustment"
             ]
           },
           "basis": {
@@ -59507,16 +60992,19 @@
               "per_thousand_units_per_day",
               "per_receipt_line",
               "per_pick",
-              "per_order"
+              "per_order",
+              "per_unit",
+              "per_invoice"
             ]
           },
           "uom": {
             "type": "string",
-            "nullable": true
+            "nullable": true,
+            "description": "The base UoM of a storage line, the unit of an ad-hoc charge; null otherwise"
           },
           "quantity": {
             "type": "string",
-            "description": "A decimal string — base-unit-days for storage, a whole count otherwise"
+            "description": "A decimal string — base-unit-days for storage, units for an ad-hoc charge, a whole count otherwise"
           },
           "unitAmountPaise": {
             "type": "number",
@@ -59540,6 +61028,10 @@
           },
           "igstPaise": {
             "type": "number"
+          },
+          "description": {
+            "type": "string",
+            "description": "Story 5-5a — present only on an ad-hoc charge or minimum-charge adjustment line: what the line is for, as printed"
           }
         },
         "required": [
@@ -59750,7 +61242,9 @@
               "storage",
               "inbound_handling",
               "pick",
-              "outbound_handling"
+              "outbound_handling",
+              "adhoc",
+              "minimum_adjustment"
             ]
           },
           "basis": {
@@ -59759,7 +61253,9 @@
               "per_thousand_units_per_day",
               "per_receipt_line",
               "per_pick",
-              "per_order"
+              "per_order",
+              "per_unit",
+              "per_invoice"
             ]
           },
           "uom": {
@@ -59793,6 +61289,10 @@
           },
           "igstPaise": {
             "type": "number"
+          },
+          "description": {
+            "type": "string",
+            "description": "Story 5-5a — the amended invoice line’s description, present only for an ad-hoc charge or minimum-charge adjustment line"
           }
         },
         "required": [

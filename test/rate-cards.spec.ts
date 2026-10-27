@@ -15,12 +15,15 @@ import { istDateOf as ewayIstDateOf } from '../src/modules/invoicing/eway-thresh
 import { isIsoDate as ewayIsIsoDate } from '../src/modules/invoicing/eway-json';
 import { ArithmeticOverflowError } from '../src/modules/invoicing/arith';
 import { rateCardClock } from '../src/modules/billing/rate-card.command';
+import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
 import { rateCardInForceInTx, rateCardSegmentsInTx } from '../src/modules/billing/billing.facade';
 import {
   BASIS_COUNTING_UNIT,
-  CHARGE_BASIS,
   CHARGE_CODES,
   RATE_BASES,
+  RATE_CARD_LINE_BASES,
+  RATE_CARD_LINE_BASIS,
+  RATE_CARD_LINE_CODES,
   RATE_CARD_STATUSES,
 } from '../src/modules/billing/rate-cards';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
@@ -388,22 +391,31 @@ describe('story 21-3: rate cards', () => {
           return arms.sort();
         };
         expect(armsOf('rate_cards_status_check')).toEqual([...RATE_CARD_STATUSES].sort());
-        expect(armsOf('rate_card_lines_charge_code_check')).toEqual([...CHARGE_CODES].sort());
-        expect(armsOf('rate_card_lines_basis_check')).toEqual([...RATE_BASES].sort());
+        // Story 5-5a (A1) — retargeted: the line CHECKs now admit the widened
+        // card-line vocabularies (the four metered codes + minimum_monthly,
+        // the four bases + per_month). CHARGE_CODES / RATE_BASES stay the
+        // metered four (metering's and the usage DTO's vocabulary).
+        expect(armsOf('rate_card_lines_charge_code_check')).toEqual([...RATE_CARD_LINE_CODES].sort());
+        expect(armsOf('rate_card_lines_basis_check')).toEqual([...RATE_CARD_LINE_BASES].sort());
+        expect(RATE_CARD_LINE_CODES.slice(0, 4)).toEqual([...CHARGE_CODES]);
+        expect(RATE_CARD_LINE_BASES.slice(0, 4)).toEqual([...RATE_BASES]);
         // Every basis has its counting unit stated for 21-4.
         expect(Object.keys(BASIS_COUNTING_UNIT).sort()).toEqual([...RATE_BASES].sort());
       });
 
-      it('every charge × basis combination: exactly the four pairs insert, the other twelve are refused (23514)', async () => {
+      it('every charge × basis combination: exactly the five pairs insert, the other twenty are refused (23514)', async () => {
+        // Story 5-5a (A1) — retargeted from 4 × 4 to the widened 5 × 5 (the
+        // minimum line carries its counting rule, A19).
         const cardId = uuidv7();
         await sql`insert into rate_cards (id, tenant_id, client_id, status, created_by)
           values (${cardId}, ${tenantId}, ${acmeId}, 'draft', ${uuidv7()})`;
         const accepted: string[] = [];
-        for (const chargeCode of CHARGE_CODES) {
-          for (const basis of RATE_BASES) {
-            const attempt = sql`insert into rate_card_lines (id, tenant_id, client_id, rate_card_id, charge_code, basis, amount_paise)
-              values (${uuidv7()}, ${tenantId}, ${acmeId}, ${cardId}, ${chargeCode}, ${basis}, 100)`;
-            if (CHARGE_BASIS[chargeCode] === basis) {
+        for (const chargeCode of RATE_CARD_LINE_CODES) {
+          for (const basis of RATE_CARD_LINE_BASES) {
+            const counts = chargeCode === 'minimum_monthly' ? 'all' : null;
+            const attempt = sql`insert into rate_card_lines (id, tenant_id, client_id, rate_card_id, charge_code, basis, amount_paise, minimum_counts)
+              values (${uuidv7()}, ${tenantId}, ${acmeId}, ${cardId}, ${chargeCode}, ${basis}, 100, ${counts})`;
+            if (RATE_CARD_LINE_BASIS[chargeCode] === basis) {
               await attempt;
               accepted.push(`${chargeCode}:${basis}`);
             } else {
@@ -416,6 +428,7 @@ describe('story 21-3: rate cards', () => {
           'inbound_handling:per_receipt_line',
           'pick:per_pick',
           'outbound_handling:per_order',
+          'minimum_monthly:per_month',
         ]);
         // A second line for the same charge on one card → the unique index.
         await expect(sql`insert into rate_card_lines (id, tenant_id, client_id, rate_card_id, charge_code, basis, amount_paise)
@@ -506,6 +519,39 @@ describe('story 21-3: rate cards', () => {
         // The cap itself and ₹0 are admitted (₹0 = billed at zero).
         const edge = await draft(acmeId, [storage(10_000_000), pick(0)]).expect(201);
         expect(edge.body.rateCard.lines).toEqual([storage(10_000_000), pick(0)]);
+      });
+
+      it('5-5a (A12, A19, G6): a ₹2 lakh minimum_monthly is accepted (counts default all), a ₹2 lakh storage rate is 400; counts on a metered line 400; a minimum-only card activates; a metered card hashes as in 21-3', async () => {
+        const minimum = (amountPaise: number, extra: Record<string, unknown> = {}) => ({ chargeCode: 'minimum_monthly', basis: 'per_month', amountPaise, ...extra }) as unknown as Line;
+        const big = await draft(acmeId, [storage(330), minimum(20_000_000)]).expect(201);
+        expect(big.body.rateCard.lines).toEqual([storage(330), { chargeCode: 'minimum_monthly', basis: 'per_month', amountPaise: 20_000_000, minimumCounts: 'all' }]);
+        expectProblem(await draft(acmeId, [storage(20_000_000)]), 400, 'validation-failed');
+        for (const lines of [
+          [minimum(0)],
+          [minimum(1_000_000_001)],
+          [minimum(100, { minimumCounts: 'adhoc' })],
+          [{ ...storage(1), minimumCounts: 'all' } as unknown as Line],
+          [{ chargeCode: 'minimum_monthly', basis: 'per_order', amountPaise: 100 }],
+        ]) {
+          expectProblem(await draft(acmeId, lines), 400, 'validation-failed');
+        }
+        const metered = await draft(acmeId, [minimum(5_000_000, { minimumCounts: 'metered' })]).expect(201);
+        expect(metered.body.rateCard.lines).toEqual([{ chargeCode: 'minimum_monthly', basis: 'per_month', amountPaise: 5_000_000, minimumCounts: 'metered' }]);
+        const stored = await sql<{ minimum_counts: string | null }[]>`select minimum_counts from rate_card_lines where rate_card_id = ${metered.body.rateCard.id as string}`;
+        expect(stored).toEqual([{ minimum_counts: 'metered' }]);
+
+        // A19 — a card whose only line is the minimum activates (a fresh client: no events, one GSTIN footprint).
+        const mini = await createClient(`MINI${ulid().slice(22)}`);
+        const only = await draft(mini, [minimum(3_100_000)]).expect(201);
+        expect((await activate(only.body.rateCard.id as string, '2026-12-01').expect(200)).body.rateCard.status).toBe('active');
+
+        // G6 — a card without a minimum hashes exactly as 21-3 did: `{tenantId, clientId, lines}`, no minimumCounts key.
+        const key = ulid();
+        await draft(acmeId, [pick(300), storage(330)], accountantToken, key).expect(201);
+        const row = await sql<{ payload_hash: string }[]>`select payload_hash from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`;
+        expect(row[0]!.payload_hash).toBe(
+          hashCommandPayload({ tenantId, clientId: acmeId, lines: [{ chargeCode: 'storage', basis: 'per_thousand_units_per_day', amountPaise: 330 }, { chargeCode: 'pick', basis: 'per_pick', amountPaise: 300 }] }),
+        );
       });
 
       it("the tenant's own client → 400; a suspended client → 409 client-not-active; unknown/foreign → 404; malformed → 400", async () => {

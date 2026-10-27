@@ -11,8 +11,10 @@ import { lockClientInTx, shareLockClientInTx, type LockedClientFacts } from '../
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { assertPermission } from '../tenancy/permissions';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
-import { getMemberRoleIn } from '../tenancy/tenancy.service';
+import { clientInvoiceSupplierFactsInTx, getMemberRoleIn } from '../tenancy/tenancy.service';
+import { InventoryFacade } from '../inventory/inventory.facade';
 import { linesByCardInTx, rateCardNotFound, toRateCardSnapshot, type RateCardSnapshot } from './billing.facade';
+import { clientGstinFootprintInTx } from './client-invoices';
 import { lineProblems, sortLines, type RateCardLineInput } from './rate-cards';
 
 /**
@@ -67,13 +69,22 @@ type AuditAction =
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 const OPEN_CARD_INDEX = 'rate_cards_one_open_per_client';
 
-/** The canonical line form the hash and the write both use. */
+/**
+ * The canonical line form the hash and the write both use. Story 5-5a (A19):
+ * the `minimum_monthly` line carries `minimumCounts` (default `all`); every
+ * other line hashes exactly as in 21-3 (the key is absent — G6), unless the
+ * request sent one, which `lineProblems` then refuses.
+ */
 function normalizeLines(lines: readonly RateCardLineInput[]): RateCardLineInput[] {
-  return sortLines(lines).map((line) => ({
-    chargeCode: line.chargeCode,
-    basis: line.basis,
-    amountPaise: line.amountPaise,
-  }));
+  return sortLines(lines).map((line) => {
+    const minimumCounts = line.chargeCode === 'minimum_monthly' ? (line.minimumCounts ?? 'all') : line.minimumCounts;
+    return {
+      chargeCode: line.chargeCode,
+      basis: line.basis,
+      amountPaise: line.amountPaise,
+      ...(minimumCounts === undefined ? {} : { minimumCounts }),
+    };
+  });
 }
 
 /**
@@ -98,7 +109,10 @@ function normalizeLines(lines: readonly RateCardLineInput[]): RateCardLineInput[
  */
 @Injectable()
 export class RateCardCommand {
-  constructor(@Inject(DATABASE) private readonly db: Database) {}
+  constructor(
+    @Inject(DATABASE) private readonly db: Database,
+    @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
+  ) {}
 
   async createDraft(command: CreateRateCardDraftCommand, idempotencyKey: string): Promise<RateCardMutationSnapshot> {
     const lines = normalizeLines(command.lines);
@@ -270,6 +284,28 @@ export class RateCardCommand {
           'A card must price at least one charge before it is activated.',
         );
       }
+      // Story 5-5a (A21) — the LAST guard: a minimum monthly charge is per
+      // invoice, and cards are tenant-wide, so a client billed under more
+      // than one GSTIN would pay the minimum once per GSTIN.
+      if (targetLines.some((line) => line.chargeCode === 'minimum_monthly')) {
+        const scopes = await this.inventory.clientWarehousesWithEventsInTx(tx, command.tenantId, [client.id]);
+        const footprint = await clientGstinFootprintInTx(
+          tx,
+          command.tenantId,
+          client.id,
+          scopes.map((scope) => scope.warehouseId),
+          await clientInvoiceSupplierFactsInTx(tx, command.tenantId),
+        );
+        if (footprint.length > 1) {
+          throw new ProblemException(
+            'minimum-needs-single-gstin',
+            409,
+            'A minimum monthly charge needs a single GSTIN',
+            `Client ${client.code} is billed under ${footprint.length} GSTINs (${footprint.map((gstin) => gstin ?? 'no GSTIN').join(', ')}) — a minimum applies to each monthly invoice (one per GSTIN), so it would bill the minimum ${footprint.length} times. Remove the minimum from this card.`,
+            { gstins: footprint },
+          );
+        }
+      }
 
       const now = nowIso();
       // 1. Close the previous open card at F — BEFORE B becomes active.
@@ -440,6 +476,7 @@ export class RateCardCommand {
         chargeCode: line.chargeCode,
         basis: line.basis,
         amountPaise: line.amountPaise,
+        minimumCounts: line.minimumCounts ?? null,
       })),
     );
   }

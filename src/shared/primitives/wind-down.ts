@@ -22,6 +22,10 @@ export const WIND_DOWN_BLOCKER_KINDS = [
   'open-counts',
   'open-review-items',
   'unsettled-invoices',
+  // Story 5-5a (A15) — ad-hoc charges not yet billed: pending ones, and
+  // approved ones on no issued, disputed or settled invoice. A departing
+  // client is billed for its extras.
+  'unbilled-charges',
   // Decision 9 — any channel mapping of its SKUs (the owner unmaps first).
   'channel-mappings',
 ] as const;

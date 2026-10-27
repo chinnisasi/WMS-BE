@@ -728,7 +728,7 @@ describe('story 1-2a: the client master record', () => {
       expect((await sql`select status from clients where id = ${trioId}`)[0]!.status).toBe('active');
     });
 
-    it('every blocker kind bites: a client with all ten is refused naming all ten, in order', async () => {
+    it('every blocker kind bites: a client with every kind (5-5a: eleven, with unbilled-charges) is refused naming every one, in order', async () => {
       const windId = await createClient('WIND');
       await importCsv(['WIND-A,Wind A,pcs,1800,,,', 'WIND-B,Wind B,pcs,1800,,,'], windId).expect(201);
       await refreshSkus();
@@ -761,6 +761,11 @@ describe('story 1-2a: the client master record', () => {
       await sql`insert into client_invoices (id, tenant_id, client_id, status, period_start, period_end, subtotal_paise, cgst_paise, sgst_paise, igst_paise,
                                              tax_paise, total_paise, round_off_paise, payable_paise, gaps, warnings, party, content_hash, created_by)
         values (${uuidv7()}, ${tenantId}, ${windId}, 'draft', '2026-09-01', '2026-09-30', 0, 0, 0, 0, 0, 0, 0, 0, '[]', '[]', '{}', 'x', ${ownerUserId})`;
+      // Story 5-5a (A15) — an unbilled (pending) ad-hoc charge.
+      await sql`insert into client_charges (id, tenant_id, client_id, warehouse_id, supplier_gstin, charge_date, bill_month, category, description,
+                                            sac_code, unit, quantity_milli, unit_rate_paise, amount_paise, status, recorded_by, recorded_at)
+        values (${uuidv7()}, ${tenantId}, ${windId}, ${warehouseId}, null, '2026-09-05', '2026-09-01', 'extra_labour', 'probe', '996719', 'hour',
+                1000, 100, 100, 'pending', ${ownerUserId}, now())`;
       // Decision 9 — a channel mapping of its SKU.
       await sql`insert into channel_mappings (id, tenant_id, integration_id, external_ref, sku_id)
         values (${uuidv7()}, ${tenantId}, ${await shopifyIntegration()}, 'EXT-WIND', ${sku('WIND-A')})`;

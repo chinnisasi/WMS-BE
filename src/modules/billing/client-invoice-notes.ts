@@ -51,7 +51,7 @@ import {
   type ClientInvoiceView,
 } from './client-invoices';
 import { assertMeteringPeriod } from './metering';
-import type { ChargeCode, RateBasis } from './rate-cards';
+import type { InvoiceLineBasis, InvoiceLineCode } from './client-charges';
 
 /**
  * Story 5-6a — GST credit and debit notes (CGST Act s.34) against ONE issued,
@@ -336,8 +336,8 @@ export function computeNoteFigures(input: NoteFiguresInput): NoteFigures {
 export interface NoteLineView {
   readonly id: string;
   readonly invoiceLineId: string;
-  readonly chargeCode: ChargeCode;
-  readonly basis: RateBasis;
+  readonly chargeCode: InvoiceLineCode;
+  readonly basis: InvoiceLineBasis;
   readonly uom: string | null;
   /** IST dates, inclusive (the invoice line's segment). */
   readonly segmentFrom: string;
@@ -351,6 +351,8 @@ export interface NoteLineView {
   readonly sgstPaise: number;
   readonly igstPaise: number;
   readonly overrideReason: string | null;
+  /** Story 5-5a — the amended invoice line's printed description, present only for an `adhoc` / `minimum_adjustment` line. */
+  readonly description?: string;
 }
 
 export interface NoteEntryView {
@@ -469,18 +471,21 @@ export function invoiceTotalsOf(row: ClientInvoice): ClientInvoiceTotalsView {
 }
 
 async function noteLinesOfInTx(tx: TenantTx, tenantId: string, noteId: string): Promise<NoteLineView[]> {
-  const rows = await tx
-    .select()
+  const joined = await tx
+    .select({ line: clientInvoiceNoteLines, description: clientInvoiceLines.description, adhocChargeId: clientInvoiceLines.adhocChargeId })
     .from(clientInvoiceNoteLines)
+    // Story 5-5a — the amended invoice line's description (and its charge, for the canonical order).
+    .leftJoin(clientInvoiceLines, and(eq(clientInvoiceLines.tenantId, clientInvoiceNoteLines.tenantId), eq(clientInvoiceLines.id, clientInvoiceNoteLines.invoiceLineId)))
     .where(and(eq(clientInvoiceNoteLines.tenantId, tenantId), eq(clientInvoiceNoteLines.noteId, noteId)));
+  const rows = joined.map((row) => ({ ...row.line, description: row.description, adhocChargeId: row.adhocChargeId }));
   return rows
     .map((row) => ({ ...row, segmentFrom: new Date(row.segmentFrom).toISOString(), segmentTo: new Date(row.segmentTo).toISOString() }))
     .sort((a, b) => compareLines(a, b) || (a.invoiceLineId < b.invoiceLineId ? -1 : a.invoiceLineId > b.invoiceLineId ? 1 : 0))
     .map((row) => ({
       id: row.id,
       invoiceLineId: row.invoiceLineId,
-      chargeCode: row.chargeCode as ChargeCode,
-      basis: row.basis as RateBasis,
+      chargeCode: row.chargeCode as InvoiceLineCode,
+      basis: row.basis as InvoiceLineBasis,
       uom: row.uom,
       segmentFrom: istDateOf(row.segmentFrom),
       segmentTo: addIsoDays(istDateOf(row.segmentTo), -1),
@@ -493,6 +498,7 @@ async function noteLinesOfInTx(tx: TenantTx, tenantId: string, noteId: string): 
       sgstPaise: Number(row.sgstPaise),
       igstPaise: Number(row.igstPaise),
       overrideReason: row.overrideReason,
+      ...(row.description === null || row.description === undefined ? {} : { description: row.description }),
     }));
 }
 

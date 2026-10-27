@@ -11,7 +11,7 @@ import { getMemberClientIdIn } from '../tenancy/tenancy.service';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import { MeteringService, type MeteredPeriod } from './metering';
 import { StorageSnapshotService, type SnapshotTickResult, type SnapshotVerifyResult } from './storage-snapshot';
-import { MAX_DRAFT_LIST, sortLines, type ChargeCode, type RateBasis, type RateCardStatus } from './rate-cards';
+import { MAX_DRAFT_LIST, sortLines, type MinimumCounts, type RateCardLineBasis, type RateCardLineCode, type RateCardStatus } from './rate-cards';
 import { decodeCursor, type Page } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { PORTAL_PAGE_DEFAULT_LIMIT } from '../../shared/primitives/portal-page';
@@ -45,10 +45,21 @@ function decodePortalCursor(cursor: string): { createdAt: string; id: string } {
 
 /** One priced line as every read returns it. */
 export interface RateCardLineSnapshot {
-  readonly chargeCode: ChargeCode;
-  readonly basis: RateBasis;
-  /** Integer paise per unit of the basis, GST-exclusive. */
+  /** The four metered charges, or (story 5-5a) `minimum_monthly` — metering reads only the four. */
+  readonly chargeCode: RateCardLineCode;
+  readonly basis: RateCardLineBasis;
+  /** Integer paise per unit of the basis, GST-exclusive (the minimum: per month). */
   readonly amountPaise: number;
+  /** Story 5-5a (A19) — present on the `minimum_monthly` line only (every other line's bytes are unchanged). */
+  readonly minimumCounts?: MinimumCounts;
+}
+
+/** One stored card line as the reads fold it (story 5-5a adds the minimum's counting rule). */
+export interface RateCardLineRow {
+  readonly chargeCode: string;
+  readonly basis: string;
+  readonly amountPaise: number;
+  readonly minimumCounts?: string | null | undefined;
 }
 
 /**
@@ -90,7 +101,7 @@ const iso = (value: string | null): string | null => (value === null ? null : ne
 
 export function toRateCardSnapshot(
   row: RateCard,
-  lines: readonly { chargeCode: string; basis: string; amountPaise: number }[],
+  lines: readonly RateCardLineRow[],
 ): RateCardSnapshot {
   const effectiveFromAt = iso(row.effectiveFrom);
   const effectiveToAt = iso(row.effectiveTo);
@@ -104,9 +115,11 @@ export function toRateCardSnapshot(
     effectiveFromAt,
     effectiveToAt,
     lines: sortLines(lines).map((line) => ({
-      chargeCode: line.chargeCode as ChargeCode,
-      basis: line.basis as RateBasis,
+      chargeCode: line.chargeCode as RateCardLineCode,
+      basis: line.basis as RateCardLineBasis,
       amountPaise: Number(line.amountPaise),
+      // A conditional key (the minimum line only), so a card without one keeps its bytes.
+      ...(line.minimumCounts === undefined || line.minimumCounts === null ? {} : { minimumCounts: line.minimumCounts as MinimumCounts }),
     })),
     createdBy: row.createdBy,
     createdAt: new Date(row.createdAt).toISOString(),
@@ -123,8 +136,8 @@ export async function linesByCardInTx(
   tx: TenantTx,
   tenantId: string,
   cardIds: readonly string[],
-): Promise<Map<string, { chargeCode: string; basis: string; amountPaise: number }[]>> {
-  const grouped = new Map<string, { chargeCode: string; basis: string; amountPaise: number }[]>();
+): Promise<Map<string, RateCardLineRow[]>> {
+  const grouped = new Map<string, RateCardLineRow[]>();
   if (cardIds.length === 0) return grouped;
   const rows = await tx
     .select({
@@ -132,6 +145,7 @@ export async function linesByCardInTx(
       chargeCode: rateCardLines.chargeCode,
       basis: rateCardLines.basis,
       amountPaise: rateCardLines.amountPaise,
+      minimumCounts: rateCardLines.minimumCounts,
     })
     .from(rateCardLines)
     .where(and(eq(rateCardLines.tenantId, tenantId), inArray(rateCardLines.rateCardId, [...new Set(cardIds)])));

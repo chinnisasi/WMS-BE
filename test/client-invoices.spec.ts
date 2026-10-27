@@ -33,6 +33,7 @@ import {
   type ClientInvoiceDraftInput,
 } from '../src/modules/billing/client-invoices';
 import { ProblemException } from '../src/shared/problem-details/problem.exception';
+import { INVOICE_LINE_BASES, INVOICE_LINE_CODES, compareLines, formatPaiseEnIn } from '../src/modules/billing/client-charges';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
@@ -303,6 +304,240 @@ describe('story 21-5: client invoices', () => {
       expect(computeClientInvoiceDraft(draftInput()).contentHash).toBe('5e97cb9cf4619b50a0339c6bbb4e92b575ac93d2aecd12b7db29e156b96ca81c');
     });
 
+    // ── story 5-5a — contract billing: ad-hoc lines and the minimum ──────────
+    describe('5-5a: ad-hoc charges and the minimum monthly charge (pure)', () => {
+      /** An October month, metered lines priced to `amounts` (the minimum's "charges"). */
+      function october(overrides: Partial<ClientInvoiceDraftInput> = {}, lines?: MeteredPeriod['segments'][number]['lines']): ClientInvoiceDraftInput {
+        return draftInput({
+          periodStart: '2026-10-01',
+          periodEnd: '2026-10-31',
+          metered: {
+            segments: [
+              {
+                rateCardId: 'card-a',
+                fromDate: '2026-10-01',
+                toDate: '2026-10-31',
+                storageMeasuredThrough: '2026-10-31',
+                lines: lines ?? [{ chargeCode: 'inbound_handling', basis: 'per_receipt_line', uom: null, quantity: '1', ratePaise: 3125040, amountPaise: 3125040 }],
+              },
+            ],
+            storageCompleteThrough: '2026-10-31',
+          },
+          ...overrides,
+        });
+      }
+      const MIN_50K: ClientInvoiceDraftInput['minimumSegments'] = [{ fromDate: '2026-10-01', toDate: '2026-10-31', minimumPaise: 5_000_000, counts: 'all' }];
+      const charge = (overrides: Partial<NonNullable<ClientInvoiceDraftInput['charges']>[number]> = {}): NonNullable<ClientInvoiceDraftInput['charges']>[number] => ({
+        id: '01900000-0000-7000-8000-00000000c001',
+        chargeDate: '2026-10-05',
+        category: 'extra_labour',
+        description: 'Unloading a 40-ft container',
+        reference: null,
+        clientAuthorizationRef: null,
+        unit: 'hour',
+        quantityMilli: 2500n,
+        unitRatePaise: 35000,
+        amountPaise: 87500,
+        sacCode: '996719',
+        ...overrides,
+      });
+
+      it('formatPaiseEnIn groups en-IN by hand (last three, then pairs), two decimals — never Intl', () => {
+        expect(formatPaiseEnIn(0)).toBe('0.00');
+        expect(formatPaiseEnIn(5)).toBe('0.05');
+        expect(formatPaiseEnIn(99_999)).toBe('999.99');
+        expect(formatPaiseEnIn(100_000)).toBe('1,000.00');
+        expect(formatPaiseEnIn(4_548_387)).toBe('45,483.87');
+        expect(formatPaiseEnIn(1_000_000_000)).toBe('1,00,00,000.00');
+        expect(formatPaiseEnIn(123_456_789_012n)).toBe('1,23,45,67,890.12');
+      });
+
+      it('no new term: charges [], a pending count of 0 and card segments without a minimum hash exactly as the 21-5 draft (G1 literal)', () => {
+        const plain = computeClientInvoiceDraft(draftInput());
+        const widened = computeClientInvoiceDraft(
+          draftInput({ charges: [], pendingCount: 0, minimumSegments: [{ fromDate: '2026-09-01', toDate: '2026-09-30', minimumPaise: null, counts: null }] }),
+        );
+        expect(widened.contentHash).toBe('5e97cb9cf4619b50a0339c6bbb4e92b575ac93d2aecd12b7db29e156b96ca81c');
+        expect(widened).toEqual(plain);
+        // A11 — the optional keys are ABSENT on metered lines (never null).
+        for (const line of widened.lines) {
+          expect(Object.keys(line)).not.toContain('description');
+          expect(Object.keys(line)).not.toContain('adhocChargeId');
+        }
+      });
+
+      it('minimum short: ₹50,000 floor, ₹31,250.40 of charges → one minimum_adjustment of 1,874,960 paise with the exact description, taxed like any line', () => {
+        const draft = computeClientInvoiceDraft(october({ minimumSegments: MIN_50K }));
+        const adjustment = draft.lines.at(-1)!;
+        expect(adjustment).toEqual({
+          rateCardId: null,
+          segmentFrom: istIso('2026-10-01T00:00'),
+          segmentTo: istIso('2026-11-01T00:00'),
+          chargeCode: 'minimum_adjustment',
+          basis: 'per_invoice',
+          uom: null,
+          quantity: 1n,
+          unitAmountPaise: 1_874_960,
+          amountPaise: 1_874_960,
+          sacCode: '996729',
+          gstBps: 1800,
+          placeOfSupply: '29',
+          supplyType: 'intra',
+          cgstPaise: 168_746,
+          sgstPaise: 168_747,
+          igstPaise: 0,
+          description: 'Minimum monthly charge ₹50,000.00 less all charges ₹31,250.40',
+        });
+        expect(draft.totals.subtotalPaise).toBe(5_000_000);
+        expect(draft.gaps).toEqual([]);
+        expect(draft.warnings).toEqual([]);
+      });
+
+      it('minimum met: ₹62,000 of charges → no adjustment, and the hash EQUALS the same fixture’s without the minimum term (AC3)', () => {
+        const lines = [{ chargeCode: 'inbound_handling' as const, basis: 'per_receipt_line' as const, uom: null, quantity: '1', ratePaise: 6_200_000, amountPaise: 6_200_000 }];
+        const withMinimum = computeClientInvoiceDraft(october({ minimumSegments: MIN_50K }, lines));
+        const without = computeClientInvoiceDraft(october({}, lines));
+        expect(withMinimum.lines.map((line) => line.chargeCode)).toEqual(['inbound_handling']);
+        expect(withMinimum.contentHash).toBe(without.contentHash);
+        // Exactly at the floor is met too (floor > charges adds a line, never =).
+        const exact = [{ ...lines[0]!, ratePaise: 5_000_000, amountPaise: 5_000_000 }];
+        expect(computeClientInvoiceDraft(october({ minimumSegments: MIN_50K }, exact)).lines).toHaveLength(1);
+      });
+
+      it('prorated across two cards: ₹40,000 for 1–14 Oct, ₹50,000 from 15 Oct → floor 4,548,387 paise and the A10 golden description', () => {
+        const draft = computeClientInvoiceDraft(
+          october({
+            minimumSegments: [
+              { fromDate: '2026-10-01', toDate: '2026-10-14', minimumPaise: 4_000_000, counts: 'all' },
+              { fromDate: '2026-10-15', toDate: '2026-10-31', minimumPaise: 5_000_000, counts: 'all' },
+            ],
+          }),
+        );
+        const adjustment = draft.lines.at(-1)!;
+        expect(adjustment.amountPaise).toBe(4_548_387 - 3_125_040);
+        expect(adjustment.description).toBe(
+          'Minimum monthly charge ₹45,483.87 (01–14 Oct 2026 at ₹40,000.00/month; 15–31 Oct 2026 at ₹50,000.00/month) less all charges ₹31,250.40',
+        );
+      });
+
+      it('a first card from 15 Oct carrying ₹31,000 → floor 1,700,000 paise (17/31); a card without a minimum contributes 0', () => {
+        const small = [{ chargeCode: 'pick' as const, basis: 'per_pick' as const, uom: null, quantity: '1', ratePaise: 100, amountPaise: 100 }];
+        const draft = computeClientInvoiceDraft(october({ minimumSegments: [{ fromDate: '2026-10-15', toDate: '2026-10-31', minimumPaise: 3_100_000, counts: 'all' }] }, small));
+        expect(draft.lines.at(-1)!.amountPaise).toBe(1_700_000 - 100);
+        expect(draft.lines.at(-1)!.description).toBe('Minimum monthly charge ₹17,000.00 less all charges ₹1.00');
+        const mixed = computeClientInvoiceDraft(
+          october(
+            {
+              minimumSegments: [
+                { fromDate: '2026-10-01', toDate: '2026-10-14', minimumPaise: null, counts: null },
+                { fromDate: '2026-10-15', toDate: '2026-10-31', minimumPaise: 3_100_000, counts: 'all' },
+              ],
+            },
+            small,
+          ),
+        );
+        expect(mixed.lines.at(-1)!.amountPaise).toBe(1_700_000 - 100);
+        expect(mixed.lines.at(-1)!.description).toBe(
+          'Minimum monthly charge ₹17,000.00 (01–14 Oct 2026 at ₹0.00/month; 15–31 Oct 2026 at ₹31,000.00/month) less all charges ₹1.00',
+        );
+      });
+
+      it('`metered` counts leave the ad-hoc lines out of the floor’s charges; `all` counts them; the latest minimum-bearing segment’s rule applies', () => {
+        const metered = computeClientInvoiceDraft(october({ minimumSegments: [{ ...MIN_50K![0]!, counts: 'metered' }], charges: [charge()] }));
+        expect(metered.lines.at(-1)!.amountPaise).toBe(5_000_000 - 3_125_040);
+        expect(metered.lines.at(-1)!.description).toBe('Minimum monthly charge ₹50,000.00 less metered charges ₹31,250.40');
+        const all = computeClientInvoiceDraft(october({ minimumSegments: MIN_50K, charges: [charge()] }));
+        expect(all.lines.at(-1)!.amountPaise).toBe(5_000_000 - 3_125_040 - 87_500);
+        const latestWins = computeClientInvoiceDraft(
+          october({
+            charges: [charge()],
+            minimumSegments: [
+              { fromDate: '2026-10-01', toDate: '2026-10-14', minimumPaise: 5_000_000, counts: 'all' },
+              { fromDate: '2026-10-15', toDate: '2026-10-31', minimumPaise: 5_000_000, counts: 'metered' },
+            ],
+          }),
+        );
+        expect(latestWins.lines.at(-1)!.description).toContain('less metered charges ₹31,250.40');
+      });
+
+      it('A27 — while storage is incomplete or a line is unpriced, the minimum is a BLOCKING `minimum-charge-pending` gap (after adhoc-charge-pending, before einvoice-required) and no line', () => {
+        const incomplete = computeClientInvoiceDraft(
+          october({ minimumSegments: MIN_50K, pendingCount: 2, eInvoiceApplies: true, metered: { ...october().metered, storageCompleteThrough: '2026-10-20' } }),
+        );
+        expect(incomplete.lines.map((line) => line.chargeCode)).toEqual(['inbound_handling']);
+        expect(incomplete.gaps.map((gap) => gap.code)).toEqual(['storage-not-complete', 'adhoc-charge-pending', 'minimum-charge-pending', 'einvoice-required']);
+        expect(incomplete.gaps[1]).toMatchObject({ code: 'adhoc-charge-pending', count: 2 });
+        const unpriced = computeClientInvoiceDraft(
+          october({ minimumSegments: MIN_50K }, [{ chargeCode: 'pick', basis: 'per_pick', uom: null, quantity: '4', ratePaise: null, amountPaise: null }]),
+        );
+        expect(unpriced.gaps.map((gap) => gap.code)).toEqual(['line-unpriced', 'minimum-charge-pending']);
+        expect(unpriced.lines).toHaveLength(1);
+      });
+
+      it('A21 — a footprint of more than one GSTIN: the minimum is NOT applied, a warning names the groups, nothing blocks', () => {
+        const draft = computeClientInvoiceDraft(october({ minimumSegments: MIN_50K, footprintGroups: [T29, W27] }));
+        expect(draft.lines.map((line) => line.chargeCode)).toEqual(['inbound_handling']);
+        expect(draft.gaps).toEqual([]);
+        expect(draft.warnings).toEqual([{ code: 'minimum-not-applied-multi-gstin', detail: expect.stringContaining(`${T29}, ${W27}`) as unknown as string }]);
+      });
+
+      it('a dormant month (no other line) gets no adjustment; an adjustment over ad-hoc lines only warns minimum-from-charges-only', () => {
+        const empty = computeClientInvoiceDraft(october({ minimumSegments: MIN_50K }, []));
+        expect(empty.lines).toEqual([]);
+        const chargesOnly = computeClientInvoiceDraft(october({ minimumSegments: MIN_50K, charges: [charge()] }, []));
+        expect(chargesOnly.lines.map((line) => line.chargeCode)).toEqual(['adhoc', 'minimum_adjustment']);
+        expect(chargesOnly.warnings.map((warning) => warning.code)).toEqual(['minimum-from-charges-only']);
+      });
+
+      it('ad-hoc lines: metered first in 21-5 order, then ad-hoc by (segment_from, charge id), then the adjustment; the description, quantity and SAC as recorded; intra and inter tax', () => {
+        const late = charge({ id: '01900000-0000-7000-8000-00000000c003', chargeDate: '2026-09-28', category: 'relabelling', description: 'Relabel 120 cartons', unit: 'carton', quantityMilli: 120_000n, unitRatePaise: 1500, amountPaise: 180_000, sacCode: '998540', reference: 'GRN-0042', clientAuthorizationRef: 'PO 7781' });
+        const second = charge({ id: '01900000-0000-7000-8000-00000000c002' });
+        const first = charge();
+        const draft = computeClientInvoiceDraft(october({ charges: [second, late, first], minimumSegments: MIN_50K }));
+        expect(draft.lines.map((line) => [line.chargeCode, line.adhocChargeId ?? null])).toEqual([
+          ['inbound_handling', null],
+          ['adhoc', late.id],
+          ['adhoc', first.id],
+          ['adhoc', second.id],
+          ['minimum_adjustment', null],
+        ]);
+        const relabel = draft.lines[1]!;
+        expect(relabel).toMatchObject({
+          rateCardId: null,
+          // A4 — the line keeps the charge's TRUE service day, before the period.
+          segmentFrom: istIso('2026-09-28T00:00'),
+          segmentTo: istIso('2026-09-29T00:00'),
+          basis: 'per_unit',
+          uom: 'carton',
+          quantity: 120_000n,
+          unitAmountPaise: 1500,
+          amountPaise: 180_000,
+          sacCode: '998540',
+          cgstPaise: 16_200,
+          sgstPaise: 16_200,
+          igstPaise: 0,
+          description: 'Relabelling — Relabel 120 cartons · Ref GRN-0042 · Client auth PO 7781',
+        });
+        expect(draft.lines[2]!.description).toBe('Extra labour — Unloading a 40-ft container');
+        // Inter-state: IGST.
+        const inter = computeClientInvoiceDraft(october({ charges: [first], client: { code: 'ACME', name: 'Acme', taxDetails: { ...FULL_TAX, gstin: null, billingStateCode: '27', billingCity: 'Pune', billingPincode: '411001' } } }));
+        expect(inter.lines[1]).toMatchObject({ chargeCode: 'adhoc', supplyType: 'inter', igstPaise: 15_750, cgstPaise: 0, sgstPaise: 0 });
+        // The hash carries the two keys (it moves with the description).
+        const renamed = computeClientInvoiceDraft(october({ charges: [{ ...first, description: 'Unloading two containers' }] }));
+        expect(renamed.contentHash).not.toBe(computeClientInvoiceDraft(october({ charges: [first] })).contentHash);
+      });
+
+      it('compareLines: two metered lines compare exactly as in 21-5; the kinds rank metered < adhoc < minimum_adjustment whatever their dates', () => {
+        const metered = (from: string, chargeCode: string, uom: string | null = null) => ({ segmentFrom: istIso(`${from}T00:00`), chargeCode, uom });
+        expect(compareLines(metered('2026-10-01', 'pick'), metered('2026-10-01', 'storage', 'each'))).toBeGreaterThan(0);
+        expect(compareLines(metered('2026-10-01', 'storage', null), metered('2026-10-01', 'storage', 'each'))).toBeLessThan(0);
+        expect(compareLines(metered('2026-10-15', 'storage', 'each'), metered('2026-10-01', 'outbound_handling'))).toBeGreaterThan(0);
+        const adhoc = { segmentFrom: istIso('2026-09-01T00:00'), chargeCode: 'adhoc', uom: 'hour', adhocChargeId: 'a' };
+        expect(compareLines(adhoc, metered('2026-10-15', 'outbound_handling'))).toBeGreaterThan(0);
+        expect(compareLines({ ...adhoc, chargeCode: 'minimum_adjustment', uom: null, adhocChargeId: null }, adhoc)).toBeGreaterThan(0);
+      });
+    });
+
     it('supplierGroups: every warehouse in exactly one group, keyed by its GSTIN, else the tenant’s; the null group last', () => {
       const facts = {
         tenantName: 'T',
@@ -492,8 +727,14 @@ describe('story 21-5: client invoices', () => {
           'client_invoice_lines_basis_check', 'client_invoices_tax_shape')`;
       const values = (name: string): string[] => [...defs.find((row) => row.conname === name)!.def.matchAll(/'([a-z_]+)'::text/g)].map((m) => m[1]!);
       expect(values('client_invoices_status_check')).toEqual([...CLIENT_INVOICE_STATUSES]);
-      expect(values('client_invoice_lines_charge_code_check')).toEqual([...CHARGE_CODES]);
-      expect(values('client_invoice_lines_basis_check')).toEqual([...RATE_BASES]);
+      // Story 5-5a — retargeted: the line CHECKs admit the widened invoice-line
+      // vocabularies (the four metered codes, then `adhoc` and
+      // `minimum_adjustment`; the four bases, then `per_unit` and `per_invoice`),
+      // and the metered four keep their 21-5 order at the head.
+      expect(values('client_invoice_lines_charge_code_check')).toEqual([...INVOICE_LINE_CODES]);
+      expect(values('client_invoice_lines_basis_check')).toEqual([...INVOICE_LINE_BASES]);
+      expect(INVOICE_LINE_CODES.slice(0, 4)).toEqual([...CHARGE_CODES]);
+      expect(INVOICE_LINE_BASES.slice(0, 4)).toEqual([...RATE_BASES]);
       expect(values('client_invoices_tax_shape')).toEqual([...SUPPLY_TYPES]);
       // …and an unknown status is refused.
       const id = await draft('2026-01');

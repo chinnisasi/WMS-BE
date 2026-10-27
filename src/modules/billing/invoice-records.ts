@@ -2,7 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, eq, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { clientInvoiceLines, clientInvoices } from '../../shared/db/schema';
+import { clientCharges, clientInvoiceLines, clientInvoices } from '../../shared/db/schema';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { encodeCursor, type CursorPayload, type KeysetWindow } from '../../shared/primitives/pagination';
@@ -20,6 +20,7 @@ import {
   supplierGroups,
   type ClientInvoiceStatus,
 } from './client-invoices';
+import type { ClientChargeCategory, ClientChargeStatus, InvoiceLineCode } from './client-charges';
 import { milliToDecimal } from './metering';
 import type { ChargeCode } from './rate-cards';
 
@@ -57,16 +58,25 @@ import type { ChargeCode } from './rate-cards';
 export const LINE_RECORDS_DEFAULT_LIMIT = 100;
 export const LINE_RECORDS_MAX_LIMIT = 1000;
 
-/** The record kinds, one per charge. */
-export const LINE_RECORD_KINDS = ['receipt-line', 'pick', 'order', 'storage-day'] as const;
+/** The record kinds, one per charge (story 5-5a adds the ad-hoc charge's own record). */
+export const LINE_RECORD_KINDS = ['receipt-line', 'pick', 'order', 'storage-day', 'adhoc-charge'] as const;
 export type LineRecordKind = (typeof LINE_RECORD_KINDS)[number];
 
+/** The record kind of each METERED charge (21-5b — unchanged; G4). */
 export const RECORD_KIND_OF_CHARGE: Readonly<Record<ChargeCode, LineRecordKind>> = {
   inbound_handling: 'receipt-line',
   pick: 'pick',
   outbound_handling: 'order',
   storage: 'storage-day',
 };
+
+/**
+ * Story 5-5a — an `adhoc` line drills to its one charge (`adhoc-charge`); a
+ * `minimum_adjustment` line has no records: it is computed from the other
+ * lines, so its drill answers 409 `line-not-drillable` (the web shows the
+ * line's description instead).
+ */
+export const ADHOC_RECORD_KIND: LineRecordKind = 'adhoc-charge';
 
 /**
  * An order's client-facing reference — the raw fields; the web composes the
@@ -151,7 +161,37 @@ export interface StorageDayRecordView {
   readonly onHand: string;
 }
 
-export type LineRecordView = ReceiptLineRecordView | PickRecordView | OrderRecordView | StorageDayRecordView;
+/**
+ * Story 5-5a — an `adhoc` line's ONE record: the charge it bills (by
+ * `adhoc_charge_id`, no predicate). Staff appear as ids and emails; the
+ * web's CSV pseudonymises the ids (the 21-5b rule). Never the evidence note.
+ */
+export interface AdhocChargeRecordView {
+  readonly kind: 'adhoc-charge';
+  /** The charge's id. */
+  readonly id: string;
+  readonly chargeId: string;
+  /** The IST date of the work. */
+  readonly chargeDate: string;
+  readonly warehouseId: string;
+  readonly warehouseCode: string;
+  readonly category: ClientChargeCategory;
+  readonly description: string;
+  readonly unit: string;
+  /** Units of `unit`, a decimal string (up to three places). */
+  readonly quantity: string;
+  readonly unitRatePaise: number;
+  readonly amountPaise: number;
+  readonly reference: string | null;
+  readonly clientAuthorizationRef: string | null;
+  readonly status: ClientChargeStatus;
+  readonly recordedBy: string;
+  readonly recordedByEmail: string | null;
+  readonly decidedBy: string | null;
+  readonly decidedByEmail: string | null;
+}
+
+export type LineRecordView = ReceiptLineRecordView | PickRecordView | OrderRecordView | StorageDayRecordView | AdhocChargeRecordView;
 
 export interface LineRecordsSummary {
   /** The line's quantity, as the line view states it. */
@@ -304,6 +344,37 @@ export function storageDays(
   return { fromDay, throughDay: measured < lastDay ? measured : lastDay };
 }
 
+/** Story 5-5a — the invoice and line a drill addresses, before any group is resolved. */
+interface FoundLine {
+  readonly invoice: {
+    readonly id: string;
+    readonly clientId: string;
+    readonly status: ClientInvoiceStatus;
+    readonly periodStart: string;
+    readonly periodEnd: string;
+    readonly supplierGstin: string | null;
+    readonly storageMeasuredThrough: string | null;
+  };
+  readonly line: {
+    readonly chargeCode: InvoiceLineCode;
+    readonly uom: string | null;
+    readonly segmentFrom: string;
+    readonly segmentTo: string;
+    readonly quantity: string;
+    readonly adhocChargeId: string | null;
+  };
+}
+
+/** Story 5-5a — a `minimum_adjustment` line is computed from the others: it has no records of its own. */
+function lineNotDrillable(): ProblemException {
+  return new ProblemException(
+    'line-not-drillable',
+    409,
+    'This line has no records',
+    'The minimum-charge adjustment is computed from the invoice’s other lines (its description shows the working) — drill into those lines instead.',
+  );
+}
+
 function lineNotFound(lineId: string): ProblemException {
   return new ProblemException('not-found', 404, 'Invoice line not found', `No line with id "${lineId}" on this client invoice — a draft's lines are rewritten when it is refreshed; reload the invoice.`);
 }
@@ -332,7 +403,13 @@ export class InvoiceRecordsService {
 
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       if ((await getMemberClientIdIn(tx, tenantId, actorUserId)) !== null) throw portalRefused();
-      const target = await this.targetInTx(tx, tenantId, invoiceId, lineId);
+      // Story 5-5a (A16) — the two new kinds dispatch BEFORE the group
+      // re-resolution: they read no predicate, so `invoice-group-changed`
+      // never fires for them.
+      const found = await this.invoiceAndLineInTx(tx, tenantId, invoiceId, lineId);
+      if (found.line.chargeCode === 'minimum_adjustment') throw lineNotDrillable();
+      if (found.line.chargeCode === 'adhoc') return this.adhocRecordsInTx(tx, tenantId, found, firstPage);
+      const target = await this.groupTargetInTx(tx, tenantId, found);
       const { invoice, line } = target;
       const kind = RECORD_KIND_OF_CHARGE[line.chargeCode];
       const window: KeysetWindow = { after, limit: limit + 1 };
@@ -490,10 +567,12 @@ export class InvoiceRecordsService {
 
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       if ((await getMemberClientIdIn(tx, tenantId, actorUserId)) !== null) throw portalRefused();
-      const target = await this.targetInTx(tx, tenantId, invoiceId, lineId);
-      const { invoice, line } = target;
       const notHere = (why: string) =>
         new ProblemException('not-found', 404, 'No storage day to break down', `${why} — a breakdown is of one measured day of a storage line, in a warehouse of its invoice.`);
+      const found = await this.invoiceAndLineInTx(tx, tenantId, invoiceId, lineId);
+      if (found.line.chargeCode !== 'storage') throw notHere('This line is not a storage line');
+      const target = await this.groupTargetInTx(tx, tenantId, found);
+      const { invoice, line } = target;
       if (line.chargeCode !== 'storage' || line.uom === null) throw notHere('This line is not a storage line');
       const days = storageDays(line, invoice);
       if (date < days.fromDay || date > days.throughDay) {
@@ -530,11 +609,61 @@ export class InvoiceRecordsService {
   }
 
   /**
-   * The invoice (404), the line ON it (404 — a draft's line ids change on
-   * refresh), and the invoice's supplying-GSTIN group re-resolved from the
-   * tenant's warehouses — empty → 409 `invoice-group-changed`.
+   * Story 5-5a — an `adhoc` line's one record: its charge, read by
+   * `(tenant, client = the invoice's client, id = the line's adhoc_charge_id)`.
+   * The summary compares the line's quantity with the charge's (milli →
+   * decimal, exactly). One record, never paged.
    */
-  private async targetInTx(tx: TenantTx, tenantId: string, invoiceId: string, lineId: string): Promise<DrillTarget> {
+  private async adhocRecordsInTx(tx: TenantTx, tenantId: string, found: FoundLine, firstPage: boolean): Promise<LineRecordsPage> {
+    const { invoice, line } = found;
+    const rows =
+      line.adhocChargeId === null
+        ? []
+        : await tx
+            .select()
+            .from(clientCharges)
+            .where(and(eq(clientCharges.tenantId, tenantId), eq(clientCharges.clientId, invoice.clientId), eq(clientCharges.id, line.adhocChargeId)))
+            .limit(1);
+    const charge = rows[0];
+    const records: AdhocChargeRecordView[] = [];
+    if (charge !== undefined && firstPage) {
+      const facts = await clientInvoiceSupplierFactsInTx(tx, tenantId);
+      const emails = await userEmailsInTx(tx, tenantId, [charge.recordedBy, ...(charge.decidedBy === null ? [] : [charge.decidedBy])]);
+      records.push({
+        kind: 'adhoc-charge',
+        id: charge.id,
+        chargeId: charge.id,
+        chargeDate: charge.chargeDate,
+        warehouseId: charge.warehouseId,
+        warehouseCode: facts.warehouses.find((warehouse) => warehouse.id === charge.warehouseId)?.code ?? charge.warehouseId,
+        category: charge.category as ClientChargeCategory,
+        description: charge.description,
+        unit: charge.unit,
+        quantity: milliToDecimal(BigInt(charge.quantityMilli)),
+        unitRatePaise: Number(charge.unitRatePaise),
+        amountPaise: Number(charge.amountPaise),
+        reference: charge.reference,
+        clientAuthorizationRef: charge.clientAuthorizationRef,
+        status: charge.status as ClientChargeStatus,
+        recordedBy: charge.recordedBy,
+        recordedByEmail: emails.get(charge.recordedBy) ?? null,
+        decidedBy: charge.decidedBy,
+        decidedByEmail: charge.decidedBy === null ? null : (emails.get(charge.decidedBy) ?? null),
+      });
+    }
+    const lineQuantity = milliToDecimal(BigInt(line.quantity));
+    const recordsQuantity = charge === undefined ? '0' : milliToDecimal(BigInt(charge.quantityMilli));
+    return {
+      kind: ADHOC_RECORD_KIND,
+      invoiceStatus: invoice.status,
+      ...(firstPage ? { summary: { lineQuantity, recordsQuantity, reconciles: lineQuantity === recordsQuantity } } : {}),
+      records,
+      nextCursor: null,
+    };
+  }
+
+  /** The invoice (404) and the line ON it (404 — a draft's line ids change on refresh). */
+  private async invoiceAndLineInTx(tx: TenantTx, tenantId: string, invoiceId: string, lineId: string): Promise<FoundLine> {
     if (!UUID_RE.test(invoiceId)) throw clientInvoiceNotFound(invoiceId);
     if (!UUID_RE.test(lineId)) throw lineNotFound(lineId);
     const invoices = await tx
@@ -559,12 +688,27 @@ export class InvoiceRecordsService {
         segmentFrom: clientInvoiceLines.segmentFrom,
         segmentTo: clientInvoiceLines.segmentTo,
         quantity: sql<string>`${clientInvoiceLines.quantity}::text`,
+        adhocChargeId: clientInvoiceLines.adhocChargeId,
       })
       .from(clientInvoiceLines)
       .where(and(eq(clientInvoiceLines.tenantId, tenantId), eq(clientInvoiceLines.invoiceId, invoice.id), eq(clientInvoiceLines.id, lineId)))
       .limit(1);
     const line = lines[0];
     if (line === undefined) throw lineNotFound(lineId);
+    return {
+      invoice: { ...invoice, status: invoice.status as ClientInvoiceStatus },
+      line: { ...line, chargeCode: line.chargeCode as InvoiceLineCode },
+    };
+  }
+
+  /**
+   * A metered line's drill target: the invoice's supplying-GSTIN group
+   * re-resolved from the tenant's warehouses — empty → 409
+   * `invoice-group-changed`.
+   */
+  private async groupTargetInTx(tx: TenantTx, tenantId: string, found: FoundLine): Promise<DrillTarget> {
+    const { invoice } = found;
+    const line = { ...found.line, chargeCode: found.line.chargeCode as ChargeCode };
 
     const facts = await clientInvoiceSupplierFactsInTx(tx, tenantId);
     const group = groupOf(supplierGroups(facts), invoice.supplierGstin);

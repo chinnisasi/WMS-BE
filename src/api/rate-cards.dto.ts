@@ -5,6 +5,7 @@ import {
   IsArray,
   IsIn,
   IsInt,
+  IsOptional,
   Matches,
   Max,
   Min,
@@ -14,13 +15,15 @@ import {
 } from 'class-validator';
 import { isIsoDate } from '../shared/primitives/time';
 import {
-  CHARGE_CODES,
-  MAX_RATE_AMOUNT_PAISE,
+  MAX_MINIMUM_MONTHLY_PAISE,
+  MINIMUM_COUNTS,
   MIN_RATE_AMOUNT_PAISE,
-  RATE_BASES,
+  RATE_CARD_LINE_BASES,
+  RATE_CARD_LINE_CODES,
   RATE_CARD_STATUSES,
-  type ChargeCode,
-  type RateBasis,
+  type MinimumCounts,
+  type RateCardLineBasis,
+  type RateCardLineCode,
   type RateCardStatus,
 } from '../modules/billing/rate-cards';
 
@@ -43,39 +46,52 @@ export function IsIsoDate(): PropertyDecorator {
 }
 
 export class RateCardLineDto {
-  @ApiProperty({ enum: [...CHARGE_CODES], description: 'The charge this line prices — each at most once per card' })
-  @IsIn([...CHARGE_CODES])
-  chargeCode!: ChargeCode;
+  @ApiProperty({
+    enum: [...RATE_CARD_LINE_CODES],
+    description: 'The charge this line prices — each at most once per card. Story 5-5a: `minimum_monthly` is the minimum monthly charge (per invoice — one per GSTIN)',
+  })
+  @IsIn([...RATE_CARD_LINE_CODES])
+  chargeCode!: RateCardLineCode;
 
   @ApiProperty({
-    enum: [...RATE_BASES],
+    enum: [...RATE_CARD_LINE_BASES],
     description:
-      'The basis — fixed per charge: storage ↔ per_thousand_units_per_day (₹ per 1,000 SKU base units per day), inbound_handling ↔ per_receipt_line, pick ↔ per_pick, outbound_handling ↔ per_order',
+      'The basis — fixed per charge: storage ↔ per_thousand_units_per_day (₹ per 1,000 SKU base units per day), inbound_handling ↔ per_receipt_line, pick ↔ per_pick, outbound_handling ↔ per_order, minimum_monthly ↔ per_month',
   })
-  @IsIn([...RATE_BASES])
-  basis!: RateBasis;
+  @IsIn([...RATE_CARD_LINE_BASES])
+  basis!: RateCardLineBasis;
 
   @ApiProperty({
     minimum: MIN_RATE_AMOUNT_PAISE,
-    maximum: MAX_RATE_AMOUNT_PAISE,
+    maximum: MAX_MINIMUM_MONTHLY_PAISE,
     example: 330,
-    description: 'Integer paise per unit of the basis, GST-exclusive (₹0 is billed at zero; ₹1 lakh cap)',
+    description:
+      'Integer paise per unit of the basis, GST-exclusive. A metered rate is ₹0 .. ₹1 lakh (₹0 is billed at zero); the minimum_monthly line ₹0.01 .. ₹1 crore (the per-code bound is the command’s — 400 validation-failed)',
   })
   @IsInt()
   @Min(MIN_RATE_AMOUNT_PAISE)
-  @Max(MAX_RATE_AMOUNT_PAISE)
+  @Max(MAX_MINIMUM_MONTHLY_PAISE)
   amountPaise!: number;
+
+  @ApiProperty({
+    required: false,
+    enum: [...MINIMUM_COUNTS],
+    description: 'Story 5-5a — on the minimum_monthly line only: what counts toward the floor — `all` (metered + ad-hoc charges, the default) or `metered`',
+  })
+  @IsOptional()
+  @IsIn([...MINIMUM_COUNTS])
+  minimumCounts?: MinimumCounts;
 }
 
 export class RateCardLinesDto {
   @ApiProperty({
     type: [RateCardLineDto],
-    maxItems: CHARGE_CODES.length,
+    maxItems: RATE_CARD_LINE_CODES.length,
     description:
-      'The charges this card prices — any subset of the four. A charge with no line is not billed. A draft may have none; activation needs at least one',
+      'The charges this card prices — any subset of the four metered charges, plus an optional minimum monthly charge. A charge with no line is not billed. A draft may have none; activation needs at least one',
   })
   @IsArray()
-  @ArrayMaxSize(CHARGE_CODES.length)
+  @ArrayMaxSize(RATE_CARD_LINE_CODES.length)
   @ValidateNested({ each: true })
   @Type(() => RateCardLineDto)
   lines!: RateCardLineDto[];
@@ -95,14 +111,17 @@ export class ActivateRateCardDto {
 }
 
 export class RateCardLineResponseDto {
-  @ApiProperty({ enum: [...CHARGE_CODES] })
-  chargeCode!: ChargeCode;
+  @ApiProperty({ enum: [...RATE_CARD_LINE_CODES] })
+  chargeCode!: RateCardLineCode;
 
-  @ApiProperty({ enum: [...RATE_BASES] })
-  basis!: RateBasis;
+  @ApiProperty({ enum: [...RATE_CARD_LINE_BASES] })
+  basis!: RateCardLineBasis;
 
-  @ApiProperty({ description: 'Integer paise per unit of the basis, GST-exclusive' })
+  @ApiProperty({ description: 'Integer paise per unit of the basis, GST-exclusive (the minimum: per month)' })
   amountPaise!: number;
+
+  @ApiProperty({ required: false, enum: [...MINIMUM_COUNTS], description: 'Story 5-5a — present on the minimum_monthly line only' })
+  minimumCounts?: MinimumCounts;
 }
 
 export class RateCardDto {

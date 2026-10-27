@@ -273,6 +273,17 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
     await sql`insert into client_invoice_note_policies (id, tenant_id, require_second_approver, updated_by)
       values (${uuidv7()}, ${tenantId}, true, ${actorId})`;
 
+    // Story 5-5a (A7) — per client, one pending ad-hoc charge, plus the
+    // tenant's self-approval policy row (both operator-only tables).
+    for (const clientId of [clientA, clientB]) {
+      await sql`insert into client_charges (id, tenant_id, client_id, warehouse_id, supplier_gstin, charge_date, bill_month, category, description,
+          sac_code, unit, quantity_milli, unit_rate_paise, amount_paise, status, recorded_by, recorded_at)
+        values (${uuidv7()}, ${tenantId}, ${clientId}, ${warehouseId}, '29ABCDE1234F1Z5', '2026-10-05', '2026-10-01', 'extra_labour', 'probe',
+          '996719', 'hour', 1000, 100, 100, 'pending', ${actorId}, now())`;
+    }
+    await sql`insert into client_charge_policies (id, tenant_id, self_approve_limit_paise, updated_by)
+      values (${uuidv7()}, ${tenantId}, 1000000, ${actorId})`;
+
     // The INHERITED rows: stock and batch rows carry no client_id — their
     // isolation rides the SKU join, which the skus policy now filters.
     await sql`insert into batches (id, tenant_id, sku_id, code) values (${batchAId}, ${tenantId}, ${skuAId}, 'CI-B-A')`;
@@ -941,6 +952,34 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       await expectCount((t) => t`select count(*)::int as n from ${t('client_invoice_notes')} where tenant_id = ${tenantId}`, 6);
     });
 
+    it('ad-hoc charges (5-5a, A7): both tables are OPERATOR-ONLY — a portal session reads none of its own client’s charges and writes none', async () => {
+      expect(countOf(await portal((tx) => tx`select count(*)::int as n from client_charges where tenant_id = ${tenantId}`))).toBe(0);
+      expect(countOf(await portal((tx) => tx`select count(*)::int as n from client_charges where client_id = ${clientA}`))).toBe(0);
+      expect(countOf(await portal((tx) => tx`select count(*)::int as n from client_charge_policies where tenant_id = ${tenantId}`))).toBe(0);
+      // The positive control: the operator sees both charges and the policy.
+      expect(countOf(await operator((tx) => tx`select count(*)::int as n from client_charges where tenant_id = ${tenantId}`))).toBe(2);
+      expect(countOf(await operator((tx) => tx`select count(*)::int as n from client_charge_policies where tenant_id = ${tenantId}`))).toBe(1);
+      for (const table of ['client_charges', 'client_charge_policies']) {
+        expect(countOf(await probe.unsafe(`select count(*)::int as n from ${table} where tenant_id = '${tenantId}'::uuid`))).toBe(0);
+      }
+      // An own-client INSERT under the portal stamp: the trigger admits a
+      // pending row, so the operator-only WITH CHECK refuses it (42501).
+      await expect(
+        portal((tx) =>
+          tx`insert into client_charges (id, tenant_id, client_id, warehouse_id, supplier_gstin, charge_date, bill_month, category, description,
+              sac_code, unit, quantity_milli, unit_rate_paise, amount_paise, status, recorded_by, recorded_at)
+            values (${uuidv7()}, ${tenantId}, ${clientA}, ${warehouseId}, '29ABCDE1234F1Z5', '2026-10-05', '2026-10-01', 'extra_labour', 'probe',
+              '996719', 'hour', 1000, 100, 100, 'pending', ${uuidv7()}, now())`,
+        ),
+      ).rejects.toMatchObject({ code: '42501' });
+      await expect(
+        portal((tx) => tx`insert into client_charge_policies (id, tenant_id, self_approve_limit_paise, updated_by) values (${uuidv7()}, ${uuidv7()}, 0, ${uuidv7()})`),
+      ).rejects.toMatchObject({ code: '42501' });
+      expect(await portal((tx) => tx`update client_charges set updated_at = now() where client_id = ${clientA} returning id`)).toHaveLength(0);
+      expect(await portal((tx) => tx`update client_charge_policies set self_approve_limit_paise = 0 returning id`)).toHaveLength(0);
+      await expectCount((t) => t`select count(*)::int as n from ${t('client_charges')} where tenant_id = ${tenantId} and status = 'pending'`, 2);
+    });
+
     it('the UPDATE and DELETE arms bind too: a portal session cannot re-stamp its row to the sibling, and deletes ZERO of the sibling’s rows', async () => {
       // UPDATE arm (WITH CHECK on skus): the session's own row is visible
       // (USING passes) but may not be MOVED to the sibling's client.
@@ -1143,7 +1182,15 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // through the parent, plus operator-only INSERT, UPDATE and DELETE),
       // and one operator-only tenant policy each for
       // client_invoice_note_series and client_invoice_note_policies.
-      expect(policies).toHaveLength(138);
+      // Story 5-5a: + two (0099) — one operator-only FOR ALL tenant policy
+      // each for client_charges and client_charge_policies (the
+      // client_invoice_series shape, A7). Retargeted 138 → 140.
+      expect(policies).toHaveLength(140);
+      for (const name of ['client_charges_tenant_isolation', 'client_charge_policies_tenant_isolation']) {
+        const policy = policies.find((row) => row.policyname === name)!;
+        expect(policy.qual).toContain("current_setting('app.client_id'");
+        expect(policy.qual).toContain('IS NULL');
+      }
       const noteRead = policies.find((row) => row.policyname === 'client_invoice_notes_tenant_isolation')!;
       expect(noteRead.qual).toContain("status <> 'draft'");
       expect(policies.find((row) => row.policyname === 'client_invoice_note_lines_tenant_isolation')!.qual).toContain('client_invoice_notes');

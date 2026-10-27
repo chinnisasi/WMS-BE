@@ -42,6 +42,7 @@ import { RateCardsController } from './rate-cards.controller';
 import { BillingUsageController } from './billing-usage.controller';
 import { ClientInvoicesController } from './client-invoices.controller';
 import { ClientInvoiceNotesController } from './client-invoice-notes.controller';
+import { ClientChargesController } from './client-charges.controller';
 import { BillingModule } from '../modules/billing/billing.module';
 import { PortalController } from './portal.controller';
 import { NotificationsController } from './notifications.controller';
@@ -156,6 +157,7 @@ import { ReadinessService } from './readiness.service';
     // issue, dispute/settle/void) — `ClientInvoiceService` owns every rule.
     ClientInvoicesController,
     ClientInvoiceNotesController,
+    ClientChargesController,
     // Story 21-7 — the client portal (read-only, `PortalSessionGuard` from
     // the clients module): each read is its owning module's facade method.
     PortalController,

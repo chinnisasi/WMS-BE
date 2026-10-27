@@ -16,6 +16,41 @@ export async function clientWindDownBlockersInTx(
   tenantId: string,
   clientId: string,
 ): Promise<WindDownBlocker[]> {
+  return [...(await unsettledInvoicesInTx(tx, tenantId, clientId)), ...(await unbilledChargesInTx(tx, tenantId, clientId))];
+}
+
+/**
+ * Story 5-5a (A15) — the `unbilled-charges` blocker: pending charges, plus
+ * approved charges with no `adhoc` line on an issued, disputed or settled
+ * invoice — by the line link, not by month. `codes` names each by its IST
+ * date and category. Deliberately asymmetric: metered usage never blocks a
+ * wind-down (only unsettled invoices do), but a charge is an explicit
+ * record someone asserted.
+ */
+async function unbilledChargesInTx(tx: TenantTx, tenantId: string, clientId: string): Promise<WindDownBlocker[]> {
+  return windDownBlockerInTx(
+    tx,
+    'unbilled-charges',
+    sql`select count(*)::bigint as n, (array_agg(label order by label))[1:5] as codes
+        from (
+          select c.charge_date::text || ' ' || c.category as label
+          from client_charges c
+          where c.tenant_id = ${tenantId} and c.client_id = ${clientId}
+            and (
+              c.status = 'pending'
+              or (c.status = 'approved' and not exists (
+                select 1 from client_invoice_lines l
+                join client_invoices i on i.tenant_id = l.tenant_id and i.id = l.invoice_id
+                where l.tenant_id = c.tenant_id and l.adhoc_charge_id = c.id
+                  and i.status in ('issued', 'disputed', 'settled')
+              ))
+            )
+        ) unbilled`,
+    true,
+  );
+}
+
+async function unsettledInvoicesInTx(tx: TenantTx, tenantId: string, clientId: string): Promise<WindDownBlocker[]> {
   return windDownBlockerInTx(
     tx,
     'unsettled-invoices',

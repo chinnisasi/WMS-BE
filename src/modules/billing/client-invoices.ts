@@ -5,6 +5,7 @@ import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
   auditEvents,
+  clientCharges,
   clientInvoiceLines,
   clientInvoiceNoteLines,
   clientInvoiceNotes,
@@ -41,8 +42,22 @@ import {
   type ClientInvoiceSupplierFacts,
   type ClientInvoiceWarehouseFacts,
 } from '../tenancy/tenancy.service';
+import { divideRoundHalfUp } from '../../shared/primitives/money';
+import { InventoryFacade } from '../inventory/inventory.facade';
+import { rateCardSegmentsInTx } from './billing.facade';
+import {
+  MINIMUM_ADJUSTMENT_SAC,
+  adhocLineDescription,
+  compareLines,
+  minimumLineDescription,
+  type ClientChargeCategory,
+  type InvoiceLineBasis,
+  type InvoiceLineCode,
+} from './client-charges';
 import { MeteringService, milliToDecimal, type MeteredPeriod } from './metering';
-import { CHARGE_CODES, type ChargeCode, type RateBasis } from './rate-cards';
+import { type ChargeCode, type MinimumCounts } from './rate-cards';
+
+export { compareLines } from './client-charges';
 
 /**
  * Story 21-5 — client invoices (CAP-7, FR-78): a monthly SERVICES (SAC) GST
@@ -113,12 +128,25 @@ export const CLIENT_INVOICE_GAP_CODES = [
   'client-billing-address-missing',
   'storage-not-complete',
   'line-unpriced',
+  // Story 5-5a — a charge recorded for this month awaits approval (money is
+  // never silently left off an invoice about to issue), and the minimum
+  // monthly charge cannot be computed yet (storage incomplete or a line
+  // unpriced). Both appear only when their term applies.
+  'adhoc-charge-pending',
+  'minimum-charge-pending',
   'einvoice-required',
 ] as const;
 export type ClientInvoiceGapCode = (typeof CLIENT_INVOICE_GAP_CODES)[number];
 
 /** What does not block issue. */
-export const CLIENT_INVOICE_WARNING_CODES = ['supplier-state-differs'] as const;
+export const CLIENT_INVOICE_WARNING_CODES = [
+  'supplier-state-differs',
+  // Story 5-5a (A21) — the client's GSTIN footprint grew past one group, so a
+  // per-invoice minimum would bill it once per GSTIN: not applied.
+  'minimum-not-applied-multi-gstin',
+  // Story 5-5a (A26) — the minimum adjustment exists while every other line is ad-hoc.
+  'minimum-from-charges-only',
+] as const;
 export type ClientInvoiceWarningCode = (typeof CLIENT_INVOICE_WARNING_CODES)[number];
 
 export interface ClientInvoiceGap {
@@ -127,6 +155,8 @@ export interface ClientInvoiceGap {
   readonly warehouseId?: string;
   /** The IST date the line's rate-card segment starts (line-scoped gaps). */
   readonly segmentFrom?: string;
+  /** Story 5-5a — `adhoc-charge-pending` only: how many charges await approval. */
+  readonly count?: number;
 }
 
 export interface ClientInvoiceWarning {
@@ -220,14 +250,20 @@ export function groupOf(groups: readonly SupplierGroup[], supplierGstin: string 
   return groups.find((group) => group.supplierGstin === supplierGstin) ?? { supplierGstin, warehouses: [] };
 }
 
-/** One line as the draft computes it (quantity in milli-unit-days or a count, as a BigInt). */
+/**
+ * One line as the draft computes it (quantity in milli-unit-days, a count,
+ * milli-units of an ad-hoc charge's unit, or 1 for the minimum adjustment —
+ * a BigInt). Story 5-5a (A11): `description` and `adhocChargeId` are
+ * OPTIONAL and ABSENT on a metered line (never `null`), so a metered draft
+ * deep-equals the 21-5 one and hashes the same.
+ */
 export interface ClientInvoiceDraftLine {
   readonly rateCardId: string | null;
   /** IST-midnight instants, `[from, to)`. */
   readonly segmentFrom: string;
   readonly segmentTo: string;
-  readonly chargeCode: ChargeCode;
-  readonly basis: RateBasis;
+  readonly chargeCode: InvoiceLineCode;
+  readonly basis: InvoiceLineBasis;
   readonly uom: string | null;
   readonly quantity: bigint;
   readonly unitAmountPaise: number | null;
@@ -239,6 +275,35 @@ export interface ClientInvoiceDraftLine {
   readonly cgstPaise: number;
   readonly sgstPaise: number;
   readonly igstPaise: number;
+  /** Story 5-5a — the printed description of an `adhoc` / `minimum_adjustment` line; absent otherwise. */
+  readonly description?: string;
+  /** Story 5-5a — the charge an `adhoc` line bills; absent otherwise. */
+  readonly adhocChargeId?: string;
+}
+
+/** Story 5-5a — one approved ad-hoc charge as the compute bills it (its figures fixed at record). */
+export interface InvoiceAdhocCharge {
+  readonly id: string;
+  /** The IST date of the work — the line's segment, which may precede the period (A4). */
+  readonly chargeDate: string;
+  readonly category: ClientChargeCategory;
+  readonly description: string;
+  readonly reference: string | null;
+  readonly clientAuthorizationRef: string | null;
+  readonly unit: string;
+  readonly quantityMilli: bigint;
+  readonly unitRatePaise: number;
+  readonly amountPaise: number;
+  readonly sacCode: string;
+}
+
+/** Story 5-5a — one rate-card segment of the month as the minimum reads it (IST dates, inclusive). */
+export interface InvoiceMinimumSegment {
+  readonly fromDate: string;
+  readonly toDate: string;
+  /** The card's `minimum_monthly`, or null when the card carries none (the segment contributes 0). */
+  readonly minimumPaise: number | null;
+  readonly counts: MinimumCounts | null;
 }
 
 export interface ClientInvoiceTotals {
@@ -276,6 +341,18 @@ export interface ClientInvoiceDraftInput {
   readonly metered: Pick<MeteredPeriod, 'segments' | 'storageCompleteThrough'>;
   readonly eInvoiceApplies: boolean;
   readonly states: Pick<GstStateResolver, 'nameOf' | 'codeOfText'>;
+  /**
+   * Story 5-5a — every term below is optional: absent (or empty), the draft
+   * is exactly the 21-5 one. The APPROVED ad-hoc charges billing on this
+   * invoice (`bill_month = period_start`, this group).
+   */
+  readonly charges?: readonly InvoiceAdhocCharge[];
+  /** Pending charges of this month and group (the `adhoc-charge-pending` gap). */
+  readonly pendingCount?: number;
+  /** The month's rate-card segments, for the minimum monthly charge. */
+  readonly minimumSegments?: readonly InvoiceMinimumSegment[];
+  /** The client's supplying-GSTIN footprint (A21); more than one group → the minimum is not applied. */
+  readonly footprintGroups?: readonly (string | null)[];
 }
 
 const MILLI = 10n ** BigInt(QUANTITY_DECIMALS);
@@ -285,23 +362,6 @@ export function decimalToMilli(value: string): bigint {
   const match = /^(\d+)(?:\.(\d{1,3}))?$/.exec(value);
   if (match === null) throw new Error(`client invoice: malformed metered quantity "${value}"`);
   return BigInt(match[1]!) * MILLI + BigInt((match[2] ?? '').padEnd(QUANTITY_DECIMALS, '0'));
-}
-
-const chargeRank = (code: string): number => (CHARGE_CODES as readonly string[]).indexOf(code);
-
-/** The canonical line order: (segment_from, charge — `CHARGE_CODES` order, uom — null first). */
-export function compareLines(
-  a: { segmentFrom: string; chargeCode: string; uom: string | null },
-  b: { segmentFrom: string; chargeCode: string; uom: string | null },
-): number {
-  const from = Date.parse(a.segmentFrom) - Date.parse(b.segmentFrom);
-  if (from !== 0) return from;
-  const charge = chargeRank(a.chargeCode) - chargeRank(b.chargeCode);
-  if (charge !== 0) return charge;
-  if (a.uom === b.uom) return 0;
-  if (a.uom === null) return -1;
-  if (b.uom === null) return 1;
-  return a.uom < b.uom ? -1 : 1;
 }
 
 const isFull = (value: string | null): value is string => value !== null && value.trim() !== '';
@@ -400,6 +460,95 @@ export function computeClientInvoiceDraft(input: ClientInvoiceDraftInput): Clien
       });
     }
   }
+
+  // ── story 5-5a: each approved ad-hoc charge is its own line (decision 6):
+  // its figures as recorded, its own SAC, the invoice's tax rule, segment =
+  // the charge's true service day (which may precede the period — A4).
+  const meteredCount = lines.length;
+  for (const charge of input.charges ?? []) {
+    const lineTax = computeLineTax(1000, asPaise(charge.amountPaise), asGstBps(CLIENT_INVOICE_GST_BPS), supplyType);
+    lines.push({
+      rateCardId: null,
+      segmentFrom: istMidnightOf(charge.chargeDate),
+      segmentTo: istMidnightOf(addIsoDays(charge.chargeDate, 1)),
+      chargeCode: 'adhoc',
+      basis: 'per_unit',
+      uom: charge.unit,
+      quantity: charge.quantityMilli,
+      unitAmountPaise: charge.unitRatePaise,
+      amountPaise: charge.amountPaise,
+      sacCode: charge.sacCode,
+      gstBps: CLIENT_INVOICE_GST_BPS,
+      placeOfSupply,
+      supplyType,
+      cgstPaise: lineTax.cgstPaise,
+      sgstPaise: lineTax.sgstPaise,
+      igstPaise: lineTax.igstPaise,
+      description: adhocLineDescription(charge),
+      adhocChargeId: charge.id,
+    });
+  }
+
+  // ── story 5-5a: the minimum monthly charge (decision 10, A19, A21, A27).
+  // Per invoice; the floor prorated by days across the month's card
+  // segments; computed only once every other line is priced and storage is
+  // complete (else the blocking `minimum-charge-pending`); never for a month
+  // with no other line (a dormant month — deferred); not applied when the
+  // client's GSTIN footprint spans more than one group (a warning).
+  const minimumSegments = input.minimumSegments ?? [];
+  const bearing = minimumSegments.filter((segment) => segment.minimumPaise !== null);
+  let minimumState: 'none' | 'pending' | 'multi-gstin' | 'applied' = 'none';
+  let adjustment: ClientInvoiceDraftLine | null = null;
+  const footprint = input.footprintGroups ?? [supplierGstin];
+  if (bearing.length > 0 && lines.length > 0) {
+    if (footprint.length > 1) {
+      minimumState = 'multi-gstin';
+    } else if (!storageComplete || lines.some((line) => line.amountPaise === null)) {
+      minimumState = 'pending';
+    } else {
+      minimumState = 'applied';
+      const dayCount = (from: string, to: string): bigint => BigInt(Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000) + 1);
+      const monthDays = dayCount(input.periodStart, input.periodEnd);
+      const numerator = bearing.reduce((sum, segment) => sum + BigInt(segment.minimumPaise!) * dayCount(segment.fromDate, segment.toDate), 0n);
+      const floor = divideRoundHalfUp(numerator, monthDays);
+      // A19 — the rule of the LATEST minimum-bearing segment applies to the whole month.
+      const counts: MinimumCounts = bearing.at(-1)!.counts ?? 'all';
+      let charges = 0n;
+      for (const line of lines) {
+        if (line.chargeCode === 'adhoc' && counts === 'metered') continue;
+        charges += BigInt(line.amountPaise!);
+      }
+      if (floor > charges) {
+        const amount = Number(floor - charges);
+        const lineTax = computeLineTax(1000, asPaise(amount), asGstBps(CLIENT_INVOICE_GST_BPS), supplyType);
+        adjustment = {
+          rateCardId: null,
+          segmentFrom: istMidnightOf(input.periodStart),
+          segmentTo: istMidnightOf(addIsoDays(input.periodEnd, 1)),
+          chargeCode: 'minimum_adjustment',
+          basis: 'per_invoice',
+          uom: null,
+          quantity: 1n,
+          unitAmountPaise: amount,
+          amountPaise: amount,
+          sacCode: MINIMUM_ADJUSTMENT_SAC,
+          gstBps: CLIENT_INVOICE_GST_BPS,
+          placeOfSupply,
+          supplyType,
+          cgstPaise: lineTax.cgstPaise,
+          sgstPaise: lineTax.sgstPaise,
+          igstPaise: lineTax.igstPaise,
+          description: minimumLineDescription({
+            floorPaise: floor,
+            chargesPaise: charges,
+            counts,
+            segments: minimumSegments.map((segment) => ({ fromDate: segment.fromDate, toDate: segment.toDate, minimumPaise: segment.minimumPaise ?? 0 })),
+          }),
+        };
+      }
+    }
+  }
+  if (adjustment !== null) lines.push(adjustment);
   lines.sort(compareLines);
 
   // ── the totals (sums of rounded lines; the rupee rounding on the total only).
@@ -481,6 +630,20 @@ export function computeClientInvoiceDraft(input: ClientInvoiceDraftInput): Clien
       segmentFrom: from,
     });
   }
+  const pendingCount = input.pendingCount ?? 0;
+  if (pendingCount > 0) {
+    gaps.push({
+      code: 'adhoc-charge-pending',
+      detail: `${pendingCount} ad-hoc charge${pendingCount === 1 ? '' : 's'} recorded for this month ${pendingCount === 1 ? 'awaits' : 'await'} approval — approve or reject ${pendingCount === 1 ? 'it' : 'them'}, then refresh.`,
+      count: pendingCount,
+    });
+  }
+  if (minimumState === 'pending') {
+    gaps.push({
+      code: 'minimum-charge-pending',
+      detail: 'The minimum monthly charge cannot be worked out yet — it needs storage measured through the month’s end and every line priced. Refresh once the gaps above clear.',
+    });
+  }
   if (input.eInvoiceApplies && tax.gstin !== null) {
     gaps.push({
       code: 'einvoice-required',
@@ -501,6 +664,20 @@ export function computeClientInvoiceDraft(input: ClientInvoiceDraftInput): Clien
         });
       }
     }
+  }
+
+  if (minimumState === 'multi-gstin') {
+    const named = [...footprint].map((gstin) => gstin ?? 'no GSTIN').join(', ');
+    warnings.push({
+      code: 'minimum-not-applied-multi-gstin',
+      detail: `The minimum monthly charge is not applied: this client is billed under more than one GSTIN (${named}), and a per-invoice minimum would bill it once per GSTIN.`,
+    });
+  }
+  if (adjustment !== null && meteredCount === 0) {
+    warnings.push({
+      code: 'minimum-from-charges-only',
+      detail: 'This invoice has no metered usage — the minimum monthly charge applies to ad-hoc charges alone. Check the month is meant to bill the minimum.',
+    });
   }
 
   const draft = {
@@ -562,6 +739,10 @@ export function clientInvoiceContentHash(draft: Omit<ClientInvoiceDraft, 'conten
     cgstPaise: big(line.cgstPaise),
     sgstPaise: big(line.sgstPaise),
     igstPaise: big(line.igstPaise),
+    // Story 5-5a — the conditional-key exception (IMPLEMENTATION-GUIDE §4):
+    // present only on the two new kinds, so a metered line hashes as in 21-5.
+    ...(line.description === undefined ? {} : { description: line.description }),
+    ...(line.adhocChargeId === undefined ? {} : { adhocChargeId: line.adhocChargeId }),
   }));
   const totals = Object.fromEntries(Object.entries(draft.totals).map(([key, value]) => [key, big(value)]));
   const content = {
@@ -584,6 +765,8 @@ export function clientInvoiceContentHash(draft: Omit<ClientInvoiceDraft, 'conten
 export interface ComputedDraft extends ClientInvoiceDraft {
   /** Story 21-5b — the group's snapshot watermark clipped to `period_end` (`period_start − 1`: the group has no snapshot scope). */
   readonly storageMeasuredThrough: string;
+  /** Story 5-5a (A6) — pending charges of this month and group: a month with only those still gets a (zero-line) draft. */
+  readonly pendingCount: number;
 }
 
 /**
@@ -626,10 +809,11 @@ export interface ClientInvoiceLineView {
   /** IST dates, inclusive. */
   readonly segmentFrom: string;
   readonly segmentTo: string;
-  readonly chargeCode: ChargeCode;
-  readonly basis: RateBasis;
+  readonly chargeCode: InvoiceLineCode;
+  readonly basis: InvoiceLineBasis;
+  /** A storage line's base UoM; an ad-hoc line's unit; null otherwise. */
   readonly uom: string | null;
-  /** Base-unit-days for storage (to three decimals), a whole count otherwise — a decimal string. */
+  /** Base-unit-days for storage and units for an ad-hoc line (to three decimals), a whole count otherwise — a decimal string. */
   readonly quantity: string;
   readonly unitAmountPaise: number | null;
   readonly amountPaise: number | null;
@@ -640,6 +824,10 @@ export interface ClientInvoiceLineView {
   readonly cgstPaise: number;
   readonly sgstPaise: number;
   readonly igstPaise: number;
+  /** Story 5-5a — present only on an `adhoc` or `minimum_adjustment` line: the printed description. */
+  readonly description?: string;
+  /** Story 5-5a — present only on an `adhoc` line: the charge it bills. */
+  readonly adhocChargeId?: string;
 }
 
 export interface ClientInvoiceTotalsView {
@@ -732,6 +920,8 @@ async function linesOfInTx(tx: TenantTx, tenantId: string, invoiceId: string): P
       cgstPaise: clientInvoiceLines.cgstPaise,
       sgstPaise: clientInvoiceLines.sgstPaise,
       igstPaise: clientInvoiceLines.igstPaise,
+      description: clientInvoiceLines.description,
+      adhocChargeId: clientInvoiceLines.adhocChargeId,
     })
     .from(clientInvoiceLines)
     .where(and(eq(clientInvoiceLines.tenantId, tenantId), eq(clientInvoiceLines.invoiceId, invoiceId)));
@@ -743,10 +933,10 @@ async function linesOfInTx(tx: TenantTx, tenantId: string, invoiceId: string): P
       rateCardId: row.rateCardId,
       segmentFrom: istDateOf(row.segmentFrom),
       segmentTo: addIsoDays(istDateOf(row.segmentTo), -1),
-      chargeCode: row.chargeCode as ChargeCode,
-      basis: row.basis as RateBasis,
+      chargeCode: row.chargeCode as InvoiceLineCode,
+      basis: row.basis as InvoiceLineBasis,
       uom: row.uom,
-      quantity: row.chargeCode === 'storage' ? milliToDecimal(BigInt(row.quantity)) : row.quantity,
+      quantity: row.chargeCode === 'storage' || row.chargeCode === 'adhoc' ? milliToDecimal(BigInt(row.quantity)) : row.quantity,
       unitAmountPaise: numberOrNull(row.unitAmountPaise),
       amountPaise: numberOrNull(row.amountPaise),
       sac: row.sacCode,
@@ -756,6 +946,9 @@ async function linesOfInTx(tx: TenantTx, tenantId: string, invoiceId: string): P
       cgstPaise: Number(row.cgstPaise),
       sgstPaise: Number(row.sgstPaise),
       igstPaise: Number(row.igstPaise),
+      // Story 5-5a — conditional keys: an existing invoice's JSON is byte-identical.
+      ...(row.description === null ? {} : { description: row.description }),
+      ...(row.adhocChargeId === null ? {} : { adhocChargeId: row.adhocChargeId }),
     }));
 }
 
@@ -892,6 +1085,7 @@ export class ClientInvoiceService {
     @Inject(DATABASE) private readonly db: Database,
     @Inject(MeteringService) private readonly metering: MeteringService,
     @Inject(InvoicingFacade) private readonly invoicing: InvoicingFacade,
+    @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
   ) {}
 
   // ── commands ──────────────────────────────────────────────────────────────
@@ -938,12 +1132,15 @@ export class ClientInvoiceService {
       for (const group of context.groups) {
         const draft = await this.computeInTx(tx, command.tenantId, client, group, periodStart, periodEnd, context);
         const liveRow = live.find((row) => row.supplierGstin === group.supplierGstin);
-        if (draft.lines.length > 0) anyUsage = true;
+        // Story 5-5a (A6) — a month whose only usage is a PENDING charge still
+        // gets a (zero-line) draft carrying the `adhoc-charge-pending` gap.
+        const hasUsage = draft.lines.length > 0 || draft.pendingCount > 0;
+        if (hasUsage) anyUsage = true;
         if (liveRow !== undefined) {
           existing.push(await viewOfInTx(tx, liveRow));
           continue;
         }
-        if (draft.lines.length === 0) continue;
+        if (!hasUsage) continue;
         const replaces = await this.latestUnreplacedVoidInTx(tx, command.tenantId, client.id, periodStart, group.supplierGstin);
         const row = await this.insertDraftInTx(tx, command, client.id, draft, replaces);
         await this.audit(tx, command, 'client_invoice.prepared', row.id, idempotencyKey);
@@ -954,7 +1151,7 @@ export class ClientInvoiceService {
           'nothing-to-invoice',
           409,
           'Nothing to invoice',
-          `Client ${client.code} has no billable usage in ${command.month} — no receipt line, pick, dispatched order or stored unit.`,
+          `Client ${client.code} has no billable usage in ${command.month} — no receipt line, pick, dispatched order, stored unit or ad-hoc charge.`,
         );
       }
 
@@ -1064,7 +1261,10 @@ export class ClientInvoiceService {
         .where(and(eq(clientInvoices.tenantId, command.tenantId), eq(clientInvoices.id, row.id), eq(clientInvoices.status, 'draft')))
         .returning();
       const result: IssueClientInvoiceResult = { outcome: 'issued', invoice: await viewOfInTx(tx, issued[0]!) };
-      await this.audit(tx, command, 'client_invoice.issued', row.id, idempotencyKey);
+      // Story 5-5a (A31) — the charges an issue bills, ONLY when it bills any
+      // (an invoice without ad-hoc lines keeps the 21-5 audit row exactly).
+      const adhocChargeIds = draft.lines.flatMap((line) => (line.adhocChargeId === undefined ? [] : [line.adhocChargeId]));
+      await this.audit(tx, command, 'client_invoice.issued', row.id, idempotencyKey, adhocChargeIds.length === 0 ? undefined : { adhocChargeIds });
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, result);
       return result;
     });
@@ -1233,11 +1433,64 @@ export class ClientInvoiceService {
     // The line quantities are the group's; the `storage-not-complete` gap
     // reads the CLIENT's watermark (the frozen Boundaries) — a group with
     // counts but no stock events has no snapshot scope of its own.
+    const scopes = await this.inventory.clientWarehousesWithEventsInTx(tx, tenantId, [client.id]);
+    const clientWatermark = await this.metering.clientStorageCompleteThroughInTx(tx, tenantId, client.id);
+    // Story 5-5a (A5) — a client with NO snapshot scope (no ledger event at
+    // all) has nothing to store: its storage is complete through the month's
+    // end once the month has ended (prepare already refused one that has
+    // not), so a charge-only invoice can issue.
     const metered = {
       ...narrowed,
-      storageCompleteThrough: await this.metering.clientStorageCompleteThroughInTx(tx, tenantId, client.id),
+      storageCompleteThrough: clientWatermark === null && scopes.length === 0 ? periodEnd : clientWatermark,
     };
     const eInvoiceApplies = group.supplierGstin === null ? false : await this.invoicing.eInvoiceAppliesInTx(tx, tenantId, group.supplierGstin);
+
+    // Story 5-5a — the contract terms: this month's ad-hoc charges of this
+    // group (by `bill_month` and the GSTIN frozen on the charge), and the
+    // month's card segments for the minimum.
+    const chargeRows = await tx
+      .select()
+      .from(clientCharges)
+      .where(
+        and(
+          eq(clientCharges.tenantId, tenantId),
+          eq(clientCharges.clientId, client.id),
+          eq(clientCharges.billMonth, periodStart),
+          inArray(clientCharges.status, ['approved', 'pending']),
+          sql`coalesce(${clientCharges.supplierGstin}, '') = ${group.supplierGstin ?? ''}`,
+        ),
+      )
+      .orderBy(asc(clientCharges.id));
+    const charges: InvoiceAdhocCharge[] = chargeRows
+      .filter((row) => row.status === 'approved')
+      .map((row) => ({
+        id: row.id,
+        chargeDate: row.chargeDate,
+        category: row.category as ClientChargeCategory,
+        description: row.description,
+        reference: row.reference,
+        clientAuthorizationRef: row.clientAuthorizationRef,
+        unit: row.unit,
+        quantityMilli: BigInt(row.quantityMilli),
+        unitRatePaise: Number(row.unitRatePaise),
+        amountPaise: Number(row.amountPaise),
+        sacCode: row.sacCode,
+      }));
+    const pendingCount = chargeRows.filter((row) => row.status === 'pending').length;
+    const segments = await rateCardSegmentsInTx(tx, tenantId, client.id, istMidnightOf(periodStart), istMidnightOf(addIsoDays(periodEnd, 1)));
+    const minimumSegments: InvoiceMinimumSegment[] = segments.map((segment) => {
+      const minimum = segment.lines.find((line) => line.chargeCode === 'minimum_monthly');
+      return {
+        fromDate: istDateOf(segment.from),
+        toDate: addIsoDays(istDateOf(segment.to), -1),
+        minimumPaise: minimum === undefined ? null : minimum.amountPaise,
+        counts: minimum === undefined ? null : (minimum.minimumCounts ?? 'all'),
+      };
+    });
+    const footprintGroups = minimumSegments.some((segment) => segment.minimumPaise !== null)
+      ? await clientGstinFootprintInTx(tx, tenantId, client.id, scopes.map((scope) => scope.warehouseId), context.supplier)
+      : undefined;
+
     const draft = computeClientInvoiceDraft({
       periodStart,
       periodEnd,
@@ -1247,10 +1500,14 @@ export class ClientInvoiceService {
       metered,
       eInvoiceApplies,
       states: context.states,
+      charges,
+      pendingCount,
+      minimumSegments,
+      ...(footprintGroups === undefined ? {} : { footprintGroups }),
     });
     // Story 21-5b: the storage lines counted the GROUP's measured days (the
     // narrowed watermark), clipped to the month — what the drill lists.
-    return { ...draft, storageMeasuredThrough: measuredThroughOf(narrowed.storageCompleteThrough, periodStart, periodEnd) };
+    return { ...draft, storageMeasuredThrough: measuredThroughOf(narrowed.storageCompleteThrough, periodStart, periodEnd), pendingCount };
   }
 
   private draftColumns(draft: ComputedDraft) {
@@ -1365,6 +1622,8 @@ export class ClientInvoiceService {
         cgstPaise: line.cgstPaise,
         sgstPaise: line.sgstPaise,
         igstPaise: line.igstPaise,
+        description: line.description ?? null,
+        adhocChargeId: line.adhocChargeId ?? null,
       })),
     );
   }
@@ -1463,6 +1722,7 @@ export class ClientInvoiceService {
     action: AuditAction,
     invoiceId: string,
     reference: string,
+    changes?: Record<string, unknown>,
   ): Promise<void> {
     await tx.insert(auditEvents).values({
       id: uuidv7(),
@@ -1472,6 +1732,7 @@ export class ClientInvoiceService {
       targetType: 'client_invoice',
       targetId: invoiceId,
       reference,
+      ...(changes === undefined ? {} : { changes }),
       occurredAt: nowIso(),
     });
   }
@@ -1597,6 +1858,34 @@ async function discardDraftNotesInTx(tx: TenantTx, row: ClientInvoice, actorUser
       occurredAt: nowIso(),
     })),
   );
+}
+
+/**
+ * Story 5-5a (A21) — the client's supplying-GSTIN footprint: the groups
+ * (`warehouses.gstin ?? tenants.gstin`) of the warehouses where it has
+ * ledger events, plus the groups frozen on its pending and approved
+ * charges. Sorted, the no-GSTIN group (null) last. A minimum monthly charge
+ * applies per invoice only while this is ONE group.
+ */
+export async function clientGstinFootprintInTx(
+  tx: TenantTx,
+  tenantId: string,
+  clientId: string,
+  eventWarehouseIds: readonly string[],
+  supplier: ClientInvoiceSupplierFacts,
+): Promise<(string | null)[]> {
+  const groupOfWarehouse = new Map(supplier.warehouses.map((warehouse) => [warehouse.id, warehouse.gstin ?? supplier.tenantGstin ?? '']));
+  const keys = new Set<string>();
+  for (const warehouseId of eventWarehouseIds) {
+    const key = groupOfWarehouse.get(warehouseId);
+    if (key !== undefined) keys.add(key);
+  }
+  const rows = await tx
+    .selectDistinct({ gstin: sql<string>`coalesce(${clientCharges.supplierGstin}, '')` })
+    .from(clientCharges)
+    .where(and(eq(clientCharges.tenantId, tenantId), eq(clientCharges.clientId, clientId), inArray(clientCharges.status, ['pending', 'approved'])));
+  for (const row of rows) keys.add(row.gstin);
+  return [...keys].sort((a, b) => (a === '' ? 1 : b === '' ? -1 : a.localeCompare(b))).map((key) => (key === '' ? null : key));
 }
 
 /** The tenant's own client is never invoiced (409 `client-not-billable`). */

@@ -694,6 +694,13 @@
       "when": 1793077787113,
       "tag": "0098_client_invoice_notes",
       "breakpoints": true
+    },
+    {
+      "idx": 99,
+      "version": "7",
+      "when": 1793082443271,
+      "tag": "0099_contract_billing",
+      "breakpoints": true
     }
   ]
 }
