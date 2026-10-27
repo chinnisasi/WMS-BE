@@ -660,7 +660,7 @@ describe('return receipts (e2e, story 13-2)', () => {
     const line = { id: 'line-1', skuId: 'sku-bs', orderLineId: 'ol-1', serialIds: ['ser-1', 'ser-2'] };
     const ctx: ClassifyContext = {
       lineById: new Map([[line.id, line]]),
-      skuFacts: new Map([['sku-bs', { batchTracked: true, serialTracked: true, catchWeightTracked: false, uom: 'pcs', uomPrecision: 0 }]]),
+      skuFacts: new Map([['sku-bs', { code: 'SKU-BS', name: 'Batch and serial', batchTracked: true, serialTracked: true, catchWeightTracked: false, uom: 'pcs', uomPrecision: 0 }]]),
       remaining: new Map([[line.id, 2000]]),
       serialIdByEntry: new Map([
         [0, 'ser-1'],
@@ -703,7 +703,7 @@ describe('return receipts (e2e, story 13-2)', () => {
   it('the classification (pure): batch over-claim, qty-precision, unexpected-capture, weight-out-of-range, missing-capture', () => {
     const line = { id: 'line-b', skuId: 'sku-b', orderLineId: 'ol-b', serialIds: [] as string[] };
     const facts = (over: Partial<{ batchTracked: boolean; catchWeightTracked: boolean; uomPrecision: number }>) => ({
-      batchTracked: false, serialTracked: false, catchWeightTracked: false, uom: 'pcs', uomPrecision: 0, ...over,
+      code: 'SKU-X', name: 'Fixture', batchTracked: false, serialTracked: false, catchWeightTracked: false, uom: 'pcs', uomPrecision: 0, ...over,
     });
     const ctx = (sku: ReturnType<typeof facts>): ClassifyContext => ({
       lineById: new Map([[line.id, line]]),
@@ -908,7 +908,9 @@ describe('return receipts (e2e, story 13-2)', () => {
     // (a refused unload — re-applying would be refused again). Named here.
     // Story 2-5a adds the device-uploaded Discard-only `receipt-photo.stage`
     // (a refused damage photo — the device deleted the file). Named here.
-    const discardOnly = new Set(['return.receive', 'grn.lines-refused', 'grn.inactive-sku-received', 'gate-in.unload', 'receipt-photo.stage']);
+    // Story 4-7a adds the device-uploaded Discard-only `return.restock` (A4 —
+    // the units were placed in the scanned bin; restock them on the web).
+    const discardOnly = new Set(['return.receive', 'grn.lines-refused', 'grn.inactive-sku-received', 'gate-in.unload', 'receipt-photo.stage', 'return.restock']);
     for (const type of REJECTED_OP_TYPES) {
       const expected =
         // Story 3-1 adds the device-uploaded `stock.move` — apply + discard (a

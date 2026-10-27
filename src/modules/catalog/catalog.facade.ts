@@ -29,6 +29,7 @@ import {
   markHandlingUnitsAdjustedInTx,
   markHandlingUnitsPackedInTx,
   settleHandlingUnitIntakeInTx,
+  settleReturnedHandlingUnitsInTx,
 } from './handling-unit.store';
 import { getKitCompositionInTx, getKitSkuIdsInTx } from './kit.store';
 // Story 3-3a — the batch block verb and its lifecycle view (the facade only
@@ -138,6 +139,9 @@ export interface SerialIdentity {
  * precision (the Epic 10 rule a quantity is checked against).
  */
 export interface SkuFacts {
+  /** Story 4-7a — the SKU's code and name (a refusal names it; the portal returns read shows it). */
+  readonly code: string;
+  readonly name: string;
   /** Story 13-2 — the return receipt binds a batch-tracked unit to its picked batch. */
   readonly batchTracked: boolean;
   readonly serialTracked: boolean;
@@ -997,6 +1001,8 @@ export class CatalogFacade {
     const query = tx
       .select({
         id: skus.id,
+        code: skus.code,
+        name: skus.name,
         uom: skus.uom,
         batchTracked: skus.batchTracked,
         serialTracked: skus.serialTracked,
@@ -1013,6 +1019,8 @@ export class CatalogFacade {
       rows.map((row) => [
         row.id,
         {
+          code: row.code,
+          name: row.name,
           batchTracked: row.batchTracked,
           serialTracked: row.serialTracked,
           catchWeightTracked: row.catchWeightTracked,
@@ -1365,6 +1373,16 @@ export class CatalogFacade {
     assignments: readonly HandlingUnitPackAssignment[],
   ): Promise<HandlingUnitIdentity[]> {
     return markHandlingUnitsPackedInTx(tx, tenantId, assignments);
+  }
+
+  /** See `settleReturnedHandlingUnitsInTx` — story 4-7a's `returned → active | rejected`. */
+  async settleReturnedHandlingUnitsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    ids: readonly string[],
+    status: 'active' | 'rejected',
+  ): Promise<HandlingUnitIdentity[]> {
+    return settleReturnedHandlingUnitsInTx(tx, tenantId, ids, status);
   }
 
   /** See `handlingUnitsByIdsInTx` — story 13-2's unlocked read (a returned case's weight). */

@@ -77,9 +77,13 @@ export interface ReleaseQcHoldCommand {
  * Story 1-2b — the hold kinds (`qc_holds.kind`, CHECK `qc_holds_kind_check`
  * in migration 0078): `manual` — an Ops Manager's or an excursion's (sku,
  * bin) scope hold, one open per scope; `receipt` — QC on receipt, one per
- * booked GRN line, never part of the one-per-scope rule.
+ * booked GRN line, never part of the one-per-scope rule. Story 4-7a adds
+ * `return` — a returned unit quarantined out of the system RETURNS bin (its
+ * origin: a release brings the units back to awaiting disposition), placed
+ * by the returns module through `holdReturnLineInTx`; never part of the
+ * one-per-scope rule either. Mirrored by `qc_holds_kind_check` (0097).
  */
-export const QC_HOLD_KINDS = ['manual', 'receipt'] as const;
+export const QC_HOLD_KINDS = ['manual', 'receipt', 'return'] as const;
 export type QcHoldKind = (typeof QC_HOLD_KINDS)[number];
 
 /**
@@ -267,6 +271,39 @@ export interface HoldReceiptLineInput {
   readonly occurredAt: string;
   readonly recordedAt: string;
   readonly reason: string;
+}
+
+/**
+ * Story 4-7a — one return-receipt line's units (or part of them) quarantined
+ * out of the system RETURNS bin. Milli-units.
+ */
+export interface HoldReturnLineInput {
+  readonly tenantId: string;
+  readonly warehouseId: string;
+  readonly skuId: string;
+  /** The warehouse's system RETURNS bin — the origin a release returns to. */
+  readonly returnsBinId: string;
+  readonly batchId: string | null;
+  /** Milli-units (> 0). */
+  readonly quantity: number;
+  readonly actorUserId: string;
+  readonly occurredAt: string;
+  readonly recordedAt: string;
+  /** `return <RMA code> · <reasonCode>` (A14), at most 200 characters. */
+  readonly reason: string;
+}
+
+/**
+ * Story 4-7a (A23) — what QC's own record says about a return hold: its
+ * status, the units it held (Σ its `qc.held` events) and, once closed, the
+ * units that came back to the origin (all of them on a release; the passed
+ * units on an inspection) and the units that failed (to DAMAGED). Milli-units.
+ */
+export interface ReturnHoldOutcome {
+  readonly status: QcHoldStatus;
+  readonly heldMilli: number;
+  readonly returnedMilli: number;
+  readonly failedMilli: number;
 }
 
 /** Story 1-2b — `POST …/qc-holds/release-receipt`: every open receipt hold of one GRN. */
@@ -800,6 +837,116 @@ export class QcCommand {
       overReceiptId: input.overReceiptId,
     });
     return holdId;
+  }
+
+  /**
+   * Story 4-7a — quarantine part of a return-receipt line, in the CALLER's
+   * transaction (the returns module's disposition command, through
+   * `QcFacade`): one `qc.held` RETURNS → QC-HOLD on the line's batch arm and
+   * an open hold of kind `return` whose origin is the RETURNS bin, so a
+   * release (or 2-8a's passed units) brings the units back to awaiting
+   * disposition. The `holdReceiptLineInTx` shape — no scope read, no bin lock,
+   * no role gate (the caller holds `returns.manage`) — plus the
+   * `qc_hold.placed` outbox event in the manual hold's exact payload shape, so
+   * the existing `qc-hold` notification raises and its release resolves it
+   * (a return hold's release payload carries no `kind`). No audit row: the
+   * caller writes one per command. Returns the hold id.
+   */
+  async holdReturnLineInTx(tx: TenantTx, input: HoldReturnLineInput): Promise<string> {
+    if (input.reason.trim() === '' || input.reason.length > MAX_REASON_LENGTH) {
+      throw qcValidation(`reason is required (at most ${MAX_REASON_LENGTH} characters).`);
+    }
+    const holdId = uuidv7();
+    const qcBin = await ensureQcHoldBinInTx(tx, input.tenantId, input.warehouseId);
+    await this.inventory.appendLedgerEventInTx(tx, {
+      tenantId: input.tenantId,
+      warehouseId: input.warehouseId,
+      type: 'qc.held',
+      skuId: input.skuId,
+      quantityDelta: signedQuantity(input.quantity),
+      fromBinId: input.returnsBinId,
+      toBinId: qcBin.binId,
+      batchRef: input.batchId,
+      serialRef: null,
+      actorUserId: input.actorUserId,
+      occurredAt: input.occurredAt,
+      recordedAt: input.recordedAt,
+      referenceDoc: { kind: 'qc-hold', holdId, fromBinId: input.returnsBinId },
+    });
+    await tx.insert(qcHolds).values({
+      id: holdId,
+      tenantId: input.tenantId,
+      warehouseId: input.warehouseId,
+      skuId: input.skuId,
+      binId: input.returnsBinId,
+      reason: input.reason,
+      status: 'open',
+      heldBy: input.actorUserId,
+      heldAt: input.recordedAt,
+      kind: 'return',
+    });
+    await this.outbox.append(tx, {
+      messageId: uuidv7(),
+      tenantId: input.tenantId,
+      type: 'qc_hold.placed',
+      occurredAt: input.recordedAt,
+      payload: {
+        holdId,
+        tenantId: input.tenantId,
+        warehouseId: input.warehouseId,
+        skuId: input.skuId,
+        binId: input.returnsBinId,
+        reason: input.reason,
+        heldBy: input.actorUserId,
+        heldAt: input.recordedAt,
+      },
+    });
+    return holdId;
+  }
+
+  /**
+   * Story 4-7a (A23) — one hold's outcome from QC's OWN record, in the
+   * caller's transaction (the returns hold-settlement subscriber reads it;
+   * it never trusts an event payload): held = Σ the hold's `qc.held` events;
+   * returned = held on a release (a release is all-or-nothing), the passed
+   * rows on an inspection; failed = the failed rows. Null for an unknown hold.
+   * The status map is a `Record` over `QcHoldStatus`, so a widened status
+   * vocabulary fails `typecheck` here (A2).
+   */
+  async returnHoldOutcomeInTx(tx: TenantTx, tenantId: string, holdId: string): Promise<ReturnHoldOutcome | null> {
+    const rows = await tx
+      .select({ id: qcHolds.id, status: qcHolds.status, warehouseId: qcHolds.warehouseId })
+      .from(qcHolds)
+      .where(and(eq(qcHolds.tenantId, tenantId), eq(qcHolds.id, holdId)))
+      .limit(1);
+    const hold = rows[0];
+    if (hold === undefined) return null;
+    const arms = await this.inventory.qcHeldArmsInTx(tx, tenantId, hold.warehouseId, hold.id);
+    const heldMilli = arms.reduce((sum, arm) => sum + arm.quantity, 0);
+    const status = hold.status as QcHoldStatus;
+    const byStatus: Record<QcHoldStatus, () => Promise<{ returnedMilli: number; failedMilli: number }>> = {
+      open: async () => ({ returnedMilli: 0, failedMilli: 0 }),
+      released: async () => ({ returnedMilli: heldMilli, failedMilli: 0 }),
+      inspected: async () => {
+        const lines = await tx
+          .select({ outcome: qcInspectionLines.outcome, quantity: qcInspectionLines.quantity })
+          .from(qcInspectionLines)
+          .innerJoin(
+            qcInspections,
+            and(eq(qcInspections.tenantId, qcInspectionLines.tenantId), eq(qcInspections.id, qcInspectionLines.inspectionId)),
+          )
+          .where(and(eq(qcInspections.tenantId, tenantId), eq(qcInspections.holdId, hold.id)));
+        let passed = 0;
+        let failed = 0;
+        for (const line of lines) {
+          if (line.outcome === 'passed') passed += Number(line.quantity);
+          else failed += Number(line.quantity);
+        }
+        return { returnedMilli: passed, failedMilli: failed };
+      },
+    };
+    const outcome = await byStatus[status]();
+    return { status, heldMilli, ...outcome };
   }
 
   /**

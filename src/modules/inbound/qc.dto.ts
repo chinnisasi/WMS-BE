@@ -111,7 +111,7 @@ export class QcHoldDto {
     enum: [...QC_HOLD_KINDS],
     required: false,
     description:
-      "Story 1-2b — `receipt`: placed by the receipt itself (the client's QC on receipt), one per GRN line; `manual`: an Ops Manager's (sku, bin) scope hold. Always present on the list; on a command's answer present only for a receipt hold",
+      "Story 1-2b — `receipt`: placed by the receipt itself (the client's QC on receipt), one per GRN line; `manual`: an Ops Manager's (sku, bin) scope hold; `return` (story 4-7a): a returned unit quarantined from the RETURNS bin. Always present on the list; on a command's answer present only for a receipt hold",
   })
   kind?: QcHoldKind;
 
@@ -121,7 +121,7 @@ export class QcHoldDto {
 
 /** Story 1-2b — one row of the holds list: the hold plus what a reviewer needs to work it. */
 export class QcHoldEntryDto extends QcHoldDto {
-  @ApiProperty({ enum: [...QC_HOLD_KINDS], required: true, description: "Story 1-2b — `receipt`: placed by the receipt itself (the client's QC on receipt), one per GRN line; `manual`: an Ops Manager's (sku, bin) scope hold" })
+  @ApiProperty({ enum: [...QC_HOLD_KINDS], required: true, description: "Story 1-2b — `receipt`: placed by the receipt itself (the client's QC on receipt), one per GRN line; `manual`: an Ops Manager's (sku, bin) scope hold; `return` (story 4-7a): a returned unit quarantined from the RETURNS bin" })
   declare kind: QcHoldKind;
 
   @ApiProperty({ format: 'uuid', type: String, nullable: true, description: "Story 1-2b — the receipt hold's GRN (null on a manual hold)" })
@@ -135,6 +135,12 @@ export class QcHoldEntryDto extends QcHoldDto {
 
   @ApiProperty({ format: 'uuid', description: "Story 1-2b — the held SKU's client" })
   clientId!: string;
+
+  @ApiProperty({
+    required: false,
+    description: 'Story 4-7a — a return hold\'s return authorization code (RMA-0001); absent on every other hold',
+  })
+  rmaCode?: string;
 
   @ApiProperty({ format: 'uuid', type: String, nullable: true, description: 'Story 1-2b — the batch held (null on an untracked SKU, or when a manual hold moved several batches)' })
   batchId!: string | null;

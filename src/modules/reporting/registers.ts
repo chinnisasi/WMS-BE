@@ -403,6 +403,9 @@ export function referenceSummary(doc: LedgerReferenceDoc, grnCodes: ReadonlyMap<
       return `transfer ${doc.transferId}`;
     case 'return-receipt':
       return `return ${doc.rmaId}`;
+    // Story 4-7a — a restock or scrap of a returned unit.
+    case 'return-disposition':
+      return `return ${doc.outcome} ${doc.rmaId}${doc.reasonCode === undefined ? '' : ` (${doc.reasonCode})`}`;
     default: {
       const unknown: never = doc;
       const kind = (unknown as { kind?: unknown }).kind;

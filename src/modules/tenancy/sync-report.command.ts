@@ -140,7 +140,15 @@ export type RejectedOpType =
   // rejected, so there is nothing to re-apply — the receipt itself was never
   // affected (add a photo on the web if one is needed). Excluded from
   // `ApplicableOpType`, so tenancy never imports the photo command.
-  | 'receipt-photo.stage';
+  | 'receipt-photo.stage'
+  // Story 4-7a — the handheld's restock of returned units, refused on replay
+  // (less awaiting than it named, a serial not awaiting, an expired or
+  // blocked batch, a retired bin, a stale identity). DEVICE-UPLOADED;
+  // Discard ONLY (A4): the units were physically placed in the scanned bin,
+  // so the reviewer restocks them on the web to that bin, or records a move
+  // or count to match the floor. Excluded from `ApplicableOpType`, so tenancy
+  // never imports returns.
+  | 'return.restock';
 
 export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'grn.submit',
@@ -159,6 +167,7 @@ export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'stock.move',
   'stock.adjust',
   'receipt-photo.stage',
+  'return.restock',
 ];
 
 /**
@@ -234,6 +243,9 @@ export const REJECTED_OP_DECISIONS_BY_TYPE: Readonly<Record<RejectedOpType, read
   // Story 2-5a — a refused damage photo: Discard only (the device deleted the
   // file when the op was rejected; the receipt was never affected).
   'receipt-photo.stage': ['discard'],
+  // Story 4-7a (A4) — a refused restock: Discard only (the remedy is a web
+  // restock to the bin the units were placed in, or a move/count).
+  'return.restock': ['discard'],
 };
 
 /** Story 1-6d — the 403 an Apply on a `grn.licence-refused` row answers without `licences.manage`. */
@@ -245,7 +257,7 @@ export const RESOLVE_NOTE_MAX = 500;
 /** The op types the apply arm can re-execute (every type admitting `apply`). */
 type ApplicableOpType = Exclude<
   RejectedOpType,
-  'return.receive' | 'grn.lines-refused' | 'grn.inactive-sku-received' | 'gate-in.unload' | 'receipt-photo.stage'
+  'return.receive' | 'grn.lines-refused' | 'grn.inactive-sku-received' | 'gate-in.unload' | 'receipt-photo.stage' | 'return.restock'
 >;
 
 function isApplicableOpType(opType: RejectedOpType): opType is ApplicableOpType {
@@ -477,6 +489,17 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
     ['quantityDelta', 'number'],
     ['reasonCode', 'string'],
     ['note', 'string'],
+  ],
+  // Story 4-7a — the handheld's restock as it enqueued it (A4): what the
+  // reviewer needs to restock it on the web. `serialNumbers` (an array of
+  // strings or null) is not an object array — the command shape-checks it.
+  'return.restock': [
+    ['warehouseId', 'uuid'],
+    ['skuId', 'uuid'],
+    ['qty', 'number'],
+    ['batchCode', 'string-or-null'],
+    ['toBinId', 'uuid'],
+    ['occurredAt', 'string'],
   ],
   'stock.move': [
     ['warehouseId', 'uuid'],

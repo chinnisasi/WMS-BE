@@ -35,6 +35,15 @@ import {
   type ReturnEntryRefusal,
 } from './return-receipt.command';
 import { MAX_HANDLING_UNIT_WEIGHT_GRAMS } from '../catalog/handling-unit';
+import {
+  MAX_DISPOSITION_NOTE,
+  MAX_RESTOCK_SERIALS,
+  RETURN_DISPOSITION_OUTCOMES,
+  RETURN_DISPOSITION_REASONS,
+  type ReturnDispositionOutcome,
+  type ReturnDispositionReason,
+} from './return-disposition.command';
+import { PORTAL_DISPOSITION_STATES, type PortalDispositionState } from './disposition-reads';
 
 /*
  * Story 13-1 — the returns surface's DTOs. The body DTOs type the request;
@@ -481,6 +490,9 @@ export class ReturnReceiptResultDto {
 }
 
 export class ReturnReceiptLineViewDto {
+  @ApiProperty({ format: 'uuid', description: "Story 4-7a — the receipt line's id (a disposition's address)" })
+  id!: string;
+
   @ApiProperty({ format: 'uuid' })
   rmaLineId!: string;
 
@@ -504,6 +516,21 @@ export class ReturnReceiptLineViewDto {
 
   @ApiProperty({ type: Number, nullable: true, description: "A returned case's captured weight, grams" })
   weightGrams!: number | null;
+
+  @ApiProperty({ minimum: 0, description: 'Story 4-7a — units still awaiting a disposition, base UoM' })
+  openQty!: number;
+
+  @ApiProperty({ minimum: 0, description: 'Story 4-7a — units restocked to a storage bin, base UoM' })
+  restockedQty!: number;
+
+  @ApiProperty({ minimum: 0, description: 'Story 4-7a — units scrapped, base UoM' })
+  scrappedQty!: number;
+
+  @ApiProperty({ minimum: 0, description: 'Story 4-7a — units on an open return QC hold, base UoM' })
+  onHoldQty!: number;
+
+  @ApiProperty({ minimum: 0, description: 'Story 4-7a — units that failed a return hold\'s inspection (now in DAMAGED), base UoM' })
+  failedInspectionQty!: number;
 }
 
 export class ReturnReceiptViewDto {
@@ -521,4 +548,378 @@ export class ReturnReceiptViewDto {
 
   @ApiProperty({ type: [ReturnReceiptLineViewDto] })
   lines!: readonly ReturnReceiptLineViewDto[];
+}
+
+// ── story 4-7a: returns disposition ─────────────────────────────────────────
+
+/** POST /tenants/{tenantId}/returns/dispositions body — the web's disposition of one receipt line. */
+export class DisposeReturnDto {
+  @ApiProperty({ format: 'uuid', description: "The warehouse — must be the receipt's (409 document-warehouse-mismatch otherwise)" })
+  @LowercaseUuid()
+  @IsUUID()
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The return-receipt line dispositioned (the detail read\'s receipts[].lines[].id)' })
+  @LowercaseUuid()
+  @IsUUID()
+  receiptLineId!: string;
+
+  @ApiProperty({ enum: [...RETURN_DISPOSITION_OUTCOMES], description: 'restock (to a storage bin), quarantine (a QC hold) or scrap' })
+  @IsIn([...RETURN_DISPOSITION_OUTCOMES])
+  outcome!: ReturnDispositionOutcome;
+
+  @ApiProperty({
+    description: `Units dispositioned, base UoM — at most what the line still awaits. ${QUANTITY_FIELD_DESCRIPTION} A serial unit or a returned case is exactly 1.`,
+    minimum: 0.001,
+    maximum: MAX_QUANTITY_BASE,
+  })
+  @Type(() => Number)
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(0.001)
+  @Max(MAX_QUANTITY_BASE)
+  qty!: number;
+
+  @ApiProperty({ required: false, type: String, nullable: true, format: 'uuid', description: 'Restock only — the storage bin the units go to' })
+  @IsOptional()
+  @LowercaseUuid()
+  @IsUUID()
+  toBinId?: string | null;
+
+  @ApiProperty({ required: false, type: String, nullable: true, enum: [...RETURN_DISPOSITION_REASONS, null], description: 'Quarantine and scrap only (required there)' })
+  @IsOptional()
+  @IsIn([...RETURN_DISPOSITION_REASONS])
+  reasonCode?: ReturnDispositionReason | null;
+
+  @ApiProperty({
+    required: false,
+    type: String,
+    nullable: true,
+    description: `Quarantine and scrap only — trimmed, blank means absent, at most ${MAX_DISPOSITION_NOTE} characters; required with the reason "other"`,
+    maxLength: MAX_DISPOSITION_NOTE * 2,
+  })
+  @IsOptional()
+  @IsString()
+  @Length(0, MAX_DISPOSITION_NOTE * 2)
+  note?: string | null;
+}
+
+/** POST /tenants/{tenantId}/returns/restocks body — the handheld's `return.restock` op. */
+export class RestockReturnDto {
+  @ApiProperty({ format: 'uuid' })
+  @LowercaseUuid()
+  @IsUUID()
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The SKU restocked — the server allocates it to the oldest sellable awaiting lines' })
+  @LowercaseUuid()
+  @IsUUID()
+  skuId!: string;
+
+  @ApiProperty({ description: `Units restocked, base UoM. ${QUANTITY_FIELD_DESCRIPTION}`, minimum: 0.001, maximum: MAX_QUANTITY_BASE })
+  @Type(() => Number)
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(0.001)
+  @Max(MAX_QUANTITY_BASE)
+  qty!: number;
+
+  @ApiProperty({ required: false, type: String, nullable: true, description: 'Batch-tracked (non-serial) SKUs: the batch restocked (required — 400 batch-required)', maxLength: 128 })
+  @IsOptional()
+  @IsString()
+  @Length(0, 128)
+  batchCode?: string | null;
+
+  @ApiProperty({
+    required: false,
+    type: [String],
+    nullable: true,
+    description: `Serial-tracked SKUs: one serial number per unit (qty = count), at most ${MAX_RESTOCK_SERIALS}`,
+    maxItems: MAX_RESTOCK_SERIALS,
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(MAX_RESTOCK_SERIALS)
+  @IsString({ each: true })
+  @Length(0, 400, { each: true })
+  serialNumbers?: string[] | null;
+
+  @ApiProperty({ format: 'uuid', description: 'The storage bin scanned' })
+  @LowercaseUuid()
+  @IsUUID()
+  toBinId!: string;
+
+  @ApiProperty({ description: "Device time (ISO-8601 UTC, Z-suffixed) — the ledger event's business time" })
+  @IsString()
+  occurredAt!: string;
+}
+
+export class ReturnDispositionEntryDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  receiptLineId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  rmaId!: string;
+
+  @ApiProperty({ enum: [...RETURN_DISPOSITION_OUTCOMES] })
+  outcome!: ReturnDispositionOutcome;
+
+  @ApiProperty({ description: 'Units, base UoM' })
+  qty!: number;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'Restock: the storage bin' })
+  toBinId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'Quarantine: the QC hold (kind return)' })
+  qcHoldId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'Restock / scrap: the ledger event' })
+  ledgerEventId!: string | null;
+}
+
+/** The 201 of both disposition routes — and their idempotency snapshot. */
+export class ReturnDispositionResultDto {
+  @ApiProperty({ type: [ReturnDispositionEntryDto] })
+  dispositions!: readonly ReturnDispositionEntryDto[];
+}
+
+/** GET /tenants/{tenantId}/returns/awaiting query. */
+export class AwaitingDispositionQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Only one warehouse's lines (tenant-wide when absent)" })
+  @IsOptional()
+  @LowercaseUuid()
+  @IsUUID()
+  warehouseId?: string;
+
+  @ApiProperty({ required: false, format: 'uuid', description: "Only one client's lines. An unknown id is an empty page" })
+  @IsOptional()
+  @LowercaseUuid()
+  @IsUUID()
+  clientId?: string;
+
+  @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
+  @IsOptional()
+  @IsString()
+  cursor?: string;
+
+  @ApiProperty({ required: false, example: 50, minimum: 1, maximum: 100 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit?: number;
+}
+
+export class AwaitingDispositionDto {
+  @ApiProperty({ format: 'uuid' })
+  receiptLineId!: string;
+
+  @ApiProperty({ description: 'RRN-0001' })
+  receiptCode!: string;
+
+  @ApiProperty({ description: 'When the unit was received (device time, ISO-8601 UTC)' })
+  receivedAt!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  rmaId!: string;
+
+  @ApiProperty({ description: 'RMA-0001' })
+  rmaCode!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  orderReference!: string | null;
+
+  @ApiProperty({ format: 'uuid' })
+  clientId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty()
+  skuName!: string;
+
+  @ApiProperty({ description: 'The base unit of measure' })
+  uom!: string;
+
+  @ApiProperty({ enum: [...RETURN_CONDITIONS], description: 'The grade the unit was received with' })
+  condition!: ReturnCondition;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The inspection note at receipt' })
+  note!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  batchCode!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  serialNumber!: string | null;
+
+  @ApiProperty({ type: Number, nullable: true, description: "A returned case's weight, grams" })
+  weightGrams!: number | null;
+
+  @ApiProperty({ description: 'Units received on the line, base UoM' })
+  receivedQty!: number;
+
+  @ApiProperty({ description: 'Units still awaiting a disposition, base UoM' })
+  openQty!: number;
+
+  @ApiProperty({ description: 'Units on an open return QC hold, base UoM' })
+  onHoldQty!: number;
+
+  @ApiProperty({ description: 'How many times the line was quarantined before' })
+  priorQuarantines!: number;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The latest quarantine or scrap reason on the line' })
+  lastReasonCode!: string | null;
+}
+
+export class AwaitingDispositionListResponse {
+  @ApiProperty({ type: [AwaitingDispositionDto] })
+  items!: readonly AwaitingDispositionDto[];
+
+  @ApiProperty({ type: String, nullable: true })
+  nextCursor!: string | null;
+}
+
+// ── story 4-7a: the client portal's returns ─────────────────────────────────
+
+/** GET /tenants/{tenantId}/portal/returns query. */
+export class PortalReturnsQuery {
+  @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
+  @IsOptional()
+  @IsString()
+  cursor?: string;
+
+  @ApiProperty({ required: false, example: 50, minimum: 1, maximum: 100 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit?: number;
+
+  @ApiProperty({
+    required: false,
+    enum: [...PORTAL_DISPOSITION_STATES],
+    description: '`awaiting` — units still open or on an unsettled hold; `dispositioned` — every received unit decided',
+  })
+  @IsOptional()
+  @IsIn([...PORTAL_DISPOSITION_STATES])
+  dispositionState?: PortalDispositionState;
+}
+
+export class PortalReturnRowDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ description: 'RMA-0001' })
+  code!: string;
+
+  @ApiProperty({ enum: [...RMA_STATUSES] })
+  status!: RmaStatus;
+
+  @ApiProperty({ format: 'uuid' })
+  orderId!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  orderReference!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  externalReference!: string | null;
+
+  @ApiProperty({ description: 'ISO-8601 UTC' })
+  createdAt!: string;
+
+  @ApiProperty()
+  lineCount!: number;
+
+  @ApiProperty({ description: 'Base units (summed across lines)' })
+  receivedTotal!: number;
+
+  @ApiProperty()
+  restockedTotal!: number;
+
+  @ApiProperty()
+  onHoldTotal!: number;
+
+  @ApiProperty()
+  failedInspectionTotal!: number;
+
+  @ApiProperty()
+  scrappedTotal!: number;
+
+  @ApiProperty()
+  openTotal!: number;
+}
+
+export class PortalReturnPageResponse {
+  @ApiProperty({ type: [PortalReturnRowDto] })
+  items!: readonly PortalReturnRowDto[];
+
+  @ApiProperty({ type: String, nullable: true })
+  nextCursor!: string | null;
+}
+
+export class PortalReturnLineDto {
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty()
+  skuName!: string;
+
+  @ApiProperty()
+  authorizedQty!: number;
+
+  @ApiProperty()
+  receivedQty!: number;
+
+  @ApiProperty({ enum: [...RETURN_REASON_CODES], description: 'Why the customer returned it' })
+  returnReasonCode!: ReturnReasonCode;
+
+  @ApiProperty()
+  restockedQty!: number;
+
+  @ApiProperty()
+  onHoldQty!: number;
+
+  @ApiProperty()
+  failedInspectionQty!: number;
+
+  @ApiProperty()
+  scrappedQty!: number;
+
+  @ApiProperty()
+  openQty!: number;
+}
+
+export class PortalReturnDispositionDto {
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty({ enum: [...RETURN_DISPOSITION_OUTCOMES] })
+  outcome!: ReturnDispositionOutcome;
+
+  @ApiProperty()
+  qty!: number;
+
+  @ApiProperty({ type: String, nullable: true, enum: [...RETURN_DISPOSITION_REASONS, null], description: 'Quarantine and scrap reasons; null on a restock' })
+  reasonCode!: ReturnDispositionReason | null;
+
+  @ApiProperty({ description: 'ISO-8601 UTC' })
+  occurredAt!: string;
+}
+
+export class PortalReturnDetailResponse extends PortalReturnRowDto {
+  @ApiProperty({ type: [PortalReturnLineDto] })
+  lines!: readonly PortalReturnLineDto[];
+
+  @ApiProperty({ type: [PortalReturnDispositionDto], description: 'Oldest first' })
+  dispositions!: readonly PortalReturnDispositionDto[];
 }

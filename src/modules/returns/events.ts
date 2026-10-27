@@ -46,3 +46,43 @@ export interface ReturnReceiptRecordedPayload {
   readonly appliedCount: number;
   readonly refusedCount: number;
 }
+
+/**
+ * Story 4-7a — a disposition command committed (a web dispose or a handheld
+ * restock): one event per command, flat ids and counts only (A18, the
+ * `return_receipt.recorded` precedent). Nothing consumes it yet. The action
+ * string doubles as the audit action (`AUDIT_NEW_ACTIONS`).
+ */
+export const RETURN_DISPOSITION_RECORDED_EVENT = 'return_disposition.recorded';
+
+/** `return_disposition.recorded`'s payload. */
+export interface ReturnDispositionRecordedPayload {
+  readonly warehouseId: string;
+  readonly clientId: string;
+  readonly skuId: string;
+  readonly outcome: 'restock' | 'quarantine' | 'scrap';
+  /** The command's total, base units as a decimal string (the outbox's exact-quantity convention). */
+  readonly qty: string;
+  readonly dispositionCount: number;
+  readonly firstDispositionId: string;
+}
+
+/**
+ * Story 4-7a (A3) — a returned unit was scrapped: the client-facing signal
+ * (one per scrap disposition). Nothing consumes it yet; roadmap 5.2's client
+ * notifications will.
+ */
+export const RETURN_SCRAP_RECORDED_EVENT = 'return_scrap.recorded';
+
+/** `return_scrap.recorded`'s payload. */
+export interface ReturnScrapRecordedPayload {
+  readonly rmaId: string;
+  readonly rmaCode: string;
+  readonly clientId: string;
+  readonly warehouseId: string;
+  readonly skuId: string;
+  /** Base units as a decimal string. */
+  readonly qty: string;
+  readonly reasonCode: string;
+  readonly dispositionId: string;
+}

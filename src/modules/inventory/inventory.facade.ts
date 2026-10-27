@@ -2,7 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, asc, desc, eq, inArray, or, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { batchOnHand, bins, inventoryQuarantines, ledgerEvents, skus, stockOnHand } from '../../shared/db/schema';
+import { batchOnHand, bins, inventoryQuarantines, ledgerEvents, skus, stockAdjustmentPolicies, stockOnHand } from '../../shared/db/schema';
 import { getClientLabelsInTx, skuCodeLabelsInTx } from '../clients/clients.facade';
 import type { LedgerEvent, UserRole } from '../../shared/db/schema';
 import { skuOfClient } from '../../shared/db/client-filter';
@@ -523,6 +523,21 @@ export class InventoryFacade {
    */
   async undatedBatchesOnHandOfClient(tenantId: string, clientId: string): Promise<number> {
     return withTenantTransaction(this.db, tenantId, (tx) => undatedBatchesOnHandOfClientInTx(tx, tenantId, clientId));
+  }
+
+  /**
+   * Story 4-7a (A3) — the tenant's write-off threshold (base units) in the
+   * CALLER's transaction: a return scrap above it is refused. Null when no
+   * policy row exists or its threshold is null (no limit) — the adjustment's
+   * own reading of the row.
+   */
+  async adjustmentThresholdInTx(tx: TenantTx, tenantId: string): Promise<number | null> {
+    const rows = await tx
+      .select({ quantityThreshold: stockAdjustmentPolicies.quantityThreshold })
+      .from(stockAdjustmentPolicies)
+      .where(eq(stockAdjustmentPolicies.tenantId, tenantId))
+      .limit(1);
+    return rows[0]?.quantityThreshold ?? null;
   }
 
   /** GET …/inventory/adjustment-policies — null when no row exists (flow disabled). */
@@ -2457,7 +2472,7 @@ export class InventoryFacade {
        * `move` (the bin-to-bin move). The machine codes and statuses are the
        * same either way.
        */
-      readonly subject?: 'transfer' | 'move';
+      readonly subject?: 'transfer' | 'move' | 'restock';
     },
   ): Promise<{ readonly binId: string; readonly binCode: string }> {
     const subject = args.subject ?? 'transfer';

@@ -39,6 +39,7 @@ import type { LedgerMovement } from '../inventory/inventory.facade';
 import { canonicalUuid, rmaNotFound } from './return-authorization.command';
 import type { RmaStatus } from './return-authorization.command';
 import { RETURN_RECEIPT_RECORDED_EVENT } from './events';
+import { EMPTY_SPLIT, lineSplitsInTx } from './disposition-split';
 import type { ReturnReceiptRecordedPayload } from './events';
 
 // ── vocabularies ─────────────────────────────────────────────────────────────
@@ -201,6 +202,8 @@ export interface ReturnReceiptResult {
 
 /** One received line as the detail read shows it (base units). */
 export interface ReturnReceiptLineView {
+  /** Story 4-7a — the receipt line's id (the disposition's address). */
+  readonly id: string;
   readonly rmaLineId: string;
   readonly skuId: string;
   readonly qty: number;
@@ -209,6 +212,17 @@ export interface ReturnReceiptLineView {
   readonly batchCode: string | null;
   readonly serialNumber: string | null;
   readonly weightGrams: number | null;
+  /**
+   * Story 4-7a — the line's split (base units): still awaiting a disposition
+   * (`openQty`), restocked, scrapped, on an open return hold, and failed at a
+   * return hold's inspection (now in DAMAGED). `qty = openQty + restocked +
+   * scrapped + onHold + failedInspection`.
+   */
+  readonly openQty: number;
+  readonly restockedQty: number;
+  readonly scrappedQty: number;
+  readonly onHoldQty: number;
+  readonly failedInspectionQty: number;
 }
 
 /** One receipt as the detail read shows it. */
@@ -725,6 +739,11 @@ export async function receiptsOfRmaInTx(
     tenantId,
     [...new Set(headers.map((header) => header.receivedBy))],
   );
+  const splits = await lineSplitsInTx(
+    tx,
+    tenantId,
+    lines.map((line) => line.id),
+  );
   return headers.map((header) => ({
     id: header.id,
     code: header.code,
@@ -732,7 +751,10 @@ export async function receiptsOfRmaInTx(
     operatorEmail: emails.get(header.receivedBy) ?? null,
     lines: lines
       .filter((line) => line.returnReceiptId === header.id)
-      .map((line) => ({
+      .map((line) => {
+        const split = splits.get(line.id) ?? EMPTY_SPLIT;
+        return {
+        id: line.id,
         rmaLineId: line.rmaLineId,
         skuId: line.skuId,
         qty: fromMilli(Number(line.qty)),
@@ -741,7 +763,13 @@ export async function receiptsOfRmaInTx(
         batchCode: line.batchId === null ? null : (batchCodeById.get(line.batchId) ?? null),
         serialNumber: line.serialId === null ? null : (serialNumberById.get(line.serialId) ?? null),
         weightGrams: line.handlingUnitId === null ? null : (weightById.get(line.handlingUnitId) ?? null),
-      })),
+        openQty: fromMilli(Number(line.openQty)),
+        restockedQty: fromMilli(split.restocked),
+        scrappedQty: fromMilli(split.scrapped),
+        onHoldQty: fromMilli(split.onHold),
+        failedInspectionQty: fromMilli(split.failed),
+        };
+      }),
   }));
 }
 
@@ -1099,6 +1127,8 @@ export class ReturnReceiptCommand {
               // Request order among the applied entries, 1..n.
               lineNo: i + 1,
               qty: item.milli,
+              // Story 4-7a (A1) — every received unit starts awaiting a disposition.
+              openQty: item.milli,
               condition: item.entry.condition,
               note: item.entry.note,
               batchId: item.batchId,

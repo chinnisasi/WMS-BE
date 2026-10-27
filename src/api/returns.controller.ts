@@ -9,14 +9,19 @@ import type { DeviceSession, TenantSession } from '../modules/tenancy/jwt-sessio
 import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/idempotency-guard';
 import { UUID_RE } from '../shared/primitives/ids';
 import { ReturnsFacade } from '../modules/returns/returns.facade';
-import type { ReturnableOrder, ReturnReceiptResult, RmaDetail } from '../modules/returns/returns.facade';
+import type { ReturnableOrder, ReturnDispositionResult, ReturnReceiptResult, RmaDetail } from '../modules/returns/returns.facade';
 // Constructor params are types here but must stay value imports: Nest
 // decorator metadata needs the runtime class tokens (eslint rule bends).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import {
+  AwaitingDispositionListResponse,
+  AwaitingDispositionQuery,
   CancelReturnAuthorizationDto,
   CreateReturnAuthorizationDto,
+  DisposeReturnDto,
   ReceiveReturnDto,
+  RestockReturnDto,
+  ReturnDispositionResultDto,
   ReturnReceiptResultDto,
   ReturnableOrderDto,
   ReturnableQuery,
@@ -55,6 +60,12 @@ const READ_403 = 'Session belongs to another tenant (permission-denied), or a cl
  * Story 13-2 adds `POST returns/receipts` — `return.receive`, the handheld op
  * under `DeviceSessionGuard` (the badge-in session; `grn.submit`'s shape) —
  * and the detail read's receipts.
+ *
+ * Story 4-7a adds the disposition surface: `POST returns/dispositions` (the
+ * web — restock, quarantine or scrap one receipt line; `returns.manage`),
+ * `POST returns/restocks` (the handheld's `return.restock`, a badge-in floor
+ * role) and `GET returns/awaiting` (the queue, oldest first) — the literal
+ * `awaiting` declared before `:rmaId`, like `returnable`.
  */
 @ApiTags('returns')
 @ApiExtraModels(ProblemDetailsDto)
@@ -194,6 +205,155 @@ export class ReturnsController {
       key,
     );
     return toReceiptDto(result);
+  }
+
+  /**
+   * Story 4-7a — the web's disposition of one receipt line (or part of it):
+   * restock into a storage bin, quarantine on a QC hold, or scrap.
+   */
+  @Post(':tenantId/returns/dispositions')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Dispositions a received return unit (returns.manage): restock — return.restocked RETURNS → a storage bin through every placement gate (ATP rises); quarantine — a QC hold of kind return (RETURNS → QC-HOLD; a release brings the units back); scrap — return.scrapped out of RETURNS with a reason (above the tenant write-off threshold refused). At most what the line still awaits',
+  })
+  @ApiBody({ type: DisposeReturnDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: ReturnDispositionResultDto, description: 'The disposition (the idempotency snapshot)' })
+  @ApiResponse({
+    status: 400,
+    ...problemJsonResponse(
+      'Missing or malformed Idempotency-Key, or an invalid body — an unknown outcome, a non-positive qty, a restock without toBinId or with a reason/note, a quarantine or scrap without a reason or with a bin, "other" without a note, a note over 200 characters, a quantity finer than its unit, a serial unit or returned case not disposed whole, or a system bin as the target (validation-failed)',
+    ),
+  })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse(`${WRITE_403}; or a secure target bin without secure.move (role-denied)`) })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse, the receipt line or the target bin does not exist in this tenant (not-found)') })
+  @ApiResponse({
+    status: 409,
+    ...problemJsonResponse(
+      "The line is another warehouse's (document-warehouse-mismatch); quarantine of a serial-tracked or catch-weight unit (disposition-not-supported); an expired or blocked batch on a restock (batch-expired / batch-blocked); more than the line awaits — member awaitingQty (exceeds-awaiting); a scrap above the tenant's write-off threshold — members awaitingQty, threshold (scrap-above-threshold); a reconcile quarantine on RETURNS or the target (disposition-scope-quarantined); a placement-gate refusal with the gate's own code (bin-retired, bin-blocked, bin-storage-mismatch, bin-client-mismatch, bin-occupancy-conflict, bin-segregation-conflict, bin-full, bin-overweight, bin-volume-exceeded, bin-item-oversize); or a concurrent idempotent request (conflict)",
+    ),
+  })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async dispose(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: DisposeReturnDto,
+  ): Promise<ReturnDispositionResultDto> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    // BASE units cross this edge; the command scales them behind its replay
+    // lookup (story 10.2).
+    const result = await this.returns.dispose(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        warehouseId: dto.warehouseId,
+        receiptLineId: dto.receiptLineId,
+        outcome: dto.outcome,
+        qty: dto.qty,
+        toBinId: dto.toBinId ?? null,
+        reasonCode: dto.reasonCode ?? null,
+        note: dto.note ?? null,
+      },
+      key,
+    );
+    return toDispositionDto(result);
+  }
+
+  /**
+   * Story 4-7a — `return.restock`, the handheld op (badge-in device session;
+   * the `Idempotency-Key` is the op's ULID): a SKU (batch, or serials)
+   * restocked into a scanned storage bin, allocated oldest-first.
+   */
+  @Post(':tenantId/returns/restocks')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(DeviceSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "return.restock — restocks returned units into a storage bin exactly once (badge-in session required): the server allocates the SKU (and batch, or the named serials) to the warehouse's oldest sellable (resaleable) awaiting receipt lines and writes one return.restocked per line through every placement gate",
+  })
+  @ApiBody({ type: RestockReturnDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: ReturnDispositionResultDto, description: 'The dispositions, one per receipt line drawn (the idempotency snapshot)' })
+  @ApiResponse({
+    status: 400,
+    ...problemJsonResponse(
+      'Missing or malformed Idempotency-Key, or an invalid body — a malformed id, a non-positive qty, a non-UTC occurredAt, repeated or uncounted serials, serials with a batchCode, serials on a SKU that is not serial-tracked (or none on one that is), a batch on an unbatched SKU, a catch-weight SKU (restocked on the web), a quantity finer than its unit, or a system bin as the target (validation-failed); a batch-tracked SKU without its batch (batch-required)',
+    ),
+  })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Unknown or revoked device (device-revoked), the operator is not a floor role, or a secure target bin without secure.move (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse, the SKU or the target bin does not exist (not-found)') })
+  @ApiResponse({
+    status: 409,
+    ...problemJsonResponse(
+      "Less is awaiting than the restock names — member awaitingQty (exceeds-awaiting); a named serial is not awaiting (or was graded non-sellable) — member serialNumber (serial-not-awaiting); an expired or blocked batch (batch-expired / batch-blocked); a reconcile quarantine (disposition-scope-quarantined); a placement-gate refusal with the gate's own code; or a concurrent idempotent request (conflict)",
+    ),
+  })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the device token)' })
+  async restock(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentDeviceSession() session: DeviceSession,
+    @Body() dto: RestockReturnDto,
+  ): Promise<ReturnDispositionResultDto> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    if (session.userId === null) {
+      throw new ProblemException('unauthenticated', 401, 'Badge-in required', 'This endpoint requires an operator badge-in session.');
+    }
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const result = await this.returns.restock(
+      {
+        tenantId,
+        deviceId: session.deviceId,
+        operatorUserId: session.userId,
+        warehouseId: dto.warehouseId,
+        skuId: dto.skuId,
+        qty: dto.qty,
+        batchCode: dto.batchCode ?? null,
+        serialNumbers: dto.serialNumbers ?? null,
+        toBinId: dto.toBinId,
+        occurredAt: dto.occurredAt,
+      },
+      key,
+    );
+    return toDispositionDto(result);
+  }
+
+  // Declared BEFORE `:rmaId` — see the class comment.
+  @Get(':tenantId/returns/awaiting')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Story 4-7a — the awaiting-disposition queue: every received return line with units still awaiting a disposition, OLDEST first (keyset on the line's createdAt, id), optionally one warehouse's and one client's — with the grade, the capture, the open and on-hold quantities and the line's quarantine history",
+  })
+  @ApiOkResponse({ type: AwaitingDispositionListResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed warehouseId or clientId, a limit outside 1–100 (validation-failed), or a malformed cursor (invalid-cursor)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse(READ_403) })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async awaiting(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: AwaitingDispositionQuery,
+  ): Promise<AwaitingDispositionListResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    const page = await this.returns.listAwaiting(tenantId, {
+      warehouseId: query.warehouseId,
+      clientId: query.clientId,
+      cursor: query.cursor,
+      limit: query.limit,
+    });
+    return { items: page.items.map((item) => ({ ...item })), nextCursor: page.nextCursor };
   }
 
   // Declared BEFORE `:rmaId` — see the class comment.
@@ -341,6 +501,10 @@ function toRmaDto(rma: RmaDetail): ReturnAuthorizationDto {
       ? {}
       : { receipts: receipts.map((receipt) => ({ ...receipt, lines: receipt.lines.map((line) => ({ ...line })) })) }),
   };
+}
+
+function toDispositionDto(result: ReturnDispositionResult): ReturnDispositionResultDto {
+  return { dispositions: result.dispositions.map((entry) => ({ ...entry })) };
 }
 
 function toReceiptDto(result: ReturnReceiptResult): ReturnReceiptResultDto {

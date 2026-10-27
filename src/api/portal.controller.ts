@@ -23,6 +23,10 @@ import { BillingFacade } from '../modules/billing/billing.facade';
 import { CatalogFacade } from '../modules/catalog/catalog.facade';
 import { TenancyService } from '../modules/tenancy/tenancy.service';
 import { ReportingFacade } from '../modules/reporting/reporting.facade';
+import { ReturnsFacade } from '../modules/returns/returns.facade';
+// Bound to @Query() — a value import (the query class is read by the ValidationPipe).
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { PortalReturnDetailResponse, PortalReturnPageResponse, PortalReturnsQuery } from '../modules/returns/returns.dto';
 import { ServiceReportDto, toServiceReportDto } from './reporting.dto';
 // Bound to @Query() — a value import (see the portal.dto import below).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
@@ -100,6 +104,7 @@ export class PortalController {
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
     @Inject(TenancyService) private readonly tenancy: TenancyService,
     @Inject(ReportingFacade) private readonly reporting: ReportingFacade,
+    @Inject(ReturnsFacade) private readonly returns: ReturnsFacade,
   ) {}
 
   @Get(':tenantId/portal/me')
@@ -548,6 +553,66 @@ export class PortalController {
     );
   }
 
+  /**
+   * Story 4-7a — this client's returns with what happened to the goods
+   * (decision 11): read only, the RMA list and detail, an exact allowlist —
+   * totals per outcome, reasons and times; never a bin, user, note or hold id.
+   */
+  @Get(':tenantId/portal/returns')
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Story 4-7a — this client's return authorizations, newest first (keyset), each with received / restocked / on hold / failed inspection / scrapped / still open totals; optionally only those still awaiting a disposition or fully dispositioned",
+  })
+  @ApiOkResponse({ type: PortalReturnPageResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse(PORTAL_PAGE_400) })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async portalReturns(
+    @Param('tenantId') tenantId: string,
+    @CurrentPortalSession() session: PortalSession,
+    @Query() query: PortalReturnsQuery,
+  ): Promise<PortalReturnPageResponse> {
+    assertOwnTenant(session, tenantId);
+    const page = await this.returns.portalReturns(tenantId, session.clientId, {
+      ...pageQuery(query),
+      ...(query.dispositionState === undefined ? {} : { dispositionState: query.dispositionState }),
+    });
+    return { items: page.items.map((item) => ({ ...item })), nextCursor: page.nextCursor };
+  }
+
+  @Get(':tenantId/portal/returns/:rmaId')
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Story 4-7a — one of this client\'s returns: per line authorized, received, restocked, on hold, failed inspection, scrapped and open, with the return reason; and every disposition (outcome, quantity, reason, time), oldest first',
+  })
+  @ApiOkResponse({ type: PortalReturnDetailResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed rmaId path parameter (validation-failed — it must be a uuid)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("No such return of this client — unknown, or another client's (not-found)") })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'rmaId', format: 'uuid' })
+  async portalReturn(
+    @Param('tenantId') tenantId: string,
+    @Param('rmaId') rmaId: string,
+    @CurrentPortalSession() session: PortalSession,
+  ): Promise<PortalReturnDetailResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(rmaId, 'rmaId');
+    const rma = await this.returns.portalReturn(tenantId, session.clientId, rmaId);
+    if (rma === null) throw notFound('Return', rmaId);
+    return {
+      ...rma,
+      lines: rma.lines.map((line) => ({ ...line })),
+      dispositions: rma.dispositions.map((entry) => ({ ...entry })),
+    };
+  }
+
   @Get(':tenantId/portal/invoices')
   @UseGuards(PortalSessionGuard)
   @ApiBearerAuth()
@@ -610,7 +675,7 @@ function assertOwnTenant(session: PortalSession, tenantId: string): void {
   }
 }
 
-function assertUuidParam(value: string, name: 'orderId' | 'asnId' | 'poId' | 'grnId'): void {
+function assertUuidParam(value: string, name: 'orderId' | 'asnId' | 'poId' | 'grnId' | 'rmaId'): void {
   if (!UUID_RE.test(value)) {
     throw new ProblemException(
       'validation-failed',

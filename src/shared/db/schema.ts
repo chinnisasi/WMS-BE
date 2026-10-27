@@ -2886,7 +2886,9 @@ export const qcHolds = pgTable(
      * Story 1-2b — `manual` (an Ops Manager's or an excursion's scope hold)
      * or `receipt` (QC on receipt: one hold per booked GRN line, placed by
      * the receipt itself). `kind = 'receipt'` ⇔ `grn_line_id IS NOT NULL`
-     * (CHECK `qc_holds_kind_pairing`, migration 0078 only).
+     * (CHECK `qc_holds_kind_pairing`, migration 0078 only). Story 4-7a adds
+     * `return` — a returned unit quarantined from the system RETURNS bin
+     * (its origin), linked from `return_dispositions.qc_hold_id` (0097).
      */
     kind: text('kind').notNull().default('manual'),
     /** Story 1-2b — the GRN line a receipt hold holds (null on a manual hold). */
@@ -6130,6 +6132,14 @@ export const returnReceiptLines = pgTable(
     serialId: uuid('serial_id'),
     handlingUnitId: uuid('handling_unit_id'),
     ledgerEventId: uuid('ledger_event_id').notNull(),
+    /**
+     * Story 4-7a (A1) — milli-units still awaiting a disposition: `qty` at
+     * receipt, decremented by every restock, scrap and quarantine in the same
+     * transaction, and raised again by the hold-settlement subscriber when a
+     * return hold closes (`returned` units only). CHECK `0 ≤ open_qty ≤ qty`
+     * (0097, migration SQL only).
+     */
+    openQty: bigint('open_qty', { mode: 'number' }).notNull().default(0),
     createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
   },
   (table) => [
@@ -6138,10 +6148,117 @@ export const returnReceiptLines = pgTable(
       .on(table.rmaLineId, table.serialId)
       .where(sql`${table.serialId} IS NOT NULL`),
     index('return_receipt_lines_tenant_rma_line_idx').on(table.tenantId, table.rmaLineId),
+    // Story 4-7a — the awaiting-disposition queue (oldest first, keyset ASC).
+    index('return_receipt_lines_tenant_open_idx')
+      .on(table.tenantId, table.createdAt, table.id)
+      .where(sql`${table.openQty} > 0`),
+    // Story 4-7a — the device restock's candidate read (SKU, batch, oldest first).
+    index('return_receipt_lines_tenant_sku_batch_open_idx')
+      .on(table.tenantId, table.skuId, table.batchId, table.createdAt, table.id)
+      .where(sql`${table.openQty} > 0`),
+    // Story 4-7a (A12) — a serial resolves to the receipt line holding it.
+    index('return_receipt_lines_tenant_serial_idx')
+      .on(table.tenantId, table.serialId)
+      .where(sql`${table.serialId} IS NOT NULL`),
   ],
 );
 
 export type ReturnReceiptLineRow = typeof returnReceiptLines.$inferSelect;
+
+/**
+ * Story 4-7a — one disposition of (part of) a return-receipt line: `restock`
+ * (RETURNS → a storage bin, `return.restocked`), `quarantine` (a QC hold of
+ * kind `return`, its `qc.held` QC's own) or `scrap` (RETURNS → out,
+ * `return.scrapped`). Append-only: no `updated_at`, never updated or
+ * deleted. `qty` in milli-units; a serial or a handling unit (a returned
+ * case) is exactly one unit. `device_id` is set only on a handheld restock.
+ * Every CHECK and both partial uniques' rules, the RLS policy (the
+ * `return_receipts` tenant + client shape) and the probes live in
+ * `drizzle/0097_return_dispositions.sql`. No FKs (guide §3).
+ */
+export const returnDispositions = pgTable(
+  'return_dispositions',
+  {
+    id: uuid('id').primaryKey(),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    returnReceiptId: uuid('return_receipt_id').notNull(),
+    returnReceiptLineId: uuid('return_receipt_line_id').notNull(),
+    rmaId: uuid('rma_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    outcome: text('outcome').notNull(),
+    /** Milli-units — base UoM × 10³. */
+    qty: bigint('qty', { mode: 'number' }).notNull(),
+    batchId: uuid('batch_id'),
+    serialId: uuid('serial_id'),
+    handlingUnitId: uuid('handling_unit_id'),
+    /** Restock only — the storage bin the units went to. */
+    toBinId: uuid('to_bin_id'),
+    /** Quarantine only — the QC hold (kind `return`) that holds the units. */
+    qcHoldId: uuid('qc_hold_id'),
+    /** Quarantine and scrap — `RETURN_DISPOSITION_REASONS`; null on a restock. */
+    reasonCode: text('reason_code'),
+    note: text('note'),
+    /** A handheld restock's device (null on the web). */
+    deviceId: uuid('device_id'),
+    decidedBy: uuid('decided_by').notNull(),
+    /** Restock and scrap — their `return.restocked` / `return.scrapped` event. */
+    ledgerEventId: uuid('ledger_event_id'),
+    occurredAt: timestamp('occurred_at', { withTimezone: true, mode: 'string' }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('return_dispositions_tenant_line_idx').on(table.tenantId, table.returnReceiptLineId),
+    index('return_dispositions_tenant_rma_idx').on(table.tenantId, table.rmaId),
+    index('return_dispositions_tenant_client_created_idx').on(table.tenantId, table.clientId, table.createdAt, table.id),
+    uniqueIndex('return_dispositions_tenant_hold_unique')
+      .on(table.tenantId, table.qcHoldId)
+      .where(sql`${table.qcHoldId} IS NOT NULL`),
+    // 4-7b's fix to the 4-7a design: per RECEIPT LINE, so a serial returned
+    // a second time (restocked, re-sold, returned again — a new receipt line)
+    // can be dispositioned again.
+    uniqueIndex('return_dispositions_tenant_line_serial_unique')
+      .on(table.tenantId, table.returnReceiptLineId, table.serialId)
+      .where(sql`${table.serialId} IS NOT NULL AND ${table.outcome} <> 'quarantine'`),
+    uniqueIndex('return_dispositions_tenant_handling_unit_unique')
+      .on(table.tenantId, table.handlingUnitId)
+      .where(sql`${table.handlingUnitId} IS NOT NULL`),
+  ],
+);
+
+export type ReturnDispositionRow = typeof returnDispositions.$inferSelect;
+
+/**
+ * Story 4-7a (A1) — the settlement of one closed return hold, written ONLY by
+ * the returns module's hold-settlement subscriber (`qc_hold.released` /
+ * `qc_hold.inspected`), at most once per hold (`(tenant_id, qc_hold_id)`
+ * unique — the redelivery guard). The quantities are QC's own record, never
+ * the event payload: `held_qty = returned_qty + failed_qty`, milli-units.
+ * Append-only. CHECKs, RLS and probes in 0097 only.
+ */
+export const returnHoldSettlements = pgTable(
+  'return_hold_settlements',
+  {
+    id: uuid('id').primaryKey(),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    dispositionId: uuid('disposition_id').notNull(),
+    qcHoldId: uuid('qc_hold_id').notNull(),
+    status: text('status').notNull(),
+    heldQty: bigint('held_qty', { mode: 'number' }).notNull(),
+    returnedQty: bigint('returned_qty', { mode: 'number' }).notNull(),
+    failedQty: bigint('failed_qty', { mode: 'number' }).notNull(),
+    settledAt: timestamp('settled_at', { withTimezone: true, mode: 'string' }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('return_hold_settlements_tenant_hold_unique').on(table.tenantId, table.qcHoldId),
+    uniqueIndex('return_hold_settlements_tenant_disposition_unique').on(table.tenantId, table.dispositionId),
+  ],
+);
+
+export type ReturnHoldSettlementRow = typeof returnHoldSettlements.$inferSelect;
 
 /**
  * Story 2-5a — the attachments foundation: one row per stored (or awaited)

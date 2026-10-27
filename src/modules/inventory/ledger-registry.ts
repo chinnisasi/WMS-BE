@@ -286,6 +286,21 @@ export type LedgerReferenceDoc =
       readonly rmaId: string;
       readonly rmaLineId: string;
     }
+  // Story 4-7a — the return-disposition arm: every `return.restocked` /
+  // `return.scrapped` event names the disposition it books, the receipt line
+  // it draws from, the authorization and the outcome. `reasonCode` (a scrap)
+  // and `handlingUnitIds` (a returned case) are OMITTED when absent, never
+  // `null` (the 9-3a rule), so every event carries exactly what was decided.
+  // NEW union arm — the earlier kinds are never reshaped.
+  | {
+      readonly kind: 'return-disposition';
+      readonly dispositionId: string;
+      readonly returnReceiptLineId: string;
+      readonly rmaId: string;
+      readonly outcome: 'restock' | 'scrap';
+      readonly reasonCode?: string;
+      readonly handlingUnitIds?: readonly string[];
+    }
   // Story 3-1 — the bin-to-bin move arm: every `stock.moved` event names the
   // move it belongs to (one move = one request: a batch arm, or one event per
   // serial unit), the operator's reason code and — only when given — the
@@ -663,6 +678,42 @@ registerLedgerEventType({
   type: 'stock.moved',
   sinceVersion: 1,
   referenceKinds: ['bin-move'],
+  allowsBatchArm: true,
+  allowsSerialArm: true,
+});
+
+/**
+ * Grammar v1, Story 4-7a — the restock of a returned unit (FR-48): a
+ * RELOCATION from the warehouse's system RETURNS bin into a storage bin
+ * (`fromBinId` RETURNS, `toBinId` the target — the putaway/move convention,
+ * one event folding both bins), after every placement gate. The units leave
+ * "awaiting disposition" (`returnsAwaitingUnits`) and join ATP. One event
+ * per disposition; a serial-tracked unit is one magnitude-1 event carrying
+ * its serial (the serial guard admits it: its latest event is the
+ * `return.received` intake into RETURNS). Both identity arms are OPEN. It
+ * meters 0 (a `both`-shape relocation). Registers sinceVersion 1.
+ */
+registerLedgerEventType({
+  type: 'return.restocked',
+  sinceVersion: 1,
+  referenceKinds: ['return-disposition'],
+  allowsBatchArm: true,
+  allowsSerialArm: true,
+});
+
+/**
+ * Grammar v1, Story 4-7a — the scrap of a returned unit: a pure DRAW out of
+ * the system RETURNS bin (`fromBinId` RETURNS, `toBinId` null — the
+ * `pick.picked` / write-off convention), with the reason on the reference.
+ * Never a negative `stock.adjusted`: a scrapped return is a disposition of a
+ * return, and adjustment analytics stay clean. Both identity arms are OPEN
+ * (a scrapped serial leaves stock — its latest event names no bin). It meters
+ * `['from']` (on-hand drops). Registers sinceVersion 1.
+ */
+registerLedgerEventType({
+  type: 'return.scrapped',
+  sinceVersion: 1,
+  referenceKinds: ['return-disposition'],
   allowsBatchArm: true,
   allowsSerialArm: true,
 });
