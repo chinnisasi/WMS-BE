@@ -11885,6 +11885,93 @@
         ]
       }
     },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/shelf-life": {
+      "get": {
+        "operationId": "OutboundController_getOrderShelfLife",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderShelfLifeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed orderId path parameter (validation-failed — it must be a uuid)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No order with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-3b — one order's customer shelf life: the client minimum and the consignee's rule (resolved from the order's consignee GSTIN, with why it did or did not apply), and per line the binding minimum and how much on-hand stock in the order's warehouse qualifies if it were waved today (other orders' claims ignored, and spent in qualifyingUnclaimed). A staff read — no capability, nothing stored",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
     "/tenants/{tenantId}/outbound/orders/{orderId}": {
       "get": {
         "operationId": "OutboundController_getOrder",
@@ -32429,6 +32516,144 @@
         ]
       }
     },
+    "/tenants/{tenantId}/partners/{partnerId}/links/{linkId}/shelf-life": {
+      "put": {
+        "operationId": "PartnersController_updatePartnerLinkShelfLife",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "partnerId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "linkId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePartnerLinkShelfLifeDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PartnerResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a missing key or a value out of range — days 1–3650, percent 1–100, whole numbers (validation-failed naming the field), or a vendor link (link-role-invalid)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks vendor.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such partner, or no such link on it — another partner's link included (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-3b — replaces a CONSIGNEE link's own minimum remaining shelf life for the client's orders (vendor.manage): IST days and/or percent of each SKU's total shelf life, both keys required (null = none). Orders whose consignee GSTIN matches the partner are planned only from batches meeting it, on top of the client minimum; it applies to waves generated after saving. An unchanged rule is a no-op that stores the key",
+        "tags": [
+          "partners"
+        ]
+      }
+    },
     "/tenants/{tenantId}/clients/{clientId}/rate-cards/in-force": {
       "get": {
         "operationId": "RateCardsController_inForce",
@@ -51590,6 +51815,225 @@
           "rates"
         ]
       },
+      "OrderShelfLifeResolvedPartnerDto": {
+        "type": "object",
+        "properties": {
+          "partnerId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "description": "The partner display name"
+          }
+        },
+        "required": [
+          "partnerId",
+          "code",
+          "name"
+        ]
+      },
+      "OrderShelfLifeConsigneeDto": {
+        "type": "object",
+        "properties": {
+          "partnerId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "description": "The partner display name"
+          },
+          "minShelfLifeDays": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 3650
+          },
+          "minShelfLifePercent": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100
+          }
+        },
+        "required": [
+          "partnerId",
+          "code",
+          "name",
+          "minShelfLifeDays",
+          "minShelfLifePercent"
+        ]
+      },
+      "OrderShelfLifeLineDto": {
+        "type": "object",
+        "properties": {
+          "orderLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "reservedQty": {
+            "type": "number",
+            "description": "Base units the line holds (its reservation)"
+          },
+          "effectiveMinDays": {
+            "type": "integer",
+            "nullable": true,
+            "description": "The binding minimum remaining shelf life (IST days) a batch needs for this line: the larger of the client minimum and the consignee's effective minimum; null when neither applies, or when the line cannot be judged (judgeable: false)"
+          },
+          "shelfLifeBaseDays": {
+            "type": "integer",
+            "nullable": true,
+            "description": "The SKU's total shelf life in days (the percent rule's base); null when not set"
+          },
+          "judgeable": {
+            "type": "boolean",
+            "description": "False when the consignee has a percent rule and the SKU has no total shelf life — no dated batch can be shown to meet it (set the SKU's shelf life to fix)"
+          },
+          "qualifyingOnHand": {
+            "type": "number",
+            "description": "Base units on hand in the order's warehouse's pickable bins that meet every rule, if waved today (other orders' claims ignored) — per line, after the earlier lines of the same SKU (in line order) have taken their reserved units"
+          },
+          "qualifyingUnclaimed": {
+            "type": "number",
+            "description": "What still qualifies after other open lines' claims are spent in rank order (not qualifyingOnHand minus claims); this order's own lines are not claims. Per line, after the earlier lines of the same SKU"
+          },
+          "belowConsigneeMinimumOnHand": {
+            "type": "number",
+            "description": "Base units the client rule allows but the consignee's rule does not (undated or unattributed stock of a batch-tracked SKU included)"
+          },
+          "plannedQty": {
+            "type": "number",
+            "nullable": true,
+            "description": "When the line is on an open wave: the units its planned slices name (base units); null otherwise"
+          },
+          "shortfallQty": {
+            "type": "number",
+            "nullable": true,
+            "description": "When the line is on an open wave: the units it planned as unfulfillable (base units); null otherwise"
+          },
+          "shortfallCause": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "consignee-shelf-life",
+              "consignee-unjudgeable",
+              null
+            ],
+            "description": "The planner's frozen cause of that shortfall; null when none or no stock at all"
+          }
+        },
+        "required": [
+          "orderLineId",
+          "skuId",
+          "skuCode",
+          "reservedQty",
+          "effectiveMinDays",
+          "shelfLifeBaseDays",
+          "judgeable",
+          "qualifyingOnHand",
+          "qualifyingUnclaimed",
+          "belowConsigneeMinimumOnHand",
+          "plannedQty",
+          "shortfallQty",
+          "shortfallCause"
+        ]
+      },
+      "OrderShelfLifeDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "judgedOn": {
+            "type": "string",
+            "format": "date",
+            "description": "The IST date judged on — the server's today, the date a wave generated now would plan on"
+          },
+          "clientMinShelfLifeDays": {
+            "type": "integer",
+            "nullable": true,
+            "description": "The order's client's minimum remaining shelf life at dispatch (4-3a); null when none"
+          },
+          "consigneeResolution": {
+            "type": "string",
+            "enum": [
+              "no-gstin",
+              "no-partner",
+              "no-consignee-link",
+              "no-rule",
+              "applied"
+            ],
+            "description": "Why the consignee rule did or did not apply: no-gstin (the order names no consignee GSTIN), no-partner (no partner holds that GSTIN), no-consignee-link (the partner has no consignee link to the order's client), no-rule (the link sets no minimum), applied"
+          },
+          "consigneeGstin": {
+            "type": "string",
+            "nullable": true,
+            "description": "The order's consignee GSTIN as stored; null when none"
+          },
+          "resolvedPartner": {
+            "nullable": true,
+            "description": "The partner holding that GSTIN (any status) — set for no-consignee-link, no-rule and applied; null otherwise",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OrderShelfLifeResolvedPartnerDto"
+              }
+            ]
+          },
+          "consignee": {
+            "nullable": true,
+            "description": "The consignee whose rule applies; null unless consigneeResolution is applied",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OrderShelfLifeConsigneeDto"
+              }
+            ]
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrderShelfLifeLineDto"
+            }
+          }
+        },
+        "required": [
+          "orderId",
+          "judgedOn",
+          "clientMinShelfLifeDays",
+          "consigneeResolution",
+          "consigneeGstin",
+          "resolvedPartner",
+          "consignee",
+          "lines"
+        ]
+      },
+      "OrderShelfLifeResponse": {
+        "type": "object",
+        "properties": {
+          "orderShelfLife": {
+            "$ref": "#/components/schemas/OrderShelfLifeDto"
+          }
+        },
+        "required": [
+          "orderShelfLife"
+        ]
+      },
       "OrderEntryDto": {
         "type": "object",
         "properties": {
@@ -52385,7 +52829,7 @@
           },
           "shortfallQty": {
             "type": "number",
-            "description": "Uncovered units — non-zero on an unfulfillable slice (nothing pickable was ever found) and on a short one (story 4.4: qty − shortfallQty is what actually moved)"
+            "description": "Uncovered units — non-zero on an unfulfillable slice (nothing pickable — or nothing meeting the consignee's shelf-life rule (shortfallCause) — was found) and on a short one (story 4.4: qty − shortfallQty is what actually moved)"
           },
           "reasonCode": {
             "type": "string",
@@ -52456,6 +52900,40 @@
             "minimum": 1,
             "maximum": 3650,
             "description": "Story 4-3a — the minimum remaining shelf life (IST days) this line was planned under (frozen); null when none"
+          },
+          "consigneeName": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 4-3b — the consignee (partner display name) whose shelf-life rule this line was planned under (frozen); null when none applied"
+          },
+          "consigneeMinShelfLifeDays": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 3650,
+            "description": "Story 4-3b — the consignee's EFFECTIVE minimum remaining shelf life (IST days) this line was planned under (frozen: max of its days rule and its percent of the SKU's total shelf life); null when no consignee rule applied, or when it cannot be judged (a percent rule over a SKU with no total shelf life — consigneeMinShelfLifePercent is then set)"
+          },
+          "consigneeMinShelfLifePercent": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100,
+            "description": "Story 4-3b — the consignee's percent-of-total-shelf-life rule the line was planned under (frozen; display); null when none"
+          },
+          "consigneeShelfLifeBaseDays": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Story 4-3b — the SKU's total shelf life in days the percent rule was converted from at plan (frozen with it); null without a percent rule or a shelf life"
+          },
+          "shortfallCause": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "consignee-shelf-life",
+              "consignee-unjudgeable",
+              null
+            ],
+            "description": "Story 4-3b — why an unfulfillable slice was left short: consignee-shelf-life (stock existed, but not enough met the consignee's minimum) or consignee-unjudgeable (a percent rule over a SKU with no total shelf life); null = no pickable stock at all"
           }
         },
         "required": [
@@ -54732,6 +55210,18 @@
             "minimum": 1,
             "maximum": 3650,
             "description": "Story 4-3a — the minimum remaining shelf life (IST days) this line was planned under (frozen); null when none"
+          },
+          "consigneeName": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 4-3b — the consignee (partner display name) whose shelf-life rule the line was planned under; null when none. Display only — an older server omits it"
+          },
+          "consigneeMinShelfLifeDays": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 3650,
+            "description": "Story 4-3b — the consignee's effective minimum remaining shelf life (IST days) the line was planned under; null when none. Display only"
           }
         },
         "required": [
@@ -67647,6 +68137,20 @@
             "type": "string",
             "nullable": true,
             "description": "The client's own code for the partner"
+          },
+          "minShelfLifeDays": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 3650,
+            "description": "Story 4-3b — a consignee link's own minimum remaining shelf life for the client's orders, in IST days; null = none. Optional: a stored reply predates it"
+          },
+          "minShelfLifePercent": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100,
+            "description": "Story 4-3b — the same minimum as a percent of each SKU's TOTAL shelf life (skus.shelfLifeDays); null = none. Both must hold when both are set. Optional: a stored reply predates it"
           }
         },
         "required": [
@@ -68087,6 +68591,29 @@
             "description": "true makes it the client's default vendor; false clears it"
           }
         }
+      },
+      "UpdatePartnerLinkShelfLifeDto": {
+        "type": "object",
+        "properties": {
+          "minShelfLifeDays": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 3650,
+            "description": "IST days of remaining shelf life the consignee requires; null for none (required — send null explicitly)"
+          },
+          "minShelfLifePercent": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100,
+            "description": "Percent of each SKU's total shelf life that must remain; null for none (required — send null explicitly)"
+          }
+        },
+        "required": [
+          "minShelfLifeDays",
+          "minShelfLifePercent"
+        ]
       },
       "RateCardLineResponseDto": {
         "type": "object",

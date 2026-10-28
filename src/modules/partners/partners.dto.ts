@@ -19,6 +19,12 @@ import {
 } from 'class-validator';
 import { PARTNER_LINK_ROLES, PARTNER_ROLES, PARTNER_STATUSES, type PartnerLinkRole, type PartnerRole, type PartnerStatus } from '../../shared/db/schema';
 import { ADDRESS_FIELD_LENGTHS } from '../../shared/primitives/address';
+import {
+  CONSIGNEE_MIN_SHELF_LIFE_DAYS_MAX,
+  CONSIGNEE_MIN_SHELF_LIFE_DAYS_MIN,
+  CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MAX,
+  CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MIN,
+} from '../../shared/primitives/batch-allocation';
 
 /**
  * Story 1-3 — the business partner surface's DTOs. The DTO checks types and
@@ -318,6 +324,62 @@ export class PartnerLinkDto {
 
   @ApiProperty({ type: String, nullable: true, description: "The client's own code for the partner" })
   clientCode!: string | null;
+
+  @ApiProperty({
+    type: 'integer',
+    nullable: true,
+    required: false,
+    minimum: CONSIGNEE_MIN_SHELF_LIFE_DAYS_MIN,
+    maximum: CONSIGNEE_MIN_SHELF_LIFE_DAYS_MAX,
+    description:
+      "Story 4-3b — a consignee link's own minimum remaining shelf life for the client's orders, in IST days; null = none. Optional: a stored reply predates it",
+  })
+  minShelfLifeDays?: number | null;
+
+  @ApiProperty({
+    type: 'integer',
+    nullable: true,
+    required: false,
+    minimum: CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MIN,
+    maximum: CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MAX,
+    description:
+      "Story 4-3b — the same minimum as a percent of each SKU's TOTAL shelf life (skus.shelfLifeDays); null = none. Both must hold when both are set. Optional: a stored reply predates it",
+  })
+  minShelfLifePercent?: number | null;
+}
+
+/**
+ * Story 4-3b — `PUT /partners/{id}/links/{linkId}/shelf-life`: a full replace
+ * of a consignee link's two minimums. BOTH keys are required (`null` = none —
+ * a missing key is a 400, the 4-3a A11 precedent); the command re-checks each
+ * behind the replay lookup.
+ */
+export class UpdatePartnerLinkShelfLifeDto {
+  @ApiProperty({
+    type: 'integer',
+    nullable: true,
+    minimum: CONSIGNEE_MIN_SHELF_LIFE_DAYS_MIN,
+    maximum: CONSIGNEE_MIN_SHELF_LIFE_DAYS_MAX,
+    description: 'IST days of remaining shelf life the consignee requires; null for none (required — send null explicitly)',
+  })
+  @ValidateIf((_, value) => value !== null)
+  @IsInt()
+  @Min(CONSIGNEE_MIN_SHELF_LIFE_DAYS_MIN)
+  @Max(CONSIGNEE_MIN_SHELF_LIFE_DAYS_MAX)
+  minShelfLifeDays!: number | null;
+
+  @ApiProperty({
+    type: 'integer',
+    nullable: true,
+    minimum: CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MIN,
+    maximum: CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MAX,
+    description: "Percent of each SKU's total shelf life that must remain; null for none (required — send null explicitly)",
+  })
+  @ValidateIf((_, value) => value !== null)
+  @IsInt()
+  @Min(CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MIN)
+  @Max(CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MAX)
+  minShelfLifePercent!: number | null;
 }
 
 /** One business partner — its links inline. */

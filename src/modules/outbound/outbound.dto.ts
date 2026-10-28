@@ -35,7 +35,17 @@ import { ORDER_IMPORT_ROW_ERROR_CODES, type OrderImportRowErrorCode } from './or
 import { MAX_EXTERNAL_ID_LENGTH } from '../../shared/primitives/ids';
 import { AddressDto } from '../tenancy/tenancy.dto';
 import { SHORT_PICK_REASON_CODES } from './pick.command';
-import { ALLOCATION_RULES, MIN_OUTBOUND_SHELF_LIFE_DAYS_MAX, MIN_OUTBOUND_SHELF_LIFE_DAYS_MIN } from '../../shared/primitives/batch-allocation';
+import {
+  ALLOCATION_RULES,
+  CONSIGNEE_MIN_SHELF_LIFE_DAYS_MAX,
+  CONSIGNEE_MIN_SHELF_LIFE_DAYS_MIN,
+  CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MAX,
+  CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MIN,
+  MIN_OUTBOUND_SHELF_LIFE_DAYS_MAX,
+  MIN_OUTBOUND_SHELF_LIFE_DAYS_MIN,
+  SHORTFALL_CAUSES,
+} from '../../shared/primitives/batch-allocation';
+import { CONSIGNEE_RESOLUTIONS } from '../partners/partners.facade';
 // The pack bounds are the COMMAND's constants, imported rather than copied:
 // a literal here and a constant there drift silently, and the DTO is the
 // gate every HTTP caller actually hits. (`order.command` / `pick.command`
@@ -867,7 +877,7 @@ export class PicklistLineDto {
 
   @ApiProperty({
     description:
-      'Uncovered units — non-zero on an unfulfillable slice (nothing pickable was ever found) and on a short one (story 4.4: qty − shortfallQty is what actually moved)',
+      "Uncovered units — non-zero on an unfulfillable slice (nothing pickable — or nothing meeting the consignee's shelf-life rule (shortfallCause) — was found) and on a short one (story 4.4: qty − shortfallQty is what actually moved)",
   })
   shortfallQty!: number;
 
@@ -929,6 +939,54 @@ export class PicklistLineDto {
     description: 'Story 4-3a — the minimum remaining shelf life (IST days) this line was planned under (frozen); null when none',
   })
   minOutboundShelfLifeDays?: number | null;
+
+  // ── Story 4-3b — OPTIONAL: a wave snapshot stored before 4-3b lacks them. ──
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    description: "Story 4-3b — the consignee (partner display name) whose shelf-life rule this line was planned under (frozen); null when none applied",
+  })
+  consigneeName?: string | null;
+
+  @ApiProperty({
+    type: 'integer',
+    nullable: true,
+    required: false,
+    minimum: CONSIGNEE_MIN_SHELF_LIFE_DAYS_MIN,
+    maximum: CONSIGNEE_MIN_SHELF_LIFE_DAYS_MAX,
+    description:
+      "Story 4-3b — the consignee's EFFECTIVE minimum remaining shelf life (IST days) this line was planned under (frozen: max of its days rule and its percent of the SKU's total shelf life); null when no consignee rule applied, or when it cannot be judged (a percent rule over a SKU with no total shelf life — consigneeMinShelfLifePercent is then set)",
+  })
+  consigneeMinShelfLifeDays?: number | null;
+
+  @ApiProperty({
+    type: 'integer',
+    nullable: true,
+    required: false,
+    minimum: CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MIN,
+    maximum: CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MAX,
+    description: "Story 4-3b — the consignee's percent-of-total-shelf-life rule the line was planned under (frozen; display); null when none",
+  })
+  consigneeMinShelfLifePercent?: number | null;
+
+  @ApiProperty({
+    type: 'integer',
+    nullable: true,
+    required: false,
+    description: "Story 4-3b — the SKU's total shelf life in days the percent rule was converted from at plan (frozen with it); null without a percent rule or a shelf life",
+  })
+  consigneeShelfLifeBaseDays?: number | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    enum: [...SHORTFALL_CAUSES, null],
+    description:
+      "Story 4-3b — why an unfulfillable slice was left short: consignee-shelf-life (stock existed, but not enough met the consignee's minimum) or consignee-unjudgeable (a percent rule over a SKU with no total shelf life); null = no pickable stock at all",
+  })
+  shortfallCause?: string | null;
 }
 
 export class PicklistDto {
@@ -1422,6 +1480,24 @@ export class PickTaskDto {
     description: 'Story 4-3a — the minimum remaining shelf life (IST days) this line was planned under (frozen); null when none',
   })
   minOutboundShelfLifeDays?: number | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    description: "Story 4-3b — the consignee (partner display name) whose shelf-life rule the line was planned under; null when none. Display only — an older server omits it",
+  })
+  consigneeName?: string | null;
+
+  @ApiProperty({
+    type: 'integer',
+    nullable: true,
+    required: false,
+    minimum: CONSIGNEE_MIN_SHELF_LIFE_DAYS_MIN,
+    maximum: CONSIGNEE_MIN_SHELF_LIFE_DAYS_MAX,
+    description: "Story 4-3b — the consignee's effective minimum remaining shelf life (IST days) the line was planned under; null when none. Display only",
+  })
+  consigneeMinShelfLifeDays?: number | null;
 }
 
 // ── Packing (Story 4.5) ─────────────────────────────────────────────────────
@@ -2733,4 +2809,129 @@ export class AllocationDto {
 export class AllocateOrderResponse {
   @ApiProperty({ type: AllocationDto })
   allocation!: AllocationDto;
+}
+
+
+// ── Story 4-3b — the order's customer shelf life read ───────────────────────
+
+export class OrderShelfLifeConsigneeDto {
+  @ApiProperty({ format: 'uuid' })
+  partnerId!: string;
+
+  @ApiProperty()
+  code!: string;
+
+  @ApiProperty({ description: 'The partner display name' })
+  name!: string;
+
+  @ApiProperty({ type: 'integer', nullable: true, minimum: CONSIGNEE_MIN_SHELF_LIFE_DAYS_MIN, maximum: CONSIGNEE_MIN_SHELF_LIFE_DAYS_MAX })
+  minShelfLifeDays!: number | null;
+
+  @ApiProperty({ type: 'integer', nullable: true, minimum: CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MIN, maximum: CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MAX })
+  minShelfLifePercent!: number | null;
+}
+
+export class OrderShelfLifeResolvedPartnerDto {
+  @ApiProperty({ format: 'uuid' })
+  partnerId!: string;
+
+  @ApiProperty()
+  code!: string;
+
+  @ApiProperty({ description: 'The partner display name' })
+  name!: string;
+}
+
+export class OrderShelfLifeLineDto {
+  @ApiProperty({ format: 'uuid' })
+  orderLineId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty({ description: 'Base units the line holds (its reservation)' })
+  reservedQty!: number;
+
+  @ApiProperty({
+    type: 'integer',
+    nullable: true,
+    description:
+      "The binding minimum remaining shelf life (IST days) a batch needs for this line: the larger of the client minimum and the consignee's effective minimum; null when neither applies, or when the line cannot be judged (judgeable: false)",
+  })
+  effectiveMinDays!: number | null;
+
+  @ApiProperty({ type: 'integer', nullable: true, description: "The SKU's total shelf life in days (the percent rule's base); null when not set" })
+  shelfLifeBaseDays!: number | null;
+
+  @ApiProperty({
+    description:
+      "False when the consignee has a percent rule and the SKU has no total shelf life — no dated batch can be shown to meet it (set the SKU's shelf life to fix)",
+  })
+  judgeable!: boolean;
+
+  @ApiProperty({
+    description:
+      "Base units on hand in the order's warehouse's pickable bins that meet every rule, if waved today (other orders' claims ignored) — per line, after the earlier lines of the same SKU (in line order) have taken their reserved units",
+  })
+  qualifyingOnHand!: number;
+
+  @ApiProperty({
+    description:
+      "What still qualifies after other open lines' claims are spent in rank order (not qualifyingOnHand minus claims); this order's own lines are not claims. Per line, after the earlier lines of the same SKU",
+  })
+  qualifyingUnclaimed!: number;
+
+  @ApiProperty({ description: "Base units the client rule allows but the consignee's rule does not (undated or unattributed stock of a batch-tracked SKU included)" })
+  belowConsigneeMinimumOnHand!: number;
+
+  @ApiProperty({ type: Number, nullable: true, description: 'When the line is on an open wave: the units its planned slices name (base units); null otherwise' })
+  plannedQty!: number | null;
+
+  @ApiProperty({ type: Number, nullable: true, description: 'When the line is on an open wave: the units it planned as unfulfillable (base units); null otherwise' })
+  shortfallQty!: number | null;
+
+  @ApiProperty({ type: String, nullable: true, enum: [...SHORTFALL_CAUSES, null], description: "The planner's frozen cause of that shortfall; null when none or no stock at all" })
+  shortfallCause!: string | null;
+}
+
+export class OrderShelfLifeDto {
+  @ApiProperty({ format: 'uuid' })
+  orderId!: string;
+
+  @ApiProperty({ format: 'date', description: "The IST date judged on — the server's today, the date a wave generated now would plan on" })
+  judgedOn!: string;
+
+  @ApiProperty({ type: 'integer', nullable: true, description: "The order's client's minimum remaining shelf life at dispatch (4-3a); null when none" })
+  clientMinShelfLifeDays!: number | null;
+
+  @ApiProperty({
+    enum: [...CONSIGNEE_RESOLUTIONS],
+    description:
+      "Why the consignee rule did or did not apply: no-gstin (the order names no consignee GSTIN), no-partner (no partner holds that GSTIN), no-consignee-link (the partner has no consignee link to the order's client), no-rule (the link sets no minimum), applied",
+  })
+  consigneeResolution!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: "The order's consignee GSTIN as stored; null when none" })
+  consigneeGstin!: string | null;
+
+  @ApiProperty({
+    type: OrderShelfLifeResolvedPartnerDto,
+    nullable: true,
+    description: 'The partner holding that GSTIN (any status) — set for no-consignee-link, no-rule and applied; null otherwise',
+  })
+  resolvedPartner!: OrderShelfLifeResolvedPartnerDto | null;
+
+  @ApiProperty({ type: OrderShelfLifeConsigneeDto, nullable: true, description: 'The consignee whose rule applies; null unless consigneeResolution is applied' })
+  consignee!: OrderShelfLifeConsigneeDto | null;
+
+  @ApiProperty({ type: [OrderShelfLifeLineDto] })
+  lines!: OrderShelfLifeLineDto[];
+}
+
+export class OrderShelfLifeResponse {
+  @ApiProperty({ type: OrderShelfLifeDto })
+  orderShelfLife!: OrderShelfLifeDto;
 }

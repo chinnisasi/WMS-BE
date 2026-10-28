@@ -2329,6 +2329,16 @@ export const partnerClientLinks = pgTable(
     active: boolean('active').notNull().default(true),
     /** Implies role = vendor AND active (the 0079 CHECK). */
     isDefault: boolean('is_default').notNull().default(false),
+    /**
+     * Story 4-3b — a CONSIGNEE link's own minimum remaining shelf life for the
+     * client's orders: in IST days (1–3650) and/or in percent (1–100) of each
+     * SKU's total shelf life (`skus.shelf_life_days`). Each optional; every
+     * one set must hold. Only a `consignee` link may carry them. The CHECKs
+     * (`partner_client_links_min_shelf_life_days_range`, `…_percent_range`,
+     * `…_shelf_life_consignee_only`) live ONLY in migration 0111.
+     */
+    minShelfLifeDays: integer('min_shelf_life_days'),
+    minShelfLifePercent: smallint('min_shelf_life_percent'),
     ...tenantTimestamps,
   },
   (table) => [
@@ -3985,6 +3995,35 @@ export const picklistLines = pgTable(
      */
     allocationRule: text('allocation_rule'),
     minOutboundShelfLifeDays: integer('min_outbound_shelf_life_days'),
+    /**
+     * Story 4-3b — the consignee shelf-life rule this line was planned under,
+     * FROZEN at generate (copied by a re-plan): the consignee partner, its
+     * EFFECTIVE minimum in IST days (`max(days, ceil(percent × SKU shelf
+     * life / 100))`) and the percent it was set with (display). All null when
+     * no consignee rule applied (every pre-4-3b line). A line is UNJUDGEABLE
+     * exactly when the partner and the percent are set and the days are null
+     * (a percent rule over a SKU with no total shelf life — A3). The CHECKs
+     * (ranges, `picklist_lines_consignee_pairing`,
+     * `picklist_lines_consignee_needs_rule`, all NOT VALID) live ONLY in
+     * migration 0111.
+     */
+    consigneePartnerId: uuid('consignee_partner_id'),
+    consigneeMinShelfLifeDays: integer('consignee_min_shelf_life_days'),
+    consigneeMinShelfLifePercent: smallint('consignee_min_shelf_life_percent'),
+    /**
+     * Story 4-3b (A2) — the SKU's TOTAL shelf life (days) the percent was
+     * converted from, FROZEN with it (so the wave row shows the base USED,
+     * not today's catalog value). Set only beside a percent rule on a SKU
+     * that had a base; null otherwise (CHECKs in migration 0111).
+     */
+    consigneeShelfLifeBaseDays: integer('consignee_shelf_life_base_days'),
+    /**
+     * Story 4-3b (A6) — why the planner left this `unfulfillable` slice short:
+     * `consignee-shelf-life | consignee-unjudgeable` (`SHORTFALL_CAUSES`), or
+     * null (no stock at all — the pre-4-3b meaning). Value-only CHECK
+     * `picklist_lines_shortfall_cause_check` (NOT VALID, migration 0111).
+     */
+    shortfallCause: text('shortfall_cause'),
     ...tenantTimestamps,
   },
   (table) => [

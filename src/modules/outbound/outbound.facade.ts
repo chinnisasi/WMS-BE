@@ -67,6 +67,7 @@ import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
 import { OrderCommandService } from './order.command';
 import { OrderImportCommand } from './order-import.command';
 import { CancelRestockCommandService } from './cancel-restock.command';
+import { OrderShelfLifeReader, type OrderShelfLife } from './order-shelf-life';
 import type { CancelOrderWithRestockCommand, CancelRestockSnapshot, RestockPlan } from './cancel-restock.command';
 export type { CancelOrderWithRestockCommand, CancelRestockSnapshot, RestockLineSnapshot, RestockPlan, RestockPlanLine, RestockedEntry } from './cancel-restock.command';
 import type {
@@ -552,6 +553,8 @@ export class OutboundFacade {
     @Inject(CancelRestockCommandService) private readonly cancelRestock: CancelRestockCommandService,
     // Story 4-2c — the backorder allocation (verb, sweep, after-dispatch attempt).
     @Inject(AllocationCommandService) private readonly allocation: AllocationCommandService,
+    // Story 4-3b — the order's customer shelf life read.
+    @Inject(OrderShelfLifeReader) private readonly orderShelfLife: OrderShelfLifeReader,
   ) {}
 
   /**
@@ -1016,6 +1019,15 @@ export class OutboundFacade {
       }
       return (await this.snapshotOf(tx, order)).order;
     });
+  }
+
+  /**
+   * Story 4-3b (decision 8) — which shelf-life rules apply to one order and
+   * how much on-hand stock qualifies if it were waved today. A staff read;
+   * null when the order does not exist in the tenant.
+   */
+  async getOrderShelfLife(tenantId: string, orderId: string): Promise<OrderShelfLife | null> {
+    return this.orderShelfLife.read(tenantId, orderId);
   }
 
   /**

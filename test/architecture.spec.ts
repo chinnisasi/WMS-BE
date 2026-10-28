@@ -477,6 +477,37 @@ describe('architecture: catalog identity is catalog-module-owned (story 10.3)', 
     expect(ownSort.test('drawable.sort((a, b) => { const left = byId.get(a.batchId)?.expiryDate ?? null; return 0; })')).toBe(true);
   });
 
+  it('story 4-3b (A6 extended): ONE consignee predicate — the planner, the re-plan, the pick and the order read import it; the pick and the re-plan read the frozen line through consigneeArmOf', () => {
+    // A consignee check written inline in one of the four users would let
+    // the plan, the draw and the order read disagree on what qualifies.
+    const importsOf = (name: string) =>
+      new RegExp(`import\\s*\\{[^}]*\\b${name}\\b[^}]*\\}\\s*from\\s*['"][^'"]*shared\\/primitives\\/batch-allocation['"]`);
+    for (const file of [
+      'modules/outbound/wave.command.ts',
+      'modules/outbound/replan.ts',
+      'modules/outbound/pick.command.ts',
+      'modules/outbound/order-shelf-life.ts',
+    ]) {
+      const source = readFileSync(join(SRC_ROOT, file), 'utf8');
+      expect({ file, predicate: importsOf('meetsConsigneeShelfLife').test(source) }).toEqual({ file, predicate: true });
+      // No hand-written reading of the frozen days column as "no minimum".
+      expect({ file, inline: /consigneeMinShelfLifeDays\s*===\s*null\s*\?/.test(source) }).toEqual({ file, inline: false });
+    }
+    const pick = readFileSync(join(SRC_ROOT, 'modules/outbound/pick.command.ts'), 'utf8');
+    expect(importsOf('consigneeArmOf').test(pick)).toBe(true);
+    // The planner and the order read convert the rule with the one helper.
+    for (const file of ['modules/outbound/wave.command.ts', 'modules/outbound/order-shelf-life.ts']) {
+      expect(importsOf('consigneeMinimumDays').test(readFileSync(join(SRC_ROOT, file), 'utf8'))).toBe(true);
+    }
+    // The guard bites.
+    expect(importsOf('meetsConsigneeShelfLife').test("import { rankSlots } from '../../shared/primitives/batch-allocation';")).toBe(false);
+    // The order read's `applied` arm is the planner's own match — one definition.
+    const planMatch = /import\s*\{[^}]*\bconsigneeShelfLifeRulesInTx\b[^}]*\}\s*from\s*['"]\.\.\/partners\/partners\.facade['"]/;
+    for (const file of ['modules/outbound/wave.command.ts', 'modules/outbound/order-shelf-life.ts']) {
+      expect({ file, planMatch: planMatch.test(readFileSync(join(SRC_ROOT, file), 'utf8')) }).toEqual({ file, planMatch: true });
+    }
+  });
+
   it('story 3-3a: inventory reads catalog `batches` in ONE file, locate-only (status + expiry), and the block verb writes them', () => {
     // The unpromisable-batch ATP hook (`unpromisableBatchUnits`) and the
     // approval's blocked-batch re-check (`batchBlockedInTx`) read catalog's

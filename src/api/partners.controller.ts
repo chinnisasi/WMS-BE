@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Patch, Post, Put, Query, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiBody, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
@@ -18,6 +18,7 @@ import {
   PartnerResponse,
   UpdatePartnerDto,
   UpdatePartnerLinkDto,
+  UpdatePartnerLinkShelfLifeDto,
   UpdatePartnerStatusDto,
 } from '../modules/partners/partners.dto';
 import type { PartnerDto } from '../modules/partners/partners.dto';
@@ -252,6 +253,50 @@ export class PartnersController {
         clientCode: dto.clientCode,
         active: dto.active,
         isDefault: dto.isDefault,
+      },
+      key,
+    );
+    return { partner: toPartnerDto(snapshot.partner) };
+  }
+
+  @Put(':tenantId/partners/:partnerId/links/:linkId/shelf-life')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Story 4-3b — replaces a CONSIGNEE link's own minimum remaining shelf life for the client's orders (vendor.manage): IST days and/or percent of each SKU's total shelf life, both keys required (null = none). Orders whose consignee GSTIN matches the partner are planned only from batches meeting it, on top of the client minimum; it applies to waves generated after saving. An unchanged rule is a no-op that stores the key",
+  })
+  @ApiBody({ type: UpdatePartnerLinkShelfLifeDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: PartnerResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a missing key or a value out of range — days 1–3650, percent 1–100, whole numbers (validation-failed naming the field), or a vendor link (link-role-invalid)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse(WRITE_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No such partner, or no such link on it — another partner\'s link included (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse(KEY_409) })
+  @ApiResponse({ status: 422, ...problemJsonResponse(KEY_422) })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'partnerId', format: 'uuid' })
+  @ApiParam({ name: 'linkId', format: 'uuid' })
+  async updatePartnerLinkShelfLife(
+    @Param('tenantId') tenantId: string,
+    @Param('partnerId') partnerId: string,
+    @Param('linkId') linkId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: UpdatePartnerLinkShelfLifeDto,
+  ): Promise<PartnerResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.command.updateLinkShelfLife(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        partnerId,
+        linkId,
+        minShelfLifeDays: dto.minShelfLifeDays,
+        minShelfLifePercent: dto.minShelfLifePercent,
       },
       key,
     );

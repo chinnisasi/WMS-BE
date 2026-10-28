@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
 import { bins, picklistLines } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { InventoryFacade } from '../inventory/inventory.facade';
@@ -10,8 +10,10 @@ import { storageClassSatisfies } from '../../shared/primitives/storage-class';
 // with the pick's batch re-derivation and the ATP hook (A6 pins the import).
 import {
   isBatchAllocatableAt,
+  meetsConsigneeShelfLife,
   rankSlots,
   type AllocationRule,
+  type ConsigneeArm,
 } from '../../shared/primitives/batch-allocation';
 
 /**
@@ -284,6 +286,13 @@ export async function findReplanSlices(
     readonly minDays: number | null;
     /** Story 4-3a (A3) — the IST date the minimum is judged on (the one-day grace). */
     readonly minJudgedOn: string;
+    /**
+     * Story 4-3b — the short line's FROZEN consignee arm (null = none, every
+     * pre-4-3b line) and whether the SKU is batch-tracked (an untracked SKU
+     * is never limited by it). Judged on the same `minJudgedOn`.
+     */
+    readonly consignee: ConsigneeArm | null;
+    readonly batchTracked: boolean;
   },
 ): Promise<ReplanSlice[]> {
   if (scope.need <= 0) {
@@ -337,11 +346,29 @@ export async function findReplanSlices(
     }
   }
 
+  // Story 4-3b (A12) — the consignee arm is applied AFTER the claim spend:
+  // the claims are spent against every slot in rank order (what a pick would
+  // draw), and only then is a non-qualifying slot skipped. Folding the arm
+  // into `policyOf` instead would spend claims against qualifying slots only.
+  const consignee = scope.consignee;
+  const batchById = new Map(batchIdentities.map((batch) => [batch.id, batch]));
   const slices: ReplanSlice[] = [];
   let need = scope.need;
   for (const slot of slots) {
     if (need === 0) break;
     if (slot.remaining <= 0) continue;
+    if (
+      consignee !== null &&
+      !meetsConsigneeShelfLife(
+        { batchId: slot.batchId, expiryDate: slot.batchId === null ? null : (batchById.get(slot.batchId)?.expiryDate ?? null) },
+        scope.batchTracked,
+        scope.at,
+        consignee,
+        scope.minJudgedOn,
+      )
+    ) {
+      continue;
+    }
     const take = Math.min(need, slot.remaining);
     need -= take;
     slices.push({ binId: slot.binId, binCode: slot.binCode, batchId: slot.batchId, qty: take, rankIndex: slices.length });
@@ -388,6 +415,47 @@ async function openClaimsInTx(
   return new Map(
     rows.flatMap((row) => (row.binId === null ? [] : [[row.binId, Number(row.claimed)] as const])),
   );
+}
+
+/**
+ * Story 4-3b (A8) — `openClaimsInTx` for a SET of SKUs in ONE statement (the
+ * order read): skuId → binId → claimed milli-units, `planned` lines only, an
+ * order's own lines excluded.
+ */
+export async function openClaimsBySkuInTx(
+  tx: TenantTx,
+  tenantId: string,
+  skuIds: readonly string[],
+  binIds: readonly string[],
+  excludeOrderId: string,
+): Promise<Map<string, Map<string, number>>> {
+  const result = new Map<string, Map<string, number>>();
+  if (skuIds.length === 0 || binIds.length === 0) return result;
+  const rows = await tx
+    .select({
+      skuId: picklistLines.skuId,
+      binId: picklistLines.binId,
+      // Story 10.1: `::bigint` (milli-units overflow int4 at ~2.1M base units).
+      claimed: sql<string>`coalesce(sum(${picklistLines.qty}), 0)::bigint`,
+    })
+    .from(picklistLines)
+    .where(
+      and(
+        eq(picklistLines.tenantId, tenantId),
+        inArray(picklistLines.skuId, [...new Set(skuIds)]),
+        eq(picklistLines.status, 'planned'),
+        inArray(picklistLines.binId, [...binIds]),
+        ne(picklistLines.orderId, excludeOrderId),
+      ),
+    )
+    .groupBy(picklistLines.skuId, picklistLines.binId);
+  for (const row of rows) {
+    if (row.binId === null) continue;
+    const bySku = result.get(row.skuId) ?? new Map<string, number>();
+    bySku.set(row.binId, Number(row.claimed));
+    result.set(row.skuId, bySku);
+  }
+  return result;
 }
 
 /**

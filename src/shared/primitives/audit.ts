@@ -341,6 +341,8 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'partner.link_updated', targetType: 'partner_link' },
   { action: 'partner.link_deactivated', targetType: 'partner_link' },
   { action: 'partner.link_reactivated', targetType: 'partner_link' },
+  // Story 4-3b — a consignee link's shelf-life rule (`PUT …/links/{l}/shelf-life`).
+  { action: 'partner.link_shelf_life_updated', targetType: 'partner_link' },
   // Story 1-6c — the licence master (`LicenceCommand`); an unchanged edit is
   // a declared no-op (`licences.edit:unchanged`). The expiry sweep's raises
   // are unkeyed system rows (`SYSTEM_ACTOR_ID`), outside this list.

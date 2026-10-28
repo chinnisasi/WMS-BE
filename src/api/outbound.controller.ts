@@ -50,6 +50,7 @@ import {
   PicklistLineListResponse,
   OrderImportResponseDto,
   OrderRatesResponse,
+  OrderShelfLifeResponse,
   OrderResponse,
   PackOrderDto,
   PackResponse,
@@ -640,6 +641,41 @@ export class OutboundController {
       throw orderNotFound(orderId);
     }
     return { rates: { orderId: snapshot.rates.orderId, items: snapshot.rates.items.map((item) => ({ ...item })) } };
+  }
+
+  @Get(':tenantId/outbound/orders/:orderId/shelf-life')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Story 4-3b — one order's customer shelf life: the client minimum and the consignee's rule (resolved from the order's consignee GSTIN, with why it did or did not apply), and per line the binding minimum and how much on-hand stock in the order's warehouse qualifies if it were waved today (other orders' claims ignored, and spent in qualifyingUnclaimed). A staff read — no capability, nothing stored",
+  })
+  @ApiOkResponse({ type: OrderShelfLifeResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed orderId path parameter (validation-failed — it must be a uuid)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No order with this id exists in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async getOrderShelfLife(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<OrderShelfLifeResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const read = await this.outbound.getOrderShelfLife(tenantId, orderId);
+    if (read === null) {
+      throw orderNotFound(orderId);
+    }
+    return {
+      orderShelfLife: {
+        ...read,
+        consignee: read.consignee === null ? null : { ...read.consignee },
+        resolvedPartner: read.resolvedPartner === null ? null : { ...read.resolvedPartner },
+        lines: read.lines.map((line) => ({ ...line })),
+      },
+    };
   }
 
   @Get(':tenantId/outbound/orders/:orderId')

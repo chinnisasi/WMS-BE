@@ -1043,6 +1043,29 @@ export class CatalogFacade {
   }
 
   /**
+   * Story 4-3b (A1) — the SKU facts a consignee shelf-life rule needs: the
+   * TOTAL shelf life (`skus.shelf_life_days`, the percent rule's base; null =
+   * none set) and whether the SKU is batch-tracked (an untracked SKU is never
+   * limited by a consignee rule). One read per plan (and per order read),
+   * inside the caller's transaction; an id the catalog does not know is
+   * absent from the map.
+   */
+  async skuShelfLifeFactsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    skuIds: readonly string[],
+  ): Promise<ReadonlyMap<string, { readonly shelfLifeDays: number | null; readonly batchTracked: boolean }>> {
+    if (skuIds.length === 0) {
+      return new Map();
+    }
+    const rows = await tx
+      .select({ id: skus.id, shelfLifeDays: skus.shelfLifeDays, batchTracked: skus.batchTracked })
+      .from(skus)
+      .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, [...new Set(skuIds)])));
+    return new Map(rows.map((row) => [row.id, { shelfLifeDays: row.shelfLifeDays, batchTracked: row.batchTracked }]));
+  }
+
+  /**
    * The storage classes of a SET of SKUs (Story 12-1, FR-40), inside the
    * caller's transaction — the wave planner's and the short-pick re-plan's
    * conformance filter (`buildStockPool`), the `getBatchesForSkusInTx` shape:
