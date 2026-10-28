@@ -1534,8 +1534,31 @@ export class CatalogCountTaskDto {
   @ApiProperty({ description: 'When the task was created (ISO-8601 UTC)' })
   createdAt!: string;
 
+  @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    description: 'Story 3-5b (additive) — the stock take this task counts for; null = a cycle count. The count stays blind — nothing else about the take rides the card',
+  })
+  stockTakeId!: string | null;
+
   @ApiProperty({ type: [CatalogCountTaskLineDto], description: 'The SKUs the task lists (blind — no expected quantity); every line must be counted at submit, and SKUs found in the bin may be added' })
   lines!: readonly CatalogCountTaskLineDto[];
+}
+
+/** Story 3-5b — one active stock take of the warehouse, as the device snapshot carries it. */
+export class CatalogStockTakeDto {
+  @ApiProperty({ format: 'uuid' })
+  stockTakeId!: string;
+
+  @ApiProperty({ type: [String], nullable: true, description: 'The zones frozen; null = the whole warehouse' })
+  zoneIds!: string[] | null;
+
+  @ApiProperty({ description: 'The freeze instant (ISO-8601 UTC)' })
+  frozenAt!: string;
+
+  @ApiProperty({ description: 'Pending count tasks of the take (recounts included)' })
+  pendingTasks!: number;
 }
 
 /**
@@ -1711,6 +1734,13 @@ export class CatalogSnapshotResponse {
       'Story 5-3 (additive): the STORED pending count tasks of this warehouse — the Count inbox tasks whose submit the operator executes (every task line must be counted; 0 is a valid explicit count). The expectations were FROZEN at task start and are read here, never recomputed',
   })
   countTasks!: readonly CatalogCountTaskDto[];
+
+  @ApiProperty({
+    type: [CatalogStockTakeDto],
+    description:
+      'Story 3-5b (additive): the warehouse\'s counting (and posting) stock takes — the handheld groups their count tasks by zone and refuses movements into or out of a frozen bin (bins[].frozen). An older server omits it',
+  })
+  stockTakes!: readonly CatalogStockTakeDto[];
 
   @ApiProperty({
     type: [CatalogOpenReturnDto],

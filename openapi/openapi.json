@@ -2207,7 +2207,7 @@
             }
           },
           "409": {
-            "description": "The bin is already retired (bin-retired — retirement is terminal)",
+            "description": "The bin is already retired (bin-retired — retirement is terminal), or a stock take froze it (bin-frozen — story 3-5b: close or abandon the take first)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6990,7 +6990,7 @@
             }
           },
           "409": {
-            "description": "Row already resolved (rejected-op-resolved), a decision the op type does not admit — story 13-2: a return.receive row is Discard only; story 1-2b: a grn.shelf-life-refused row admits Apply and Discard; story 1-6d: so does a grn.licence-refused row (decision-not-available, member decisions), a pending count task on the bin (count-task-open), or the re-executed command's own conflict (verbatim)",
+            "description": "Row already resolved (rejected-op-resolved), a decision the op type does not admit — story 13-2: a return.receive row is Discard only; story 1-2b: a grn.shelf-life-refused row admits Apply and Discard; story 1-6d: so does a grn.licence-refused row (decision-not-available, member decisions), a pending count task on the bin (count-task-open), a recount of a bin frozen by a stock take (bin-in-stock-take — story 3-5b), or the re-executed command's own conflict (verbatim)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -19908,7 +19908,7 @@
             }
           },
           "409": {
-            "description": "The single bin already has a pending count task (count-task-open), or a concurrent idempotent request (conflict)",
+            "description": "The single bin is frozen by a stock take (bin-in-stock-take — checked first), already has a pending count task (count-task-open), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -19969,7 +19969,8 @@
               "type": "string",
               "enum": [
                 "pending",
-                "completed"
+                "completed",
+                "cancelled"
               ]
             }
           },
@@ -20266,7 +20267,7 @@
             }
           },
           "409": {
-            "description": "The task is already completed (count-task-completed), or a concurrent idempotent request (conflict)",
+            "description": "The task is already completed (count-task-completed) or was cancelled (count-task-cancelled), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -20295,6 +20296,1082 @@
           }
         ],
         "summary": "Submits a count (counts.execute — either session family): every task line is recorded with its counted quantity, and a SKU found in the bin is added with an expected of 0; counted ≠ expected appends an open variance row; the bin's epoch is compared for EQUALITY under the locks — a mismatch flags the variances AND auto-creates a fresh recount task (never a stock write). Story 3-5a — the response is BLIND: variances is always empty",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/movements/counts/{taskId}/cancel": {
+      "post": {
+        "operationId": "MovementsController_cancelCountTask",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "taskId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The task cancelled (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CancelCountTaskResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed taskId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid web session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks counts.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The count task does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The task is completed (count-task-completed) or already cancelled (count-task-cancelled), it belongs to a stock take (stock-take-task), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Cancels a PENDING count task (counts.manage — story 3-5b). A stock take's task is refused (abandon the take); a device submit that lands later answers 409 count-task-cancelled; the scheduler may mint the bin again at its next due tick",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/movements/warehouses/{warehouseId}/stock-takes": {
+      "post": {
+        "operationId": "MovementsController_startStockTake",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartStockTakeDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The take counting (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartStockTakeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an invalid body — no zones, more than 50, a repeated zone, a note over 200 characters (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid web session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks counts.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse or a zone does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A bin is already frozen by another take (stock-take-overlap, naming it), a count task was created on a bin while the take started (conflict — retry), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No storage bin in scope (stock-take-empty), more than 3,000 bins frozen in the warehouse (too-many-bins), or the key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Starts a stock take (counts.manage — story 3-5b): freezes every storage bin of the warehouse (or of the named zones) — every stock movement into or out of them is refused (409 bin-frozen) until the take is closed or abandoned, except a handheld op and a quarantine — and creates one count task per bin (adopting a pending one), empty bins included. At most 3,000 frozen bins per warehouse",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/movements/stock-takes": {
+      "get": {
+        "operationId": "MovementsController_listStockTakes",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "counting",
+                "posting",
+                "closed",
+                "abandoned"
+              ]
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StockTakeListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed filter, cursor or limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid web session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse filter names a warehouse outside this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists stock takes (story 3-5b — newest first, keyset cursor; warehouse and status filters; any staff role, no quantities)",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/movements/stock-takes/{stockTakeId}": {
+      "get": {
+        "operationId": "MovementsController_getStockTake",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "stockTakeId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StockTakeDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed stockTakeId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid web session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The stock take does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One stock take (story 3-5b): the dashboard — totals, per-zone progress, the bins that need a recount, the handheld writes admitted after the freeze, and the openVarianceDigest the close sends back. No quantities; any staff role",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/movements/stock-takes/{stockTakeId}/variances": {
+      "get": {
+        "operationId": "MovementsController_listStockTakeVariances",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "stockTakeId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "open",
+                "adjusted",
+                "recounted"
+              ]
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 500,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StockTakeVarianceListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed stockTakeId, status, cursor or limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid web session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), a client-portal session, or a role with neither counts.manage nor variances.resolve (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The stock take does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "A stock take's variances (story 3-5b): expected beside counted, the owner-only flag, the unposted refusal once closed — keyset by bin code. A GATED read: counts.manage or variances.resolve (an operator is 403); web staff sessions only",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/movements/stock-takes/{stockTakeId}/report": {
+      "get": {
+        "description": "The `Content-Disposition` filename is not readable cross-origin — a client names the file itself.",
+        "operationId": "MovementsController_downloadStockTakeReport",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "stockTakeId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "format",
+            "required": true,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "csv",
+                "xlsx"
+              ]
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Only this client's (SKU, bin) rows; an unknown client is 404",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The report file",
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed stockTakeId or clientId, or a missing/unknown format (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid web session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), a client-portal session, or a role with neither counts.manage nor variances.resolve (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The stock take or the client does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "A stock take's client report as CSV or Excel (story 3-5b): one row per (SKU, bin) of each bin's latest count — book, counted, variance and the outcome as of the close (matched | adjusted | unposted:<code> | open). Optionally one client. Counted bins only. Allowed while counting, marked provisional (a first column status). Gated: counts.manage or variances.resolve",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/movements/stock-takes/{stockTakeId}/recount": {
+      "post": {
+        "operationId": "MovementsController_recountStockTakeBins",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "stockTakeId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecountStockTakeBinsDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The recounts (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecountStockTakeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, no bins, more than 500, a repeated bin, or a bin outside the take (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid web session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks variances.resolve (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The stock take does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The take is not counting (stock-take-not-counting), a named bin already has a pending task (count-task-open), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Recounts selected bins of a counting stock take (variances.resolve — story 3-5b): a take-stamped recount task per bin (never pushed), and the bin's open variances in the take marked recounted",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/movements/stock-takes/{stockTakeId}/close": {
+      "post": {
+        "operationId": "MovementsController_closeStockTake",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "stockTakeId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloseStockTakeDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The take closed (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CloseStockTakeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed openVarianceDigest (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid web session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks variances.resolve (role-denied), or an open variance is over its frozen threshold and the caller is not the owner (variance-owner-required, naming them)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The stock take does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The take is closed or abandoned (stock-take-not-counting), bins are still pending (stock-take-incomplete), counted bins moved since their count (stock-take-recount-required, listing up to 20 and the total), the open variances changed since they were reviewed (stock-take-changed), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Posts and closes a stock take (variances.resolve — story 3-5b): approved once against the openVarianceDigest (owner when any open variance is over its frozen threshold), then each open variance is posted as a stock.adjusted correction in batches of 200, the freeze lifted bin by bin; a variance the adjustment guards refuse stays open and is listed unposted. A retry, or any close on a posting take, resumes the batches",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/movements/stock-takes/{stockTakeId}/abandon": {
+      "post": {
+        "operationId": "MovementsController_abandonStockTake",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "stockTakeId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AbandonStockTakeDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The take abandoned (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AbandonStockTakeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a note over 200 characters (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid web session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks counts.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The stock take does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The take is posting, closed or abandoned (stock-take-not-counting), a recount was created meanwhile (conflict — retry), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Abandons a counting stock take (counts.manage — story 3-5b): its pending tasks are cancelled and the freeze lifted. Nothing is posted; the variances stay open on the variance queue",
         "tags": [
           "movements"
         ]
@@ -21041,7 +22118,7 @@
             }
           },
           "409": {
-            "description": "The variance is already resolved (variance-resolved), the task's frozen bin epoch no longer matches (variance-basis-moved — recount is the remedy), the bin already has an open count task on the RECOUNT arm (count-task-open — approve_adjust under an open sibling task is legal), or a concurrent idempotent request (conflict)",
+            "description": "The variance belongs to a counting or posting stock take (variance-in-stock-take — the take's own verbs resolve it), is already resolved (variance-resolved), the task's frozen bin epoch no longer matches (variance-basis-moved — recount is the remedy), the bin already has an open count task on the RECOUNT arm (count-task-open — approve_adjust under an open sibling task is legal), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -25687,6 +26764,7 @@
                 "stock_adjustment_policy",
                 "suggested_po",
                 "temperature_excursion",
+                "stock_take",
                 "tenant",
                 "transfer_order",
                 "user",
@@ -51718,6 +52796,10 @@
             "type": "boolean",
             "description": "System bins (Receiving/QC-hold) are never placement targets"
           },
+          "frozen": {
+            "type": "boolean",
+            "description": "Story 3-5b — the bin is frozen for a stock take: the handheld refuses every movement into or out of it offline (count it, or wait for the take to close). A client reading a snapshot cached before 3-5b treats an absent field as false"
+          },
           "storageClass": {
             "type": "string",
             "enum": [
@@ -51747,6 +52829,7 @@
           "blocked",
           "blockedReason",
           "systemOwned",
+          "frozen",
           "storageClass",
           "dedicatedClientId"
         ]
@@ -52235,6 +53318,12 @@
             "type": "string",
             "description": "When the task was created (ISO-8601 UTC)"
           },
+          "stockTakeId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 3-5b (additive) — the stock take this task counts for; null = a cycle count. The count stays blind — nothing else about the take rides the card"
+          },
           "lines": {
             "description": "The SKUs the task lists (blind — no expected quantity); every line must be counted at submit, and SKUs found in the bin may be added",
             "type": "array",
@@ -52251,7 +53340,39 @@
           "origin",
           "binStateEpoch",
           "createdAt",
+          "stockTakeId",
           "lines"
+        ]
+      },
+      "CatalogStockTakeDto": {
+        "type": "object",
+        "properties": {
+          "stockTakeId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "zoneIds": {
+            "nullable": true,
+            "description": "The zones frozen; null = the whole warehouse",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "frozenAt": {
+            "type": "string",
+            "description": "The freeze instant (ISO-8601 UTC)"
+          },
+          "pendingTasks": {
+            "type": "number",
+            "description": "Pending count tasks of the take (recounts included)"
+          }
+        },
+        "required": [
+          "stockTakeId",
+          "zoneIds",
+          "frozenAt",
+          "pendingTasks"
         ]
       },
       "CatalogOpenReturnSerialDto": {
@@ -52769,6 +53890,13 @@
               "$ref": "#/components/schemas/CatalogCountTaskDto"
             }
           },
+          "stockTakes": {
+            "description": "Story 3-5b (additive): the warehouse's counting (and posting) stock takes — the handheld groups their count tasks by zone and refuses movements into or out of a frozen bin (bins[].frozen). An older server omits it",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogStockTakeDto"
+            }
+          },
           "openReturns": {
             "description": "Story 13-2 (additive): the warehouse's return authorizations that can still receive (open or partially received) — the handheld receives returned units against them offline, grading each unit; units not on an authorization are queued for review, never refused on the device",
             "type": "array",
@@ -52862,6 +53990,7 @@
           "handlingUnits",
           "transferTasks",
           "countTasks",
+          "stockTakes",
           "openReturns",
           "openVendorReturns",
           "clients",
@@ -56740,7 +57869,8 @@
             "enum": [
               "count-task-open",
               "system-bin",
-              "bin-retired"
+              "bin-retired",
+              "stock-take"
             ],
             "description": "count-task-open: the bin already has a pending count; system-bin / bin-retired: a listed bin that cannot be counted"
           }
@@ -57267,7 +58397,8 @@
             "type": "string",
             "enum": [
               "pending",
-              "completed"
+              "completed",
+              "cancelled"
             ]
           },
           "origin": {
@@ -57307,6 +58438,12 @@
           "openVarianceCount": {
             "type": "number",
             "minimum": 0
+          },
+          "stockTakeId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Story 3-5b — the stock take this task counts for; null = a cycle count (only a cycle count can be cancelled)"
           }
         },
         "required": [
@@ -57322,7 +58459,8 @@
           "completedAt",
           "lineCount",
           "varianceCount",
-          "openVarianceCount"
+          "openVarianceCount",
+          "stockTakeId"
         ]
       },
       "CountTaskListResponse": {
@@ -57365,7 +58503,8 @@
             "type": "string",
             "enum": [
               "pending",
-              "completed"
+              "completed",
+              "cancelled"
             ]
           },
           "origin": {
@@ -57401,6 +58540,23 @@
           "epochConflict": {
             "type": "boolean",
             "description": "A movement moved the bin between task start and submit (OQ-2) — the submit minted a recount; false while pending"
+          },
+          "stockTakeId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Story 3-5b — the stock take this task counts for; null = a cycle count"
+          },
+          "cancelledBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Story 3-5b — who cancelled it (null unless cancelled)"
+          },
+          "cancelledAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 3-5b — when it was cancelled (null unless cancelled)"
           }
         },
         "required": [
@@ -57415,7 +58571,10 @@
           "createdAt",
           "completedBy",
           "completedAt",
-          "epochConflict"
+          "epochConflict",
+          "stockTakeId",
+          "cancelledBy",
+          "cancelledAt"
         ]
       },
       "CountTaskDetailLineDto": {
@@ -57644,6 +58803,688 @@
           "countTask",
           "variances",
           "recountTaskId"
+        ]
+      },
+      "CancelledCountTaskDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "cancelled"
+            ]
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "cancelledBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "cancelledAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "warehouseId",
+          "binId",
+          "cancelledBy",
+          "cancelledAt"
+        ]
+      },
+      "CancelCountTaskResponse": {
+        "type": "object",
+        "properties": {
+          "countTask": {
+            "$ref": "#/components/schemas/CancelledCountTaskDto"
+          }
+        },
+        "required": [
+          "countTask"
+        ]
+      },
+      "StartStockTakeDto": {
+        "type": "object",
+        "properties": {
+          "zoneIds": {
+            "nullable": true,
+            "minItems": 1,
+            "maxItems": 50,
+            "uniqueItems": true,
+            "description": "The zones to freeze and count (1–50, each once); absent or null = the whole warehouse",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200
+          }
+        }
+      },
+      "StockTakeSummaryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "zoneIds": {
+            "nullable": true,
+            "description": "Sorted; null = the whole warehouse",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "counting",
+              "posting",
+              "closed",
+              "abandoned"
+            ]
+          },
+          "note": {
+            "type": "string",
+            "nullable": true
+          },
+          "binCount": {
+            "type": "number",
+            "description": "Bins frozen at the start"
+          },
+          "startedBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "startedAt": {
+            "type": "string",
+            "description": "The freeze instant (ISO-8601 UTC)"
+          },
+          "approvedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "approvedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "closedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "closedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "abandonedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "abandonedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "abandonNote": {
+            "type": "string",
+            "nullable": true,
+            "description": "The abandon note (the start note stays in `note`)"
+          },
+          "deviceWrites": {
+            "type": "number",
+            "description": "Handheld writes admitted after the freeze on bins already released (the detail totals add the live rows)"
+          },
+          "postedCount": {
+            "type": "number",
+            "nullable": true
+          },
+          "unpostedCount": {
+            "type": "number",
+            "nullable": true
+          }
+        },
+        "required": [
+          "id",
+          "warehouseId",
+          "zoneIds",
+          "status",
+          "note",
+          "binCount",
+          "startedBy",
+          "startedAt",
+          "approvedBy",
+          "approvedAt",
+          "closedBy",
+          "closedAt",
+          "abandonedBy",
+          "abandonedAt",
+          "abandonNote",
+          "deviceWrites",
+          "postedCount",
+          "unpostedCount"
+        ]
+      },
+      "StartStockTakeResponse": {
+        "type": "object",
+        "properties": {
+          "stockTake": {
+            "$ref": "#/components/schemas/StockTakeSummaryDto"
+          },
+          "adoptedTaskCount": {
+            "type": "number",
+            "description": "Pending cycle tasks already on an in-scope bin, now counted for the take"
+          },
+          "createdTaskCount": {
+            "type": "number"
+          },
+          "supersededVarianceCount": {
+            "type": "number",
+            "description": "Older open variances on in-scope bins marked recounted against the take"
+          }
+        },
+        "required": [
+          "stockTake",
+          "adoptedTaskCount",
+          "createdTaskCount",
+          "supersededVarianceCount"
+        ]
+      },
+      "StockTakeProgressDto": {
+        "type": "object",
+        "properties": {
+          "bins": {
+            "type": "number"
+          },
+          "counted": {
+            "type": "number",
+            "description": "Bins with a completed count and no pending task"
+          },
+          "pending": {
+            "type": "number",
+            "description": "Pending count tasks (recounts included)"
+          }
+        },
+        "required": [
+          "bins",
+          "counted",
+          "pending"
+        ]
+      },
+      "StockTakeListEntryDto": {
+        "type": "object",
+        "properties": {
+          "stockTake": {
+            "$ref": "#/components/schemas/StockTakeSummaryDto"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/StockTakeProgressDto"
+          }
+        },
+        "required": [
+          "stockTake",
+          "progress"
+        ]
+      },
+      "StockTakeListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StockTakeListEntryDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "StockTakeTotalsDto": {
+        "type": "object",
+        "properties": {
+          "bins": {
+            "type": "number"
+          },
+          "counted": {
+            "type": "number",
+            "description": "Bins with a completed count and no pending task"
+          },
+          "pending": {
+            "type": "number",
+            "description": "Pending count tasks (recounts included)"
+          },
+          "recountPending": {
+            "type": "number"
+          },
+          "withVariance": {
+            "type": "number"
+          },
+          "openVariances": {
+            "type": "number"
+          },
+          "overThreshold": {
+            "type": "number",
+            "description": "Open variances over their frozen threshold — the post needs the owner"
+          },
+          "deviceWrites": {
+            "type": "number",
+            "description": "Handheld writes admitted on the frozen bins after the freeze"
+          }
+        },
+        "required": [
+          "bins",
+          "counted",
+          "pending",
+          "recountPending",
+          "withVariance",
+          "openVariances",
+          "overThreshold",
+          "deviceWrites"
+        ]
+      },
+      "StockTakeZoneDto": {
+        "type": "object",
+        "properties": {
+          "zoneId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "zoneCode": {
+            "type": "string"
+          },
+          "bins": {
+            "type": "number"
+          },
+          "counted": {
+            "type": "number"
+          },
+          "pending": {
+            "type": "number"
+          },
+          "withVariance": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "zoneId",
+          "zoneCode",
+          "bins",
+          "counted",
+          "pending",
+          "withVariance"
+        ]
+      },
+      "StockTakeBinRefDto": {
+        "type": "object",
+        "properties": {
+          "binId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binCode": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "binId",
+          "binCode"
+        ]
+      },
+      "StockTakeDetailResponse": {
+        "type": "object",
+        "properties": {
+          "stockTake": {
+            "$ref": "#/components/schemas/StockTakeSummaryDto"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/StockTakeTotalsDto"
+          },
+          "zones": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StockTakeZoneDto"
+            }
+          },
+          "recountRequiredBins": {
+            "description": "Counted bins that moved since their count (up to 50) — recount them before posting",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StockTakeBinRefDto"
+            }
+          },
+          "recountRequiredCount": {
+            "type": "number"
+          },
+          "openVarianceDigest": {
+            "type": "string",
+            "description": "The close's approval token over the open variances — send it back on close"
+          }
+        },
+        "required": [
+          "stockTake",
+          "totals",
+          "zones",
+          "recountRequiredBins",
+          "recountRequiredCount",
+          "openVarianceDigest"
+        ]
+      },
+      "StockTakeVarianceEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "taskId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binCode": {
+            "type": "string"
+          },
+          "zoneCode": {
+            "type": "string"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string",
+            "nullable": true
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expectedQuantity": {
+            "type": "number",
+            "description": "Base units — the book quantity the count was compared against"
+          },
+          "countedQuantity": {
+            "type": "number"
+          },
+          "delta": {
+            "type": "number"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "adjusted",
+              "recounted"
+            ]
+          },
+          "thresholdQuantity": {
+            "type": "number",
+            "nullable": true
+          },
+          "overThreshold": {
+            "type": "boolean",
+            "description": "Over the frozen threshold — owner only"
+          },
+          "epochConflict": {
+            "type": "boolean"
+          },
+          "latest": {
+            "type": "boolean",
+            "description": "The variance belongs to its bin's latest take task"
+          },
+          "needsLotCount": {
+            "type": "boolean",
+            "description": "Needs a batch- or serial-level count (not yet supported) — cannot be posted"
+          },
+          "unpostedCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The close's refusal code once closed and left unposted"
+          }
+        },
+        "required": [
+          "id",
+          "taskId",
+          "binId",
+          "binCode",
+          "zoneCode",
+          "skuId",
+          "skuCode",
+          "skuName",
+          "clientId",
+          "expectedQuantity",
+          "countedQuantity",
+          "delta",
+          "status",
+          "thresholdQuantity",
+          "overThreshold",
+          "epochConflict",
+          "latest",
+          "needsLotCount",
+          "unpostedCode"
+        ]
+      },
+      "StockTakeVarianceListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StockTakeVarianceEntryDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "RecountStockTakeBinsDto": {
+        "type": "object",
+        "properties": {
+          "binIds": {
+            "minItems": 1,
+            "maxItems": 500,
+            "uniqueItems": true,
+            "description": "Bins of the stock take to recount (1–500, each once)",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        },
+        "required": [
+          "binIds"
+        ]
+      },
+      "StockTakeRecountEntryDto": {
+        "type": "object",
+        "properties": {
+          "binId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binCode": {
+            "type": "string"
+          },
+          "taskId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "binId",
+          "binCode",
+          "taskId"
+        ]
+      },
+      "RecountStockTakeResponse": {
+        "type": "object",
+        "properties": {
+          "stockTake": {
+            "$ref": "#/components/schemas/StockTakeSummaryDto"
+          },
+          "recounts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StockTakeRecountEntryDto"
+            }
+          },
+          "recountedVarianceCount": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "stockTake",
+          "recounts",
+          "recountedVarianceCount"
+        ]
+      },
+      "CloseStockTakeDto": {
+        "type": "object",
+        "properties": {
+          "openVarianceDigest": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "description": "The `openVarianceDigest` the stock take detail served when the variances were reviewed — a mismatch is 409 stock-take-changed"
+          }
+        },
+        "required": [
+          "openVarianceDigest"
+        ]
+      },
+      "UnpostedVarianceDto": {
+        "type": "object",
+        "properties": {
+          "varianceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binCode": {
+            "type": "string"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string",
+            "description": "The adjustment guard's machine code, or basis-moved"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "needsLotCount": {
+            "type": "boolean",
+            "description": "A batch-, serial- or catch-weight-tracked SKU — needs a batch- or serial-level count (not yet supported)"
+          }
+        },
+        "required": [
+          "varianceId",
+          "binId",
+          "binCode",
+          "skuId",
+          "skuCode",
+          "code",
+          "detail",
+          "needsLotCount"
+        ]
+      },
+      "CloseStockTakeResponse": {
+        "type": "object",
+        "properties": {
+          "stockTake": {
+            "$ref": "#/components/schemas/StockTakeSummaryDto"
+          },
+          "postedCount": {
+            "type": "number"
+          },
+          "unposted": {
+            "description": "Variances left open (they stay on the variance queue)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UnpostedVarianceDto"
+            }
+          }
+        },
+        "required": [
+          "stockTake",
+          "postedCount",
+          "unposted"
+        ]
+      },
+      "AbandonStockTakeDto": {
+        "type": "object",
+        "properties": {
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200
+          }
+        }
+      },
+      "AbandonStockTakeResponse": {
+        "type": "object",
+        "properties": {
+          "stockTake": {
+            "$ref": "#/components/schemas/StockTakeSummaryDto"
+          },
+          "cancelledTaskCount": {
+            "type": "number"
+          },
+          "releasedTaskCount": {
+            "type": "number",
+            "description": "Pending tasks a variance names as its recount — released to the cycle queue (still pending), not cancelled"
+          }
+        },
+        "required": [
+          "stockTake",
+          "cancelledTaskCount",
+          "releasedTaskCount"
         ]
       },
       "CountPolicyDto": {
@@ -61118,6 +62959,7 @@
               "stock_adjustment_policy",
               "suggested_po",
               "temperature_excursion",
+              "stock_take",
               "tenant",
               "transfer_order",
               "user",
@@ -61222,6 +63064,7 @@
               "stock_adjustment_policy",
               "suggested_po",
               "temperature_excursion",
+              "stock_take",
               "tenant",
               "transfer_order",
               "user",

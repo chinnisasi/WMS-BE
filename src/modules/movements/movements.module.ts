@@ -7,6 +7,7 @@ import { TransferService } from './transfer.command';
 import { VariancePolicyCommand } from './variance-policy.command';
 import { MoveCommand } from './move.command';
 import { MovementsFacade } from './transfer.facade';
+import { StockTakeCommand } from './stock-take.command';
 
 /**
  * Movements module — the cross-warehouse stock-motion spine (Story 5-1, the
@@ -27,7 +28,7 @@ import { MovementsFacade } from './transfer.facade';
  */
 @Module({
   imports: [SharedModule, InventoryModule, forwardRef(() => TenancyModule)],
-  providers: [TransferService, CountService, VariancePolicyCommand, MoveCommand, MovementsFacade],
+  providers: [TransferService, CountService, VariancePolicyCommand, MoveCommand, StockTakeCommand, MovementsFacade],
   exports: [MovementsFacade],
 })
 export class MovementsModule {}

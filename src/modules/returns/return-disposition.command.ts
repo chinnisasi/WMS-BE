@@ -818,6 +818,8 @@ export class ReturnDispositionCommand {
           tenantId,
           warehouseId: plan.warehouseId,
           type: restock ? 'return.restocked' : 'return.scrapped',
+          // Story 3-5b (A1) — a handheld restock is admitted by the freeze.
+          ...(plan.deviceId === null ? {} : { surface: 'device' as const }),
           skuId: sku.id,
           // A relocation is a positive two-arm event; a scrap is a draw.
           quantityDelta: signedQuantity(restock ? item.milli : -item.milli),

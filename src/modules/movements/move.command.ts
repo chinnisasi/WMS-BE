@@ -495,6 +495,8 @@ export class MoveCommand {
           tenantId: command.tenantId,
           warehouseId: command.warehouseId,
           type: 'stock.moved',
+          // Story 3-5b (A1) — the freeze admits a handheld move, never a web one.
+          ...(command.deviceId === null ? {} : { surface: 'device' as const }),
           skuId: sku.id,
           quantityDelta: signedQuantity(arm.qty),
           fromBinId: origin.id,

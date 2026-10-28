@@ -2,13 +2,13 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, asc, desc, eq, inArray, or, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { batchOnHand, bins, inventoryQuarantines, ledgerEvents, skus, stockAdjustmentPolicies, stockOnHand } from '../../shared/db/schema';
+import { batchOnHand, bins, inventoryQuarantines, ledgerEvents, skus, stockAdjustmentPolicies, stockFreezeBins, stockOnHand } from '../../shared/db/schema';
 import { getClientLabelsInTx, skuCodeLabelsInTx } from '../clients/clients.facade';
 import type { LedgerEvent, UserRole } from '../../shared/db/schema';
 import { skuOfClient } from '../../shared/db/client-filter';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { KeysetWindow, Page } from '../../shared/primitives/pagination';
-import { UUID_RE } from '../../shared/primitives/ids';
+import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { fromMilli, QUANTITY_DECIMALS, QUANTITY_SCALE } from '../../shared/primitives/quantity';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
@@ -49,6 +49,9 @@ import {
   warehouseAdvisoryLock,
 } from './ledger.service';
 import type { LedgerMovement } from './ledger.service';
+// Story 3-5b — the freeze refusal, for the modules that consult the freeze
+// (bin retire) — re-exported so they never reach past the facade.
+export { binFrozen } from './ledger.service';
 import {
   clientOnHandAtInTx as clientOnHandAtInTxImpl,
   clientOnHandFoldByDayInTx as clientOnHandFoldByDayInTxImpl,
@@ -1952,6 +1955,118 @@ export class InventoryFacade {
     await tx.execute(warehouseAdvisoryLock(tenantId, warehouseId));
   }
 
+  // ── Story 3-5b: the stock-take freeze (inventory owns stock_freeze_bins) ──
+
+  /**
+   * Freeze a set of bins for one stock take, in the CALLER's transaction —
+   * which must hold the warehouse advisory (the ledger append probes the
+   * freeze under the same lock, so every append either committed before the
+   * freeze or sees it). Batched, chunked under the bind-parameter ceiling
+   * (the chunk derives from the row's own column count, guide §3). A bin
+   * already frozen raises the unique violation on
+   * `stock_freeze_bins_tenant_bin_unique` — the caller checks overlap first.
+   */
+  async freezeBinsInTx(
+    tx: TenantTx,
+    input: {
+      readonly tenantId: string;
+      readonly warehouseId: string;
+      readonly stockTakeId: string;
+      readonly frozenAt: string;
+      readonly bins: readonly { readonly id: string; readonly code: string }[];
+    },
+  ): Promise<void> {
+    const rows = input.bins.map((bin) => ({
+      id: uuidv7(),
+      tenantId: input.tenantId,
+      warehouseId: input.warehouseId,
+      binId: bin.id,
+      binCode: bin.code,
+      stockTakeId: input.stockTakeId,
+      frozenAt: input.frozenAt,
+    }));
+    if (rows.length === 0) return;
+    const chunk = Math.floor(65_535 / Object.keys(rows[0]!).length);
+    for (let at = 0; at < rows.length; at += chunk) {
+      await tx.insert(stockFreezeBins).values(rows.slice(at, at + chunk));
+    }
+  }
+
+  /**
+   * Lift a take's freeze — every bin of it, or only `binIds` (the close's
+   * per-batch release, design review A2). Returns how many rows it removed
+   * and the sum of their `device_writes` (the caller adds it to the take, so
+   * the count survives the rows).
+   */
+  async releaseFreezeInTx(
+    tx: TenantTx,
+    tenantId: string,
+    stockTakeId: string,
+    binIds?: readonly string[],
+  ): Promise<{ removed: number; deviceWrites: number }> {
+    if (binIds !== undefined && binIds.length === 0) return { removed: 0, deviceWrites: 0 };
+    const removed = await tx
+      .delete(stockFreezeBins)
+      .where(
+        and(
+          eq(stockFreezeBins.tenantId, tenantId),
+          eq(stockFreezeBins.stockTakeId, stockTakeId),
+          binIds === undefined ? undefined : inArray(stockFreezeBins.binId, [...binIds]),
+        ),
+      )
+      .returning({ id: stockFreezeBins.id, deviceWrites: stockFreezeBins.deviceWrites });
+    return { removed: removed.length, deviceWrites: removed.reduce((sum, row) => sum + Number(row.deviceWrites), 0) };
+  }
+
+  /**
+   * The frozen bins of a warehouse (all, or only those of `binIds`) with the
+   * take that froze each, its start and the handheld writes admitted since —
+   * the stock take's overlap check, the count verbs' consult, bin retire's
+   * refusal, the 5-6 review recount's refusal and the device snapshot's
+   * `bins[].frozen` all read the freeze through this one seam (the putaway
+   * ranking reads the table in its candidate query).
+   */
+  async frozenBinsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    binIds?: readonly string[],
+  ): Promise<Map<string, FrozenBin>> {
+    if (binIds !== undefined && binIds.length === 0) return new Map();
+    const rows = await tx
+      .select({
+        binId: stockFreezeBins.binId,
+        binCode: stockFreezeBins.binCode,
+        stockTakeId: stockFreezeBins.stockTakeId,
+        frozenAt: stockFreezeBins.frozenAt,
+        deviceWrites: stockFreezeBins.deviceWrites,
+      })
+      .from(stockFreezeBins)
+      .where(
+        and(
+          eq(stockFreezeBins.tenantId, tenantId),
+          eq(stockFreezeBins.warehouseId, warehouseId),
+          binIds === undefined ? undefined : inArray(stockFreezeBins.binId, [...new Set(binIds)]),
+        ),
+      );
+    return new Map(
+      rows.map((row) => [
+        row.binId,
+        {
+          binCode: row.binCode,
+          stockTakeId: row.stockTakeId,
+          frozenAt: canonicalInstant(row.frozenAt),
+          deviceWrites: Number(row.deviceWrites),
+        },
+      ]),
+    );
+  }
+
+  /** The frozen bins of a warehouse in their own transaction (the device snapshot's composition). */
+  async frozenBins(tenantId: string, warehouseId: string): Promise<Map<string, FrozenBin>> {
+    return withTenantTransaction(this.db, tenantId, (tx) => this.frozenBinsInTx(tx, tenantId, warehouseId));
+  }
+
   /**
    * The consulted-seqs probe (Story 5-4): which of the given ledger seqs
    * exist in ONE warehouse's ledger, inside the caller's transaction — the
@@ -3036,6 +3151,16 @@ interface QcScopeBatch {
 }
 
 /** Story 2-8b — one DAMAGED arm's on-hand (milli-units). */
+/** Story 3-5b — one frozen bin as the freeze seam reports it. */
+export interface FrozenBin {
+  readonly binCode: string;
+  readonly stockTakeId: string;
+  /** The take's start (canonical ISO instant). */
+  readonly frozenAt: string;
+  /** Handheld writes admitted on the bin after the freeze (design review A1). */
+  readonly deviceWrites: number;
+}
+
 export interface DamagedArm {
   readonly skuId: string;
   readonly batchId: string | null;

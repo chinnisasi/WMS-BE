@@ -13,6 +13,7 @@ import {
   countVariancePolicies,
   idempotencyKeys,
   skus,
+  stockTakes,
   type CountTask,
 } from '../../shared/db/schema';
 // Type-only: the status tuple's element type rides `typeof` — no runtime use.
@@ -36,6 +37,7 @@ import { getKitSkuIdsInTx } from '../catalog/kit.store';
 import { ABC_CLASSES } from '../../shared/primitives/abc-class';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import type { AdjustStockCommand } from '../inventory/inventory.facade';
+import { createRecountTaskInTx, supersedeVariancesInTx } from './count-tasks';
 
 /**
  * Cycle counts (Story 5-3, FR-cycle-count): the movements module's second
@@ -120,7 +122,7 @@ export interface CreateCountsBulkCommand {
 export const MAX_BULK_COUNT_BINS = 500;
 
 /** Why a bulk create passed over a bin. */
-export const BULK_COUNT_SKIP_REASONS = ['count-task-open', 'system-bin', 'bin-retired'] as const;
+export const BULK_COUNT_SKIP_REASONS = ['count-task-open', 'system-bin', 'bin-retired', 'stock-take'] as const;
 export type BulkCountSkipReason = (typeof BULK_COUNT_SKIP_REASONS)[number];
 
 /** The bulk create's response body (and its idempotency snapshot). */
@@ -145,6 +147,25 @@ export interface DeleteCountPolicyCommand {
   readonly actorUserId: string;
   readonly warehouseId: string;
   readonly abcClass: string;
+}
+
+/** Story 3-5b — `POST …/movements/counts/{taskId}/cancel` (counts.manage). */
+export interface CancelCountTaskCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly taskId: string;
+}
+
+/** The cancel's answer (and its idempotency snapshot). */
+export interface CancelCountTaskSnapshot {
+  readonly countTask: {
+    readonly id: string;
+    readonly status: 'cancelled';
+    readonly warehouseId: string;
+    readonly binId: string;
+    readonly cancelledBy: string;
+    readonly cancelledAt: string;
+  };
 }
 
 /** One counted line of a submit, in the client's own order. */
@@ -387,8 +408,52 @@ const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
 // ── machine-code helpers (the spec's matrix fixes these) ─────────────────────
 
+/** Story 3-5b — a submit (or a second cancel) meeting a cancelled task. */
+export function countTaskCancelled(): ProblemException {
+  return new ProblemException(
+    'count-task-cancelled',
+    409,
+    'Count task was cancelled',
+    'This count task was cancelled (by a supervisor, or because its stock take was abandoned) — the count is not recorded; nothing changed.',
+  );
+}
+
+/** Story 3-5b — a create naming a bin a stock take froze. */
+export function binInStockTake(binCode: string, stockTakeId: string): ProblemException {
+  return new ProblemException(
+    'bin-in-stock-take',
+    409,
+    'The bin is in a stock take',
+    `Bin "${binCode}" is frozen for stock take ${stockTakeId} — the take counts it; a cycle count cannot be added until the take is closed or abandoned.`,
+    { binCode, stockTakeId },
+  );
+}
+
+/** Story 3-5b — a cancel of a task a stock take owns. */
+function stockTakeTask(stockTakeId: string): ProblemException {
+  return new ProblemException(
+    'stock-take-task',
+    409,
+    'The task belongs to a stock take',
+    `This count task belongs to stock take ${stockTakeId} — its tasks are cancelled only by abandoning the take.`,
+    { stockTakeId },
+  );
+}
+
+/** Story 3-5b (A3) — a single resolve of a variance an active take owns. */
+function varianceInStockTake(varianceId: string, stockTakeId: string): ProblemException {
+  return new ProblemException(
+    'variance-in-stock-take',
+    409,
+    'The variance belongs to an active stock take',
+    `Variance "${varianceId}" was counted in stock take ${stockTakeId}, which is still open — its variances are posted (or recounted) from the take, not one at a time.`,
+    { stockTakeId },
+  );
+}
+
 /** Any submit meeting a task that is no longer `pending`. */
 function countWrongState(status: string): ProblemException {
+  if (status === 'cancelled') return countTaskCancelled();
   return new ProblemException(
     'count-task-completed',
     409,
@@ -641,6 +706,16 @@ export class CountService {
         // The warehouse advisory lock LAST (the canonical order's tail); the
         // epoch + expected reads below sit UNDER the locks.
         await this.inventory.lockWarehouseInTx(tx, command.tenantId, command.warehouseId);
+
+        // Story 3-5b (A3) — a bin a stock take froze answers the take's own
+        // code, under the advisory and BEFORE the open-task rule (the take
+        // holds a pending task on every bin it froze).
+        const frozen = (
+          await this.inventory.frozenBinsInTx(tx, command.tenantId, command.warehouseId, [command.binId])
+        ).get(command.binId);
+        if (frozen !== undefined) {
+          throw binInStockTake(bin.code, frozen.stockTakeId);
+        }
 
         // One open task per bin — re-checked UNDER the locks so a concurrent
         // create or scheduler tick on the same bin cannot double-open it.
@@ -982,11 +1057,20 @@ export class CountService {
 
       const skipped: { binId: string; binCode: string; reason: BulkCountSkipReason }[] = [];
       const eligible: { id: string; code: string }[] = [];
+      // Story 3-5b — a bin a stock take froze is the take's to count.
+      const frozenBins = await this.inventory.frozenBinsInTx(
+        tx,
+        command.tenantId,
+        command.warehouseId,
+        decidedRows.map((row) => row.id),
+      );
       for (const row of decidedRows) {
         if (row.systemOwned) {
           skipped.push({ binId: row.id, binCode: row.code, reason: 'system-bin' });
         } else if (row.retiredAt !== null) {
           skipped.push({ binId: row.id, binCode: row.code, reason: 'bin-retired' });
+        } else if (frozenBins.has(row.id)) {
+          skipped.push({ binId: row.id, binCode: row.code, reason: 'stock-take' });
         } else {
           eligible.push({ id: row.id, code: row.code });
         }
@@ -1110,6 +1194,107 @@ export class CountService {
       created.sort((a, b) => (a.binCode < b.binCode ? -1 : a.binCode > b.binCode ? 1 : 0));
       const snapshot: CreateCountsBulkSnapshot = { created, skipped };
 
+      try {
+        await tx.insert(idempotencyKeys).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          key: idempotencyKey,
+          payloadHash,
+          responseSnapshot: snapshot,
+        });
+      } catch (err) {
+        if (isUniqueViolationOn(err, IDEMPOTENCY_TENANT_KEY)) {
+          throw new ProblemException(
+            'conflict',
+            409,
+            'Concurrent idempotent request',
+            'The same Idempotency-Key is being processed concurrently; retry to read the settled result.',
+          );
+        }
+        throw err;
+      }
+      return { snapshot, replayed: false };
+    });
+  }
+
+  // ── cancelCountTask (story 3-5b, counts.manage) ─────────────────────────
+
+  /** The cancel fingerprint (golden-pinned; design review A11). */
+  cancelFingerprint(command: CancelCountTaskCommand): string {
+    return hashCommandPayload({ tenantId: command.tenantId, arm: 'count.cancel', taskId: command.taskId });
+  }
+
+  /**
+   * Cancel a PENDING count task (story 3-5b, folded in from deferred-work).
+   * A stock take's task is refused (409 `stock-take-task` — abandon the
+   * take). A recount variance that named this task stays `recounted`; the
+   * scheduler may mint the bin again at its next due tick; a device submit
+   * that lands later answers 409 `count-task-cancelled` (fate `rejected`).
+   * Order: authority → replay → task `FOR UPDATE` → replay again → pending →
+   * take → warehouse advisory → conditional UPDATE → outbox `count.cancelled`
+   * → audit → key.
+   */
+  async cancelCountTask(
+    command: CancelCountTaskCommand,
+    idempotencyKey: string,
+  ): Promise<{ snapshot: CancelCountTaskSnapshot; replayed: boolean }> {
+    const payloadHash = this.cancelFingerprint(command);
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'counts.manage');
+      const replay = async (): Promise<CancelCountTaskSnapshot | null> => {
+        const existing = await this.lookupIdempotencyKey(tx, command.tenantId, idempotencyKey);
+        if (existing === undefined) return null;
+        if (existing.payloadHash !== payloadHash) throw idempotencyKeyReuse();
+        return existing.responseSnapshot as CancelCountTaskSnapshot;
+      };
+      const first = await replay();
+      if (first !== null) return { snapshot: first, replayed: true };
+
+      const task = await this.lockTaskInTx(tx, command.tenantId, command.taskId);
+      const underLock = await replay();
+      if (underLock !== null) return { snapshot: underLock, replayed: true };
+      if (task.status === 'cancelled') throw countTaskCancelled();
+      if (task.status !== 'pending') throw countWrongState(task.status);
+      if (task.stockTakeId !== null) throw stockTakeTask(task.stockTakeId);
+
+      await this.inventory.lockWarehouseInTx(tx, command.tenantId, task.warehouseId);
+      const at = nowIso();
+      const cancelled = await tx
+        .update(countTasks)
+        .set({ status: 'cancelled', cancelledBy: command.actorUserId, cancelledAt: at, updatedAt: at })
+        .where(
+          and(eq(countTasks.tenantId, command.tenantId), eq(countTasks.id, task.id), eq(countTasks.status, 'pending')),
+        )
+        .returning({ id: countTasks.id });
+      if (cancelled[0] === undefined) throw countWrongState('completed');
+
+      await this.outbox.append(tx, {
+        messageId: uuidv7(),
+        tenantId: command.tenantId,
+        type: 'count.cancelled',
+        occurredAt: at,
+        payload: { taskId: task.id, binId: task.binId, warehouseId: task.warehouseId, cancelledBy: command.actorUserId },
+      });
+      const snapshot: CancelCountTaskSnapshot = {
+        countTask: {
+          id: task.id,
+          status: 'cancelled',
+          warehouseId: task.warehouseId,
+          binId: task.binId,
+          cancelledBy: command.actorUserId,
+          cancelledAt: at,
+        },
+      };
+      await tx.insert(auditEvents).values({
+        id: uuidv7(),
+        tenantId: command.tenantId,
+        actorUserId: command.actorUserId,
+        action: 'count.cancelled',
+        targetType: 'count_task',
+        targetId: task.id,
+        reference: idempotencyKey,
+        occurredAt: at,
+      });
       try {
         await tx.insert(idempotencyKeys).values({
           id: uuidv7(),
@@ -1333,6 +1518,11 @@ export class CountService {
         // count is an observation, and a mis-slotted item is the finding.
         const listedSkus = new Set(taskLines.map((line) => line.skuId));
         const foundSkuIds = skuIds.filter((skuId) => !listedSkus.has(skuId));
+        // Story 3-5b (A7) — inside a stock take a found batch-, serial- or
+        // catch-weight-tracked SKU is RECORDED (its variance cannot be posted
+        // and is listed unposted at close — 3-5d counts it properly); refusing
+        // it would leave the take uncloseable. A found kit is still refused.
+        const inTake = task.stockTakeId !== null;
         if (foundSkuIds.length > 0) {
           const kitIds = new Set(await getKitSkuIdsInTx(tx, command.tenantId, foundSkuIds));
           const refused = foundSkuIds
@@ -1341,7 +1531,9 @@ export class CountService {
               code: sku.code,
               why: kitIds.has(sku.id)
                 ? 'a kit'
-                : sku.serialTracked
+                : inTake
+                  ? null
+                  : sku.serialTracked
                   ? 'serial-tracked'
                   : sku.batchTracked
                     ? 'batch-tracked'
@@ -1504,14 +1696,33 @@ export class CountService {
         if (epochConflict) {
           // Story 3-5a — stamped created_at = the source's completed_at, so
           // the web detail can derive this conflict recount from the rows
-          // alone (the task table records no link).
-          recountTaskId = await this.createRecountTaskInTx(
-            tx,
-            command.tenantId,
-            task,
+          // alone (the task table records no link). Story 3-5b — on a frozen
+          // bin it carries the take's id and `bulk: true` (never pushed).
+          const recount = await createRecountTaskInTx(tx, this.inventory, this.outbox, {
+            tenantId: command.tenantId,
+            warehouseId: task.warehouseId,
+            binId: task.binId,
+            supersededTaskId: task.id,
             occurredAt,
-            completedAt,
-          );
+            createdAt: completedAt,
+          });
+          recountTaskId = recount.taskId;
+          // Story 3-5b (decision 6, A5) — inside a take the variances this
+          // submit just wrote are superseded by the recount in the same
+          // transaction, so the take's open variances are always those of
+          // each bin's latest count. Each is marked `recounted` with its
+          // basis rewritten to the recount's line (the resolve's recount
+          // arm), and emits the full `count.variance.resolved` so a 9-2
+          // panel row its threshold_exceeded raised resolves.
+          if (recount.stockTakeId !== null && varianceRows.length > 0) {
+            await supersedeVariancesInTx(tx, this.outbox, {
+              tenantId: command.tenantId,
+              actorUserId: command.actorUserId,
+              idempotencyKey,
+              at: completedAt,
+              entries: varianceRows.map((row) => ({ varianceId: row.id, recountTaskId: recount.taskId })),
+            });
+          }
         }
 
         await this.outbox.append(tx, {
@@ -1728,6 +1939,21 @@ export class CountService {
           throw varianceResolved(variance.status, variance.id);
         }
 
+        // Story 3-5b (A3) — a variance of a counting or posting stock take is
+        // the take's: its own verbs post or recount it. After the variance
+        // row lock, before the bin lock (the take's verbs lock variance rows
+        // before bin rows too, so the two never deadlock).
+        const takeRows = await tx
+          .select({ id: stockTakes.id, status: stockTakes.status })
+          .from(countTasks)
+          .innerJoin(stockTakes, and(eq(stockTakes.tenantId, countTasks.tenantId), eq(stockTakes.id, countTasks.stockTakeId)))
+          .where(and(eq(countTasks.tenantId, command.tenantId), eq(countTasks.id, variance.taskId)))
+          .limit(1);
+        const take = takeRows[0];
+        if (take !== undefined && (take.status === 'counting' || take.status === 'posting')) {
+          throw varianceInStockTake(variance.id, take.id);
+        }
+
         // The frozen-threshold guard: the variance's OWN submit-time stamp
         // decides, not today's policy — a later policy PUT cannot un-stamp
         // (or re-threshold) the variance.
@@ -1894,12 +2120,15 @@ export class CountService {
           if (openRows[0] !== undefined) {
             throw countTaskOpen(bin.code);
           }
-          const mintedTaskId = await this.createRecountTaskInTx(
-            tx,
-            command.tenantId,
-            task,
-            occurredAt,
-          );
+          const mintedTaskId = (
+            await createRecountTaskInTx(tx, this.inventory, this.outbox, {
+              tenantId: command.tenantId,
+              warehouseId: task.warehouseId,
+              binId: task.binId,
+              supersededTaskId: task.id,
+              occurredAt,
+            })
+          ).taskId;
           recountTaskId = mintedTaskId;
           // The recounted variance's expected basis becomes the recount
           // snapshot's line expectation — 0 when the bin's on-hand is empty
@@ -2489,8 +2718,11 @@ export class CountService {
     // classed SKUs' on-hand rows — without this filter every tick would
     // mint a recurring count task for a bin whose own commands are mid-way
     // through moving that stock. Post-filtered on the rows already read.
-    const storageBinRows = binRows.filter((binRow) => !binRow.systemOwned);
     await this.inventory.lockWarehouseInTx(tx, tenantId, warehouseId);
+    // Story 3-5b — nor a bin a stock take froze (the take counts it), read
+    // UNDER the advisory a take starts under.
+    const frozenBins = await this.inventory.frozenBinsInTx(tx, tenantId, warehouseId, dueBinIds);
+    const storageBinRows = binRows.filter((binRow) => !binRow.systemOwned && !frozenBins.has(binRow.id));
 
     const recheckOpen = await tx
       .select({ binId: countTasks.binId })
@@ -2626,76 +2858,6 @@ export class CountService {
   }
 
   /**
-   * The OQ-2 recount: a fresh task for the same bin (origin `recount`), its
-   * expectations the bin's CURRENT on-hand and its epoch the LIVE one —
-   * both read under the locks the caller holds. `createdBy` is null (the
-   * system re-planned; the submit's actor is recorded on the completed task
-   * and in the variance rows). Bounded by the open-task-per-bin rule: the
-   * caller settles the old task BEFORE calling, in the same transaction.
-   */
-  private async createRecountTaskInTx(
-    tx: TenantTx,
-    tenantId: string,
-    completedTask: CountTask,
-    occurredAt: string,
-    createdAt?: string,
-  ): Promise<string> {
-    const expected = await this.inventory.onHandInBinInTx(
-      tx,
-      tenantId,
-      completedTask.warehouseId,
-      completedTask.binId,
-    );
-    const epochs = await this.inventory.binStateEpochsInTx(
-      tx,
-      tenantId,
-      completedTask.warehouseId,
-      [completedTask.binId],
-    );
-    const epoch = epochs.get(completedTask.binId) ?? null;
-
-    const taskId = uuidv7();
-    await tx.insert(countTasks).values({
-      id: taskId,
-      tenantId,
-      warehouseId: completedTask.warehouseId,
-      binId: completedTask.binId,
-      status: 'pending',
-      origin: 'recount',
-      binStateEpoch: epoch,
-      createdBy: null,
-      ...(createdAt === undefined ? {} : { createdAt }),
-    });
-    const lineValues = expected
-      .filter((arm) => arm.quantity !== 0)
-      .map((arm) => ({
-        id: uuidv7(),
-        tenantId,
-        taskId,
-        skuId: arm.skuId,
-        expectedQuantity: arm.quantity,
-      }));
-    if (lineValues.length > 0) {
-      await tx.insert(countTaskLines).values(lineValues);
-    }
-
-    await this.outbox.append(tx, {
-      messageId: uuidv7(),
-      tenantId,
-      type: 'count.created',
-      occurredAt,
-      payload: {
-        taskId,
-        binId: completedTask.binId,
-        warehouseId: completedTask.warehouseId,
-        origin: 'recount',
-        supersededTaskId: completedTask.id,
-      },
-    });
-    return taskId;
-  }
-
-  /**
    * Story 5-6 — the AD-14 recount arm without a superseded task: the
    * `createRecountTaskInTx` core against a plain bin (the human-review
    * surface never had a prior count task; it re-plans from the bin's CURRENT
@@ -2718,6 +2880,13 @@ export class CountService {
     binCode: string,
     occurredAt: string,
   ): Promise<string> {
+    // Story 3-5b — a frozen bin is the take's: its own recount verb (which
+    // supersedes the bin's open take variances) is the only path. Under the
+    // caller's locks, before the open-task rule.
+    const frozen = (await this.inventory.frozenBinsInTx(tx, tenantId, warehouseId, [binId])).get(binId);
+    if (frozen !== undefined) {
+      throw binInStockTake(binCode, frozen.stockTakeId);
+    }
     const openRows = await tx
       .select({ id: countTasks.id })
       .from(countTasks)
@@ -2734,41 +2903,15 @@ export class CountService {
       throw countTaskOpen(binCode);
     }
 
-    const expected = await this.inventory.onHandInBinInTx(tx, tenantId, warehouseId, binId);
-    const epochs = await this.inventory.binStateEpochsInTx(tx, tenantId, warehouseId, [binId]);
-    const epoch = epochs.get(binId) ?? null;
-
-    const taskId = uuidv7();
-    await tx.insert(countTasks).values({
-      id: taskId,
+    // Story 3-5b — the shared mint: on a frozen bin it carries the take's
+    // id and `bulk: true`.
+    const minted = await createRecountTaskInTx(tx, this.inventory, this.outbox, {
       tenantId,
       warehouseId,
       binId,
-      status: 'pending',
-      origin: 'recount',
-      binStateEpoch: epoch,
-      createdBy: null,
-    });
-    const lineValues = expected
-      .filter((arm) => arm.quantity !== 0)
-      .map((arm) => ({
-        id: uuidv7(),
-        tenantId,
-        taskId,
-        skuId: arm.skuId,
-        expectedQuantity: arm.quantity,
-      }));
-    if (lineValues.length > 0) {
-      await tx.insert(countTaskLines).values(lineValues);
-    }
-
-    await this.outbox.append(tx, {
-      messageId: uuidv7(),
-      tenantId,
-      type: 'count.created',
+      supersededTaskId: null,
       occurredAt,
-      payload: { taskId, binId, warehouseId, origin: 'recount' },
     });
-    return taskId;
+    return minted.taskId;
   }
 }

@@ -292,6 +292,12 @@ export class PutawayBinDto {
   systemOwned!: boolean;
 
   @ApiProperty({
+    description:
+      'Story 3-5b — the bin is frozen for a stock take: the handheld refuses every movement into or out of it offline (count it, or wait for the take to close). A client reading a snapshot cached before 3-5b treats an absent field as false',
+  })
+  frozen!: boolean;
+
+  @ApiProperty({
     enum: [...STORAGE_CLASSES],
     description:
       'Story 12.8 (UX-DR29): the bin\'s storage class (defaults to `ambient`). It rides the snapshot beside the SKU arm\'s class (the catalog snapshot) so the device\'s offline conformance mirror can refuse a non-conforming placement in the Rejected banner — before anything queues.',

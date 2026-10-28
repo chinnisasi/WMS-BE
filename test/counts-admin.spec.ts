@@ -745,9 +745,11 @@ describe('blind counts and count admin (e2e, story 3-5a)', () => {
         order by created_at desc, id desc`) as unknown as { id: string }[];
       expect(all.map((row) => row.id)).toEqual(db.map((row) => row.id));
       const first = await auth(http().get(`${API}/${tenantId}/movements/counts?warehouseId=${warehouseId}&limit=1`)).expect(200);
-      // No quantity on the list (the web reads the detail for those).
+      // No quantity on the list (the web reads the detail for those). Story
+      // 3-5b adds `stockTakeId` (the take a task counts for — not a quantity;
+      // the web's take chip and its Cancel gate read it).
       expect(Object.keys(first.body.items[0]).sort()).toEqual([
-        'binCode', 'binId', 'completedAt', 'completedBy', 'createdAt', 'createdBy', 'id', 'lineCount', 'openVarianceCount', 'origin', 'status', 'varianceCount', 'warehouseId',
+        'binCode', 'binId', 'completedAt', 'completedBy', 'createdAt', 'createdBy', 'id', 'lineCount', 'openVarianceCount', 'origin', 'status', 'stockTakeId', 'varianceCount', 'warehouseId',
       ]);
       const recounts = await auth(http().get(`${API}/${tenantId}/movements/counts?origin=recount`)).expect(200);
       expect((recounts.body.items as { origin: string }[]).length).toBeGreaterThan(0);

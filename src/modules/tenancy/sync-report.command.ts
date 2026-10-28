@@ -1736,6 +1736,9 @@ export class SyncReportCommand {
             // epoch compare runs under its locks.
             binStateEpoch: undefined,
             occurredAt: opTime,
+            // Story 3-5b (A1) — a replayed handheld op is a device write: the
+            // stock-take freeze admits it (not hashed — see the command).
+            surface: 'device',
           },
           idempotencyKey,
         )) as unknown as Record<string, unknown>;

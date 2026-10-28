@@ -1788,6 +1788,45 @@ export const binStateEpochs = pgTable(
 export type BinStateEpoch = typeof binStateEpochs.$inferSelect;
 
 /**
+ * Story 3-5b — the stock-take FREEZE: one row per frozen bin (inventory owns
+ * it; movements' stock-take commands write it only through the inventory
+ * facade's `freezeBinsInTx` / `releaseFreezeInTx`). `appendMovement` probes it
+ * right after the warehouse advisory lock: a movement whose `fromBinId` or
+ * `toBinId` is frozen is refused 409 `bin-frozen` — unless the movement is a
+ * handheld op (`surface: 'device'`, admitted whatever its time, design review
+ * A1) or a `qc.held` (the one exempt type). An admitted device write bumps
+ * `device_writes` here (never a movements table), so the take's dashboard can
+ * say how many writes landed after the freeze. Unique on `(tenant, bin)`: a
+ * bin is in at most one active take. RLS lives only in the migration (0107).
+ */
+export const stockFreezeBins = pgTable(
+  'stock_freeze_bins',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    binId: uuid('bin_id').notNull(),
+    /** The bin's code at the freeze — the refusal names it without a join. */
+    binCode: text('bin_code').notNull(),
+    /** The movements `stock_takes` row that froze it (bare uuid, no FK). */
+    stockTakeId: uuid('stock_take_id').notNull(),
+    /** The take's start instant (= `stock_takes.started_at`). */
+    frozenAt: timestamp('frozen_at', { withTimezone: true, mode: 'string' }).notNull(),
+    /** Handheld writes admitted on this bin after the freeze (design review A1). */
+    deviceWrites: integer('device_writes').notNull().default(0),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('stock_freeze_bins_tenant_bin_unique').on(table.tenantId, table.binId),
+    index('stock_freeze_bins_tenant_take_idx').on(table.tenantId, table.stockTakeId),
+  ],
+);
+
+export type StockFreezeBin = typeof stockFreezeBins.$inferSelect;
+
+/**
  * Chain anchors (Story 2.1, AD-16 — the human Option A decision): chain
  * heads anchor to this append-only Postgres table — `digest` over the
  * event-hash range, `from_seq`..`to_seq` inclusive, `anchored_at` the
@@ -4475,10 +4514,11 @@ export type StockAdjustmentPending = typeof stockAdjustmentPendings.$inferSelect
  * The count task's lifecycle vocabulary (story 5-3): the TS side of the
  * three mirrored layers (DB CHECK in `drizzle/0045_cycle_counts.sql`, DTO
  * `@IsIn` in `src/modules/movements/count.dto.ts`). A task is `pending`
- * until its submit settles it to `completed` — there is no cancel in 5-3
- * (a stale task is simply submitted or superseded by a recount).
+ * until its submit settles it to `completed`. Story 3-5b adds `cancelled`
+ * (the cancel verb and a stock take's abandon; the 0107 CHECK, NOT VALID) —
+ * `cancelled` is NOT open (`client-wind-down.ts` keeps `['pending']`).
  */
-export const COUNT_TASK_STATUSES = ['pending', 'completed'] as const;
+export const COUNT_TASK_STATUSES = ['pending', 'completed', 'cancelled'] as const;
 export type CountTaskStatus = (typeof COUNT_TASK_STATUSES)[number];
 
 /** How a count task came to exist (CHECK + DTO mirror; story 5-3). */
@@ -4573,9 +4613,21 @@ export const countTasks = pgTable(
     createdBy: uuid('created_by'),
     completedBy: uuid('completed_by'),
     completedAt: timestamp('completed_at', { withTimezone: true, mode: 'string' }),
+    /** Story 3-5b — the stock take this task counts for (null = a cycle count). */
+    stockTakeId: uuid('stock_take_id'),
+    /** Story 3-5b — who cancelled it (the cancel verb or the take's abandon). */
+    cancelledBy: uuid('cancelled_by'),
+    /** Story 3-5b — paired with `status = 'cancelled'` (the 0107 CHECK). */
+    cancelledAt: timestamp('cancelled_at', { withTimezone: true, mode: 'string' }),
     ...tenantTimestamps,
   },
   (table) => [
+    // Story 3-5b — a take's tasks by status (progress, the pending re-read).
+    index('count_tasks_stock_take_status_idx')
+      .on(table.tenantId, table.stockTakeId, table.status)
+      .where(sql`stock_take_id is not null`),
+    // Story 3-5b (PENDING, 3-5a) — the web list's keyset.
+    index('count_tasks_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
     // The open-task-per-bin rule's enforcement probe (one pending row max)
     // and the scheduler's due/past-interval filters both resolve through
     // this shape.
@@ -4771,6 +4823,81 @@ export const countVariancePolicies = pgTable(
 );
 
 export type CountVariancePolicy = typeof countVariancePolicies.$inferSelect;
+
+/**
+ * Story 3-5b — the stock take's lifecycle vocabulary (the 0107 CHECK; the DTO
+ * `@IsIn`). `counting` while the freeze holds; `posting` once the close is
+ * approved and its batches post (design review A2); `closed` or `abandoned`
+ * is terminal.
+ */
+export const STOCK_TAKE_STATUSES = ['counting', 'posting', 'closed', 'abandoned'] as const;
+export type StockTakeStatus = (typeof STOCK_TAKE_STATUSES)[number];
+
+/**
+ * Story 3-5b — a stock take: every storage bin of a warehouse (`zone_ids`
+ * null) or of the named zones, counted under a freeze (inventory's
+ * `stock_freeze_bins`) and closed by one post. `started_at` IS the freeze
+ * instant. `approved_by/at` stamp the close's approval (status `posting`);
+ * `closed_*` / `abandoned_*` the terminal transition; `posted_count` /
+ * `unposted_count` the close's tally. CHECKs and RLS live only in 0107.
+ */
+export const stockTakes = pgTable(
+  'stock_takes',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    /** The zones in scope, sorted; null = the whole warehouse. */
+    zoneIds: jsonb('zone_ids').$type<string[]>(),
+    status: text('status').notNull().default('counting'),
+    note: text('note'),
+    /** How many bins the start froze. */
+    binCount: integer('bin_count').notNull(),
+    startedBy: uuid('started_by').notNull(),
+    startedAt: timestamp('started_at', { withTimezone: true, mode: 'string' }).notNull(),
+    approvedBy: uuid('approved_by'),
+    approvedAt: timestamp('approved_at', { withTimezone: true, mode: 'string' }),
+    closedBy: uuid('closed_by'),
+    closedAt: timestamp('closed_at', { withTimezone: true, mode: 'string' }),
+    abandonedBy: uuid('abandoned_by'),
+    abandonedAt: timestamp('abandoned_at', { withTimezone: true, mode: 'string' }),
+    /** The abandon's own note (the start's `note` is kept). */
+    abandonNote: text('abandon_note'),
+    /**
+     * Handheld writes admitted on the take's bins after the freeze, summed
+     * from the freeze rows as they are released (per close batch, at close,
+     * at abandon) — the dashboard reads this plus the live rows.
+     */
+    deviceWrites: integer('device_writes').notNull().default(0),
+    postedCount: integer('posted_count'),
+    unpostedCount: integer('unposted_count'),
+    /**
+     * The close's unposted variances with the refusal each met (the close's
+     * `UnpostedVariance` entries, appended per batch), fixed at close — the report's `unposted:<code>`
+     * outcome reads it (design review A10). Null until closed.
+     */
+    unposted: jsonb('unposted').$type<
+      {
+        varianceId: string;
+        binId: string;
+        binCode: string;
+        skuId: string;
+        skuCode: string;
+        code: string;
+        detail: string;
+        needsLotCount: boolean;
+      }[]
+    >(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    index('stock_takes_tenant_wh_status_idx').on(table.tenantId, table.warehouseId, table.status),
+  ],
+);
+
+export type StockTake = typeof stockTakes.$inferSelect;
 
 /**
  * The AD-14 dropped-op vocabulary (story 5-6): which replay fate a reported

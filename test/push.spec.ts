@@ -341,15 +341,27 @@ describe('mobile pushes (e2e, story 9-2b)', () => {
       expect(wave).toMatch(/type: 'wave\.released',\s+occurredAt: nowIso\(\),\s+payload: \{ wave: snapshot\.wave \}/);
       expect(wave).toMatch(/warehouseId: wave\.warehouseId,/); // the snapshot carries it
       const count = readFileSync(join(SRC, 'modules', 'movements', 'count.command.ts'), 'utf8');
-      for (const origin of ['on_demand', 'scheduled', 'recount']) {
+      for (const origin of ['on_demand', 'scheduled']) {
         expect(count).toContain(`origin: '${origin}'`);
       }
-      // Story 3-5a — five emitters: the single create, the bulk create, the
-      // scheduler and the two recount mints; the bulk one alone marks its
-      // payload `bulk: true` (the field the enqueue skips on).
-      expect(count.match(/type: 'count\.created'/g)).toHaveLength(5);
+      // Story 3-5a — the single create, the bulk create and the scheduler
+      // emit here; the bulk one alone marks its payload `bulk: true` (the
+      // field the enqueue skips on). Story 3-5b (A4) moved the two recount
+      // mints into ONE shared emitter (`count-tasks.ts`).
+      expect(count.match(/type: 'count\.created'/g)).toHaveLength(3);
       expect(count.match(/bulk: true,/g)).toHaveLength(1);
       expect(count).toMatch(/type: 'count\.created',[\s\S]{0,300}origin: 'on_demand',[\s\S]{0,300}bulk: true,/);
+      // Story 3-5b (A4) — the shared recount mint: origin `recount`, and
+      // `bulk: true` whenever the bin is frozen for a stock take (every task
+      // minted for a frozen bin — the submit's conflict recount, a requested
+      // recount, the review queue's — is never pushed).
+      const recounts = readFileSync(join(SRC, 'modules', 'movements', 'count-tasks.ts'), 'utf8');
+      expect(recounts.match(/type: 'count\.created'/g)).toHaveLength(1);
+      expect(recounts).toMatch(/type: 'count\.created',[\s\S]{0,400}origin: 'recount',[\s\S]{0,300}stockTakeId === null \? \{\} : \{ stockTakeId, bulk: true \}/);
+      // Story 3-5b — the take's start: one task per bin, every one `bulk: true`.
+      const take = readFileSync(join(SRC, 'modules', 'movements', 'stock-take.command.ts'), 'utf8');
+      expect(take.match(/type: 'count\.created'/g)).toHaveLength(1);
+      expect(take).toMatch(/type: 'count\.created',[\s\S]{0,300}origin: 'on_demand',[\s\S]{0,200}bulk: true,/);
       const transfer = readFileSync(join(SRC, 'modules', 'movements', 'transfer.command.ts'), 'utf8');
       expect(transfer).toMatch(/type: 'transfer\.outbound-confirmed',[\s\S]{0,200}destWarehouseId: order\.destWarehouseId/);
       // The approval raises are the 9-2 sources' own raise events (reused, never re-derived).
