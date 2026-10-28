@@ -69,7 +69,7 @@ export class GateInController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse(WRITE_403) })
   @ApiResponse({ status: 404, ...problemJsonResponse("The warehouse, the transporter partner, a document's purchase order or ASN, or the dock appointment does not exist in this tenant (not-found)") })
-  @ApiResponse({ status: 409, ...problemJsonResponse("The partner lacks the transporter role (partner-not-transporter) or is inactive (transporter-inactive); a document's PO or ASN is another warehouse's (document-warehouse-mismatch); the dock appointment is another warehouse's (appointment-warehouse-mismatch), cancelled or another gate-in's (appointment-closed), or does not start yesterday, today or tomorrow IST (appointment-not-due); or a concurrent idempotent request (conflict)") })
+  @ApiResponse({ status: 409, ...problemJsonResponse("The partner lacks the transporter role (partner-not-transporter) or is inactive (transporter-inactive); a document's PO or ASN is another warehouse's (document-warehouse-mismatch); the dock appointment is another warehouse's (appointment-warehouse-mismatch), cancelled or another gate-in's (appointment-closed), or does not start within a day of the visit's IST date (appointment-not-due); or a concurrent idempotent request (conflict)") })
   @ApiResponse({ status: 422, ...problemJsonResponse(WRITE_422) })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async create(

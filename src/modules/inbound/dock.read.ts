@@ -394,13 +394,14 @@ export async function dockAppointmentViewInTx(tx: TenantTx, row: DockAppointment
 }
 
 /**
- * The outbox payload's appointment: the view WITHOUT the note (A15 — a desk
- * may type a phone number into it; personal data is never copied into an
- * event).
+ * The outbox payload's appointment: the view WITHOUT the note and the cancel
+ * reason (A15 — both are desk free text a phone number can be typed into;
+ * personal data is never copied into an event).
  */
-export function outboxAppointment(view: DockAppointmentView): Omit<DockAppointmentView, 'note'> {
-  const { note, ...rest } = view;
+export function outboxAppointment(view: DockAppointmentView): Omit<DockAppointmentView, 'note' | 'cancelReason'> {
+  const { note, cancelReason, ...rest } = view;
   void note;
+  void cancelReason;
   return rest;
 }
 
@@ -533,7 +534,8 @@ export async function dockWindowInTx(tx: TenantTx, tenantId: string, query: Dock
   }));
 
   // The door set: active now, plus every door an appointment of the window names.
-  const doorIdsInWindow = new Set([...grouped.map((row) => row.doorId), ...page.map((row) => row.dockDoorId)]);
+  // Cancelled-only doors join only when their appointments are listed (the page rows).
+  const doorIdsInWindow = new Set([...grouped.filter((row) => row.scheduled > 0).map((row) => row.doorId), ...page.map((row) => row.dockDoorId)]);
   const doorRows = await tx
     .select()
     .from(dockDoors)

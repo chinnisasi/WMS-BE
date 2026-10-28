@@ -27,6 +27,7 @@ const API = '/api/v1/tenants';
 const KEY_HEADER = 'Idempotency-Key';
 const PASSWORD = 'correct-horse-battery';
 const MINUTE = 60_000;
+const DAY_MS = 86_400_000;
 
 /** Tuesday 3 Nov 2026, 10:10 IST — the suite's "now" (both command clocks). */
 const TODAY = '2026-11-03';
@@ -420,6 +421,15 @@ describe('story 2-3b: dock appointments', () => {
       expect((await book(slot('D1', TOMORROW, '09:30', '10:00')).expect(201)).body.appointment.clientId).toBeNull();
     });
 
+    it('C1: the documents hash both keys as received — a same-key resend differing only in asnId is 422, never a replay', async () => {
+      const key = ulid();
+      const body = slot('D1', TOMORROW, '10:00', '10:30', { documents: [{ poId: '', asnId: asn77 }] });
+      const booked = (await book(body, key).expect(201)).body.appointment as Appointment;
+      expect(booked.documents.map((doc) => doc.id)).toEqual([asn77]);
+      expectProblem(await book(slot('D1', TOMORROW, '10:00', '10:30', { documents: [{ poId: '', asnId: asnReceived }] }), key), 422, 'idempotency-key-reuse');
+      expect((await book(body, key).expect(201)).body.appointment).toEqual(booked);
+    });
+
     it('Overlap: D3 11:00–11:30 over DA-0001 → 409 dock-slot-taken naming DA-0001 10:30–11:30; Adjacent: 11:30–12:00 → 201', async () => {
       const res = await book(slot('D3', TOMORROW, '11:00', '11:30'));
       expectProblem(res, 409, 'dock-slot-taken');
@@ -559,12 +569,23 @@ describe('story 2-3b: dock appointments', () => {
       expect(Number((await sql`select count(*)::int as n from outbox_messages where tenant_id = ${tenantId} and type = 'dock_appointment.rescheduled'`)[0]!.n)).toBe(before);
     });
 
-    it('Reschedule, PO closed since: same documents, a new time → 200 (not re-checked); a changed set is re-checked', async () => {
+    it('Reschedule, PO closed since: same documents, a new time → 200; a kept closed PO + an added open ASN → 200; an ADDED closed PO → 409 po-not-open', async () => {
       const created = (await book(slot('D2', TOMORROW, '16:00', '16:30', { documents: [{ poId: po1002 }] })).expect(201)).body.appointment as Appointment;
       await sql`update purchase_orders set status = 'closed' where id = ${po1002}`;
       try {
         await reschedule(created.id, slot('D2', TOMORROW, '16:30', '17:00', { documents: [{ poId: po1002 }] })).expect(200);
-        expectProblem(await reschedule(created.id, slot('D2', TOMORROW, '16:30', '17:00', { documents: [{ poId: po1002 }, { poId: po1001 }] })), 409, 'po-not-open');
+        // Only the added documents are checked; the client re-derives from the full set (mixed → null).
+        const added = (await reschedule(created.id, slot('D2', TOMORROW, '16:30', '17:00', { documents: [{ poId: po1002 }, { asnId: asn77 }] })).expect(200)).body
+          .appointment as Appointment;
+        expect(added.documents.map((doc) => doc.code)).toEqual(['PO-1002', 'ASN-77']);
+        expect(added.clientId).toBeNull();
+        // Dropping the ASN again re-stamps GlowCo from the kept (closed) PO.
+        expect((await reschedule(created.id, slot('D2', TOMORROW, '16:30', '17:00', { documents: [{ poId: po1002 }] })).expect(200)).body.appointment.clientId).toBe(glowCo);
+        expectProblem(
+          await reschedule(created.id, slot('D2', TOMORROW, '16:30', '17:00', { documents: [{ poId: po1002 }, { poId: poClosed }] })),
+          409,
+          'po-not-open',
+        );
       } finally {
         await sql`update purchase_orders set status = 'open' where id = ${po1002}`;
       }
@@ -642,6 +663,22 @@ describe('story 2-3b: dock appointments', () => {
       expectProblem(await reschedule(created.id, slot('D4', TOMORROW, '16:00', '16:30')), 409, 'appointment-closed');
       expectProblem(await cancel(created.id, '   '), 400, 'validation-failed');
       expectProblem(await cancel(created.id, 'r'.repeat(201)), 400, 'validation-failed');
+      // C4 — the reason is desk free text: it rides no event.
+      const events = (await sql`select payload from outbox_messages where tenant_id = ${tenantId} and type = 'dock_appointment.cancelled'
+        and payload->'appointment'->>'id' = ${created.id}`) as unknown as { payload: { appointment: Record<string, unknown> } }[];
+      expect(events).toHaveLength(1);
+      expect(events[0]!.payload.appointment.status).toBe('cancelled');
+      expect('cancelReason' in events[0]!.payload.appointment).toBe(false);
+      expect(JSON.stringify(events[0]!.payload)).not.toContain('Vendor postponed');
+    });
+
+    it('V5: a same-door reschedule over its own old window (12:00–12:30 → 12:00–13:00) → 200; into another appointment → 409 dock-slot-taken with the clash', async () => {
+      const mine = (await book(slot('D4', TOMORROW, '12:00', '12:30')).expect(201)).body.appointment as Appointment;
+      await reschedule(mine.id, slot('D4', TOMORROW, '12:00', '13:00')).expect(200);
+      const other = (await book(slot('D4', TOMORROW, '13:00', '13:30')).expect(201)).body.appointment as Appointment;
+      const res = await reschedule(mine.id, slot('D4', TOMORROW, '12:30', '13:30'));
+      expectProblem(res, 409, 'dock-slot-taken');
+      expect(res.body.clash).toMatchObject({ id: other.id, code: other.code, startsAt: at(TOMORROW, '13:00'), endsAt: at(TOMORROW, '13:30') });
     });
 
     it('Closed / no-show: cancel an arrived one → appointment-closed; reschedule at endsAt + grace + 1 min → appointment-no-show', async () => {
@@ -662,13 +699,40 @@ describe('story 2-3b: dock appointments', () => {
 
     it('Deactivate busy door: D3 with bookings tomorrow → 409 dock-door-has-appointments naming the count and the first code', async () => {
       const count = Number(
-        (await sql`select count(*)::int as n from dock_appointments where dock_door_id = ${door.D3!} and status = 'booked' and ends_at > ${new Date(NOW_MS).toISOString()}`)[0]!.n,
+        (await sql`select count(*)::int as n from dock_appointments where dock_door_id = ${door.D3!} and status = 'booked'
+          and ends_at + grace_minutes * interval '1 minute' > ${new Date(NOW_MS).toISOString()}`)[0]!.n,
       );
       const res = await setDoor(wh1, door.D3!, { code: 'D3', active: false });
       expectProblem(res, 409, 'dock-door-has-appointments');
       expect(res.body.appointmentCount).toBe(count);
       expect(res.body.firstAppointmentCode).toMatch(/^DA-\d{4}$/);
       expect(res.body.detail).toContain(res.body.firstAppointmentCode as string);
+    });
+
+    it('C2 / V2: a booked appointment past its end but inside its grace keeps the door busy; cancelled, arrived or no-show ones do not', async () => {
+      const wh = await site('BSY-1');
+      const graced = await newDoor(wh, 'B1');
+      const free = await newDoor(wh, 'B2');
+      const seedRow = async (doorId: string, startMs: number, status: string, grace = 15): Promise<void> => {
+        const id = uuidv7();
+        const gateInId = status === 'arrived' ? uuidv7() : null;
+        await sql`insert into dock_appointments (id, tenant_id, warehouse_id, code, status, dock_door_id, starts_at, ends_at, grace_minutes, booked_by,
+                    gate_in_id, linked_at, linked_by, cancelled_at, cancelled_by, cancel_reason)
+                  values (${id}, ${tenantId}, ${wh}, ${`DA-${String(7_000_000 + Math.floor(Math.random() * 900_000))}`}, ${status}, ${doorId},
+                    ${new Date(startMs).toISOString()}, ${new Date(startMs + 30 * MINUTE).toISOString()}, ${grace}, ${ownerUserId},
+                    ${gateInId}, ${gateInId === null ? null : new Date(startMs).toISOString()}, ${gateInId === null ? null : ownerUserId},
+                    ${status === 'cancelled' ? new Date(startMs).toISOString() : null}, ${status === 'cancelled' ? ownerUserId : null}, ${status === 'cancelled' ? 'seed' : null})`;
+      };
+      // Ended 5 minutes ago, grace 15: still expected.
+      await seedRow(graced, NOW_MS - 35 * MINUTE, 'booked');
+      const busy = await setDoor(wh, graced, { code: 'B1', active: false });
+      expectProblem(busy, 409, 'dock-door-has-appointments');
+      expect(busy.body.appointmentCount).toBe(1);
+      // A future cancelled one, a future arrived one, and a long-past (no-show) booked one.
+      await seedRow(free, NOW_MS + DAY_MS, 'cancelled');
+      await seedRow(free, NOW_MS + 2 * DAY_MS, 'arrived');
+      await seedRow(free, NOW_MS - 3 * DAY_MS, 'booked');
+      expect((await setDoor(wh, free, { code: 'B2', active: false }).expect(200)).body.dockDoor.active).toBe(false);
     });
 
     it('Schedule change: slot 30 → 60 with a 10:30–11:00 booking → 200; untouched; a move must fit the new grid; a note edit still works', async () => {
@@ -706,6 +770,8 @@ describe('story 2-3b: dock appointments', () => {
     it('Window read: from = to = tomorrow lists the day by (startsAt, id) with doors and schedule; 8 days or to < from → 400', async () => {
       const view = await windowOf(wh1, TOMORROW);
       expect(view.appointments.length).toBeGreaterThan(5);
+      // V3 — only the queried warehouse's appointments (WH2's are not listed).
+      expect(view.appointments.every((a) => (a as unknown as { warehouseId: string }).warehouseId === wh1)).toBe(true);
       const starts = view.appointments.map((a) => a.startsAt);
       expect([...starts].sort()).toEqual(starts);
       expect(view.appointments.every((a) => a.status !== 'cancelled')).toBe(true);
@@ -804,6 +870,13 @@ describe('story 2-3b: dock appointments', () => {
       ]);
       expect(view.summary.byDoor.map((row) => row.doorId).sort()).toEqual([a, b, c].sort());
       expect(view.appointments.some((x) => x.startsAt === at(saturday, '10:00'))).toBe(true);
+      // C8 — an inactive door whose only appointment in the window is cancelled is no column unless cancelled ones are listed.
+      const gone = await newDoor(wh, 'U4');
+      await seed(wh, gone, [{ start: at(TOMORROW, '11:00'), minutes: 30, status: 'cancelled' }]);
+      await sql`update dock_doors set active = false where id = ${gone}`;
+      expect((await windowOf(wh, TOMORROW, saturday)).doors.map((d) => d.code)).toEqual(['U1', 'U2', 'U3']);
+      expect((await windowOf(wh, TOMORROW, saturday, { includeCancelled: true })).doors.map((d) => d.code)).toEqual(['U1', 'U2', 'U3', 'U4']);
+      expect((await windowOf(wh, TOMORROW, saturday)).summary.openMinutes).toBe(3 * 540 * 3);
     });
 
     it('A9 truncated summary: 1001 appointments in the window → truncated, 1000 listed, the summary exact', async () => {
@@ -829,6 +902,11 @@ describe('story 2-3b: dock appointments', () => {
         .appointment as Appointment;
       const cancelledToday = (await book(slot('D3', TODAY, '15:00', '15:30')).expect(201)).body.appointment as Appointment;
       await cancel(cancelledToday.id, 'gone').expect(200);
+      // V1 — an appointment that arrived today, and another warehouse's booked one today, are not listed.
+      const arrivedToday = (await book(slot('D4', TODAY, '12:00', '12:30')).expect(201)).body.appointment as Appointment;
+      await gateIn({ gatedInAt: new Date(NOW_MS).toISOString(), appointmentId: arrivedToday.id }).expect(201);
+      const elsewhere = (await book({ warehouseId: wh2, dockDoorId: doorWh2, startsAt: at(TODAY, '13:00'), endsAt: at(TODAY, '13:30') }).expect(201)).body
+        .appointment as Appointment;
       dockClock.now = () => Date.parse(at(TODAY, '12:00'));
       const snapshot = (
         await http().get(`${API}/${tenantId}/devices/catalog-snapshot`).query({ warehouseId: wh1 }).set('Authorization', `Bearer ${deviceToken}`).expect(200)
@@ -836,6 +914,8 @@ describe('story 2-3b: dock appointments', () => {
       const codes = snapshot.dockAppointments.map((a) => a.code);
       expect(codes).toContain(today.code);
       expect(codes).not.toContain(cancelledToday.code);
+      expect(codes).not.toContain(arrivedToday.code);
+      expect(codes).not.toContain(elsewhere.code);
       const entry = snapshot.dockAppointments.find((a) => a.code === today.code)!;
       expect(entry).toEqual({
         id: today.id,
@@ -851,6 +931,19 @@ describe('story 2-3b: dock appointments', () => {
       const starts = snapshot.dockAppointments.map((a) => a.startsAt as string);
       expect([...starts].sort()).toEqual(starts);
       expect(starts.every((s) => s >= istMidnightOf(TODAY) && s < istMidnightOf(TOMORROW))).toBe(true);
+    });
+
+    it('A15 / C4: no dock_appointment.* outbox payload carries the note or the cancel reason', async () => {
+      const rows = (await sql`select type, payload from outbox_messages where tenant_id = ${tenantId} and type like 'dock_appointment.%'`) as unknown as {
+        type: string;
+        payload: { appointment: Record<string, unknown> };
+      }[];
+      expect(new Set(rows.map((row) => row.type))).toEqual(new Set(['dock_appointment.booked', 'dock_appointment.rescheduled', 'dock_appointment.cancelled', 'dock_appointment.arrived']));
+      for (const row of rows) {
+        expect(Object.keys(row.payload)).toEqual(['appointment']);
+        expect('note' in row.payload.appointment).toBe(false);
+        expect('cancelReason' in row.payload.appointment).toBe(false);
+      }
     });
 
     it('the TS status vocabulary equals the 0110 CHECK', async () => {

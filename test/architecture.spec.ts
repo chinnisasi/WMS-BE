@@ -3731,7 +3731,7 @@ describe('architecture: dock appointments are inbound-owned (story 2-3b)', () =>
     expect(gateIn).toMatch(/payload:\s*\{\s*appointment:\s*outboxAppointment\(linked\.appointment\)\s*\}/);
     expect(gateIn).not.toMatch(/appointment:\s*linked\.appointment\b/);
     const read = readFileSync(join(inboundRoot, 'dock.read.ts'), 'utf8');
-    expect(read).toMatch(/const \{ note, \.\.\.rest \} = view;/);
+    expect(read).toMatch(/const \{ note, cancelReason, \.\.\.rest \} = view;/);
   });
 });
 

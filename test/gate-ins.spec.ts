@@ -1113,7 +1113,8 @@ describe('story 2-3a: gate-in and the receipt link', () => {
     /** Books `doorCode` on DAY from–to (the dock clock set to 07:00 that day), optionally with an expected vehicle. */
     async function appointment(doorCode: string, from: string, to: string, extra: Record<string, unknown> = {}, warehouseId = wh1): Promise<LinkedAppointment> {
       const saved = dockClock.now;
-      dockClock.now = () => Date.parse(at('07:00', extra.date as string | undefined));
+      // The current slot at booking: 07:00 that day, or the start itself when earlier.
+      dockClock.now = () => Math.min(Date.parse(at('07:00', extra.date as string | undefined)), Date.parse(at(from, extra.date as string | undefined)));
       try {
         const { date, ...rest } = extra;
         return (
@@ -1390,6 +1391,41 @@ describe('story 2-3a: gate-in and the receipt link', () => {
       const plain = (await create(baseBody()).expect(201)).body.gateIn as GateIn;
       expectProblem(await amend(plain.id, amendBody({ appointmentId: taken.id })), 409, 'appointment-closed');
       expect((await appointmentOf(taken.id)).gateInId).toBe(first.id);
+    });
+
+    it('C6 / V4: the due window is the VISIT\'s IST day ±1 — the day before 00:00 and the day after 23:30 link; day+2 00:00 and just before the day before refuse', async () => {
+      const before = addIsoDays(DAY, -1);
+      const after = addIsoDays(DAY, 1);
+      const yesterday = await appointment('G1', '00:00', '00:30', { date: before });
+      const tomorrowLate = await appointment('G2', '23:30', '24:00', { date: after });
+      const dayPlus2 = await appointment('G3', '00:00', '00:30', { date: addIsoDays(DAY, 2) });
+      const tooEarly = await appointment('G4', '23:30', '24:00', { date: addIsoDays(DAY, -2) });
+      clockAt('12:00');
+      const visit = (extra: Record<string, unknown>) => create(baseBody({ gatedInAt: at('12:00'), ...extra }));
+      await visit({ appointmentId: yesterday.id }).expect(201);
+      await visit({ appointmentId: tomorrowLate.id }).expect(201);
+      expectProblem(await visit({ appointmentId: dayPlus2.id }), 409, 'appointment-not-due');
+      expectProblem(await visit({ appointmentId: tooEarly.id }), 409, 'appointment-not-due');
+    });
+
+    it('C6: a backdated create, and an amend days later, link the appointment the visit met (the window follows gatedInAt, not the clock)', async () => {
+      const met = await appointment('G5', '18:00', '18:30');
+      const metToo = await appointment('G6', '18:00', '18:30');
+      // Three days later the desk records the visit with its real (past) time.
+      gateInClock.now = () => Date.parse(at('10:00', addIsoDays(DAY, 3)));
+      dockClock.now = gateInClock.now;
+      await create(baseBody({ gatedInAt: at('18:05'), appointmentId: met.id })).expect(201);
+      expect(await appointmentOf(met.id)).toMatchObject({ status: 'arrived', punctuality: 'on_time', punctualityMinutes: 5 });
+      // An open visit amended later links against its own day too …
+      clockAt('18:10');
+      const open = (await create(baseBody({ gatedInAt: at('18:10') })).expect(201)).body.gateIn as GateIn;
+      gateInClock.now = () => Date.parse(at('09:00', addIsoDays(DAY, 4)));
+      dockClock.now = gateInClock.now;
+      await amend(open.id, amendBody({ appointmentId: metToo.id })).expect(200);
+      expect(await appointmentOf(metToo.id)).toMatchObject({ status: 'arrived', gateInId: open.id, punctualityMinutes: 10 });
+      // … and an appointment due on the CLOCK's day but not the visit's is refused.
+      const clockDay = await appointment('G1', '09:00', '09:30', { date: addIsoDays(DAY, 4) });
+      expectProblem(await amend(open.id, amendBody({ appointmentId: clockDay.id })), 409, 'appointment-not-due');
     });
 
     it('A1 same-key race: two creates, one key, appointmentId — both parked on the appointment lock answer the one gate-in snapshot', async () => {

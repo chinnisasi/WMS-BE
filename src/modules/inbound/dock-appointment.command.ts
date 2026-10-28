@@ -199,7 +199,8 @@ function hashedFields(input: DockAppointmentFields): Record<string, unknown> {
     dockDoorId: input.dockDoorId,
     startsAt: input.startsAt,
     endsAt: input.endsAt,
-    documents: (input.documents ?? []).map((doc) => (doc?.poId !== null && doc?.poId !== undefined ? { poId: doc.poId } : { asnId: doc?.asnId ?? undefined })),
+    // Both keys as received — `{poId: '', asnId: X}` must not hash as `{poId: ''}`.
+    documents: (input.documents ?? []).map((doc) => ({ poId: doc?.poId ?? undefined, asnId: doc?.asnId ?? undefined })),
     vehicleNo: input.vehicleNo ?? undefined,
     transporterName: input.transporterName ?? undefined,
     note: input.note ?? undefined,
@@ -417,7 +418,17 @@ export class DockAppointmentCommand {
       }
       let clientId = current.clientId;
       if (documentsChanged) {
-        clientId = await this.assertDocumentsInTx(tx, command.tenantId, current.warehouseId, fields.documents);
+        // Only the ADDED documents are checked (a kept PO that closed since
+        // booking never blocks the edit); the client is re-derived from the
+        // full new set (A10).
+        const kept = new Set(currentDocuments.map((doc) => `${doc.kind}|${doc.id}`));
+        await this.assertDocumentsInTx(
+          tx,
+          command.tenantId,
+          current.warehouseId,
+          fields.documents.filter((doc) => !kept.has(`${doc.kind}|${doc.id}`)),
+        );
+        clientId = await this.clientOfDocumentsInTx(tx, command.tenantId, fields.documents);
       }
       const before = await this.viewOf(tx, command.tenantId, current.id, nowMs);
       await tx
@@ -647,6 +658,28 @@ export class DockAppointmentCommand {
   }
 
   // ── helpers ─────────────────────────────────────────────────────────────
+
+  /** The client stamp of a document set (decision 6): the one client every document names, else null. Plain reads. */
+  private async clientOfDocumentsInTx(tx: TenantTx, tenantId: string, documents: readonly NormalizedDocument[]): Promise<string | null> {
+    const poIds = documents.filter((doc) => doc.kind === 'po').map((doc) => doc.id);
+    const asnIds = documents.filter((doc) => doc.kind === 'asn').map((doc) => doc.id);
+    const clients = new Set<string>();
+    if (poIds.length > 0) {
+      const rows = await tx
+        .select({ clientId: purchaseOrders.clientId })
+        .from(purchaseOrders)
+        .where(and(eq(purchaseOrders.tenantId, tenantId), inArray(purchaseOrders.id, poIds)));
+      for (const row of rows) clients.add(row.clientId);
+    }
+    if (asnIds.length > 0) {
+      const rows = await tx
+        .select({ clientId: advanceShipmentNotices.clientId })
+        .from(advanceShipmentNotices)
+        .where(and(eq(advanceShipmentNotices.tenantId, tenantId), inArray(advanceShipmentNotices.id, asnIds)));
+      for (const row of rows) clients.add(row.clientId);
+    }
+    return documents.length > 0 && clients.size === 1 ? [...clients][0]! : null;
+  }
 
   /** Lock the named doors `FOR UPDATE` in id order (the lock order) — absent ones are simply missing. */
   private async lockDoors(tx: TenantTx, tenantId: string, doorIds: readonly string[]): Promise<(DockDoorRow | undefined)[]> {

@@ -196,7 +196,7 @@ export class GateInHeaderDto {
     type: String,
     format: 'uuid',
     description:
-      "Story 2-3b — the dock appointment this visit keeps: a booked appointment of this warehouse starting yesterday, today or tomorrow (IST). Create: absent or null = unscheduled. Amend: ABSENT = the link unchanged (the one field where absent ≠ null), null = clear (the appointment returns to booked), an id = move. 404 unknown; 409 appointment-warehouse-mismatch, appointment-closed (cancelled, or another gate-in's), appointment-not-due",
+      "Story 2-3b — the dock appointment this visit keeps: a booked appointment of this warehouse starting the day before, the day of or the day after the visit's gated-in date (IST). Create: absent or null = unscheduled. Amend: ABSENT = the link unchanged (the one field where absent ≠ null), null = clear (the appointment returns to booked), an id = move. 404 unknown; 409 appointment-warehouse-mismatch, appointment-closed (cancelled, or another gate-in's), appointment-not-due",
   })
   @IsOptional()
   @Nullable()

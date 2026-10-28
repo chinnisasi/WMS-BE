@@ -494,7 +494,7 @@ export class GateInCommand {
         if (row === undefined) throw appointmentNotFound();
         const replayedUnderAppointment = await this.replay<GateInSnapshot>(tx, command.tenantId, idempotencyKey, payloadHash);
         if (replayedUnderAppointment !== null) return replayedUnderAppointment;
-        await this.assertLinkable(tx, row, command.warehouseId, null);
+        await this.assertLinkable(tx, row, command.warehouseId, null, gatedInAt);
         claimed = row;
       }
       // 7. The write.
@@ -618,7 +618,7 @@ export class GateInCommand {
           if (replayedUnderAppointments !== null) return replayedUnderAppointments;
           const claimedRow = wanted === null ? null : (locked.get(wanted) ?? null);
           if (wanted !== null && claimedRow === null) throw appointmentNotFound();
-          if (claimedRow !== null) await this.assertLinkable(tx, claimedRow, current.warehouseId, current.id);
+          if (claimedRow !== null) await this.assertLinkable(tx, claimedRow, current.warehouseId, current.id, gatedInAt);
           link = { released: linked === null ? null : (locked.get(linked.id) ?? linked), claimed: claimedRow };
           changes.appointment = { before: linked?.code ?? null, after: claimedRow?.code ?? null };
         }
@@ -968,10 +968,18 @@ export class GateInCommand {
   /**
    * Decision 8 + A14 — another warehouse's appointment is 409
    * `appointment-warehouse-mismatch`; a cancelled one, or one another gate-in
-   * keeps, 409 `appointment-closed`; one starting outside IST yesterday …
-   * tomorrow 409 `appointment-not-due`. A no-show links (the visit reads late).
+   * keeps, 409 `appointment-closed`; one starting outside the day before …
+   * the day after the VISIT's own IST date (its resolved `gatedInAt` — a
+   * backdated create or a later amend links the appointment it met) 409
+   * `appointment-not-due`. A no-show links (the visit reads late).
    */
-  private async assertLinkable(tx: TenantTx, row: DockAppointmentRow, warehouseId: string, gateInId: string | null): Promise<void> {
+  private async assertLinkable(
+    tx: TenantTx,
+    row: DockAppointmentRow,
+    warehouseId: string,
+    gateInId: string | null,
+    gatedInAt: string,
+  ): Promise<void> {
     if (row.warehouseId !== warehouseId) {
       throw new ProblemException(
         'appointment-warehouse-mismatch',
@@ -994,14 +1002,14 @@ export class GateInCommand {
         `Dock appointment "${row.code}" is already linked to gate-in ${other[0]?.code ?? row.gateInId} — one appointment per visit.`,
       );
     }
-    const today = istDateOf(new Date(gateInClock.now()).toISOString());
+    const visitDay = istDateOf(gatedInAt);
     const startsAt = canonicalInstant(row.startsAt);
-    if (startsAt < istMidnightOf(addIsoDays(today, -1)) || startsAt >= istMidnightOf(addIsoDays(today, 2))) {
+    if (startsAt < istMidnightOf(addIsoDays(visitDay, -1)) || startsAt >= istMidnightOf(addIsoDays(visitDay, 2))) {
       throw new ProblemException(
         'appointment-not-due',
         409,
         'Appointment not due',
-        `Dock appointment "${row.code}" (${windowLabel(startsAt, canonicalInstant(row.endsAt))}) is not due — only an appointment starting yesterday, today or tomorrow (IST) can be linked at the gate.`,
+        `Dock appointment "${row.code}" (${windowLabel(startsAt, canonicalInstant(row.endsAt))}) is not due — only an appointment starting the day before, the day of or the day after the visit (IST) can be linked at the gate.`,
       );
     }
   }

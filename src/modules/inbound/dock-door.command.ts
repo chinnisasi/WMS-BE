@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, eq, gt, sql } from 'drizzle-orm';
+import { and, asc, eq, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { auditEvents, dockAppointments, dockDoors, idempotencyKeys, type DockDoorRow } from '../../shared/db/schema';
@@ -185,7 +185,8 @@ export class DockDoorCommand {
               eq(dockAppointments.tenantId, command.tenantId),
               eq(dockAppointments.dockDoorId, current.id),
               eq(dockAppointments.status, 'booked'),
-              gt(dockAppointments.endsAt, new Date(dockClock.now()).toISOString()),
+              // Not yet a no-show (the isNoShow rule): past its end but inside its grace, the truck is still expected.
+              sql`${dockAppointments.endsAt} + ${dockAppointments.graceMinutes} * interval '1 minute' > ${new Date(dockClock.now()).toISOString()}::timestamptz`,
             ),
           )
           .orderBy(asc(dockAppointments.startsAt), asc(dockAppointments.id))
