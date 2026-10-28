@@ -1,5 +1,5 @@
-import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import { and, asc, desc, eq, inArray, isNull, sql, type SQL } from 'drizzle-orm';
 import { warehouseFilter, type ClientCountScope } from '../../shared/db/warehouse-filter';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
@@ -26,6 +26,9 @@ import type { AddressSnapshot } from '../../shared/primitives/address';
 import { fromMilli } from '../../shared/primitives/quantity';
 import { canonicalInstant, fullPrecisionInstant } from '../../shared/primitives/time';
 import { PORTAL_PAGE_DEFAULT_LIMIT } from '../../shared/primitives/portal-page';
+import { AllocationCommandService } from './allocation.command';
+import { MIN_FOLLOW_ON_REMAINDER_MILLI } from './follow-on';
+import type { AllocateOrderCommand, AllocateOrderSnapshot, BackorderSweepReport } from './allocation.command';
 import { portalOrderInTx, portalOrdersInTx, type PortalOrderDetail, type PortalOrderRow } from './portal-orders';
 import {
   outboundRegisterInTx as outboundRegisterInTxImpl,
@@ -151,9 +154,24 @@ export interface OrderEntry {
   readonly destination: AddressSnapshot | null;
   /** Story 21-2b — the client the order is for (derived from its SKUs). */
   readonly clientId: string;
+  /**
+   * Story 4-2c — the backorder chain (a live read: always present). On a
+   * follow-on: its parent, the chain's root and its `-BO{seq}`; null on a
+   * root. `followOnOrderId`: the follow-on this order's short dispatch opened.
+   */
+  readonly followOnOfOrderId: string | null;
+  readonly followOnRootOrderId: string | null;
+  readonly followOnSeq: number | null;
+  readonly followOnOrderId: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
+
+/** Story 4-2c — one order line as the channel writeback reads it: what SHIPPED (Σ picks), base units. */
+export type WritebackOrderLine = OrderSnapshot['order']['lines'][number] & { readonly shippedQty: number };
+
+/** Story 4-2c — the writeback's order re-read: the order and its lines with what shipped. */
+export type WritebackOrder = Omit<OrderSnapshot['order'], 'lines'> & { readonly lines: readonly WritebackOrderLine[] };
 
 export interface ListOrdersQuery {
   readonly cursor?: string | undefined;
@@ -190,6 +208,8 @@ export interface ListOrdersFilter extends ListClientFilteredQuery {
    * Trimmed by the DTO; case-sensitive.
    */
   readonly reference?: string | undefined;
+  /** Story 4-2c (A15) — `true`: only backorder follow-ons; `false`: only root orders. */
+  readonly followOn?: boolean | undefined;
 }
 
 /** Story 9-1 — the windowed fact-list reads (pack failures, refusals, picklist lines). */
@@ -246,6 +266,15 @@ export interface PackTask {
   readonly orderPriority: OrderPriority;
   readonly orderShipByDate: string | null;
   readonly codAmountPaise: number | null;
+  /**
+   * Story 4-2c (A16) — what the order ORDERED of this SKU (Σ its leaf lines'
+   * `qty`, base units), whether ANY leaf line of the order was picked below
+   * its quantity (so the bench warns even when a wholly unpicked SKU has no
+   * row here), and the order's `-BO{seq}` (null on a root).
+   */
+  readonly orderedQty: number;
+  readonly orderShortfall: boolean;
+  readonly followOnSeq: number | null;
 }
 
 /**
@@ -386,6 +415,43 @@ export function truncateToWholeGroups<T>(
  * `decodeCursorSafe` pattern; the shared `UUID_RE` is retro A3's one
  * matcher).
  */
+/**
+ * Story 4-2c — the follow-on a parent's short dispatch opened, as a correlated
+ * subquery on `orders_follow_on_of_unique` (table-qualified by hand — an
+ * unqualified column would resolve against the inner FROM list, Gotcha 9).
+ */
+// Written with literal `"orders".` qualifiers: drizzle renders a column
+// interpolated into a SELECT-list fragment UNQUALIFIED, which would resolve
+// against the inner `fo` (the very Gotcha 9 this guards).
+const followOnChildSql = sql<string | null>`(select fo.id from orders fo where fo.tenant_id = "orders"."tenant_id" and fo.follow_on_of_order_id = "orders"."id" limit 1)`;
+
+/** Story 4-2c — an order snapshot's header as an `OrderEntry` (the new keys read `?? null`). */
+function toOrderEntry(header: Omit<OrderSnapshot['order'], 'lines'>): OrderEntry {
+  // Built key by key — never a spread, so the snapshot's `lines` never leak in.
+  return {
+    id: header.id,
+    tenantId: header.tenantId,
+    warehouseId: header.warehouseId,
+    status: header.status,
+    source: header.source,
+    integrationId: header.integrationId,
+    externalEventId: header.externalEventId,
+    clientOrderRef: header.clientOrderRef ?? null,
+    orderType: header.orderType ?? null,
+    priority: (header.priority ?? 'normal') as OrderPriority,
+    shipByDate: header.shipByDate ?? null,
+    codAmountPaise: header.codAmountPaise ?? null,
+    destination: header.destination,
+    clientId: header.clientId ?? '',
+    followOnOfOrderId: header.followOnOfOrderId ?? null,
+    followOnRootOrderId: header.followOnRootOrderId ?? null,
+    followOnSeq: header.followOnSeq ?? null,
+    followOnOrderId: header.followOnOrderId ?? null,
+    createdAt: header.createdAt,
+    updatedAt: header.updatedAt,
+  };
+}
+
 const CURSOR_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 
 function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
@@ -466,6 +532,8 @@ function toShipmentView(
  */
 @Injectable()
 export class OutboundFacade {
+  private readonly logger = new Logger('OutboundFacade');
+
   constructor(
     @Inject(DATABASE) private readonly db: Database,
     @Inject(OrderCommandService) private readonly orderCommand: OrderCommandService,
@@ -480,7 +548,49 @@ export class OutboundFacade {
     @Inject(OrderImportCommand) private readonly orderImport: OrderImportCommand,
     // Story 4-2b — cancel a picked or packed order with restock, and its plan read.
     @Inject(CancelRestockCommandService) private readonly cancelRestock: CancelRestockCommandService,
+    // Story 4-2c — the backorder allocation (verb, sweep, after-dispatch attempt).
+    @Inject(AllocationCommandService) private readonly allocation: AllocationCommandService,
   ) {}
+
+  /**
+   * Story 4-2c — `POST …/orders/{orderId}/allocate` ("Allocate now"):
+   * re-reserves the order's backordered lines that hold nothing.
+   */
+  async allocateOrder(command: AllocateOrderCommand, idempotencyKey: string): Promise<AllocateOrderSnapshot> {
+    return this.allocation.allocateOrder(command, idempotencyKey);
+  }
+
+  /** Story 4-2c — the backorder allocation sweep for one tenant (the jobs shell's `BackorderAllocationWorker`). System work. */
+  async sweepBackorders(tenantId: string): Promise<BackorderSweepReport> {
+    return this.allocation.sweepBackorders(tenantId);
+  }
+
+  /**
+   * Story 4-2c (A13) — the chain's OPEN follow-on of a root order (`accepted`
+   * or `ready_to_dispatch` — a follow-on exists only after its parent
+   * dispatched, so at most one is open), or null. The channel cancellation
+   * routes a cancellation of a dispatched root here.
+   */
+  async openFollowOnOfRoot(tenantId: string, rootOrderId: string): Promise<OrderEntry | null> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select({ id: orders.id })
+        .from(orders)
+        .where(
+          and(
+            eq(orders.tenantId, tenantId),
+            eq(orders.followOnRootOrderId, rootOrderId),
+            inArray(orders.status, ['accepted', 'ready_to_dispatch']),
+          ),
+        )
+        .orderBy(desc(orders.followOnSeq))
+        .limit(1);
+      const id = rows[0]?.id;
+      if (id === undefined) return null;
+      const order = (await tx.select().from(orders).where(eq(orders.id, id)).limit(1))[0]!;
+      return toOrderEntry((await this.snapshotOf(tx, order)).order);
+    });
+  }
 
   /**
    * Story 5-3a — the outbound register (`outbound-register.ts`): one row per
@@ -640,6 +750,10 @@ export class OutboundFacade {
           shipByDate: orders.shipByDate,
           codAmountPaise: orders.codAmountPaise,
           clientId: orders.clientId,
+          followOnOfOrderId: orders.followOnOfOrderId,
+          followOnRootOrderId: orders.followOnRootOrderId,
+          followOnSeq: orders.followOnSeq,
+          followOnOrderId: followOnChildSql,
           createdAt: orders.createdAt,
           updatedAt: orders.updatedAt,
         })
@@ -649,6 +763,9 @@ export class OutboundFacade {
             eq(orders.tenantId, tenantId),
             eq(orders.integrationId, integrationId),
             eq(orders.externalEventId, externalEventId),
+            // Story 4-2c — the ROOT (a follow-on shares its channel event; the
+            // narrowed `orders_source_event_root_unique` population).
+            isNull(orders.followOnOfOrderId),
           ),
         )
         .limit(1);
@@ -671,6 +788,10 @@ export class OutboundFacade {
         codAmountPaise: row.codAmountPaise,
         destination: null,
         clientId: row.clientId,
+        followOnOfOrderId: row.followOnOfOrderId,
+        followOnRootOrderId: row.followOnRootOrderId,
+        followOnSeq: row.followOnSeq,
+        followOnOrderId: row.followOnOrderId,
         createdAt: canonicalInstant(row.createdAt),
         updatedAt: canonicalInstant(row.updatedAt),
       };
@@ -683,8 +804,33 @@ export class OutboundFacade {
    * arm request from (never the event payload's word). Unknown or foreign
    * id is null (the delivery ACKs — the order cannot have moved anywhere).
    */
-  async orderForWriteback(tenantId: string, orderId: string): Promise<OrderSnapshot['order'] | null> {
-    return this.getOrder(tenantId, orderId);
+  async orderForWriteback(tenantId: string, orderId: string): Promise<WritebackOrder | null> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select()
+        .from(orders)
+        .where(and(eq(orders.id, orderId), eq(orders.tenantId, tenantId)))
+        .limit(1);
+      const order = rows[0];
+      if (order === undefined) {
+        return null;
+      }
+      const snapshot = (await this.snapshotOf(tx, order)).order;
+      // Story 4-2c (decision 8 fold-in) — what each line SHIPPED: Σ picks
+      // (the dispatch command's own figure). The fulfillment posts this, never
+      // the ordered quantity — a short shipment must not tell the channel the
+      // order was fulfilled in full. `::bigint` — int8 arrives as a string.
+      const picked = await tx
+        .select({ orderLineId: picks.orderLineId, qty: sql<string>`sum(${picks.qty})::bigint` })
+        .from(picks)
+        .where(and(eq(picks.tenantId, tenantId), eq(picks.orderId, order.id)))
+        .groupBy(picks.orderLineId);
+      const shipped = new Map(picked.map((row) => [row.orderLineId, Number(row.qty)]));
+      return {
+        ...snapshot,
+        lines: snapshot.lines.map((line) => ({ ...line, shippedQty: fromMilli(shipped.get(line.id) ?? 0) })),
+      };
+    });
   }
 
   // (the invoicing facts read's methods follow — story 8-1)
@@ -901,6 +1047,10 @@ export class OutboundFacade {
           destinationState: orders.destinationState,
           destinationPincode: orders.destinationPincode,
           clientId: orders.clientId,
+          followOnOfOrderId: orders.followOnOfOrderId,
+          followOnRootOrderId: orders.followOnRootOrderId,
+          followOnSeq: orders.followOnSeq,
+          followOnOrderId: followOnChildSql,
           createdAt: orders.createdAt,
           updatedAt: orders.updatedAt,
           // Story 9-1: the cursor carries the FULL-precision instant (a
@@ -924,6 +1074,12 @@ export class OutboundFacade {
             query.from === undefined ? undefined : sql`${orders.createdAt} >= ${query.from}::timestamptz`,
             query.to === undefined ? undefined : sql`${orders.createdAt} < ${query.to}::timestamptz`,
             query.reference === undefined ? undefined : orderReferenceMatch(orders.id, tenantId, query.reference),
+            // Story 4-2c (A15) — follow-ons only, or roots only (the SM-4 drill).
+            query.followOn === undefined
+              ? undefined
+              : query.followOn
+                ? sql`${orders.followOnOfOrderId} is not null`
+                : isNull(orders.followOnOfOrderId),
             before === undefined
               ? undefined
               : sql`(${orders.createdAt}, ${orders.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
@@ -954,6 +1110,10 @@ export class OutboundFacade {
           pincode: row.destinationPincode,
         }),
         clientId: row.clientId,
+        followOnOfOrderId: row.followOnOfOrderId,
+        followOnRootOrderId: row.followOnRootOrderId,
+        followOnSeq: row.followOnSeq,
+        followOnOrderId: row.followOnOrderId,
         createdAt: canonicalInstant(row.createdAt),
         updatedAt: canonicalInstant(row.updatedAt),
       }));
@@ -1284,7 +1444,23 @@ export class OutboundFacade {
     command: DispatchOrderCommand,
     idempotencyKey: string,
   ): Promise<DispatchSnapshot> {
-    return this.dispatchCommand.dispatchOrder(command, idempotencyKey);
+    const snapshot = await this.dispatchCommand.dispatchOrder(command, idempotencyKey);
+    // Story 4-2c (decision 6) — once the dispatch has committed, one
+    // best-effort allocation of the follow-on it opened, so stock already
+    // free (units in another bin) is reserved at once. NEVER throws (the
+    // post-commit rule): the dispatch answered; the sweep retries. A replay
+    // re-attempting it is harmless — a held line is not eligible twice.
+    const followOnOrderId = snapshot.dispatch.followOnOrderId ?? null;
+    if (followOnOrderId !== null) {
+      try {
+        await this.allocation.allocateOrderCore(command.tenantId, followOnOrderId, { entry: 'dispatch' });
+      } catch (err) {
+        this.logger.error(
+          `After-dispatch allocation of follow-on ${followOnOrderId} failed — the sweep retries it: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    return snapshot;
   }
 
   /**
@@ -1371,6 +1547,7 @@ export class OutboundFacade {
         orderPriority: orders.priority,
         orderShipByDate: orders.shipByDate,
         codAmountPaise: orders.codAmountPaise,
+        followOnSeq: orders.followOnSeq,
         skuId: picks.skuId,
         skuCode: skus.code,
         skuName: skus.name,
@@ -1417,6 +1594,36 @@ export class OutboundFacade {
     // whether the ceiling fell inside an order.
     const rows = truncateToWholeGroups(overRead, MAX_SNAPSHOT_PACK_TASKS, (row) => row.orderId);
 
+    // Story 4-2c (A16) — per (order, SKU) what the order ORDERED (its LEAF
+    // lines — a kit parent holds nothing and is never packed), and per order
+    // whether any leaf line was picked below its quantity: the bench's
+    // "Short — the rest ships later" banner. One read over the kept orders.
+    const orderIds = [...new Set(rows.map((row) => row.orderId))];
+    const leafFacts =
+      orderIds.length === 0
+        ? []
+        : ((await tx.execute(sql`
+            select ol.order_id as "orderId", ol.sku_id as "skuId", ol.qty::text as "qty",
+                   (ol.parent_line_id is not null) as "kitComponent",
+                   coalesce((select sum(p.qty) from picks p where p.tenant_id = ol.tenant_id and p.order_line_id = ol.id), 0)::bigint::text as "picked"
+            from order_lines ol
+            where ol.tenant_id = ${tenantId}::uuid
+              and ol.order_id = any(${sql.param(orderIds)}::uuid[])
+              and not exists (select 1 from order_lines c where c.tenant_id = ol.tenant_id and c.parent_line_id = ol.id)
+          `)) as unknown as { orderId: string; skuId: string; qty: string; picked: string; kitComponent: boolean }[]);
+    const orderedBySku = new Map<string, number>();
+    const shortOrders = new Set<string>();
+    for (const fact of leafFacts) {
+      const key = `${fact.orderId}:${fact.skuId}`;
+      orderedBySku.set(key, (orderedBySku.get(key) ?? 0) + Number(fact.qty));
+      // Code review C5 — "short" means a follow-on will be opened (A9): a
+      // plain line short by at least one base unit, or a kit component short
+      // at all (a kit counts whole kits). A weighed line picked 0.998 of 1 kg
+      // opens none, so the bench must not promise one.
+      const owed = Number(fact.qty) - Number(fact.picked);
+      if (fact.kitComponent ? owed > 0 : owed >= MIN_FOLLOW_ON_REMAINDER_MILLI) shortOrders.add(fact.orderId);
+    }
+
     const packTasks: PackTask[] = rows.map((row) => ({
       orderId: row.orderId,
       skuId: row.skuId,
@@ -1429,6 +1636,9 @@ export class OutboundFacade {
       orderPriority: row.orderPriority as OrderPriority,
       orderShipByDate: row.orderShipByDate,
       codAmountPaise: row.codAmountPaise,
+      orderedQty: fromMilli(orderedBySku.get(`${row.orderId}:${row.skuId}`) ?? Number(row.pickedQty)),
+      orderShortfall: shortOrders.has(row.orderId),
+      followOnSeq: row.followOnSeq,
     }));
 
     // Active units, id + skuId only (the bench resolves labels, nothing more).
@@ -1519,6 +1729,7 @@ export class OutboundFacade {
       select p.id as "id", p.created_at::text as "createdAt", p.warehouse_id as "warehouseId",
         p.order_id as "orderId", o.source as "orderSource", o.external_event_id as "orderExternalEventId",
         o.client_order_ref as "orderClientOrderRef",
+        o.follow_on_seq as "orderFollowOnSeq", o.follow_on_root_order_id as "orderFollowOnRootOrderId",
         p.sku_id as "skuId", s.code as "skuCode", s.name as "skuName", p.qty::text as "qtyMilli",
         b.code as "binCode", p.picked_by as "actorId"
       from picks p
@@ -1547,14 +1758,22 @@ export class OutboundFacade {
     if (distinct.length === 0) return new Map();
     const rows = (await tx.execute(sql`
       select o.id as "orderId", o.source as "source", o.external_event_id as "externalEventId",
-             o.client_order_ref as "clientOrderRef"
+             o.client_order_ref as "clientOrderRef",
+             o.follow_on_seq as "followOnSeq", o.follow_on_root_order_id as "followOnRootOrderId"
       from orders o
       where o.tenant_id = ${tenantId}::uuid and o.id = any(${sql.param(distinct)}::uuid[])
     `)) as unknown as OrderRef[];
     return new Map(
       rows.map((row) => [
         row.orderId,
-        { orderId: row.orderId, source: row.source, externalEventId: row.externalEventId, clientOrderRef: row.clientOrderRef },
+        {
+          orderId: row.orderId,
+          source: row.source,
+          externalEventId: row.externalEventId,
+          clientOrderRef: row.clientOrderRef,
+          followOnSeq: row.followOnSeq === null ? null : Number(row.followOnSeq),
+          followOnRootOrderId: row.followOnRootOrderId,
+        },
       ]),
     );
   }
@@ -1621,6 +1840,9 @@ export interface OrderRef {
   readonly externalEventId: string | null;
   /** Story 4-1b — the client's own order number; null when none. */
   readonly clientOrderRef: string | null;
+  /** Story 4-2c — the follow-on's `-BO{seq}` and the chain's root (the label's short id); null on a root. */
+  readonly followOnSeq: number | null;
+  readonly followOnRootOrderId: string | null;
 }
 
 /** Story 21-5b — one pick of a pick drill (quantity milli-units as text). */
@@ -1635,6 +1857,9 @@ export interface PickRecordRow {
   readonly orderExternalEventId: string | null;
   /** Story 4-1b — the order's client order number; null when none (or the order row is missing). */
   readonly orderClientOrderRef: string | null;
+  /** Story 4-2c — the order's `-BO{seq}` and its chain's root; null on a root (or a missing order row). */
+  readonly orderFollowOnSeq: number | null;
+  readonly orderFollowOnRootOrderId: string | null;
   readonly skuId: string;
   readonly skuCode: string;
   readonly skuName: string;

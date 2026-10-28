@@ -1541,6 +1541,107 @@ export class WebhookSenderWorker implements OnApplicationBootstrap, BeforeApplic
   }
 }
 
+/** `BACKORDER_ALLOCATION_POLL_MS` (story 4-2c): the backorder allocation sweep's poll; unset/`0` = OFF. */
+export function parseBackorderAllocationPollMs(raw: string | undefined): number {
+  return parsePollMs('BACKORDER_ALLOCATION_POLL_MS', raw);
+}
+
+/**
+ * Story 4-2c — the backorder allocation sweep worker. Each tick finds the
+ * tenants with an `accepted` order (cross-tenant, read-only,
+ * `AUTH_DATABASE` — the `orders_accepted_tenant_warehouse_idx` partial index)
+ * and calls `OutboundFacade.sweepBackorders(tenantId)`, which re-reserves the
+ * backordered lines that hold nothing when stock exists (at most 50 orders
+ * allocated and 500 scanned per tenant per tick, urgency first). A failing
+ * tenant is logged and retried next tick. Env-gated OFF when
+ * `BACKORDER_ALLOCATION_POLL_MS` is unset/`0` (`.env.example` 600000 — ten
+ * minutes); single-flight; `unref`'d timer.
+ *
+ * SAFE IN TWO WORKER PROCESSES: every write is the allocation's own phase 3
+ * under the order row lock — an orphan hold is adopted, a line is written
+ * only where it still names what the run read, and a grant is released only
+ * when no line references it — so two sweeps over one order end with one
+ * live hold on the line (pinned by the two-allocator race in
+ * `test/order-follow-on.spec.ts`).
+ */
+@Injectable()
+export class BackorderAllocationWorker implements OnApplicationBootstrap, BeforeApplicationShutdown, OnApplicationShutdown {
+  private readonly logger = new Logger('BackorderAllocationWorker');
+  private readonly pollMs: number;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private running = false;
+  private readonly ticks = new InFlightTick();
+
+  constructor(
+    @Inject(AUTH_DATABASE) private readonly authDb: Database,
+    @Inject(OutboundFacade) private readonly outbound: OutboundFacade,
+  ) {
+    this.pollMs = parseBackorderAllocationPollMs(process.env.BACKORDER_ALLOCATION_POLL_MS);
+  }
+
+  onApplicationBootstrap(): void {
+    if (this.pollMs === 0) {
+      return; // env-gated off
+    }
+    this.logger.log(`Backorder allocation worker started (poll every ${this.pollMs}ms)`);
+    this.ticks.track('backorder-allocation', this.pollMs);
+    this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
+    this.timer.unref?.();
+  }
+
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (!(await this.ticks.settle())) {
+      this.logger.warn('A tick was still running at the shutdown drain deadline');
+    }
+  }
+
+  onApplicationShutdown(): void {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  /** One cycle; returns the tenants it swept. */
+  async tick(): Promise<string[]> {
+    if (this.running) {
+      return [];
+    }
+    this.running = true;
+    try {
+      const tenants = (await this.authDb.execute(sql`
+        select distinct o.tenant_id as "tenantId"
+        from orders o
+        where o.status = 'accepted'
+        order by o.tenant_id asc
+      `)) as unknown as { tenantId: string }[];
+      const swept: string[] = [];
+      for (const { tenantId } of tenants) {
+        this.ticks.beat(); // one beat per tenant
+        try {
+          await this.outbound.sweepBackorders(tenantId);
+          swept.push(tenantId);
+        } catch (error) {
+          this.logger.error(
+            `Backorder allocation failed for tenant ${tenantId} — retried next tick: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      return swept;
+    } catch (error) {
+      this.logger.error(`Backorder allocation cycle failed: ${error instanceof Error ? error.message : String(error)}`);
+      return [];
+    } finally {
+      this.running = false;
+    }
+  }
+}
+
 /**
  * Story 9-2b — the wave cutoff sweep worker. Each tick finds the tenants with
  * a PLANNED wave under a policy that has a cutoff (cross-tenant, read-only,
@@ -2281,6 +2382,8 @@ export class AttachmentSweepWorker implements OnApplicationBootstrap, BeforeAppl
     AttachmentSweepWorker,
     // Story 5-2a — the client webhook sender (env-gated OFF by default).
     WebhookSenderWorker,
+    // Story 4-2c — the backorder allocation sweep (env-gated OFF by default).
+    BackorderAllocationWorker,
     // Story 6-2c (A10): the worker role's health-only listener (idle in the api role).
     WorkerHealthServer,
   ],

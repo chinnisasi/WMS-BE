@@ -4,6 +4,7 @@ import type { TenantTx } from '../../shared/db/tenant-scope';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { fromMilli } from '../../shared/primitives/quantity';
 import { ORDER_OPEN_STATUSES } from './client-wind-down';
+import { orderLabelSql } from './follow-on';
 
 /**
  * Story 3-7a — the outbound reads behind a batch recall's trace, delegated to
@@ -75,7 +76,7 @@ export async function orderTraceFactsByIdsInTx(tx: TenantTx, tenantId: string, o
   await rearmTxDeadline(tx);
   const rows = (await tx.execute(sql`
     select o.id::text as "orderId", o.warehouse_id::text as "warehouseId", o.client_id::text as "clientId", o.status as "status",
-           coalesce(o.client_order_ref, o.external_event_id, right(o.id::text, 8)) as "orderLabel",
+           ${orderLabelSql('o')} as "orderLabel",
            o.client_order_ref as "clientOrderRef",
            case when o.source = 'ingested' then o.external_event_id end as "channelOrderRef",
            o.consignee_legal_name as "consigneeLegalName", o.consignee_gstin as "consigneeGstin",

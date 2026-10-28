@@ -27,6 +27,7 @@ import {
 } from '../../shared/primitives/quantity';
 import { uomPrecision } from '../catalog/uom';
 import { canonicalInstant, nowIso } from '../../shared/primitives/time';
+import { orderLabelOf } from '../../shared/primitives/order-label';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
@@ -547,6 +548,21 @@ export class PackCommandService {
         const drawn = batchesByLine.get(row.orderLineId) ?? new Set<string | null>();
         drawn.add(row.batchId);
         batchesByLine.set(row.orderLineId, drawn);
+      }
+      // ── story 4-2c (decision 10): a zero-unit parcel is refused ─────────
+      // Every slice settled but nothing moved (every slice `unfulfillable`,
+      // or every short pick zero-unit): packing it would dispatch an empty
+      // parcel, bill a per-order charge and open a follow-on for everything.
+      // `cancelWave` frees the non-drawing lines, so the order re-waves once
+      // stock is allocated. (`picks` rows are strictly positive, so "no row"
+      // is "nothing picked".)
+      if (pickRows.length === 0) {
+        throw new ProblemException(
+          'pack-nothing-picked',
+          409,
+          'Nothing was picked for this order',
+          `Nothing was picked for order ${orderLabelOf(order)} — every pick line settled without drawing a unit. Cancel the wave to re-plan it, or cancel the order.`,
+        );
       }
 
       // ── the order's lines (one `pack.packed` event each) ────────────────

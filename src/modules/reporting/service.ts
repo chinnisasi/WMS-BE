@@ -256,6 +256,10 @@ async function lateNotDispatchedInTx(tx: TenantTx, scope: ServiceReportScope, wi
           and o.created_at >= ${ts(window.from)}
           and o.created_at < ${ts(window.to)}
           and o.status <> 'cancelled'
+          -- Story 4-2c (A15) — ROOT orders only: a follow-on waiting for the
+          -- client's stock is not the 3PL's late order (its root, which
+          -- dispatched, already counts as the client order).
+          and o.follow_on_of_order_id is null
           and o.created_at <= ${ts(window.asOf)} - make_interval(hours => ${SERVICE_TARGET_HOURS}::int)
           and not exists (
             select 1 from ledger_events le

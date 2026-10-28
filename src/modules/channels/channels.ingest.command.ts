@@ -306,11 +306,19 @@ export class ChannelsIngestCommand {
       throw channelConnectionNotFound();
     }
 
-    const order = await this.outbound.findOrderByChannelRef(
+    const root = await this.outbound.findOrderByChannelRef(
       tenantId,
       connectionId,
       parsed.orderRef,
     );
+    // Story 4-2c (A13) — a root that already DISPATCHED (short) may have an
+    // open backorder follow-on carrying the rest of the customer's order: the
+    // cancellation applies to it (at most one is open — a follow-on exists
+    // only after its parent dispatched). None → the root itself, which then
+    // answers `ignored` exactly as before.
+    const followOn =
+      root !== null && root.status === 'dispatched' ? await this.outbound.openFollowOnOfRoot(tenantId, root.id) : null;
+    const order = followOn ?? root;
     if (order === null) {
       await this.publish.recordIngestOutcome(tenantId, connectionId, {
         status: 'cancellation-unresolved',

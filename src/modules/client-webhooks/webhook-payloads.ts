@@ -149,6 +149,14 @@ export interface DispatchFact {
   readonly dispatchedAt: string;
   readonly carrierName: string | null;
   readonly trackingNumber: string | null;
+  /**
+   * Story 4-2c — the backorder chain, from the dispatch record (absent on a
+   * record stored before 4-2c → null): this order's parent and `-BO{seq}`
+   * when it is a follow-on, and the follow-on this dispatch opened.
+   */
+  readonly followOnOfOrderId: string | null;
+  readonly followOnSeq: number | null;
+  readonly followOnOrderId: string | null;
   readonly lines: readonly DispatchLineFact[];
 }
 
@@ -180,6 +188,9 @@ export function decodeDispatch(payload: unknown): DispatchFact | null {
     dispatchedAt,
     carrierName: stringOrNull(dispatch.carrierName),
     trackingNumber: stringOrNull(dispatch.trackingNumber),
+    followOnOfOrderId: uuidOf(dispatch.followOnOfOrderId),
+    followOnSeq: finite(dispatch.followOnSeq),
+    followOnOrderId: uuidOf(dispatch.followOnOrderId),
     lines,
   };
 }
@@ -292,6 +303,12 @@ export function dispatchData(fact: DispatchFact, labels: DispatchLabels): { data
       trackingNumber: fact.trackingNumber,
       // A sum across units: at the finest precision among the lines.
       totalUnits: formatQuantity(totalMilli, totalPrecision),
+      // Story 4-2c — CONDITIONAL keys (v1 stays byte-identical for an order
+      // that is no follow-on and shipped in full): a follow-on's dispatch
+      // names the order it ships the rest of and its place in the chain, and a
+      // short dispatch names the follow-on that will carry the remainder.
+      ...(fact.followOnOfOrderId === null ? {} : { backorderOf: fact.followOnOfOrderId, backorderSeq: fact.followOnSeq }),
+      ...(fact.followOnOrderId === null ? {} : { remainderOrderId: fact.followOnOrderId }),
     },
     lines,
   };

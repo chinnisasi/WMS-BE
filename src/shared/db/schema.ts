@@ -3180,6 +3180,24 @@ export const orders = pgTable(
     priority: text('priority').notNull().default('normal'),
     shipByDate: date('ship_by_date', { mode: 'string' }),
     codAmountPaise: bigint('cod_amount_paise', { mode: 'number' }),
+    /**
+     * Story 4-2c — the backorder follow-on link (migration 0104, hand-written
+     * NOT VALID CHECK `orders_follow_on_pairing`: all three null, or all three
+     * set with `follow_on_seq >= 1`). A follow-on is the order a SHORT dispatch
+     * opens for the unshipped remainder:
+     * - `follow_on_of_order_id`: the parent (the order whose dispatch shipped
+     *   short) — one follow-on per parent (`orders_follow_on_of_unique`);
+     * - `follow_on_root_order_id`: the chain's ROOT (the client's original
+     *   order) — the label's short id and the channel cancel's routing;
+     * - `follow_on_seq`: 1 for the root's follow-on, 2 for that one's, … —
+     *   the label suffix `-BO{seq}`.
+     * Null on every root order. A follow-on copies its root's identity
+     * (client number, channel event), so the two identity indexes count
+     * ROOT orders only.
+     */
+    followOnOfOrderId: uuid('follow_on_of_order_id'),
+    followOnRootOrderId: uuid('follow_on_root_order_id'),
+    followOnSeq: integer('follow_on_seq'),
     ...tenantTimestamps,
   },
   (table) => [
@@ -3203,16 +3221,23 @@ export const orders = pgTable(
     // Channel-order dedup (AD-5): one order per (tenant, integration,
     // external event id) — partial, so manual orders (null channel arms)
     // never participate.
-    uniqueIndex('orders_source_event_unique')
+    // Story 4-2c (0104) — ROOT orders only: a backorder follow-on copies its
+    // root's channel event, so the index (renamed from
+    // `orders_source_event_unique` — never a same-name rebuild) says "one
+    // ROOT order per channel event".
+    uniqueIndex('orders_source_event_root_unique')
       .on(table.tenantId, table.integrationId, table.externalEventId)
-      .where(sql`integration_id is not null and external_event_id is not null`),
+      .where(sql`integration_id is not null and external_event_id is not null and follow_on_of_order_id is null`),
     // Story 4-1b (0088) — a client order number is unique per client among
     // its live orders (a cancelled order frees it). The ref leads, so the
     // same index serves the duplicate check and the `reference` search's
     // live arm (which states both predicates).
-    uniqueIndex('orders_client_order_ref_live_unique')
+    // Story 4-2c (0104) — ROOT orders only (renamed from
+    // `orders_client_order_ref_live_unique`): a follow-on carries its root's
+    // number, and the root holds it.
+    uniqueIndex('orders_client_order_ref_live_root_unique')
       .on(table.tenantId, table.clientOrderRef, table.clientId)
-      .where(sql`client_order_ref is not null and status <> 'cancelled'`),
+      .where(sql`client_order_ref is not null and status <> 'cancelled' and follow_on_of_order_id is null`),
     // Story 4-1b (0088, code review BH5) — the `reference` search's
     // client-number arm, ANY status (the unique index above leaves cancelled
     // orders out, so a cancelled order would be unfindable by its number).
@@ -3230,6 +3255,20 @@ export const orders = pgTable(
     index('orders_tenant_client_open_idx')
       .on(table.tenantId, table.clientId, table.warehouseId)
       .where(sql`"status" IN ('accepted','ready_to_dispatch')`),
+    // Story 4-2c (0104) — one follow-on per parent: the dispatch race backstop.
+    uniqueIndex('orders_follow_on_of_unique')
+      .on(table.tenantId, table.followOnOfOrderId)
+      .where(sql`follow_on_of_order_id is not null`),
+    // Story 4-2c (0104) — a chain's follow-ons by their root (the channel
+    // cancellation's routing, the parent's `followOnOrderId` lookup).
+    index('orders_follow_on_root_idx')
+      .on(table.tenantId, table.followOnRootOrderId)
+      .where(sql`follow_on_root_order_id is not null`),
+    // Story 4-2c (0104) — the backorder allocation sweep's driving index:
+    // the accepted orders of a warehouse.
+    index('orders_accepted_tenant_warehouse_idx')
+      .on(table.tenantId, table.warehouseId, table.createdAt, table.id)
+      .where(sql`status = 'accepted'`),
   ],
 );
 

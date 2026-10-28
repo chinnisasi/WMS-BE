@@ -279,6 +279,11 @@ const OUTBOUND_COLUMNS: readonly ExportColumn[] = [
   text('priority'),
   date('ship_by_date'),
   number('cod_amount_paise'),
+  // Story 4-2c — the backorder link, appended at the END (every earlier
+  // position unchanged): the parent order a follow-on ships the remainder of,
+  // and its place in the chain (`-BO{seq}`); blank on a root order.
+  text('follow_on_of_order_id'),
+  number('follow_on_seq'),
 ];
 
 const outboundRegister: RegisterDefinition = {
@@ -323,6 +328,8 @@ const outboundRegister: RegisterDefinition = {
         // instant, so the IST midnight that begins it.
         row.shipByDate === null ? null : new Date(istMidnightOf(row.shipByDate)),
         row.codAmountPaise,
+        row.followOnOfOrderId,
+        row.followOnSeq,
       ];
     });
   },

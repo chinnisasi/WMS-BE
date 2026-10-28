@@ -614,7 +614,8 @@ describe('order fields (e2e, story 4-2a)', () => {
       const at = (name: string) => header!.indexOf(name);
       const row = csvRows.find((r) => r[at('order_id')] === orderId)!;
       expect([row[at('order_type')], row[at('priority')], row[at('ship_by_date')], row[at('cod_amount_paise')]]).toEqual(['b2c', 'high', today, '149900']);
-      expect(header!.slice(-4)).toEqual(['order_type', 'priority', 'ship_by_date', 'cod_amount_paise']);
+      // Story 4-2c appends the two backorder-link columns after the four.
+      expect(header!.slice(-6)).toEqual(['order_type', 'priority', 'ship_by_date', 'cod_amount_paise', 'follow_on_of_order_id', 'follow_on_seq']);
     });
 
     it('A12: portal urgent is 400 — the warehouse sets urgent; normal and high are the portal’s', async () => {

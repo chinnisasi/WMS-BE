@@ -20,6 +20,7 @@ import { OUTBOX_MAX_ATTEMPTS } from '../src/shared/events/outbox';
 import { testAddress } from './support/shipment-address';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { mintSignIn } from './support/sign-in';
+import { declareChannelNoOps } from './support/audit-guard';
 
 // The e2e suite talks to the real Postgres + Valkey and signs sessions; the
 // vault needs a real master key (any ≥32-char string).
@@ -376,7 +377,13 @@ describe('channel writeback: source filter, dedupe, convergence, echo, decouplin
   }
 
   /** Walks the wave → pick → pack → dispatch flow for one order. */
-  async function flowToFulfilment(orderId: string, codes: { code: string; quantity: number }[], options: { dispatch?: boolean } = {}): Promise<void> {
+  async function flowToFulfilment(
+    orderId: string,
+    codes: { code: string; quantity: number }[],
+    // Story 4-2c — `short` picks a SKU's line below its plan (the picked
+    // quantity; `codes` then names what is packed).
+    options: { dispatch?: boolean; short?: Record<string, number> } = {},
+  ): Promise<void> {
     const policyId = (
       await request(app.getHttpServer())
         .post(`${API}/${tenantId}/outbound/wave-policies`)
@@ -409,6 +416,11 @@ describe('channel writeback: source filter, dedupe, convergence, echo, decouplin
         lines: { id: string; picklistId: string; skuId: string; binId: string | null; qty: number }[];
       }[];
     };
+    const shortPick = (skuId: string, planned: number): { qty: number; reasonCode?: string } => {
+      const code = [...skuIds].find(([, id]) => id === skuId)?.[0];
+      const picked = code === undefined ? undefined : options.short?.[code];
+      return picked === undefined || picked >= planned ? { qty: planned } : { qty: picked, reasonCode: 'fewer-units-than-planned' };
+    };
     for (const picklist of wave.picklists) {
       for (const line of picklist.lines) {
         await request(app.getHttpServer())
@@ -421,7 +433,7 @@ describe('channel writeback: source filter, dedupe, convergence, echo, decouplin
             picklistLineId: line.id,
             skuId: line.skuId,
             binId: line.binId!,
-            qty: line.qty,
+            ...shortPick(line.skuId, line.qty),
             occurredAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
           })
           .expect(201);
@@ -922,6 +934,111 @@ describe('channel writeback: source filter, dedupe, convergence, echo, decouplin
     await drainAll();
     expect(WRITEBACK_STATES.get(String(ref))?.fulfillments.size ?? 0).toBe(0);
     expect((await writebackRows(connId)).length).toBe(before);
+    await clearOutbox();
+  });
+
+  // ── story 4-2c — the short shipment and its follow-on ──────────────────────
+
+  it('story 4-2c / AC4: a short shipment writes back the SHIPPED quantity (7 of 10 → 7), never the ordered; the follow-on\'s own pack and dispatch write NOTHING back (no call, no meter row)', async () => {
+    const ref = 8_300_000_000_020;
+    await putMappings(MAPPED_CODES.map((code) => ({ externalRef: code, skuId: skuIds.get(code)! }))).expect(200);
+    const orderId = await ingestRef(connId, 'test-writeback', ref, 'WB-C', 10);
+    await flowToFulfilment(orderId, [{ code: 'WB-C', quantity: 7 }], { short: { 'WB-C': 7 } });
+    await drainAll();
+    const state = WRITEBACK_STATES.get(String(ref))!;
+    expect(state.fulfillments.size).toBe(1);
+    expect((state.postedLines ?? []).map((line) => [line.externalRef, line.quantity])).toEqual(
+      (state.postedLines ?? []).map(() => ['WB-C', 7]),
+    );
+    expect(state.postedLines!.length).toBeGreaterThanOrEqual(1);
+
+    // The follow-on: the root's channel identity, roots-only reads resolve the root.
+    const root = (await outbound.findOrderByChannelRef(tenantId, connId, String(ref)))!;
+    expect(root.id).toBe(orderId);
+    const followOnId = root.followOnOrderId!;
+    expect(followOnId).toEqual(expect.any(String));
+    const followOn = (await outbound.getOrder(tenantId, followOnId))!;
+    expect(followOn).toMatchObject({ source: 'ingested', integrationId: connId, externalEventId: String(ref), followOnSeq: 1 });
+    // The after-dispatch attempt reserved the 3 still on the shelf; ship them.
+    expect(followOn.lines.map((line) => line.reservedQty)).toEqual([3]);
+    const callsBefore = (await writebackRows(connId)).length;
+    const postedBefore = state.postedLines!.length;
+    await flowToFulfilment(followOnId, [{ code: 'WB-C', quantity: 3 }]);
+    await drainAll();
+    expect(await orderStatus(followOnId)).toBe('dispatched');
+    expect((await writebackRows(connId)).length).toBe(callsBefore);
+    expect(state.postedLines!.length).toBe(postedBefore);
+    expect(state.fulfillments.size).toBe(1);
+    await clearOutbox();
+  });
+
+  it('story 4-2c (A13): a channel cancellation after a short ship cancels the OPEN follow-on (released); the root stays dispatched; the follow-on\'s cancel writes nothing back', async () => {
+    const ref = 8_300_000_000_021;
+    await putMappings(MAPPED_CODES.map((code) => ({ externalRef: code, skuId: skuIds.get(code)! }))).expect(200);
+    const orderId = await ingestRef(connId, 'test-writeback', ref, 'WB-C', 4);
+    await flowToFulfilment(orderId, [{ code: 'WB-C', quantity: 1 }], { short: { 'WB-C': 1 } });
+    await drainAll();
+    const followOnId = (await outbound.getOrder(tenantId, orderId))!.followOnOrderId!;
+    expect(await orderStatus(followOnId)).toBe('accepted');
+    const callsBefore = (await writebackRows(connId)).length;
+    const res = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/webhooks/channels/test-writeback/${connId}/cancellations`)
+      .set(HMAC_HEADER, sign(cancelBodyText(ref)))
+      .set(TOPIC_HEADER, 'orders/cancelled')
+      .set('Content-Type', 'application/json')
+      .send(cancelBodyText(ref))
+      .expect(200);
+    expect(res.body.outcome).toBe('released');
+    expect(await orderStatus(followOnId)).toBe('cancelled');
+    expect(await orderStatus(orderId)).toBe('dispatched');
+    const followOn = (await outbound.getOrder(tenantId, followOnId))!;
+    expect(followOn.lines.map((line) => [line.reservedQty, line.reservationId])).toEqual([[0, null]]);
+    await drainAll();
+    // The follow-on's order.cancelled acks with no call: the customer's
+    // channel order is never cancelled by the remainder's cancel.
+    expect(WRITEBACK_STATES.get(String(ref))!.cancelled).toBe(false);
+    expect((await writebackRows(connId)).length).toBe(callsBefore);
+    // A second cancellation finds no open follow-on: the root answers ignored, as before.
+    const again = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/webhooks/channels/test-writeback/${connId}/cancellations`)
+      .set(HMAC_HEADER, sign(cancelBodyText(ref)))
+      .set(TOPIC_HEADER, 'orders/cancelled')
+      .set('Content-Type', 'application/json')
+      .send(cancelBodyText(ref))
+      .expect(200);
+    expect(again.body.outcome).toBe('ignored');
+    await clearOutbox();
+  });
+
+  it('story 4-2c ("Channel redelivery", A15): a redelivery after a follow-on exists resolves to the ROOT (no third order); SM-4 counts the root only', async () => {
+    const ref = 8_300_000_000_022;
+    await putMappings(MAPPED_CODES.map((code) => ({ externalRef: code, skuId: skuIds.get(code)! }))).expect(200);
+    const orderId = await ingestRef(connId, 'test-writeback', ref, 'WB-C', 2);
+    await flowToFulfilment(orderId, [{ code: 'WB-C', quantity: 1 }], { short: { 'WB-C': 1 } });
+    const again = await ingestRef(connId, 'test-writeback', ref, 'WB-C', 2);
+    expect(again).toBe(orderId);
+    await declareChannelNoOps(tenantId, orderId, 'orders.createOrder:channel-redelivery');
+    const sqlh = await sqlHandle();
+    try {
+      const chain = (await sqlh`select id from orders where tenant_id = ${tenantId} and integration_id = ${connId} and external_event_id = ${String(ref)}`) as unknown as { id: string }[];
+      expect(chain).toHaveLength(2);
+      // The follow-on is ingested with every line backordered, yet SM-4
+      // ("channel orders accepted with a backordered line") counts roots only.
+      const overview = await request(app.getHttpServer()).get(`${API}/${tenantId}/warehouses/${warehouseId}/reporting/overview`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
+      const roots = (await sqlh`
+        select count(*)::int as n from orders o
+        where o.tenant_id = ${tenantId} and o.warehouse_id = ${warehouseId} and o.source = 'ingested' and o.follow_on_of_order_id is null
+          and exists (select 1 from order_lines ol where ol.order_id = o.id and ol.status = 'backordered')`) as unknown as { n: number }[];
+      const all = (await sqlh`
+        select count(*)::int as n from orders o
+        where o.tenant_id = ${tenantId} and o.warehouse_id = ${warehouseId} and o.source = 'ingested'
+          and exists (select 1 from order_lines ol where ol.order_id = o.id and ol.status = 'backordered')`) as unknown as { n: number }[];
+      expect(all[0]!.n).toBeGreaterThan(roots[0]!.n);
+      expect(overview.body.tiles.oversell.backorderedOrders.d7.value).toBe(roots[0]!.n);
+      expect(overview.body.tiles.oversell.backorderedOrders.d7.drill.query).toMatchObject({ source: 'ingested', backordered: 'true', followOn: 'false' });
+    } finally {
+      await sqlh.end();
+    }
     await clearOutbox();
   });
 });

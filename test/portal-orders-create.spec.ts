@@ -610,6 +610,12 @@ describe('portal order entry (e2e, story 4-1a)', () => {
         'codAmountPaise',
         'destination',
         'clientId',
+        // Story 4-2c (A14) — the backorder chain, appended deliberately after
+        // `clientId` (null on a root; the hash above is unchanged).
+        'followOnOfOrderId',
+        'followOnRootOrderId',
+        'followOnSeq',
+        'followOnOrderId',
         'createdAt',
         'updatedAt',
         'lines',

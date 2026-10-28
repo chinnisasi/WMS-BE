@@ -39,7 +39,7 @@ export function parseProcessRole(raw: string | undefined): ProcessRole {
 }
 
 /**
- * The fourteen job switches (`jobs.module.ts`), each env-gated by its own
+ * The seventeen job switches (`jobs.module.ts`), each env-gated by its own
  * `*_POLL_MS` (unset or `0` = off).
  */
 export const JOB_POLL_VARIABLES = [
@@ -60,6 +60,8 @@ export const JOB_POLL_VARIABLES = [
   'ATTACHMENT_SWEEP_POLL_MS',
   // Story 5-2a — the client webhook sender.
   'WEBHOOK_SEND_POLL_MS',
+  // Story 4-2c — the backorder allocation sweep.
+  'BACKORDER_ALLOCATION_POLL_MS',
 ] as const;
 
 /** The job switches set to anything other than off (unset, empty or a numeric 0). */

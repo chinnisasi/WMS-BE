@@ -1,5 +1,6 @@
 import { sql, type SQL } from 'drizzle-orm';
 import type { AnyColumn } from 'drizzle-orm';
+import { stripFollowOnSuffix } from './follow-on';
 
 /**
  * Story 4-1b — the `reference` search's one predicate, shared by the staff
@@ -29,11 +30,20 @@ export function orderReferenceMatch(
   clientId?: string,
 ): SQL {
   const client = clientId === undefined ? sql`` : sql` and r.client_id = ${clientId}::uuid`;
+  // Story 4-2c (A10) — a printed follow-on label (`1042-BO1`) is searched as
+  // typed: the reference AND, when it ends in `-BO{n}`, the reference without
+  // it. A follow-on carries its root's number, so the stripped value finds the
+  // whole chain (root and every follow-on); the raw value still finds a client
+  // number that genuinely ends in `-BO1`. Each arm stays an index probe
+  // (an equality, or an `in` of the two, on the leading column).
+  const stripped = stripFollowOnSuffix(reference);
+  const matches = (column: SQL): SQL =>
+    stripped === null ? sql`${column} = ${reference}::text` : sql`${column} in (${reference}::text, ${stripped}::text)`;
   return sql`${idColumn} = any(array(
     select r.id from orders r
-     where r.tenant_id = ${tenantId}::uuid and r.client_order_ref = ${reference}::text${client}
+     where r.tenant_id = ${tenantId}::uuid and ${matches(sql`r.client_order_ref`)}${client}
     union all
     select r.id from orders r
-     where r.tenant_id = ${tenantId}::uuid and r.external_event_id = ${reference}::text${client}
+     where r.tenant_id = ${tenantId}::uuid and ${matches(sql`r.external_event_id`)}${client}
   ))`;
 }

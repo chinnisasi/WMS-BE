@@ -91,6 +91,22 @@ describe('webhook payloads (story 5-2a)', () => {
     );
   });
 
+  it('story 4-2c: the backorder keys are CONDITIONAL — a short dispatch names the remainder order; a follow-on names the order it completes and its seq; a plain order is byte-identical (the golden above)', () => {
+    const REMAINDER = '019a0000-0000-7000-8000-0000000000b2';
+    const short = decodeDispatch({ dispatch: { ...dispatchPayload.dispatch, followOnOrderId: REMAINDER, followOnOfOrderId: null, followOnSeq: null } })!;
+    const shortData = dispatchData(short, { warehouseCode: 'BLR-1', skus, kitParentLineIds: new Set([L2]) }).data;
+    expect(Object.keys(shortData).slice(-2)).toEqual(['totalUnits', 'remainderOrderId']);
+    expect(shortData.remainderOrderId).toBe(REMAINDER);
+    expect(shortData).not.toHaveProperty('backorderOf');
+    const followOn = decodeDispatch({ dispatch: { ...dispatchPayload.dispatch, orderId: REMAINDER, followOnOrderId: null, followOnOfOrderId: ORDER, followOnSeq: 1 } })!;
+    const followData = dispatchData(followOn, { warehouseCode: 'BLR-1', skus, kitParentLineIds: new Set() }).data;
+    expect(Object.keys(followData).slice(-3)).toEqual(['totalUnits', 'backorderOf', 'backorderSeq']);
+    expect([followData.backorderOf, followData.backorderSeq]).toEqual([ORDER, 1]);
+    // A record stored before 4-2c (no keys at all) decodes to nulls and adds nothing.
+    const legacy = dispatchData(decodeDispatch(dispatchPayload)!, { warehouseCode: 'BLR-1', skus, kitParentLineIds: new Set() }).data;
+    for (const key of ['backorderOf', 'backorderSeq', 'remainderOrderId']) expect(legacy).not.toHaveProperty(key);
+  });
+
   it('order.dispatched never carries the consignee, COD, the dispatcher, reservations or internal ids', () => {
     const body = buildWebhookBody(head, dispatchData(decodeDispatch(dispatchPayload)!, { warehouseCode: 'BLR-1', skus, kitParentLineIds: new Set() }))!;
     for (const leak of ['codAmountPaise', 'dispatchedBy', 'retiredReservationIds', 'ledgerEventId', 'orderLineId', 'skuId', 'tenantId', 'warehouseId', 'orderType', '125000']) {

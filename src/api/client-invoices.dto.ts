@@ -265,6 +265,12 @@ export class OrderRefDto {
   @ApiProperty({ type: String, nullable: true, maxLength: 64, pattern: '^[!-~]([ -~]{0,62}[!-~])?$', description: "Story 4-1b — the client's own order number; null when none (or when the order row is missing)" })
   clientOrderRef!: string | null;
 
+  @ApiProperty({ type: Number, nullable: true, required: false, description: "Story 4-2c — a backorder follow-on's place in its chain (the label's `-BO{seq}`); null on a root order. Absent on a response built before 4-2c — read absent as null" })
+  followOnSeq?: number | null;
+
+  @ApiProperty({ type: String, format: 'uuid', nullable: true, required: false, description: "Story 4-2c — a follow-on's chain root (the label's short id when the order has no number); null on a root order" })
+  followOnRootOrderId?: string | null;
+
   @ApiProperty({ format: 'uuid' })
   orderId!: string;
 }
