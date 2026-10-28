@@ -974,7 +974,7 @@ export class PicklistLineDto {
     type: 'integer',
     nullable: true,
     required: false,
-    description: "Story 4-3b — the SKU's total shelf life in days that the percent rule is of (the CURRENT catalog value — display only); null without a percent rule or a shelf life",
+    description: "Story 4-3b — the SKU's total shelf life in days the percent rule was converted from at plan (frozen with it); null without a percent rule or a shelf life",
   })
   consigneeShelfLifeBaseDays?: number | null;
 
@@ -2831,6 +2831,17 @@ export class OrderShelfLifeConsigneeDto {
   minShelfLifePercent!: number | null;
 }
 
+export class OrderShelfLifeResolvedPartnerDto {
+  @ApiProperty({ format: 'uuid' })
+  partnerId!: string;
+
+  @ApiProperty()
+  code!: string;
+
+  @ApiProperty({ description: 'The partner display name' })
+  name!: string;
+}
+
 export class OrderShelfLifeLineDto {
   @ApiProperty({ format: 'uuid' })
   orderLineId!: string;
@@ -2861,10 +2872,16 @@ export class OrderShelfLifeLineDto {
   })
   judgeable!: boolean;
 
-  @ApiProperty({ description: "Base units on hand in the order's warehouse's pickable bins that meet every rule, if waved today (other orders' claims ignored)" })
+  @ApiProperty({
+    description:
+      "Base units on hand in the order's warehouse's pickable bins that meet every rule, if waved today (other orders' claims ignored) — per line, after the earlier lines of the same SKU (in line order) have taken their reserved units",
+  })
   qualifyingOnHand!: number;
 
-  @ApiProperty({ description: 'qualifyingOnHand minus the units other open planned picklist lines already claim' })
+  @ApiProperty({
+    description:
+      "What still qualifies after other open lines' claims are spent in rank order (not qualifyingOnHand minus claims); this order's own lines are not claims. Per line, after the earlier lines of the same SKU",
+  })
   qualifyingUnclaimed!: number;
 
   @ApiProperty({ description: "Base units the client rule allows but the consignee's rule does not (undated or unattributed stock of a batch-tracked SKU included)" })
@@ -2896,6 +2913,16 @@ export class OrderShelfLifeDto {
       "Why the consignee rule did or did not apply: no-gstin (the order names no consignee GSTIN), no-partner (no partner holds that GSTIN), no-consignee-link (the partner has no consignee link to the order's client), no-rule (the link sets no minimum), applied",
   })
   consigneeResolution!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: "The order's consignee GSTIN as stored; null when none" })
+  consigneeGstin!: string | null;
+
+  @ApiProperty({
+    type: OrderShelfLifeResolvedPartnerDto,
+    nullable: true,
+    description: 'The partner holding that GSTIN (any status) — set for no-consignee-link, no-rule and applied; null otherwise',
+  })
+  resolvedPartner!: OrderShelfLifeResolvedPartnerDto | null;
 
   @ApiProperty({ type: OrderShelfLifeConsigneeDto, nullable: true, description: 'The consignee whose rule applies; null unless consigneeResolution is applied' })
   consignee!: OrderShelfLifeConsigneeDto | null;

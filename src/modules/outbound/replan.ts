@@ -291,8 +291,8 @@ export async function findReplanSlices(
      * pre-4-3b line) and whether the SKU is batch-tracked (an untracked SKU
      * is never limited by it). Judged on the same `minJudgedOn`.
      */
-    readonly consignee?: ConsigneeArm | null;
-    readonly batchTracked?: boolean;
+    readonly consignee: ConsigneeArm | null;
+    readonly batchTracked: boolean;
   },
 ): Promise<ReplanSlice[]> {
   if (scope.need <= 0) {
@@ -350,7 +350,7 @@ export async function findReplanSlices(
   // the claims are spent against every slot in rank order (what a pick would
   // draw), and only then is a non-qualifying slot skipped. Folding the arm
   // into `policyOf` instead would spend claims against qualifying slots only.
-  const consignee = scope.consignee ?? null;
+  const consignee = scope.consignee;
   const batchById = new Map(batchIdentities.map((batch) => [batch.id, batch]));
   const slices: ReplanSlice[] = [];
   let need = scope.need;
@@ -361,7 +361,7 @@ export async function findReplanSlices(
       consignee !== null &&
       !meetsConsigneeShelfLife(
         { batchId: slot.batchId, expiryDate: slot.batchId === null ? null : (batchById.get(slot.batchId)?.expiryDate ?? null) },
-        scope.batchTracked ?? true,
+        scope.batchTracked,
         scope.at,
         consignee,
         scope.minJudgedOn,
@@ -387,13 +387,11 @@ export async function findReplanSlices(
  * lines are terminal records of draws that already happened, `unfulfillable`
  * names no bin, and `cancelled` lines were withdrawn.
  */
-export async function openClaimsInTx(
+async function openClaimsInTx(
   tx: TenantTx,
   tenantId: string,
   skuId: string,
   binIds: readonly string[],
-  /** Story 4-3b (A8) — the order read leaves out its OWN order's claims. */
-  excludeOrderId?: string,
 ): Promise<Map<string, number>> {
   if (binIds.length === 0) {
     return new Map();
@@ -411,13 +409,53 @@ export async function openClaimsInTx(
         eq(picklistLines.skuId, skuId),
         eq(picklistLines.status, 'planned'),
         inArray(picklistLines.binId, [...binIds]),
-        excludeOrderId === undefined ? undefined : ne(picklistLines.orderId, excludeOrderId),
       ),
     )
     .groupBy(picklistLines.binId);
   return new Map(
     rows.flatMap((row) => (row.binId === null ? [] : [[row.binId, Number(row.claimed)] as const])),
   );
+}
+
+/**
+ * Story 4-3b (A8) — `openClaimsInTx` for a SET of SKUs in ONE statement (the
+ * order read): skuId → binId → claimed milli-units, `planned` lines only, an
+ * order's own lines excluded.
+ */
+export async function openClaimsBySkuInTx(
+  tx: TenantTx,
+  tenantId: string,
+  skuIds: readonly string[],
+  binIds: readonly string[],
+  excludeOrderId: string,
+): Promise<Map<string, Map<string, number>>> {
+  const result = new Map<string, Map<string, number>>();
+  if (skuIds.length === 0 || binIds.length === 0) return result;
+  const rows = await tx
+    .select({
+      skuId: picklistLines.skuId,
+      binId: picklistLines.binId,
+      // Story 10.1: `::bigint` (milli-units overflow int4 at ~2.1M base units).
+      claimed: sql<string>`coalesce(sum(${picklistLines.qty}), 0)::bigint`,
+    })
+    .from(picklistLines)
+    .where(
+      and(
+        eq(picklistLines.tenantId, tenantId),
+        inArray(picklistLines.skuId, [...new Set(skuIds)]),
+        eq(picklistLines.status, 'planned'),
+        inArray(picklistLines.binId, [...binIds]),
+        ne(picklistLines.orderId, excludeOrderId),
+      ),
+    )
+    .groupBy(picklistLines.skuId, picklistLines.binId);
+  for (const row of rows) {
+    if (row.binId === null) continue;
+    const bySku = result.get(row.skuId) ?? new Map<string, number>();
+    bySku.set(row.binId, Number(row.claimed));
+    result.set(row.skuId, bySku);
+  }
+  return result;
 }
 
 /**

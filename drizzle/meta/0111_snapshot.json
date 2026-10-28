@@ -1,5 +1,5 @@
 {
-  "id": "07cb2391-04c7-4cbf-94be-e660f2a685fc",
+  "id": "937ab4a2-bb69-4e54-935e-82256abc2f16",
   "prevId": "4a9caf71-100c-4693-9694-90578daae05e",
   "version": "7",
   "dialect": "postgresql",
@@ -12647,6 +12647,12 @@
         "consignee_min_shelf_life_percent": {
           "name": "consignee_min_shelf_life_percent",
           "type": "smallint",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "consignee_shelf_life_base_days": {
+          "name": "consignee_shelf_life_base_days",
+          "type": "integer",
           "primaryKey": false,
           "notNull": false
         },

@@ -4011,6 +4011,13 @@ export const picklistLines = pgTable(
     consigneeMinShelfLifeDays: integer('consignee_min_shelf_life_days'),
     consigneeMinShelfLifePercent: smallint('consignee_min_shelf_life_percent'),
     /**
+     * Story 4-3b (A2) — the SKU's TOTAL shelf life (days) the percent was
+     * converted from, FROZEN with it (so the wave row shows the base USED,
+     * not today's catalog value). Set only beside a percent rule on a SKU
+     * that had a base; null otherwise (CHECKs in migration 0111).
+     */
+    consigneeShelfLifeBaseDays: integer('consignee_shelf_life_base_days'),
+    /**
      * Story 4-3b (A6) — why the planner left this `unfulfillable` slice short:
      * `consignee-shelf-life | consignee-unjudgeable` (`SHORTFALL_CAUSES`), or
      * null (no stock at all — the pre-4-3b meaning). Value-only CHECK

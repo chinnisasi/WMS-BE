@@ -501,6 +501,11 @@ describe('architecture: catalog identity is catalog-module-owned (story 10.3)', 
     }
     // The guard bites.
     expect(importsOf('meetsConsigneeShelfLife').test("import { rankSlots } from '../../shared/primitives/batch-allocation';")).toBe(false);
+    // The order read's `applied` arm is the planner's own match — one definition.
+    const planMatch = /import\s*\{[^}]*\bconsigneeShelfLifeRulesInTx\b[^}]*\}\s*from\s*['"]\.\.\/partners\/partners\.facade['"]/;
+    for (const file of ['modules/outbound/wave.command.ts', 'modules/outbound/order-shelf-life.ts']) {
+      expect({ file, planMatch: planMatch.test(readFileSync(join(SRC_ROOT, file), 'utf8')) }).toEqual({ file, planMatch: true });
+    }
   });
 
   it('story 3-3a: inventory reads catalog `batches` in ONE file, locate-only (status + expiry), and the block verb writes them', () => {

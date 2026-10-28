@@ -109,7 +109,7 @@ describe('story 4-3b: consigneeArmOf — the one reading of a line (A3)', () => 
 });
 
 describe('story 4-3b (A5): every picklist_lines insert row carries every key', () => {
-  const base: Omit<PlannedSlice, 'consigneePartnerId' | 'consigneeMinShelfLifeDays' | 'consigneeMinShelfLifePercent' | 'shortfallCause'> = {
+  const base: Omit<PlannedSlice, 'consigneePartnerId' | 'consigneeMinShelfLifeDays' | 'consigneeMinShelfLifePercent' | 'consigneeShelfLifeBaseDays' | 'shortfallCause'> = {
     orderId: 'o1',
     orderLineId: 'ol1',
     skuId: 's1',
@@ -125,12 +125,12 @@ describe('story 4-3b (A5): every picklist_lines insert row carries every key', (
     minOutboundShelfLifeDays: null,
   };
 
-  it('a row with no consignee rule and one with a rule have the same 22 keys → 2,978 rows per statement', () => {
+  it('a row with no consignee rule and one with a rule have the same 23 keys → 2,849 rows per statement', () => {
     const rows = picklistLineValues('t', 'w', [
       {
         picklistId: 'p1',
         slices: [
-          { ...base, consigneePartnerId: null, consigneeMinShelfLifeDays: null, consigneeMinShelfLifePercent: null, shortfallCause: null },
+          { ...base, consigneePartnerId: null, consigneeMinShelfLifeDays: null, consigneeMinShelfLifePercent: null, consigneeShelfLifeBaseDays: null, shortfallCause: null },
           {
             ...base,
             orderLineId: 'ol2',
@@ -142,6 +142,7 @@ describe('story 4-3b (A5): every picklist_lines insert row carries every key', (
             consigneePartnerId: 'cp',
             consigneeMinShelfLifeDays: null,
             consigneeMinShelfLifePercent: 70,
+            consigneeShelfLifeBaseDays: null,
             shortfallCause: 'consignee-unjudgeable',
           },
         ],
@@ -150,10 +151,10 @@ describe('story 4-3b (A5): every picklist_lines insert row carries every key', (
     expect(rows).toHaveLength(2);
     const keys = rows.map((row) => Object.keys(row).sort());
     expect(keys[0]).toEqual(keys[1]);
-    expect(keys[0]).toHaveLength(22);
+    expect(keys[0]).toHaveLength(23);
     expect(keys[0]).toEqual(
-      expect.arrayContaining(['consigneePartnerId', 'consigneeMinShelfLifeDays', 'consigneeMinShelfLifePercent', 'shortfallCause']),
+      expect.arrayContaining(['consigneePartnerId', 'consigneeMinShelfLifeDays', 'consigneeMinShelfLifePercent', 'consigneeShelfLifeBaseDays', 'shortfallCause']),
     );
-    expect(bindChunkRows(Object.keys(rows[0]!).length, 65_535)).toBe(2_978);
+    expect(bindChunkRows(Object.keys(rows[0]!).length, 65_535)).toBe(2_849);
   });
 });

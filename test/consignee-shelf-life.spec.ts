@@ -14,6 +14,11 @@ import {
   SHORTFALL_CAUSES,
 } from '../src/shared/primitives/batch-allocation';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
+import { batchExpiryClock } from '../src/shared/primitives/batch-expiry';
+import { WAVE_CLOCK, type WaveClock } from '../src/modules/outbound/wave.clock';
+import { withTenantTransaction } from '../src/shared/db/tenant-scope';
+import type { Database } from '../src/shared/db/db';
+import { consigneeRuleKey, consigneeShelfLifeRulesInTx, normalizeOrderGstin } from '../src/modules/partners/partners.facade';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow, noOpIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
@@ -127,6 +132,8 @@ describe('story 4-3b: customer shelf life (e2e)', () => {
   const linkOf = (partnerCode: string, clientCode: string) =>
     partner(partnerCode).links.find((l) => l.clientId === client(clientCode) && l.role === 'consignee')!;
   const expiresIn = (days: number) => istMidnightOf(addIsoDays(today, days));
+  /** 10:00 IST on today + n days. */
+  const istTen = (days: number) => new Date(Date.parse(`${addIsoDays(today, days)}T04:30:00.000Z`));
 
   beforeAll(async () => {
     suiteDb = await useSuiteDatabase('consignee_shelf_life');
@@ -220,8 +227,13 @@ describe('story 4-3b: customer shelf life (e2e)', () => {
       ['O-B', 'pcs', false],
       ['O-CL', 'pcs', true],
       ['W-SNAP', 'pcs', true],
+      ['G-GRACE', 'pcs', true],
+      ['G-CAP', 'pcs', true],
+      ['P-LESS', 'pcs', true],
+      ['A-CLAIM', 'pcs', true],
+      ['A-A11', 'pcs', true],
     ]);
-    await importSkus('CMIN', [['C-STRICT', 'pcs', true], ['C-PICK', 'pcs', true]]);
+    await importSkus('CMIN', [['C-STRICT', 'pcs', true], ['C-PICK', 'pcs', true], ['C-UND', 'pcs', true], ['C-READ', 'pcs', true]]);
     await importSkus('TIE', [['T-TIE', 'pcs', true]]);
     await importSkus('OTHER', [['X-OTHER', 'pcs', true]]);
     await sql`update skus set shelf_life_days = 180 where tenant_id = ${tenantId} and code in ('D-PCT', 'D-BOTH', 'D-TWO')`;
@@ -287,7 +299,12 @@ describe('story 4-3b: customer shelf life (e2e)', () => {
     await inventory.rebuildReservationCounters(tenantId, wh);
   });
 
+  afterEach(() => {
+    batchExpiryClock.now = () => Date.now();
+  });
+
   afterAll(async () => {
+    batchExpiryClock.now = () => Date.now();
     const rawDb = app.get<unknown>(DATABASE) as { $client?: { end(): Promise<void> } };
     await rawDb.$client?.end();
     const authDb = app.get<unknown>(AUTH_DATABASE) as { $client?: { end(): Promise<void> } };
@@ -299,13 +316,13 @@ describe('story 4-3b: customer shelf life (e2e)', () => {
 
   // ── helpers ────────────────────────────────────────────────────────────────
 
-  async function inviteAndSignIn(role: string, password: string): Promise<string> {
+  async function inviteAndSignIn(role: string, password: string, clientId?: string): Promise<string> {
     const address = `${role}-${ulid().toLowerCase()}@example.com`;
     const invited = await http()
       .post(`${API}/${tenantId}/users`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ email: address, role })
+      .send({ email: address, role, ...(clientId === undefined ? {} : { clientId }) })
       .expect(201);
     await http()
       .post(`${API}/${tenantId}/accept-invite`)
@@ -421,8 +438,9 @@ describe('story 4-3b: customer shelf life (e2e)', () => {
       .send({ warehouseId: wh, policyId, orderIds });
   }
 
-  async function wave(orderIds: string[], opts: { release?: boolean } = {}): Promise<WaveBody> {
+  async function wave(orderIds: string[], opts: { release?: boolean; at?: Date } = {}): Promise<WaveBody> {
     const policyId = await wavePolicy();
+    if (opts.at !== undefined) jest.spyOn(app.get<WaveClock>(WAVE_CLOCK), 'now').mockReturnValue(opts.at);
     const res = await generate(orderIds, policyId).expect(201);
     const waveId = res.body.wave.id as string;
     if (opts.release !== false) {
@@ -481,7 +499,7 @@ describe('story 4-3b: customer shelf life (e2e)', () => {
 
   async function stored(lineId: string) {
     return ((await sql`select consignee_partner_id, consignee_min_shelf_life_days, consignee_min_shelf_life_percent, shortfall_cause,
-        allocation_rule, min_outbound_shelf_life_days from picklist_lines where id = ${lineId}`) as unknown as Record<string, unknown>[])[0]!;
+        consignee_shelf_life_base_days, allocation_rule, min_outbound_shelf_life_days from picklist_lines where id = ${lineId}`) as unknown as Record<string, unknown>[])[0]!;
   }
 
   function shelfLifeOf(orderId: string, token = opsToken) {
@@ -498,10 +516,15 @@ describe('story 4-3b: customer shelf life (e2e)', () => {
         where conname in ('partner_client_links_min_shelf_life_days_range', 'partner_client_links_min_shelf_life_percent_range',
                           'partner_client_links_shelf_life_consignee_only',
                           'picklist_lines_consignee_min_shelf_life_days_range', 'picklist_lines_consignee_min_shelf_life_percent_range',
+                          'picklist_lines_consignee_shelf_life_base_days_range', 'picklist_lines_consignee_base_needs_percent',
                           'picklist_lines_consignee_pairing', 'picklist_lines_consignee_needs_rule', 'picklist_lines_shortfall_cause_check')
       `) as unknown as { conname: string; def: string; convalidated: boolean }[];
       const def = new Map(rows.map((row) => [row.conname, row.def.replace(/ NOT VALID$/, '')]));
-      for (const name of ['partner_client_links_min_shelf_life_days_range', 'picklist_lines_consignee_min_shelf_life_days_range']) {
+      for (const name of [
+        'partner_client_links_min_shelf_life_days_range',
+        'picklist_lines_consignee_min_shelf_life_days_range',
+        'picklist_lines_consignee_shelf_life_base_days_range',
+      ]) {
         expect(def.get(name)).toContain(`>= ${CONSIGNEE_MIN_SHELF_LIFE_DAYS_MIN}`);
         expect(def.get(name)).toContain(`<= ${CONSIGNEE_MIN_SHELF_LIFE_DAYS_MAX}`);
       }
@@ -517,6 +540,8 @@ describe('story 4-3b: customer shelf life (e2e)', () => {
         partner_client_links_shelf_life_consignee_only: true,
         picklist_lines_consignee_min_shelf_life_days_range: false,
         picklist_lines_consignee_min_shelf_life_percent_range: false,
+        picklist_lines_consignee_shelf_life_base_days_range: false,
+        picklist_lines_consignee_base_needs_percent: false,
         picklist_lines_consignee_pairing: false,
         picklist_lines_consignee_needs_rule: false,
         picklist_lines_shortfall_cause_check: false,
@@ -655,6 +680,25 @@ describe('story 4-3b: customer shelf life (e2e)', () => {
       await putShelfLife('INACT', 'BRAND', { minShelfLifeDays: 120, minShelfLifePercent: null }, noop).expect(200);
     });
 
+    it('allowed on a departed client\'s consignee link (a policy, not work)', async () => {
+      const goneId = (
+        await http().post(`${API}/${tenantId}/clients`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid()).send({ code: 'GONE', name: 'Gone Brand' }).expect(201)
+      ).body.client.id as string;
+      clientIds.set('GONE', goneId);
+      const linked = (
+        await http()
+          .post(`${API}/${tenantId}/partners/${partner('NOLINK').id}/links`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ clientId: goneId, role: 'consignee' })
+          .expect(201)
+      ).body.partner as PartnerBody;
+      await http().patch(`${API}/${tenantId}/clients/${goneId}/status`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid()).send({ status: 'departed' }).expect(200);
+      const link = linked.links.find((l) => l.clientId === goneId)!;
+      const res = await putShelfLifeRaw(partner('NOLINK').id, link.id, { minShelfLifeDays: 30, minShelfLifePercent: null }).expect(200);
+      expect((res.body.partner as PartnerBody).links.find((l) => l.id === link.id)).toMatchObject({ minShelfLifeDays: 30 });
+    });
+
     it('the PUT and the order read are in the OpenAPI document with their documented arms', async () => {
       const doc = await http().get('/api/v1/openapi.json').expect(200);
       const paths = doc.body.paths as Record<string, Record<string, { responses: Record<string, unknown> }>>;
@@ -680,7 +724,11 @@ describe('story 4-3b: customer shelf life (e2e)', () => {
       expect(sliceText(linesOf(w, dmart))).toEqual(['DD-L2:5']);
       expect(linesOf(w, b2c)[0]).toMatchObject({ consigneeName: null, consigneeMinShelfLifeDays: null, shortfallCause: null });
       expect(linesOf(w, dmart)[0]).toMatchObject({ consigneeName: 'DMart Avenue', consigneeMinShelfLifeDays: 120, consigneeMinShelfLifePercent: null });
-      expect(await stored(linesOf(w, dmart)[0]!.id)).toMatchObject({ consignee_partner_id: partner('DMART').id, consignee_min_shelf_life_days: 120 });
+      expect(await stored(linesOf(w, dmart)[0]!.id)).toMatchObject({
+        consignee_partner_id: partner('DMART').id,
+        consignee_min_shelf_life_days: 120,
+        consignee_shelf_life_base_days: null,
+      });
       // The handheld task carries the consignee hint's facts.
       const snap = await http().get(`${API}/${tenantId}/devices/catalog-snapshot?warehouseId=${wh}`).set('Authorization', `Bearer ${operatorToken}`).expect(200);
       const tasks = snap.body.pickTasks as Record<string, unknown>[];
@@ -695,6 +743,15 @@ describe('story 4-3b: customer shelf life (e2e)', () => {
       const [line] = linesOf(await wave([id]));
       expect(sliceText([line!])).toEqual(['DP-L2:4']);
       expect(line).toMatchObject({ consigneeName: 'Percent Mart', consigneeMinShelfLifeDays: 126, consigneeMinShelfLifePercent: 70, consigneeShelfLifeBaseDays: 180 });
+      // A2 — the base is FROZEN: a later SKU edit does not rewrite the row.
+      expect(await stored(line!.id)).toMatchObject({ consignee_shelf_life_base_days: 180 });
+      await sql`update skus set shelf_life_days = 365 where tenant_id = ${tenantId} and code = 'D-PCT'`;
+      try {
+        const reread = (await http().get(`${API}/${tenantId}/outbound/waves/${(await sql`select wave_id from picklist_lines where id = ${line!.id}`)[0]!.wave_id as string}`).set('Authorization', `Bearer ${opsToken}`).expect(200)).body.wave as WaveBody;
+        expect(linesOf(reread)[0]).toMatchObject({ consigneeMinShelfLifeDays: 126, consigneeShelfLifeBaseDays: 180 });
+      } finally {
+        await sql`update skus set shelf_life_days = 180 where tenant_id = ${tenantId} and code = 'D-PCT'`;
+      }
     });
 
     it('both set: 100 days and 70 % of 180 → effective 126', async () => {
@@ -793,6 +850,29 @@ describe('story 4-3b: customer shelf life (e2e)', () => {
       const id = await order([{ skuCode: 'D-LOWER', quantity: 2 }], GSTIN.DMART);
       await sql`update orders set consignee_gstin = lower(consignee_gstin) where id = ${id}`;
       expect(sliceText(linesOf(await wave([id])))).toEqual(['short:2:consignee-shelf-life']);
+    });
+
+    it('a whitespace-padded GSTIN resolves too: both resolvers match on trim + uppercase (the orders CHECK refuses padding today; the resolver does not rely on it)', async () => {
+      expect(normalizeOrderGstin(`  ${GSTIN.DMART.toLowerCase()} `)).toBe(GSTIN.DMART);
+      const rules = await withTenantTransaction(app.get<Database>(DATABASE), tenantId, (tx) =>
+        consigneeShelfLifeRulesInTx(tx, tenantId, [{ clientId: client('BRAND'), gstin: `  ${GSTIN.DMART.toLowerCase()} ` }]),
+      );
+      expect(rules.get(consigneeRuleKey(client('BRAND'), ` ${GSTIN.DMART} `))).toMatchObject({ partnerCode: 'DMART', minShelfLifeDays: 120 });
+    });
+
+    it('A11: an order attributed to another client than its SKUs refuses the wave (5xx) and writes nothing', async () => {
+      await seed('A-A11', 'A-01', 5, { code: 'AE-L1', expiryDate: expiresIn(200) });
+      const id = await order([{ skuCode: 'A-A11', quantity: 2 }], GSTIN.DMART);
+      await sql`update orders set client_id = ${client('OTHER')} where id = ${id}`;
+      try {
+        const before = (await sql`select count(*)::int as n from waves where tenant_id = ${tenantId}`)[0]!.n as number;
+        const res = await generate([id], await wavePolicy());
+        expect(res.status).toBeGreaterThanOrEqual(500);
+        expect((await sql`select count(*)::int as n from waves where tenant_id = ${tenantId}`)[0]!.n).toBe(before);
+        expect(await sql`select 1 from picklist_lines where order_id = ${id}`).toHaveLength(0);
+      } finally {
+        await sql`update orders set client_id = ${client('BRAND')} where id = ${id}`;
+      }
     });
 
     it('two constrained orders in one wave: each line judged by its own consignee (DMart 120, Percent Mart 126)', async () => {
@@ -938,6 +1018,76 @@ describe('story 4-3b: customer shelf life (e2e)', () => {
       expect(refused.body.detail).toContain("5 more cannot be shown to meet DMart Avenue's shelf-life rule (P-UJ has no total shelf life)");
     });
 
+    it('stricter client (150), consignee-only exclusion (an undated lot): the refusal names the consignee, not the client', async () => {
+      await seed('C-UND', 'A-01', 3, { code: 'CU-L2', expiryDate: expiresIn(200) });
+      const [line] = linesOf(await wave([await order([{ skuCode: 'C-UND', quantity: 3 }], GSTIN.DMART)]));
+      await http()
+        .post(`${API}/${tenantId}/inventory/adjustments`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ warehouseId: wh, skuId: sku('C-UND'), binId: bin('A-01'), quantityDelta: -3, reasonCode: 'stock-count', note: 'drain' })
+        .expect(201);
+      await seed('C-UND', 'A-01', 4, { code: 'CU-UND' });
+      const refused = await pick(line!).expect(422);
+      expect(refused.body.detail).toContain("4 more are below consignee DMart Avenue's minimum remaining shelf life of 120 days");
+      expect(refused.body.detail).not.toContain('below client');
+    });
+
+    it('A1 at the pick: unattributed units of a tracked SKU are counted in the consignee refusal', async () => {
+      await seed('P-LESS', 'A-01', 3, { code: 'PL-L2', expiryDate: expiresIn(200) });
+      const [line] = linesOf(await wave([await order([{ skuCode: 'P-LESS', quantity: 3 }], GSTIN.DMART)]));
+      await http()
+        .post(`${API}/${tenantId}/inventory/adjustments`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ warehouseId: wh, skuId: sku('P-LESS'), binId: bin('A-01'), quantityDelta: -3, reasonCode: 'stock-count', note: 'drain' })
+        .expect(201);
+      await seed('P-LESS', 'A-01', 4, { code: 'PL-L3', expiryDate: expiresIn(300) });
+      await sql`delete from batch_on_hand where tenant_id = ${tenantId} and sku_id = ${sku('P-LESS')}`;
+      const refused = await pick(line!).expect(422);
+      expect(refused.body.detail).toContain("— 4 more are below consignee DMart Avenue's minimum remaining shelf life of 120 days");
+    });
+
+    it('the consignee minimum takes the one-day grace (A3): planned yesterday with exactly 120 days left, the pick draws it', async () => {
+      await seed('G-GRACE', 'A-01', 5, { code: 'GG-1', expiryDate: expiresIn(119) });
+      batchExpiryClock.now = () => istTen(-1).getTime();
+      const id = await order([{ skuCode: 'G-GRACE', quantity: 2 }], GSTIN.DMART);
+      const [line] = linesOf(await wave([id], { at: istTen(-1) }));
+      expect(line).toMatchObject({ batchCode: 'GG-1', consigneeMinShelfLifeDays: 120 });
+      await sql`update picklists set created_at = ${istTen(-1).toISOString()} where id = ${line!.picklistId}`;
+      batchExpiryClock.now = () => Date.now();
+      await pick(line!).expect(201);
+      expect(await drawnBatchCodes(line!.id)).toEqual([{ code: 'GG-1', qty: 2 }]);
+    });
+
+    it('grace capped: planned three days ago with exactly 120 days left, the pick refuses with the consignee suffix', async () => {
+      await seed('G-CAP', 'A-01', 5, { code: 'GC-1', expiryDate: expiresIn(117) });
+      batchExpiryClock.now = () => istTen(-3).getTime();
+      const id = await order([{ skuCode: 'G-CAP', quantity: 2 }], GSTIN.DMART);
+      const [line] = linesOf(await wave([id], { at: istTen(-3) }));
+      expect(line).toMatchObject({ batchCode: 'GC-1' });
+      await sql`update picklists set created_at = ${istTen(-3).toISOString()} where id = ${line!.picklistId}`;
+      batchExpiryClock.now = () => Date.now();
+      const refused = await pick(line!).expect(422);
+      expect(refused.body.detail).toContain("5 more are below consignee DMart Avenue's minimum remaining shelf life of 120 days");
+    });
+
+    it('A12: another order\'s claim on a bin is charged to the short-life slot first — by the order read and by the re-plan', async () => {
+      await seed('A-CLAIM', 'A-01', 5, { code: 'AC-SHORT', expiryDate: expiresIn(60) });
+      await seed('A-CLAIM', 'C-01', 5, { code: 'AC-PLAN', expiryDate: expiresIn(300) });
+      const b2c = await order([{ skuCode: 'A-CLAIM', quantity: 5 }]);
+      expect(sliceText(linesOf(await wave([b2c], { release: false })))).toEqual(['AC-SHORT:5']);
+      const dmart = await order([{ skuCode: 'A-CLAIM', quantity: 5 }], GSTIN.DMART);
+      const [line] = linesOf(await wave([dmart]));
+      expect(sliceText([line!])).toEqual(['AC-PLAN:5']);
+      await seed('A-CLAIM', 'A-01', 5, { code: 'AC-OK', expiryDate: expiresIn(200) });
+      // The B2C claim (5 in A-01) lands on AC-SHORT, ranked first: AC-OK and
+      // the order's own AC-PLAN still qualify.
+      expect((await shelfLifeOf(dmart).expect(200)).body.orderShelfLife.lines[0]).toMatchObject({ qualifyingOnHand: 10, qualifyingUnclaimed: 10 });
+      const res = await pick(line!, { qty: 0, reasonCode: 'bin-empty' }).expect(201);
+      expect((res.body.pick.replanned as { binCode: string; qty: number }[]).map((s) => `${s.binCode}:${s.qty}`)).toEqual(['A-01:5']);
+    });
+
     it('a short pick re-plans under the frozen consignee rule: the 60-day lot is skipped, and the new slice copies the consignee columns', async () => {
       await seed('R-RP', 'C-01', 4, { code: 'RR-PLAN', expiryDate: expiresIn(300) });
       const [line] = linesOf(await wave([await order([{ skuCode: 'R-RP', quantity: 4 }], GSTIN.DMART)]));
@@ -1023,7 +1173,8 @@ describe('story 4-3b: customer shelf life (e2e)', () => {
       // Once waved, the line's plan rides along.
       linesOf(await wave([id], { release: false }));
       const after = (await shelfLifeOf(id).expect(200)).body.orderShelfLife.lines[0];
-      expect(after).toMatchObject({ plannedQty: 6, shortfallQty: 0, shortfallCause: null });
+      // Its own planned lines are not claims: qualifyingUnclaimed is unchanged.
+      expect(after).toMatchObject({ plannedQty: 6, shortfallQty: 0, shortfallCause: null, qualifyingOnHand: 10, qualifyingUnclaimed: 10 });
     });
 
     it('claimed elsewhere: 10 qualifying units all claimed by an earlier open wave → qualifyingOnHand 10, qualifyingUnclaimed 0', async () => {
@@ -1033,6 +1184,37 @@ describe('story 4-3b: customer shelf life (e2e)', () => {
       const dmart = await order([{ skuCode: 'O-CL', quantity: 4 }], GSTIN.DMART);
       const line = (await shelfLifeOf(dmart).expect(200)).body.orderShelfLife.lines[0];
       expect(line).toMatchObject({ qualifyingOnHand: 10, qualifyingUnclaimed: 0, reservedQty: 0 });
+    });
+
+    it('a stricter client: clientMinShelfLifeDays 150 and the binding effectiveMinDays 150', async () => {
+      await seed('C-READ', 'A-01', 5, { code: 'CR-L1', expiryDate: expiresIn(200) });
+      const id = await order([{ skuCode: 'C-READ', quantity: 1 }], GSTIN.DMART);
+      const read = (await shelfLifeOf(id).expect(200)).body.orderShelfLife;
+      expect(read).toMatchObject({ clientMinShelfLifeDays: 150, consigneeResolution: 'applied', consignee: { code: 'DMART', minShelfLifeDays: 120 } });
+      expect(read.lines[0]).toMatchObject({ effectiveMinDays: 150, qualifyingOnHand: 5 });
+    });
+
+    it('a kit order: the parent line is not listed; two lines of the same SKU are judged one after the other', async () => {
+      const id = await order(
+        [
+          { skuCode: 'K-KIT', quantity: 1 },
+          { skuCode: 'K-COMP', quantity: 3 },
+        ],
+        GSTIN.DMART,
+      );
+      const lines = (await shelfLifeOf(id).expect(200)).body.orderShelfLife.lines as { skuId: string; reservedQty: number; qualifyingOnHand: number }[];
+      expect(lines.map((l) => l.skuId)).toEqual([sku('K-COMP'), sku('K-COMP')]);
+      // KC-L2 holds 10 qualifying units: the earlier line takes its reservation first.
+      const [first, second] = lines;
+      expect(second!.qualifyingOnHand).toBe(first!.qualifyingOnHand - first!.reservedQty);
+      expect(first!.qualifyingOnHand).toBe(10);
+    });
+
+    it('a client-portal session is refused (an operator surface)', async () => {
+      const portal = await inviteAndSignIn('client', 'portal-password-123', client('BRAND'));
+      const id = await order([{ skuCode: 'O-B', quantity: 1 }], GSTIN.DMART);
+      const refused = await shelfLifeOf(id, portal).expect(403);
+      expect(refused.body.detail).toBe('This is an operator surface.');
     });
 
     it('the resolution names why a rule did not apply: no-gstin, no-partner, no-consignee-link, no-rule', async () => {
@@ -1045,7 +1227,12 @@ describe('story 4-3b: customer shelf life (e2e)', () => {
       ];
       for (const [gstin, resolution] of cases) {
         const id = await order([{ skuCode: 'O-B', quantity: 1 }], gstin);
-        expect((await shelfLifeOf(id).expect(200)).body.orderShelfLife).toMatchObject({ consigneeResolution: resolution, consignee: null });
+        expect((await shelfLifeOf(id).expect(200)).body.orderShelfLife).toMatchObject({
+          consigneeResolution: resolution,
+          consignee: null,
+          consigneeGstin: gstin ?? null,
+          resolvedPartner: resolution === 'no-consignee-link' ? { code: 'NOLINK' } : resolution === 'no-rule' ? { code: 'NORULE' } : null,
+        });
       }
     });
   });

@@ -1006,15 +1006,6 @@ export class OutboundFacade {
    * inventory.facade CHECKPOINT 1 shape): an unknown or foreign order id is
    * null → the api layer 404s.
    */
-  /**
-   * Story 4-3b (decision 8) — which shelf-life rules apply to one order and
-   * how much on-hand stock qualifies if it were waved today. A staff read;
-   * null when the order does not exist in the tenant.
-   */
-  async getOrderShelfLife(tenantId: string, orderId: string): Promise<OrderShelfLife | null> {
-    return this.orderShelfLife.read(tenantId, orderId);
-  }
-
   async getOrder(tenantId: string, orderId: string): Promise<OrderSnapshot['order'] | null> {
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       const rows = await tx
@@ -1028,6 +1019,15 @@ export class OutboundFacade {
       }
       return (await this.snapshotOf(tx, order)).order;
     });
+  }
+
+  /**
+   * Story 4-3b (decision 8) — which shelf-life rules apply to one order and
+   * how much on-hand stock qualifies if it were waved today. A staff read;
+   * null when the order does not exist in the tenant.
+   */
+  async getOrderShelfLife(tenantId: string, orderId: string): Promise<OrderShelfLife | null> {
+    return this.orderShelfLife.read(tenantId, orderId);
   }
 
   /**

@@ -384,17 +384,26 @@ export interface ConsigneeShelfLifeRuleOfOrder {
   readonly minShelfLifePercent: number | null;
 }
 
-/** The map key of one (client, GSTIN) pair: `${clientId}|${GSTIN uppercased}`. */
+/**
+ * THE normalisation an order's GSTIN is matched with (story 4-3b): trimmed and
+ * uppercased — a legacy order may carry it padded or in lowercase (K11). Both
+ * resolvers below use it; never a second spelling.
+ */
+export function normalizeOrderGstin(gstin: string): string {
+  return gstin.trim().toUpperCase();
+}
+
+/** The map key of one (client, GSTIN) pair: `${clientId}|${normalized GSTIN}`. */
 export function consigneeRuleKey(clientId: string, gstin: string): string {
-  return `${clientId}|${gstin.toUpperCase()}`;
+  return `${clientId}|${normalizeOrderGstin(gstin)}`;
 }
 
 /**
  * Story 4-3b (decision 2, A8) — the consignee shelf-life rules of a set of
  * (client, GSTIN) pairs, in ONE statement: the partner whose `gstin` equals
- * the order's GSTIN uppercased (unique per tenant —
- * `business_partners_tenant_gstin_unique`; K11: a legacy order may carry it
- * in lowercase) ⋈ its CONSIGNEE link to the order's client, with at least one
+ * the order's GSTIN trimmed and uppercased (`normalizeOrderGstin`; unique
+ * per tenant — `business_partners_tenant_gstin_unique`; K11: a legacy order
+ * may carry it padded or in lowercase) ⋈ its CONSIGNEE link to the order's client, with at least one
  * minimum set. Deliberately NOT filtered on `active` (partner or link) nor on
  * the partner's `roles` (A8/K3): a buyer's requirement does not lapse because
  * the master record was switched off, and the link's own role is
@@ -408,7 +417,8 @@ export async function consigneeShelfLifeRulesInTx(
 ): Promise<Map<string, ConsigneeShelfLifeRuleOfOrder>> {
   const byKey = new Map<string, { clientId: string; gstin: string }>();
   for (const pair of pairs) {
-    const gstin = pair.gstin.toUpperCase();
+    const gstin = normalizeOrderGstin(pair.gstin);
+    if (gstin === '') continue;
     byKey.set(consigneeRuleKey(pair.clientId, gstin), { clientId: pair.clientId, gstin });
   }
   const result = new Map<string, ConsigneeShelfLifeRuleOfOrder>();
@@ -461,31 +471,30 @@ export const CONSIGNEE_RESOLUTIONS = ['no-gstin', 'no-partner', 'no-consignee-li
 export type ConsigneeResolution = (typeof CONSIGNEE_RESOLUTIONS)[number];
 
 /**
- * Story 4-3b (A8) — the order read's explanation of ONE order's resolution:
- * the partner holding the GSTIN (any status, any roles) and its consignee
- * link to the client (any `active`), so ops can see why a rule did not apply.
- * The same match as `consigneeShelfLifeRulesInTx` (uppercased GSTIN).
+ * Story 4-3b (A8) — DIAGNOSTICS ONLY: why the planner's match
+ * (`consigneeShelfLifeRulesInTx`, which the order read calls itself for the
+ * `applied` arm) found no rule for one order — the partner holding the
+ * normalised GSTIN (any status, any roles), and whether it has a consignee
+ * link to the client (any `active`). Never a source of a rule.
  */
-export async function resolveConsigneeOfOrderInTx(
+export async function consigneeNoRuleReasonInTx(
   tx: TenantTx,
   tenantId: string,
   clientId: string,
-  gstin: string | null,
+  gstin: string,
 ): Promise<{
-  readonly resolution: ConsigneeResolution;
+  readonly resolution: Exclude<ConsigneeResolution, 'no-gstin' | 'applied'>;
   readonly partner: { readonly id: string; readonly code: string; readonly name: string } | null;
-  readonly rule: ConsigneeShelfLifeRuleOfOrder | null;
 }> {
-  if (gstin === null || gstin.trim() === '') return { resolution: 'no-gstin', partner: null, rule: null };
   const partners = await tx
     .select({ id: businessPartners.id, code: businessPartners.code, name: businessPartners.name })
     .from(businessPartners)
-    .where(and(eq(businessPartners.tenantId, tenantId), eq(businessPartners.gstin, gstin.toUpperCase())))
+    .where(and(eq(businessPartners.tenantId, tenantId), eq(businessPartners.gstin, normalizeOrderGstin(gstin))))
     .limit(1);
   const partner = partners[0];
-  if (partner === undefined) return { resolution: 'no-partner', partner: null, rule: null };
+  if (partner === undefined) return { resolution: 'no-partner', partner: null };
   const links = await tx
-    .select({ id: partnerClientLinks.id, minShelfLifeDays: partnerClientLinks.minShelfLifeDays, minShelfLifePercent: partnerClientLinks.minShelfLifePercent })
+    .select({ id: partnerClientLinks.id })
     .from(partnerClientLinks)
     .where(
       and(
@@ -496,21 +505,7 @@ export async function resolveConsigneeOfOrderInTx(
       ),
     )
     .limit(1);
-  const link = links[0];
-  if (link === undefined) return { resolution: 'no-consignee-link', partner, rule: null };
-  if (link.minShelfLifeDays === null && link.minShelfLifePercent === null) return { resolution: 'no-rule', partner, rule: null };
-  return {
-    resolution: 'applied',
-    partner,
-    rule: {
-      partnerId: partner.id,
-      partnerCode: partner.code,
-      partnerName: partner.name,
-      linkId: link.id,
-      minShelfLifeDays: link.minShelfLifeDays,
-      minShelfLifePercent: link.minShelfLifePercent,
-    },
-  };
+  return { resolution: links[0] === undefined ? 'no-consignee-link' : 'no-rule', partner };
 }
 
 /** The vendor display names of `partnerIds` (id → name) — the device snapshot's `vendorName`. */

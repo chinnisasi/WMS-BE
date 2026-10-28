@@ -255,7 +255,7 @@ export interface PicklistLineSnapshot {
    * (frozen): the consignee's display name, its effective minimum in IST
    * days (null on an UNJUDGEABLE line — a percent rule over a SKU with no
    * total shelf life), the percent it was set with, and the SKU's total shelf
-   * life the percent is of (the CURRENT catalog value — display only). All
+   * life the percent was converted from (frozen with it, A2). All
    * null when no consignee rule applied. `shortfallCause` names why an
    * `unfulfillable` slice was left short (A6; null = no stock at all).
    * OPTIONAL: a `WaveSnapshot` stored before 4-3b lacks them.
@@ -324,6 +324,8 @@ export interface PlannedSlice {
   readonly consigneePartnerId: string | null;
   readonly consigneeMinShelfLifeDays: number | null;
   readonly consigneeMinShelfLifePercent: number | null;
+  /** Story 4-3b (A2) — the SKU total shelf life the percent was converted from (frozen; null without a percent or a base). */
+  readonly consigneeShelfLifeBaseDays: number | null;
   /** Story 4-3b (A6) — why an `unfulfillable` slice is short (null = no stock at all). */
   readonly shortfallCause: ShortfallCause | null;
 }
@@ -331,8 +333,8 @@ export interface PlannedSlice {
 /**
  * Story 4-3a (A7) — Postgres binds at most 65,535 parameters per statement and
  * a multi-row insert binds one per column per row, so the picklist-line
- * insert is chunked at `floor(maxBindParams / columnCount)` rows (22 columns
- * → 2,978 since 4-3b's four consignee keys; every row carries every key, A5). The wave's order cap bounds orders, not rows (lines per order and
+ * insert is chunked at `floor(maxBindParams / columnCount)` rows (23 columns
+ * → 2,849 since 4-3b's five consignee keys; every row carries every key, A5). The wave's order cap bounds orders, not rows (lines per order and
  * slices per line are unbounded). Mutable for the chunk-failure test only.
  */
 export const picklistLineInsertTuning: { maxBindParams: number; onChunk?: ((rows: number) => void) | undefined } = { maxBindParams: 65_535 };
@@ -379,6 +381,7 @@ export function picklistLineValues(
       consigneePartnerId: slice.consigneePartnerId,
       consigneeMinShelfLifeDays: slice.consigneeMinShelfLifeDays,
       consigneeMinShelfLifePercent: slice.consigneeMinShelfLifePercent,
+      consigneeShelfLifeBaseDays: slice.consigneeShelfLifeBaseDays,
       shortfallCause: slice.shortfallCause,
     })),
   );
@@ -1449,6 +1452,10 @@ export class WaveCommandService {
     // the SKU's storage class, so a line whose only stock sits in
     // non-conforming bins plans `unfulfillable` — never a pick that always
     // refuses at the bin.
+    // ONE clock reading for the whole plan: the client minimum (the pool) and
+    // the consignee arm (below) judge on the same instant, so a plan across
+    // IST midnight never judges the two on different dates.
+    const planAt = this.clock.now().getTime();
     const pool = buildStockPool({
       skuIds,
       binOrder,
@@ -1456,7 +1463,7 @@ export class WaveCommandService {
       stock,
       batchStock,
       batchIdentities,
-      at: this.clock.now().getTime(),
+      at: planAt,
       policyOf: (skuId) => {
         const policy = policyOfSku(skuId);
         return { allocationRule: policy.allocationRule, minDays: policy.minOutboundShelfLifeDays };
@@ -1483,7 +1490,8 @@ export class WaveCommandService {
     for (const line of lines) {
       const order = orderById.get(line.orderId);
       const skuClient = skuClients.get(line.skuId);
-      if (order === undefined || (skuClient !== undefined && skuClient !== order.clientId)) {
+      // A SKU the catalog cannot attribute is a mismatch too (fail closed).
+      if (order === undefined || skuClient === undefined || skuClient !== order.clientId) {
         throw new Error(
           `wave plan: order ${line.orderId} is attributed to client ${order?.clientId ?? '(missing)'} but its line ${line.id}'s SKU belongs to client ${skuClient ?? '(missing)'} — AD-23 says they are one client (story 4-3b A11).`,
         );
@@ -1499,7 +1507,6 @@ export class WaveCommandService {
       ),
     );
     const batchById = new Map(batchIdentities.map((batch) => [batch.id, batch]));
-    const planAt = this.clock.now().getTime();
 
     const planned: PlannedSlice[] = [];
     for (const line of lines) {
@@ -1520,6 +1527,9 @@ export class WaveCommandService {
         consigneePartnerId: consignee === null ? null : rule!.partnerId,
         consigneeMinShelfLifeDays: consignee === null ? null : consignee.days,
         consigneeMinShelfLifePercent: consignee === null ? null : rule!.minShelfLifePercent,
+        // A2 — the base the percent was converted from, FROZEN beside it.
+        consigneeShelfLifeBaseDays:
+          consignee === null || rule!.minShelfLifePercent === null ? null : (skuFacts?.shelfLifeDays ?? null),
       };
       // Every quantity a picklist names is the order line's `reserved_qty`,
       // never `qty`: a backordered line contributes only what acceptance
@@ -1752,22 +1762,16 @@ export class WaveCommandService {
       wave.tenantId,
       lines.flatMap((line) => (line.batchId === null ? [] : [line.batchId])),
     );
-    // Story 4-3b — the consignees' display names (A10) and, for a percent
-    // rule, the SKU's total shelf life it is of (A2), each read ONCE per
-    // snapshot and only when a line carries a consignee rule.
+    // Story 4-3b — the consignees' display names (A10), read ONCE per
+    // snapshot and only when a line carries a consignee rule. The percent's
+    // base is the line's own frozen column (A2), never the live catalog.
     const consigneeLines = lines.filter((line) => line.consigneePartnerId !== null);
-    const [consigneeNames, consigneeBases] =
-      consigneeLines.length === 0
-        ? [new Map<string, string>(), new Map<string, { shelfLifeDays: number | null }>()]
-        : await Promise.all([
-            partnerNamesInTx(tx, wave.tenantId, consigneeLines.map((line) => line.consigneePartnerId!)),
-            this.catalog.skuShelfLifeFactsInTx(
-              tx,
-              wave.tenantId,
-              consigneeLines.filter((line) => line.consigneeMinShelfLifePercent !== null).map((line) => line.skuId),
-            ),
-          ]);
-    const consignee: ConsigneeSnapshotFacts = { names: consigneeNames, baseDaysOf: (skuId) => consigneeBases.get(skuId)?.shelfLifeDays ?? null };
+    const consignee: ConsigneeSnapshotFacts = {
+      names:
+        consigneeLines.length === 0
+          ? new Map<string, string>()
+          : await partnerNamesInTx(tx, wave.tenantId, consigneeLines.map((line) => line.consigneePartnerId!)),
+    };
     return {
       wave: {
         id: wave.id,
@@ -1816,10 +1820,9 @@ export function policySnapshot(row: WavePolicy): WavePolicySnapshotBody {
 /** Story 4-3b — what a line snapshot needs to print its consignee rule, read once per wave snapshot. */
 export interface ConsigneeSnapshotFacts {
   readonly names: ReadonlyMap<string, string>;
-  readonly baseDaysOf: (skuId: string) => number | null;
 }
 
-const NO_CONSIGNEE_FACTS: ConsigneeSnapshotFacts = { names: new Map(), baseDaysOf: () => null };
+const NO_CONSIGNEE_FACTS: ConsigneeSnapshotFacts = { names: new Map() };
 
 export function picklistSnapshot(
   row: Picklist,
@@ -1892,8 +1895,7 @@ export function lineSnapshot(
     consigneeName: row.consigneePartnerId === null ? null : (consignee.names.get(row.consigneePartnerId) ?? null),
     consigneeMinShelfLifeDays: row.consigneeMinShelfLifeDays,
     consigneeMinShelfLifePercent: row.consigneeMinShelfLifePercent,
-    consigneeShelfLifeBaseDays:
-      row.consigneePartnerId === null || row.consigneeMinShelfLifePercent === null ? null : consignee.baseDaysOf(row.skuId),
+    consigneeShelfLifeBaseDays: row.consigneeShelfLifeBaseDays,
     shortfallCause: (row.shortfallCause as ShortfallCause | null) ?? null,
   };
 }

@@ -1112,7 +1112,7 @@ export class PickCommandService {
         scaled.qty === 0
           ? { arms: [] as { batchId: string | null; qty: number }[] }
           : sku.batchTracked
-            ? await this.deriveBatchArms(tx, scaled, occurredAt, line, found.picklistCreatedAt, sku.batchTracked)
+            ? await this.deriveBatchArms(tx, scaled, occurredAt, line, found.picklistCreatedAt)
             : { arms: [{ batchId: null, qty: scaled.qty }] };
       if ('drawable' in batchDraw) {
         // Cases 3 vs today: a bin that cannot cover the draw is `409
@@ -1743,6 +1743,7 @@ export class PickCommandService {
       consigneePartnerId: line.consigneePartnerId,
       consigneeMinShelfLifeDays: line.consigneeMinShelfLifeDays,
       consigneeMinShelfLifePercent: line.consigneeMinShelfLifePercent,
+      consigneeShelfLifeBaseDays: line.consigneeShelfLifeBaseDays,
       shortfallCause: null,
     }));
     await tx.insert(picklistLines).values(rows);
@@ -1780,12 +1781,15 @@ export class PickCommandService {
     occurredAt: string,
     line: PicklistLine,
     planCreatedAt: string,
-    batchTracked: boolean,
   ): Promise<
     | { arms: { batchId: string | null; qty: number }[] }
     | {
         drawable: number;
         shelfLifeExcluded: number;
+        /** Units the CLIENT minimum excluded (whatever the consignee arm says). */
+        clientExcluded: number;
+        /** Units only the CONSIGNEE arm excluded — batch-less units of the (tracked) SKU included. */
+        consigneeOnlyExcluded: number;
         minDays: number | null;
         consignee: FrozenConsigneeArm | null;
       }
@@ -1817,9 +1821,10 @@ export class PickCommandService {
     const consignee = consigneeArmOf(line);
     const meetsConsignee = (batchId: string): boolean => {
       const batch = byId.get(batchId);
+      // Only a batch-tracked SKU reaches this helper (the caller's branch).
       return meetsConsigneeShelfLife(
         { batchId, expiryDate: batch?.expiryDate ?? null },
-        batchTracked,
+        true,
         at,
         consignee,
         minJudgedOn,
@@ -1858,33 +1863,63 @@ export class PickCommandService {
       // Story 4-3a (A16): the units the MINIMUMS alone kept out (active, not
       // expired, below the line's client minimum — or, 4-3b, not meeting its
       // consignee rule), for the refusal's suffix (A10: the combined test).
-      const shelfLifeExcluded = batchStock.reduce((sum, row) => {
+      // Counted PER ARM (code review): the client's exclusions, and what only
+      // the consignee arm kept out — so the refusal names the right owner.
+      let clientExcluded = 0;
+      let consigneeOnlyExcluded = 0;
+      for (const row of batchStock) {
         const batch = byId.get(row.batchId);
-        if (batch === undefined || batch.status !== 'active' || isBatchExpiredAt(batch.expiryDate, at)) return sum;
-        return meetsMinimumShelfLife(batch.expiryDate, at, minDays, minJudgedOn) && meetsConsignee(row.batchId)
-          ? sum
-          : sum + row.quantity;
-      }, 0);
-      return { drawable: command.qty - need, shelfLifeExcluded, minDays, consignee };
+        if (batch === undefined || batch.status !== 'active' || isBatchExpiredAt(batch.expiryDate, at)) continue;
+        if (!meetsMinimumShelfLife(batch.expiryDate, at, minDays, minJudgedOn)) clientExcluded += row.quantity;
+        else if (!meetsConsignee(row.batchId)) consigneeOnlyExcluded += row.quantity;
+      }
+      // A1 — batch-less (unattributed) units of the tracked SKU are refused by
+      // the consignee arm too: the bin's plain on-hand above what its batch
+      // rows account for (read on the refusal path only).
+      if (consignee !== null) {
+        const accounted = batchStock.reduce((sum, row) => sum + row.quantity, 0);
+        consigneeOnlyExcluded += Math.max(0, (await this.binOnHandInTx(tx, command, command.binId)) - accounted);
+      }
+      return {
+        drawable: command.qty - need,
+        shelfLifeExcluded: clientExcluded + consigneeOnlyExcluded,
+        clientExcluded,
+        consigneeOnlyExcluded,
+        minDays,
+        consignee,
+      };
     }
     return { arms };
   }
 
   /**
    * Story 4-3b (A10) — the refusal suffix's facts, read on the refusal path
-   * only: the owner of the BINDING minimum. The consignee's when its arm is
-   * unjudgeable, or its minimum is ≥ the client's (a tie goes to the
-   * consignee — the stricter promise is the buyer's); else the client's
-   * (4-3a's label). The consignee is named by its display name.
+   * only. When only the consignee arm excluded units (the client arm none —
+   * undated or unattributed stock, an unjudgeable line), the consignee is
+   * named whatever the client minimum. Otherwise the owner of the BINDING
+   * minimum: the consignee's when its arm is unjudgeable, or its minimum is
+   * ≥ the client's (a tie goes to the consignee — the stricter promise is the
+   * buyer's); else the client's (4-3a's label). The consignee is named by its
+   * display name.
    */
   private async shelfLifeShortfallInTx(
     tx: TenantTx,
     command: RecordPickCommand,
     skuCode: string,
-    draw: { readonly shelfLifeExcluded: number; readonly minDays: number | null; readonly consignee: FrozenConsigneeArm | null },
+    draw: {
+      readonly shelfLifeExcluded: number;
+      readonly clientExcluded: number;
+      readonly consigneeOnlyExcluded: number;
+      readonly minDays: number | null;
+      readonly consignee: FrozenConsigneeArm | null;
+    },
   ): Promise<ShelfLifeShortfall | undefined> {
     const { consignee, minDays } = draw;
-    if (consignee !== null && (!consignee.judgeable || consignee.days === null || minDays === null || consignee.days >= minDays)) {
+    const consigneeOnly = draw.consigneeOnlyExcluded > 0 && draw.clientExcluded === 0;
+    if (
+      consignee !== null &&
+      (consigneeOnly || !consignee.judgeable || consignee.days === null || minDays === null || consignee.days >= minDays)
+    ) {
       const consigneeName =
         (await partnerNamesInTx(tx, command.tenantId, [consignee.partnerId])).get(consignee.partnerId) ?? 'the consignee';
       return !consignee.judgeable || consignee.days === null

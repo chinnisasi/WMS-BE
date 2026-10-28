@@ -51815,6 +51815,27 @@
           "rates"
         ]
       },
+      "OrderShelfLifeResolvedPartnerDto": {
+        "type": "object",
+        "properties": {
+          "partnerId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "description": "The partner display name"
+          }
+        },
+        "required": [
+          "partnerId",
+          "code",
+          "name"
+        ]
+      },
       "OrderShelfLifeConsigneeDto": {
         "type": "object",
         "properties": {
@@ -51884,11 +51905,11 @@
           },
           "qualifyingOnHand": {
             "type": "number",
-            "description": "Base units on hand in the order's warehouse's pickable bins that meet every rule, if waved today (other orders' claims ignored)"
+            "description": "Base units on hand in the order's warehouse's pickable bins that meet every rule, if waved today (other orders' claims ignored) — per line, after the earlier lines of the same SKU (in line order) have taken their reserved units"
           },
           "qualifyingUnclaimed": {
             "type": "number",
-            "description": "qualifyingOnHand minus the units other open planned picklist lines already claim"
+            "description": "What still qualifies after other open lines' claims are spent in rank order (not qualifyingOnHand minus claims); this order's own lines are not claims. Per line, after the earlier lines of the same SKU"
           },
           "belowConsigneeMinimumOnHand": {
             "type": "number",
@@ -51959,6 +51980,21 @@
             ],
             "description": "Why the consignee rule did or did not apply: no-gstin (the order names no consignee GSTIN), no-partner (no partner holds that GSTIN), no-consignee-link (the partner has no consignee link to the order's client), no-rule (the link sets no minimum), applied"
           },
+          "consigneeGstin": {
+            "type": "string",
+            "nullable": true,
+            "description": "The order's consignee GSTIN as stored; null when none"
+          },
+          "resolvedPartner": {
+            "nullable": true,
+            "description": "The partner holding that GSTIN (any status) — set for no-consignee-link, no-rule and applied; null otherwise",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OrderShelfLifeResolvedPartnerDto"
+              }
+            ]
+          },
           "consignee": {
             "nullable": true,
             "description": "The consignee whose rule applies; null unless consigneeResolution is applied",
@@ -51981,6 +52017,8 @@
           "judgedOn",
           "clientMinShelfLifeDays",
           "consigneeResolution",
+          "consigneeGstin",
+          "resolvedPartner",
           "consignee",
           "lines"
         ]
@@ -52885,7 +52923,7 @@
           "consigneeShelfLifeBaseDays": {
             "type": "integer",
             "nullable": true,
-            "description": "Story 4-3b — the SKU's total shelf life in days that the percent rule is of (the CURRENT catalog value — display only); null without a percent rule or a shelf life"
+            "description": "Story 4-3b — the SKU's total shelf life in days the percent rule was converted from at plan (frozen with it); null without a percent rule or a shelf life"
           },
           "shortfallCause": {
             "type": "string",

@@ -672,6 +672,7 @@ export class OutboundController {
       orderShelfLife: {
         ...read,
         consignee: read.consignee === null ? null : { ...read.consignee },
+        resolvedPartner: read.resolvedPartner === null ? null : { ...read.resolvedPartner },
         lines: read.lines.map((line) => ({ ...line })),
       },
     };

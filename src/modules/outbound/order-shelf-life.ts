@@ -15,8 +15,15 @@ import {
 import { InventoryFacade } from '../inventory/inventory.facade';
 import { CatalogFacade } from '../catalog/catalog.facade';
 import { allocationPoliciesInTx, DEFAULT_ALLOCATION_POLICY } from '../clients/clients.facade';
-import { resolveConsigneeOfOrderInTx, type ConsigneeResolution } from '../partners/partners.facade';
-import { buildStockPool, openClaimsInTx, pickableBinsInTx } from './replan';
+import {
+  consigneeNoRuleReasonInTx,
+  consigneeRuleKey,
+  consigneeShelfLifeRulesInTx,
+  normalizeOrderGstin,
+  type ConsigneeResolution,
+  type ConsigneeShelfLifeRuleOfOrder,
+} from '../partners/partners.facade';
+import { buildStockPool, openClaimsBySkuInTx, pickableBinsInTx, type StockSlot } from './replan';
 import { WAVE_CLOCK } from './wave.clock';
 import type { WaveClock } from './wave.clock';
 
@@ -43,6 +50,10 @@ export interface OrderShelfLife {
   readonly judgedOn: string;
   readonly clientMinShelfLifeDays: number | null;
   readonly consigneeResolution: ConsigneeResolution;
+  /** The order's consignee GSTIN as stored (null when none) — the diagnostic's subject. */
+  readonly consigneeGstin: string | null;
+  /** The partner holding that GSTIN (any status), when one does — set for no-consignee-link, no-rule and applied. */
+  readonly resolvedPartner: { readonly partnerId: string; readonly code: string; readonly name: string } | null;
   readonly consignee: {
     readonly partnerId: string;
     readonly code: string;
@@ -67,11 +78,15 @@ export interface OrderShelfLife {
  *   through the planner's own pool (`buildStockPool` — the client rule's
  *   filters and per-bin budget), and the same consignee predicate
  *   (`meetsConsigneeShelfLife`) — no second definition.
- * - **Per line:** `qualifyingOnHand` ignores every other order's claims;
- *   `qualifyingUnclaimed` spends the units OTHER open `planned` picklist
- *   lines claim (`openClaimsInTx`, this order's own lines excluded) against
- *   the slots in rank order first — the re-plan's order (A12) — and then
- *   counts what still qualifies; `belowConsigneeMinimumOnHand` is what the
+ * - **Per line, after the earlier lines of the same SKU** (in line order — a
+ *   wave plans them so): `qualifyingOnHand` ignores every other order's
+ *   claims; `qualifyingUnclaimed` is what still qualifies after the units
+ *   OTHER open `planned` picklist lines claim (`openClaimsBySkuInTx`, this
+ *   order's own lines excluded) are spent against every slot in rank order —
+ *   the re-plan's order (A12), not qualifyingOnHand minus claims. Each
+ *   line's reserved units are then spent from what qualifies, so a later
+ *   line of the same SKU (two kit components) never counts them again. ONE
+ *   pool per figure and ONE claims read for the whole order; `belowConsigneeMinimumOnHand` is what the
  *   client rule allows and the consignee's does not. When the line is on an
  *   OPEN wave (not cancelled), its planned and unfulfillable quantities and
  *   the planner's frozen `shortfallCause` ride along.
@@ -86,6 +101,32 @@ export class OrderShelfLifeReader {
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
     @Inject(WAVE_CLOCK) private readonly clock: WaveClock,
   ) {}
+
+  /**
+   * The order's consignee resolution: the `applied` arm is the PLANNER'S own
+   * match (`consigneeShelfLifeRulesInTx`, the same normalised GSTIN), so the
+   * read and a wave cannot disagree; `consigneeNoRuleReasonInTx` only
+   * explains a rule that did not apply.
+   */
+  private async resolveInTx(
+    tx: Parameters<typeof consigneeShelfLifeRulesInTx>[0],
+    tenantId: string,
+    clientId: string,
+    gstin: string | null,
+  ): Promise<{
+    resolution: ConsigneeResolution;
+    partner: { id: string; code: string; name: string } | null;
+    rule: ConsigneeShelfLifeRuleOfOrder | null;
+  }> {
+    const normalized = gstin === null ? '' : normalizeOrderGstin(gstin);
+    if (normalized === '') return { resolution: 'no-gstin', partner: null, rule: null };
+    const rule = (await consigneeShelfLifeRulesInTx(tx, tenantId, [{ clientId, gstin: normalized }])).get(consigneeRuleKey(clientId, normalized));
+    if (rule !== undefined) {
+      return { resolution: 'applied', partner: { id: rule.partnerId, code: rule.partnerCode, name: rule.partnerName }, rule };
+    }
+    const why = await consigneeNoRuleReasonInTx(tx, tenantId, clientId, normalized);
+    return { resolution: why.resolution, partner: why.partner, rule: null };
+  }
 
   async read(tenantId: string, orderId: string): Promise<OrderShelfLife | null> {
     return withTenantTransaction(this.db, tenantId, async (tx) => {
@@ -110,7 +151,7 @@ export class OrderShelfLifeReader {
       const judgedOn = istDateOf(new Date(at).toISOString());
       const [policies, resolved, skuFacts, labels, binOrder] = await Promise.all([
         allocationPoliciesInTx(tx, tenantId, [order.clientId]),
-        resolveConsigneeOfOrderInTx(tx, tenantId, order.clientId, order.consigneeGstin),
+        this.resolveInTx(tx, tenantId, order.clientId, order.consigneeGstin),
         this.catalog.skuShelfLifeFactsInTx(tx, tenantId, skuIds),
         this.catalog.skuLabelsInTx(tx, tenantId, skuIds),
         pickableBinsInTx(tx, tenantId, order.warehouseId),
@@ -157,6 +198,24 @@ export class OrderShelfLifeReader {
                 ),
               );
 
+      // ONE pool per figure and ONE claims read for the order's SKU set.
+      const onHandPool = buildStockPool(poolInput);
+      const unclaimedPool = buildStockPool(poolInput);
+      const claims = await openClaimsBySkuInTx(tx, tenantId, skuIds, binOrder.map((bin) => bin.id), orderId);
+      for (const [skuId, byBin] of claims) {
+        const slots = unclaimedPool.get(skuId) ?? [];
+        for (const [binId, units] of byBin) {
+          let outstanding = units;
+          for (const slot of slots) {
+            if (outstanding === 0) break;
+            if (slot.binId !== binId) continue;
+            const spent = Math.min(outstanding, slot.remaining);
+            slot.remaining -= spent;
+            outstanding -= spent;
+          }
+        }
+      }
+
       const result: OrderShelfLifeLine[] = [];
       for (const line of lines) {
         const facts = skuFacts.get(line.skuId);
@@ -172,39 +231,36 @@ export class OrderShelfLifeReader {
             ? clientMin
             : Math.max(clientMin ?? 0, consignee.days);
 
-        const meets = (slot: { batchId: string | null }) =>
+        const meets = (slot: StockSlot) =>
           meetsConsigneeShelfLife(
             { batchId: slot.batchId, expiryDate: slot.batchId === null ? null : (batchById.get(slot.batchId)?.expiryDate ?? null) },
             batchTracked,
             at,
             consignee,
           );
-        // A fresh pool per line: the two sums below mutate slot remainders.
-        const slots = buildStockPool(poolInput).get(line.skuId) ?? [];
+        const onHandSlots = onHandPool.get(line.skuId) ?? [];
+        const unclaimedSlots = unclaimedPool.get(line.skuId) ?? [];
         let qualifyingOnHand = 0;
         let below = 0;
-        for (const slot of slots) {
+        for (const slot of onHandSlots) {
           if (meets(slot)) qualifyingOnHand += slot.remaining;
           else below += slot.remaining;
         }
-        const claimed = await openClaimsInTx(
-          tx,
-          tenantId,
-          line.skuId,
-          binOrder.map((bin) => bin.id),
-          orderId,
-        );
-        for (const [binId, units] of claimed) {
-          let outstanding = units;
+        const qualifyingUnclaimed = unclaimedSlots.reduce((sum, slot) => (meets(slot) ? sum + slot.remaining : sum), 0);
+        // This line's reservation is spent from what qualifies, in rank order,
+        // before a later line of the same SKU is judged.
+        const spend = (slots: readonly StockSlot[]) => {
+          let need = line.reservedQty;
           for (const slot of slots) {
-            if (outstanding === 0) break;
-            if (slot.binId !== binId) continue;
-            const spent = Math.min(outstanding, slot.remaining);
-            slot.remaining -= spent;
-            outstanding -= spent;
+            if (need === 0) break;
+            if (slot.remaining <= 0 || !meets(slot)) continue;
+            const take = Math.min(need, slot.remaining);
+            slot.remaining -= take;
+            need -= take;
           }
-        }
-        const qualifyingUnclaimed = slots.reduce((sum, slot) => (meets(slot) ? sum + slot.remaining : sum), 0);
+        };
+        spend(onHandSlots);
+        spend(unclaimedSlots);
 
         const plan = planRows.filter((row) => row.orderLineId === line.id);
         const onWave = plan.length > 0;
@@ -232,6 +288,8 @@ export class OrderShelfLifeReader {
         judgedOn,
         clientMinShelfLifeDays: policy.minOutboundShelfLifeDays,
         consigneeResolution: resolved.resolution,
+        consigneeGstin: order.consigneeGstin,
+        resolvedPartner: resolved.partner === null ? null : { partnerId: resolved.partner.id, code: resolved.partner.code, name: resolved.partner.name },
         consignee:
           resolved.rule === null
             ? null
