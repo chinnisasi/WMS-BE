@@ -803,4 +803,134 @@ describe('story 2-10b: LPN labels at receiving (e2e)', () => {
       }
     });
   });
+
+  // ── code review (2026-10-28) ───────────────────────────────────────────────
+
+  describe('code review: the cap is the units still on the dock; the placement races; the contracts', () => {
+    const handle = () => postgres(process.env.DATABASE_URL!, { max: 1, onnotice: () => undefined });
+
+    async function waitParked(holderPid: number, min: number): Promise<void> {
+      const probe = handle();
+      try {
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline) {
+          const waiting = (await probe`
+            select a.pid, pg_blocking_pids(a.pid) as blockers from pg_stat_activity a
+            where a.wait_event_type = 'Lock' and a.state = 'active'
+          `) as unknown as { pid: number; blockers: number[] }[];
+          const chain = new Set<number>([holderPid]);
+          for (let grew = true; grew; ) {
+            grew = false;
+            for (const row of waiting) {
+              if (!chain.has(row.pid) && row.blockers.some((pid) => chain.has(pid))) {
+                chain.add(row.pid);
+                grew = true;
+              }
+            }
+          }
+          if (chain.size - 1 >= min) return;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        throw new Error(`fewer than ${min} request(s) parked`);
+      } finally {
+        await probe.end();
+      }
+    }
+
+    it('a partial LPN placement: 25 of a 40 LPN → the LPN is placed, and 15 more can be labelled (16 cannot)', async () => {
+      const grn = await receiveBlind(acmeId, [{ skuId: sku('L-A'), qty: 40 }]);
+      const [lpn] = await minted(grn.id, [{ grnLineId: grn.lines[0]!.id, quantities: [40] }]);
+      const task = taskOf(await tasks(), grn.lines[0]!.id)!;
+      await place(placement(task, 25, { lpnCode: lpn!.code })).expect(201);
+      expect(await lpnRow(lpn!.id)).toMatchObject({ status: 'placed' });
+      expect((await mint(grn.id, [{ grnLineId: grn.lines[0]!.id, quantities: [16] }]).expect(422)).body).toMatchObject({ code: 'lpn-quantity-exceeds-line', remaining: 15, placed: 25 });
+      await mint(grn.id, [{ grnLineId: grn.lines[0]!.id, quantities: [15] }]).expect(201);
+    });
+
+    it('60 placed without an LPN on a 100 line → 41 is 422 (remaining 40), 40 is 201; the list serves the same unlabelledQty', async () => {
+      const grn = await receiveBlind(acmeId, [{ skuId: sku('L-A'), qty: 100 }]);
+      const task = taskOf(await tasks(), grn.lines[0]!.id)!;
+      await place(placement(task, 60)).expect(201);
+      expect((await list(grn.id).expect(200)).body.lines).toEqual([{ grnLineId: grn.lines[0]!.id, unlabelledQty: 40 }]);
+      expect((await mint(grn.id, [{ grnLineId: grn.lines[0]!.id, quantities: [41] }]).expect(422)).body).toMatchObject({ remaining: 40 });
+      await mint(grn.id, [{ grnLineId: grn.lines[0]!.id, quantities: [40] }]).expect(201);
+      expect((await list(grn.id).expect(200)).body.lines).toEqual([{ grnLineId: grn.lines[0]!.id, unlabelledQty: 0 }]);
+    });
+
+    it('the failed-inspection term: a QC-on-receipt line with 3 failed of 10 → 8 is 422, 7 is 201', async () => {
+      const qc = (await http().post(`${API}/${tenantId}/clients`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid()).send({ code: 'QCL', name: 'QC Brand' }).expect(201)).body.client.id as string;
+      await importSkus(qc, [['L-QC', 'pcs', false]]);
+      await http()
+        .put(`${API}/${tenantId}/clients/${qc}/receiving-policy`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ receivingToleranceBps: 0, qcOnReceipt: true, expiryRequired: false, minShelfLifeDays: null })
+        .expect(200);
+      const grn = await receiveBlind(qc, [{ skuId: sku('L-QC'), qty: 10 }]);
+      const holdId = ((await sql`select id from qc_holds where tenant_id = ${tenantId} and grn_line_id = ${grn.lines[0]!.id}`) as unknown as { id: string }[])[0]!.id;
+      // While held, the units are still on the dock: all 10 are labellable.
+      expect((await list(grn.id).expect(200)).body.lines[0]).toMatchObject({ unlabelledQty: 10 });
+      await http()
+        .post(`${API}/${tenantId}/receiving/qc-holds/${holdId}/inspect`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ lines: [{ batchId: null, passed: 7, failed: [{ reason: 'damaged', quantity: 3 }] }] })
+        .expect(200);
+      expect((await mint(grn.id, [{ grnLineId: grn.lines[0]!.id, quantities: [8] }]).expect(422)).body).toMatchObject({ remaining: 7 });
+      await mint(grn.id, [{ grnLineId: grn.lines[0]!.id, quantities: [7] }]).expect(201);
+    });
+
+    it('same key: two placements of one LPN parked on its row both answer the same 201 — one placement, the LPN placed once', async () => {
+      const grn = await receiveBlind(acmeId, [{ skuId: sku('L-A'), qty: 10 }]);
+      const [lpn] = await minted(grn.id, [{ grnLineId: grn.lines[0]!.id, quantities: [10] }]);
+      const task = taskOf(await tasks(), grn.lines[0]!.id)!;
+      const key = ulid();
+      const body = placement(task, 10, { lpnCode: lpn!.code });
+      const holder = handle();
+      const fired: Promise<request.Response>[] = [];
+      try {
+        await holder.begin(async (tx) => {
+          const locked = (await tx`select pg_backend_pid() as pid from lpns where id = ${lpn!.id} for update`) as unknown as { pid: number }[];
+          fired.push((async () => place(body, key))(), (async () => place(body, key))());
+          await waitParked(locked[0]!.pid, 2);
+        });
+        const [a, b] = await Promise.all(fired);
+        expect([a!.status, b!.status]).toEqual([201, 201]);
+        expect(b!.body).toEqual(a!.body);
+      } finally {
+        await Promise.allSettled(fired);
+        await holder.end();
+      }
+      expect(await sql`select 1 from putaway_placements where tenant_id = ${tenantId} and grn_line_id = ${grn.lines[0]!.id}`).toHaveLength(1);
+      expect(await keyRows(key)).toBe(1);
+    });
+
+    it('an upper-case grnLineId still places its own LPN; an lpnCode over 32 characters is the DTO 400', async () => {
+      const grn = await receiveBlind(acmeId, [{ skuId: sku('L-A'), qty: 5 }]);
+      const [lpn] = await minted(grn.id, [{ grnLineId: grn.lines[0]!.id, quantities: [5] }]);
+      const task = taskOf(await tasks(), grn.lines[0]!.id)!;
+      expect((await place(placement(task, 1, { lpnCode: 'L'.repeat(33) })).expect(400)).body.code).toBe('validation-failed');
+      await place(placement(task, 5, { lpnCode: lpn!.code, grnLineId: task.grnLineId.toUpperCase() })).expect(201);
+      expect(await lpnRow(lpn!.id)).toMatchObject({ status: 'placed' });
+    });
+
+    it('the void key is bound to its receipt: the same key and lpnId under another grnId is 422, not a replay', async () => {
+      const grn = await receiveBlind(acmeId, [{ skuId: sku('L-A'), qty: 5 }]);
+      const [lpn] = await minted(grn.id, [{ grnLineId: grn.lines[0]!.id, quantities: [5] }]);
+      const key = ulid();
+      await voidLpn(grn.id, lpn!.id, { reasonCode: 'misprint' }, key).expect(200);
+      expect((await voidLpn(mainGrn.id, lpn!.id, { reasonCode: 'misprint' }, key).expect(422)).body.code).toBe('idempotency-key-reuse');
+    });
+
+    it('print: a4 with size null counts as absent (200); a code too long for 2x1 is 422 with lpnCodes, the same at 4x2 is 200', async () => {
+      await print(mainGrn.id, { format: 'pdf', layout: 'a4', size: null }).expect(200);
+      const grn = await receiveBlind(acmeId, [{ skuId: sku('L-A'), qty: 3 }]);
+      const id = uuidv7();
+      await sql`insert into lpns (id, tenant_id, warehouse_id, grn_id, grn_line_id, sku_id, client_id, seq, code, qty, created_by)
+        values (${id}, ${tenantId}, ${wh}, ${grn.id}, ${grn.lines[0]!.id}, ${sku('L-A')}, ${acmeId}, 10000000, 'LPN-10000000', 1000, ${ownerUserId})`;
+      expect(await refusal(print(grn.id, { format: 'zpl', size: '2x1', lpnIds: [id] }), 422)).toMatchObject({ code: 'lpn-code-too-long-for-label', lpnCodes: ['LPN-10000000'] });
+      const ok = await print(grn.id, { format: 'zpl', size: '4x2', lpnIds: [id] }).expect(200);
+      expect(parseZplLabels((ok.body as Buffer).toString('ascii')).map((l) => l.payload)).toEqual(['LPN-10000000']);
+    });
+  });
 });

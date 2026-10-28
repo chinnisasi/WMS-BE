@@ -1056,10 +1056,52 @@ describe('the rejected-op sync report + the Conflicts & Reviews queue (story 5-6
       await sql.end();
     }
 
-    // Exactly one resolve audit + outbox event per applied row (two here: the
-    // GRN and the putaway), each naming the resolution.
+    // Story 2-10b (code review) — a putaway.place row carrying an LPN: the
+    // re-apply carries `lpnCode` only while that LPN is still placeable for
+    // the op (active, of its line, holding its qty); a voided LPN's op is
+    // re-applied WITHOUT it — the supervisor's judgment replaces the label.
+    const minted = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/receiving/goods-receipts/${grnId}/lpns`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ lines: [{ grnLineId, quantities: [2, 2] }] })
+      .expect(201);
+    const [activeLpn, voidedLpn] = minted.body.lpns as { id: string; code: string }[];
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/receiving/goods-receipts/${grnId}/lpns/${voidedLpn!.id}/void`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ reasonCode: 'misprint' })
+      .expect(200);
+    const lpnRow = (code: string) =>
+      reportRow('putaway.place', { warehouseId, grnId, grnLineId, skuId, batchId: null, qty: 2, toBinId: binId, reasonCode: null, lpnCode: code }, {
+        classification: 'rejected',
+        problemCode: 'lpn-not-placeable',
+        opOccurredAt: ENQUEUED_AT,
+      });
+    const activeRow = lpnRow(activeLpn!.code);
+    const voidedRow = lpnRow(voidedLpn!.code);
+    await uploadReport(tenantId, badgeSession, [activeRow, voidedRow], ulid()).expect(201);
+    const lpnListing = (await listRejectedOps(ownerToken, tenantId, { status: 'open' }).expect(200)).body;
+    const activeOp = lpnListing.items.find((i: { opId: string }) => i.opId === activeRow.opId)!;
+    const voidedOp = lpnListing.items.find((i: { opId: string }) => i.opId === voidedRow.opId)!;
+    const activeResolve = await resolveOp(ownerToken, tenantId, activeOp.id, { decision: 'apply' }, ulid()).expect(200);
+    const voidedResolve = await resolveOp(ownerToken, tenantId, voidedOp.id, { decision: 'apply' }, ulid()).expect(200);
+    const lpnSql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      const rows = await lpnSql<{ id: string; status: string; placement_id: string | null }[]>`select id, status, placement_id from lpns where id in ${lpnSql([activeLpn!.id, voidedLpn!.id])}`;
+      const byId = new Map(rows.map((r) => [r.id, r]));
+      expect(byId.get(activeLpn!.id)).toMatchObject({ status: 'placed', placement_id: activeResolve.body.outcome.snapshot.placement.id });
+      expect(byId.get(voidedLpn!.id)).toMatchObject({ status: 'voided', placement_id: null });
+      expect(voidedResolve.body.outcome.snapshot.placement.qty).toBe(2);
+    } finally {
+      await lpnSql.end();
+    }
+
+    // Exactly one resolve audit + outbox event per applied row (four here: the
+    // GRN, the putaway, and 2-10b's two LPN putaways), each naming the resolution.
     const audits = await auditRows(tenantId);
-    expect(audits.filter((a) => a.action === 'device.rejected_op.resolved')).toHaveLength(2);
+    expect(audits.filter((a) => a.action === 'device.rejected_op.resolved')).toHaveLength(4);
     const events = await outboxRows(tenantId);
     expect(
       events.filter(

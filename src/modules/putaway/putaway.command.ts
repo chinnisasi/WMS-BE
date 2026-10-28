@@ -570,10 +570,21 @@ export class PutawayCommand {
           throw lpnNotPlaceable(lpnCode, `the code is longer than ${LPN_CODE_MAX} characters — it is not an LPN of this tenant`);
         }
         lpn = await lockLpnByCodeInTx(tx, command.tenantId, lpnCode);
+        // The replay UNDER the LPN lock (guide §1): a same-key retry parked on
+        // this row wakes to the winner's snapshot, never to `placed` → 400.
+        const replayedUnderLock = await tx
+          .select()
+          .from(idempotencyKeys)
+          .where(and(eq(idempotencyKeys.tenantId, command.tenantId), eq(idempotencyKeys.key, idempotencyKey)))
+          .limit(1);
+        if (replayedUnderLock[0]) {
+          if (replayedUnderLock[0].payloadHash !== payloadHash) throw idempotencyKeyReuse();
+          return replayedUnderLock[0].responseSnapshot as PutawayPlacementSnapshot;
+        }
         if (lpn === null) {
           throw lpnNotPlaceable(lpnCode, 'no LPN with this code exists in this tenant');
         }
-        if (lpn.grnLineId !== command.grnLineId) {
+        if (lpn.grnLineId !== command.grnLineId.toLowerCase()) {
           throw lpnNotPlaceable(lpnCode, 'it labels another GRN line, not the one this placement moves');
         }
         if (lpn.status !== 'active') {

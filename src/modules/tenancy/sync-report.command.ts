@@ -17,7 +17,8 @@ import type {
   RejectedOpStatus,
 } from '../../shared/db/schema';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
-import { MAX_QUANTITY_BASE } from '../../shared/primitives/quantity';
+import { MAX_QUANTITY_BASE, QUANTITY_SCALE } from '../../shared/primitives/quantity';
+import { lpnPlaceableFor, lpnStateByCodeInTx } from '../inbound/lpn.store';
 import { assertUtcIso, canonicalInstant, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
@@ -1530,6 +1531,26 @@ export class SyncReportCommand {
    * command's actor. `self-test.echo` never reaches here (not a member of
    * `REJECTED_OP_TYPES`; the upload refuses it).
    */
+  /** Story 2-10b — the `lpnCode` a `putaway.place` re-apply carries (see the arm). */
+  private async reapplyLpnCode(tenantId: string, idempotencyKey: string, payload: Record<string, unknown>): Promise<string | null> {
+    const code = typeof payload.lpnCode === 'string' && payload.lpnCode.trim() !== '' ? payload.lpnCode.trim() : null;
+    if (code === null) return null;
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const lpn = await lpnStateByCodeInTx(tx, tenantId, code);
+      const stored = await tx
+        .select({ snapshot: idempotencyKeys.responseSnapshot })
+        .from(idempotencyKeys)
+        .where(and(eq(idempotencyKeys.tenantId, tenantId), eq(idempotencyKeys.key, idempotencyKey)))
+        .limit(1);
+      if (stored[0] !== undefined) {
+        const placementId = (stored[0].snapshot as { placement?: { id?: unknown } } | null)?.placement?.id;
+        return lpn !== null && lpn.placementId !== null && lpn.placementId === placementId ? code : null;
+      }
+      const qty = typeof payload.qty === 'number' && Number.isFinite(payload.qty) ? Math.round(payload.qty * QUANTITY_SCALE) : Number.POSITIVE_INFINITY;
+      return lpnPlaceableFor(lpn, String(payload.grnLineId ?? ''), qty) ? code : null;
+    });
+  }
+
   private async applyArm(
     opType: ApplicableOpType,
     tenantId: string,
@@ -1650,7 +1671,14 @@ export class SyncReportCommand {
           idempotencyKey,
         )) as unknown as Record<string, unknown>;
       }
-      case 'putaway.place':
+      case 'putaway.place': {
+        // Story 2-10b (code review) — the stored op's LPN rides the re-apply
+        // only while it is still placeable for the op (active, of its line,
+        // holding its qty); otherwise the supervisor's judgment replaces the
+        // label state (as binStateEpoch is stripped for picks) and the move
+        // is applied without it. A re-apply after a crash mid-arm keeps the
+        // first Apply's choice: the LPN its stored placement consumed rides.
+        const lpnCode = await this.reapplyLpnCode(tenantId, idempotencyKey, payload);
         return (await this.putaway.placePutaway(
           {
             tenantId,
@@ -1666,11 +1694,11 @@ export class SyncReportCommand {
             reasonCode: (payload.reasonCode ?? null) as string | null,
             occurredAt: opTime,
             serials: payload.serials as string[] | undefined,
-            // Story 2-10b (A1) — the stored op's LPN, when it carried one.
-            lpnCode: typeof payload.lpnCode === 'string' ? payload.lpnCode : null,
+            lpnCode,
           },
           idempotencyKey,
         )) as unknown as Record<string, unknown>;
+      }
       case 'pick.record':
         // binStateEpoch STRIPPED: the human judgment replaces the observation
         // — nothing else (stock, holds, premises, role, kit rule) is

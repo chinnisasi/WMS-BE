@@ -5,6 +5,7 @@ import { BIN_BLOCK_REASONS } from '../../shared/db/schema';
 import { ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, IsUUID, Length, Max, Min } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 import { PUTAWAY_MISMATCH_REASON_CODES as PUTAWAY_MISMATCH_REASON_ENUM } from './mismatch-reason';
+import { LPN_CODE_MAX } from '../inbound/lpn.store';
 
 // ── putaway.place input ──────────────────────────────────────────────────────
 
@@ -85,13 +86,13 @@ export class PlacePutawayDto {
     required: false,
     type: String,
     nullable: true,
-    maxLength: 32,
+    maxLength: LPN_CODE_MAX,
     description:
       "Story 2-10b — the LPN (licence plate) the operator scanned for this placement: it must be an ACTIVE LPN of this GRN line holding at least `qty`, and the placement consumes it (`placed`). Absent, null or blank = no LPN (the payload hashes exactly as before)",
   })
   @IsOptional()
   @IsString()
-  @Length(0, 64)
+  @Length(0, LPN_CODE_MAX)
   lpnCode?: string | null;
 }
 

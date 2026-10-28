@@ -2,7 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, asc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { auditEvents, goodsReceiptLines, goodsReceiptNotes, idempotencyKeys, lpns, skus, type Lpn } from '../../shared/db/schema';
+import { auditEvents, goodsReceiptLines, goodsReceiptNotes, idempotencyKeys, lpns, putawayPlacements, skus, type Lpn } from '../../shared/db/schema';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/quantity';
@@ -85,6 +85,11 @@ export interface MintLpnsSnapshot {
   readonly lpns: readonly LpnSnapshot[];
 }
 
+export interface LpnListSnapshot {
+  readonly items: readonly LpnSnapshot[];
+  readonly lines: readonly { readonly grnLineId: string; readonly unlabelledQty: number }[];
+}
+
 export interface VoidLpnSnapshot {
   readonly lpn: LpnSnapshot;
 }
@@ -137,6 +142,65 @@ export async function lpnSnapshotsInTx(
     voidReasonCode: row.voidReasonCode as LpnVoidReasonCode | null,
     voidNote: row.voidNote,
   }));
+}
+
+/** One GRN line's LPN cap facts, milli-units. */
+export interface LpnLineCap {
+  /** applied + approved over-receipt excess − failed-inspection units (≥ 0). */
+  readonly putawayQty: number;
+  /** Σ every placement of the line (with or without an LPN). */
+  readonly placed: number;
+  /** Σ the line's ACTIVE LPNs. */
+  readonly active: number;
+  /** Active + placed LPN rows (the 5000 bound). */
+  readonly rows: number;
+  /** What may still go on labels: putawayQty − placed − active, floored at 0. */
+  readonly unlabelled: number;
+}
+
+/**
+ * Story 2-10b (A4, as amended at code review) — the cap is the units still on
+ * the dock: Σ active LPNs + new ≤ applied + approved excess − failed
+ * inspection − Σ the line's placements (every placement, with or without an
+ * LPN). Placed and voided LPNs no longer count toward the quantity (a partial
+ * LPN placement frees its remainder through the placed sum); the 5000 row
+ * bound still counts active + placed rows. The mint reads it under the
+ * ':lpn-seq' lock; the list read serves `unlabelled` to the web.
+ */
+export async function lpnLineCapsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  lines: readonly { readonly id: string; readonly appliedQty: number }[],
+): Promise<Map<string, LpnLineCap>> {
+  const out = new Map<string, LpnLineCap>();
+  if (lines.length === 0) return out;
+  const ids = lines.map((line) => line.id);
+  const lpnRows = await tx
+    .select({
+      grnLineId: lpns.grnLineId,
+      active: sql<string>`coalesce(sum(${lpns.qty}) filter (where ${lpns.status} = 'active'), 0)::bigint`,
+      rows: sql<string>`count(*)::bigint`,
+    })
+    .from(lpns)
+    .where(and(eq(lpns.tenantId, tenantId), inArray(lpns.grnLineId, ids), ne(lpns.status, 'voided')))
+    .groupBy(lpns.grnLineId);
+  const byLine = new Map(lpnRows.map((row) => [row.grnLineId, { active: Number(row.active), rows: Number(row.rows) }]));
+  const placedRows = await tx
+    .select({ grnLineId: putawayPlacements.grnLineId, placed: sql<string>`coalesce(sum(${putawayPlacements.qty}), 0)::bigint` })
+    .from(putawayPlacements)
+    .where(and(eq(putawayPlacements.tenantId, tenantId), inArray(putawayPlacements.grnLineId, ids)))
+    .groupBy(putawayPlacements.grnLineId);
+  const placedByLine = new Map(placedRows.map((row) => [row.grnLineId, Number(row.placed)]));
+  for (const line of lines) {
+    const putawayQty = Math.max(
+      0,
+      line.appliedQty + (await approvedExcessOfLineInTx(tx, tenantId, line.id)) - (await failedReceiptQtyOfLineInTx(tx, tenantId, line.id)),
+    );
+    const placed = placedByLine.get(line.id) ?? 0;
+    const facts = byLine.get(line.id) ?? { active: 0, rows: 0 };
+    out.set(line.id, { putawayQty, placed, active: facts.active, rows: facts.rows, unlabelled: Math.max(0, putawayQty - placed - facts.active) });
+  }
+  return out;
 }
 
 /** The receipt's header, or 404. */
@@ -224,17 +288,8 @@ export class LpnCommand {
         .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.id, [...new Set(lineRows.map((row) => row.skuId))])));
       const skuById = new Map(skuRows.map((row) => [row.id, row]));
 
-      // What each line already carries: Σ and count of its non-voided LPNs.
-      const labelledRows = await tx
-        .select({
-          grnLineId: lpns.grnLineId,
-          labelled: sql<string>`coalesce(sum(${lpns.qty}), 0)::bigint`,
-          n: sql<string>`count(*)::bigint`,
-        })
-        .from(lpns)
-        .where(and(eq(lpns.tenantId, command.tenantId), inArray(lpns.grnLineId, lineIds), ne(lpns.status, 'voided')))
-        .groupBy(lpns.grnLineId);
-      const labelledByLine = new Map(labelledRows.map((row) => [row.grnLineId, { labelled: Number(row.labelled), n: Number(row.n) }]));
+      // Each line's cap facts — the one function the list read uses too.
+      const capByLine = await lpnLineCapsInTx(tx, command.tenantId, lineRows);
 
       // ── per line, in request order: precision (behind the replay), the cap, the bound ──
       const planned: { line: (typeof lineRows)[number]; clientId: string; milli: number[] }[] = [];
@@ -248,22 +303,24 @@ export class LpnCommand {
         if (milli.some((value) => value <= 0)) {
           throw lpnValidation(`Each label quantity must be greater than 0 ${sku.uom}.`);
         }
-        const cap =
-          row.appliedQty +
-          (await approvedExcessOfLineInTx(tx, command.tenantId, row.id)) -
-          (await failedReceiptQtyOfLineInTx(tx, command.tenantId, row.id));
-        const already = labelledByLine.get(row.id) ?? { labelled: 0, n: 0 };
+        const caps = capByLine.get(row.id)!;
         const asked = milli.reduce((sum, value) => sum + value, 0);
-        if (already.labelled + asked > cap) {
-          const remaining = Math.max(0, cap - already.labelled);
+        if (asked > caps.unlabelled) {
           throw new ProblemException(
             'lpn-quantity-exceeds-line',
             422,
             'More than the line holds',
-            `GRN line of SKU "${sku.code}" can take ${fromMilli(remaining)} ${sku.uom} more on labels (${fromMilli(Math.max(0, cap))} to put away, ${fromMilli(already.labelled)} already labelled) — ${fromMilli(asked)} cannot be labelled. Void a label to free its quantity.`,
-            { grnLineId: row.id, remaining: fromMilli(remaining), putawayQty: fromMilli(Math.max(0, cap)), labelled: fromMilli(already.labelled) },
+            `GRN line of SKU "${sku.code}" can take ${fromMilli(caps.unlabelled)} ${sku.uom} more on labels (${fromMilli(caps.putawayQty)} to put away, ${fromMilli(caps.placed)} already put away, ${fromMilli(caps.active)} on active labels) — ${fromMilli(asked)} cannot be labelled. Void a label to free its quantity.`,
+            {
+              grnLineId: row.id,
+              remaining: fromMilli(caps.unlabelled),
+              putawayQty: fromMilli(caps.putawayQty),
+              placed: fromMilli(caps.placed),
+              labelled: fromMilli(caps.active),
+            },
           );
         }
+        const already = { n: caps.rows };
         if (already.n + milli.length > MAX_LPNS_PER_LINE) {
           throw new ProblemException(
             'too-many-labels',
@@ -359,7 +416,7 @@ export class LpnCommand {
     if (command.reasonCode === 'other' && note === null) {
       throw lpnValidation('A void with the reason "other" needs a note saying why.');
     }
-    const payloadHash = hashCommandPayload({ arm: 'lpn.void', tenantId: command.tenantId, lpnId, reasonCode: command.reasonCode, note });
+    const payloadHash = hashCommandPayload({ arm: 'lpn.void', tenantId: command.tenantId, grnId, lpnId, reasonCode: command.reasonCode, note });
 
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
       assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'labels.execute');
@@ -414,8 +471,12 @@ export class LpnCommand {
     });
   }
 
-  /** Every LPN of a receipt in code order (any status) — the list read (any member). */
-  async list(tenantId: string, grnId: string): Promise<LpnSnapshot[]> {
+  /**
+   * Every LPN of a receipt in code order (any status), and each line's
+   * `unlabelledQty` (base units) from the mint's own cap function — the list
+   * read (any member).
+   */
+  async list(tenantId: string, grnId: string): Promise<LpnListSnapshot> {
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       const grn = await grnHeaderInTx(tx, tenantId, grnId.toLowerCase());
       const rows = await tx
@@ -423,7 +484,16 @@ export class LpnCommand {
         .from(lpns)
         .where(and(eq(lpns.tenantId, tenantId), eq(lpns.grnId, grn.id)))
         .orderBy(asc(lpns.seq));
-      return lpnSnapshotsInTx(tx, this.catalog, tenantId, rows);
+      const lineRows = await tx
+        .select({ id: goodsReceiptLines.id, appliedQty: goodsReceiptLines.appliedQty })
+        .from(goodsReceiptLines)
+        .where(and(eq(goodsReceiptLines.tenantId, tenantId), eq(goodsReceiptLines.grnId, grn.id)))
+        .orderBy(asc(goodsReceiptLines.createdAt), asc(goodsReceiptLines.id));
+      const caps = await lpnLineCapsInTx(tx, tenantId, lineRows);
+      return {
+        items: await lpnSnapshotsInTx(tx, this.catalog, tenantId, rows),
+        lines: lineRows.map((line) => ({ grnLineId: line.id, unlabelledQty: fromMilli(caps.get(line.id)!.unlabelled) })),
+      };
     });
   }
 

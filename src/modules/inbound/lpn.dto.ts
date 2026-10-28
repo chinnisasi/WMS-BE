@@ -134,9 +134,24 @@ export class MintLpnsResponse {
   lpns!: LpnDto[];
 }
 
+/** One line of the receipt and what may still go on labels. */
+export class LpnLineUnlabelledDto {
+  @ApiProperty({ format: 'uuid' })
+  grnLineId!: string;
+
+  @ApiProperty({
+    description:
+      "Base units that may still go on labels: applied + approved over-receipt excess − failed-inspection units − Σ the line's placements − Σ its active LPNs, floored at 0 (the mint's own cap)",
+  })
+  unlabelledQty!: number;
+}
+
 export class LpnListResponse {
   @ApiProperty({ type: [LpnDto], description: "Every LPN of the goods receipt (any status), in code order" })
   items!: LpnDto[];
+
+  @ApiProperty({ type: [LpnLineUnlabelledDto], description: 'One entry per line of the goods receipt, in receipt order' })
+  lines!: LpnLineUnlabelledDto[];
 }
 
 export class LpnResponse {

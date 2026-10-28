@@ -86,3 +86,30 @@ export async function markLpnPlacedInTx(
     throw new Error(`LPN ${args.lpnId} was not active under its own row lock`);
   }
 }
+
+/**
+ * Story 2-10b (code review) — the LPN with this code as it stands, read-only
+ * (no lock), or null. The review queue's `putaway.place` re-apply judges with
+ * it whether a stored op's `lpnCode` is still placeable (`lpnPlaceableFor`).
+ */
+export async function lpnStateByCodeInTx(
+  tx: TenantTx,
+  tenantId: string,
+  code: string,
+): Promise<{ readonly grnLineId: string; readonly qty: number; readonly status: string; readonly placementId: string | null } | null> {
+  const rows = await tx
+    .select({ grnLineId: lpns.grnLineId, qty: lpns.qty, status: lpns.status, placementId: lpns.placementId })
+    .from(lpns)
+    .where(and(eq(lpns.tenantId, tenantId), eq(lpns.code, code)))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+/** An `active` LPN of this GRN line holding at least `qtyMilli`. */
+export function lpnPlaceableFor(
+  lpn: { readonly grnLineId: string; readonly qty: number; readonly status: string } | null,
+  grnLineId: string,
+  qtyMilli: number,
+): boolean {
+  return lpn !== null && lpn.status === 'active' && lpn.grnLineId === grnLineId.toLowerCase() && lpn.qty >= qtyMilli;
+}

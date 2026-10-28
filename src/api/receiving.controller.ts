@@ -445,8 +445,8 @@ export class ReceivingController {
   ): Promise<LpnListResponse> {
     assertOwnTenantToken(session.tenantId, tenantId);
     assertUuidParam(grnId, 'grnId');
-    const items = await this.receiving.listLpns(tenantId, grnId);
-    return { items: items.map((item) => ({ ...item })) };
+    const list = await this.receiving.listLpns(tenantId, grnId);
+    return { items: list.items.map((item) => ({ ...item })), lines: list.lines.map((line) => ({ ...line })) };
   }
 
   @Post(':tenantId/receiving/goods-receipts/:grnId/lpns')
@@ -555,7 +555,7 @@ export class ReceivingController {
       throw new ProblemException('validation-failed', 400, 'Duplicate LPN ids', 'lpnIds lists the same LPN more than once (uuids compare case-insensitively).');
     }
     const layout = dto.layout ?? 'label';
-    if (layout === 'a4' && dto.size !== undefined) {
+    if (layout === 'a4' && dto.size != null) {
       throw new ProblemException('validation-failed', 400, 'size does not apply to a4', 'The A4 sheet has fixed 70 × 36 mm cells — omit `size` with `layout: a4`.');
     }
     if (layout === 'a4' && dto.format !== 'pdf') {

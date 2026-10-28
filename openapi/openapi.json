@@ -55000,6 +55000,23 @@
           "voidNote"
         ]
       },
+      "LpnLineUnlabelledDto": {
+        "type": "object",
+        "properties": {
+          "grnLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "unlabelledQty": {
+            "type": "number",
+            "description": "Base units that may still go on labels: applied + approved over-receipt excess − failed-inspection units − Σ the line's placements − Σ its active LPNs, floored at 0 (the mint's own cap)"
+          }
+        },
+        "required": [
+          "grnLineId",
+          "unlabelledQty"
+        ]
+      },
       "LpnListResponse": {
         "type": "object",
         "properties": {
@@ -55009,10 +55026,18 @@
             "items": {
               "$ref": "#/components/schemas/LpnDto"
             }
+          },
+          "lines": {
+            "description": "One entry per line of the goods receipt, in receipt order",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LpnLineUnlabelledDto"
+            }
           }
         },
         "required": [
-          "items"
+          "items",
+          "lines"
         ]
       },
       "MintLpnsLineDto": {

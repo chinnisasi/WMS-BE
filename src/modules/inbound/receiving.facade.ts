@@ -59,7 +59,7 @@ import {
   RECEIPT_PHOTOS_MAX_PER_RECEIPT,
 } from '../attachments/attachment-records';
 import { DAMAGE_REASON_CODES, SHORT_REASON_CODES } from './receipt-condition';
-import { LpnCommand, type LpnSnapshot, type MintLpnsCommand, type MintLpnsSnapshot, type VoidLpnCommand, type VoidLpnSnapshot } from './lpn.command';
+import { LpnCommand, type LpnListSnapshot, type MintLpnsCommand, type MintLpnsSnapshot, type VoidLpnCommand, type VoidLpnSnapshot } from './lpn.command';
 import { LpnLabelsService, type LpnLabelsFile, type LpnLabelsRequest } from './lpn-labels';
 
 /** One GRN header row of the GRN-list read (line counts + unit sums ride along). */
@@ -383,8 +383,8 @@ export class ReceivingFacade {
     return this.lpns.void(command, idempotencyKey);
   }
 
-  /** Every LPN of a receipt in code order, with SKU and batch codes, base units — any member (A12). */
-  async listLpns(tenantId: string, grnId: string): Promise<LpnSnapshot[]> {
+  /** Every LPN of a receipt in code order, with SKU and batch codes, base units, and each line's unlabelled quantity — any member (A12). */
+  async listLpns(tenantId: string, grnId: string): Promise<LpnListSnapshot> {
     return this.lpns.list(tenantId, grnId);
   }
 
