@@ -121,6 +121,13 @@ export const AUDIT_NO_OP_ARMS = {
   /** Story 5-2a — `ClientWebhooksCommand.update` with nothing changed (stores the key with `{ endpoint, signingSecret: null }`). */
   'clientWebhooks.update:unchanged': (snapshot: unknown) =>
     isRecord(snapshot) && sameKeys(snapshot, ['endpoint', 'signingSecret']) && snapshot.signingSecret === null && isRecord(snapshot.endpoint),
+  /** Story 4-2b — `CancelRestockCommandService.cancelOrderWithRestock` on an already-cancelled order (`{order, restock: null}`). */
+  'orders.cancelOrderWithRestock:already-cancelled': (snapshot: unknown) =>
+    isRecord(snapshot) &&
+    sameKeys(snapshot, ['order', 'restock']) &&
+    snapshot.restock === null &&
+    isRecord(snapshot.order) &&
+    snapshot.order.status === 'cancelled',
   /** Story 6-1b — `SecondFactorCommand.reset` of a user with no two-factor sign-in and no enrolment code. */
   'users.resetSecondFactor:not-enrolled': (snapshot: unknown) =>
     isRecord(snapshot) &&

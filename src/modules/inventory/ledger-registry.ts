@@ -301,6 +301,21 @@ export type LedgerReferenceDoc =
       readonly reasonCode?: string;
       readonly handlingUnitIds?: readonly string[];
     }
+  // Story 4-2b — the restock arm: every `pick.restocked` event names the
+  // cancel-with-restock it belongs to (`restockId` — one per command, shared
+  // by all its events), the order and order line whose draw it reverses, the
+  // pick line that drew it and the exact `pick.picked` event (`drawEventId`)
+  // it reverses — one restock per draw, so "what is still to put back" is the
+  // draws without a restock naming them. NEW union arm — the earlier kinds
+  // are never reshaped.
+  | {
+      readonly kind: 'restock';
+      readonly restockId: string;
+      readonly orderId: string;
+      readonly orderLineId: string;
+      readonly picklistLineId: string;
+      readonly drawEventId: string;
+    }
   // Story 3-1 — the bin-to-bin move arm: every `stock.moved` event names the
   // move it belongs to (one move = one request: a batch arm, or one event per
   // serial unit), the operator's reason code and — only when given — the
@@ -462,6 +477,29 @@ registerLedgerEventType({
   type: 'pick.picked',
   sinceVersion: 1,
   referenceKinds: ['pick'],
+  allowsBatchArm: true,
+  allowsSerialArm: true,
+});
+
+/**
+ * Grammar v1, Story 4-2b — the restock of a cancelled order's drawn units: a
+ * pure INTAKE (`fromBinId` null, `toBinId` the destination — the
+ * `grn.received` convention), the exact reversal of ONE `pick.picked` draw
+ * (its magnitude, its batch arm and its serial arm; the reference names the
+ * draw). Written only by `CancelRestockCommandService` after every placement
+ * gate and the reconcile-quarantine check on the destination. The serial
+ * guard admits it as a re-entry (a serial whose latest event is the draw has
+ * `toBinId` null), and the command first proves that latest event IS this
+ * draw (409 `restock-serial-moved` otherwise). Both identity arms are OPEN.
+ * The reconcile and metering folds read it by its bin arms (`['to']` — on-hand
+ * rises); it nets the pick (`PICK_NETTING_TYPES`), so a recall's held and
+ * dispatched figures exclude restocked units. Not a billed movement type.
+ * Registers sinceVersion 1.
+ */
+registerLedgerEventType({
+  type: 'pick.restocked',
+  sinceVersion: 1,
+  referenceKinds: ['restock'],
   allowsBatchArm: true,
   allowsSerialArm: true,
 });

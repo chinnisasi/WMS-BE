@@ -24,6 +24,9 @@ import { toAddressDto } from '../modules/tenancy/tenancy.dto';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import {
   CancelOrderDto,
+  CancelOrderWithRestockDto,
+  CancelWithRestockResponse,
+  RestockPlanResponse,
   CreateOrderDto,
   CreateWavePolicyDto,
   DevicePackDto,
@@ -291,6 +294,82 @@ export class OutboundController {
     return { order: { ...snapshot.order, destination: toAddressDto(snapshot.order.destination), lines: snapshot.order.lines.map(toLineDto) } };
   }
 
+  @Post(':tenantId/outbound/orders/:orderId/cancel-with-restock')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Story 4-2b — cancels an accepted (any pick state) or packed order and RESTOCKS it (orders.manage), in one transaction: every drawn unit goes back to stock through a pick.restocked ledger intake that reverses its pick.picked draw exactly (quantity, batch, serial) — into the bin it was drawn from, or all into restockBinId; the order’s planned and unfulfillable pick lines are withdrawn; a labelled, unmanifested shipment is voided (locally — no carrier call); the pack’s catch-weight cases become active again; every held hold is released and every committed hold retired (ATP restored); the order reads cancelled. An order with no draws ends exactly as /cancel would. Already cancelled: the idempotent 200 no-op (restock null). /cancel is unchanged (the channel cancellation calls it)',
+  })
+  @ApiBody({ type: CancelOrderWithRestockDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({
+    status: HttpStatus.OK,
+    type: CancelWithRestockResponse,
+    description: 'The cancelled order and what was put back (the idempotency snapshot — a replay re-serves it byte for byte)',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key or path parameter, restockBinId not a uuid, or restockBinId a system bin (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), the caller lacks orders.manage (role-denied), or a secure destination bin without secure.move (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The order does not exist in this tenant, or restockBinId names no bin of the order’s warehouse (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The order is dispatched — receive it back as a return (order-dispatched); its shipment is manifested, naming the manifest (shipment-manifested); its label was booked with a real courier whose AWB this build cannot cancel (shipment-void-unsupported); a destination bin refuses the intake, naming the bin, with the gate’s own code (bin-retired, bin-blocked, bin-storage-mismatch, bin-client-mismatch, bin-occupancy-conflict, bin-segregation-conflict, hazard-segregation-conflict, bin-full, bin-overweight, bin-volume-exceeded, bin-item-oversize); a (SKU, destination) under an open reconcile quarantine (restock-scope-quarantined); a serial no longer this order’s draw — counted, adjusted or moved while in the tote (restock-serial-moved); a case the pack recorded is no longer packed into the order (handling-unit-not-packed); the order was picked while it was being cancelled, or a concurrent idempotent request (conflict). Nothing is written on any refusal') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload — including a key used on /cancel (idempotency-key-reuse)') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('The reservation store is unreachable (reservation-store-unavailable)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async cancelOrderWithRestock(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @Body() body: CancelOrderWithRestockDto,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<CancelWithRestockResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.outbound.cancelOrderWithRestock(
+      { tenantId, actorUserId: session.userId, orderId, restockBinId: body.restockBinId ?? null },
+      key,
+    );
+    return {
+      order: { ...snapshot.order, destination: toAddressDto(snapshot.order.destination), lines: snapshot.order.lines.map(toLineDto) },
+      restock: snapshot.restock === null ? null : { ...snapshot.restock, lines: [...snapshot.restock.lines], releasedReservationIds: [...snapshot.restock.releasedReservationIds], retiredReservationIds: [...snapshot.restock.retiredReservationIds], handlingUnitIds: [...snapshot.restock.handlingUnitIds] },
+    };
+  }
+
+  @Get(':tenantId/outbound/orders/:orderId/restock-plan')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Story 4-2b — what cancelling an order with restock would put back (lines: its draws not yet restocked, per order line, SKU, origin bin and batch, with the serials to scan back), and what a cancel already put back (restocked), plus its shipment. A READ: no capability, no key, nothing stored; answers for any status (lines are empty unless the order is accepted or ready_to_dispatch)',
+  })
+  @ApiOkResponse({ type: RestockPlanResponse, description: 'The restock plan' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed orderId path parameter (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No order with this id exists in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async getRestockPlan(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<RestockPlanResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const plan = await this.outbound.getRestockPlan(tenantId, orderId);
+    if (plan === null) {
+      throw orderNotFound(orderId);
+    }
+    return {
+      ...plan,
+      lines: plan.lines.map((line) => ({ ...line, serialNumbers: [...line.serialNumbers] })),
+      restocked: plan.restocked.map((entry) => ({ ...entry })),
+    };
+  }
+
   @Post(':tenantId/outbound/orders/:orderId/pack')
   @HttpCode(HttpStatus.CREATED)
   @UseGuards(TenantSessionGuard)
@@ -372,7 +451,7 @@ export class OutboundController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks dispatch.execute (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Order does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The order is already dispatched under a different key, or is not packed — it reads accepted or cancelled (conflict, naming the status); story 3-7a — its picks drew a lot that is on an OPEN LIVE recall: release the lot from the recall (close it with the lot in releaseBatchIds) or wait for the packed-order cancel/unpack (order-holds-recalled-batch, members batchCodes and recallCodes); a lot blocked for any other reason still ships; or a concurrent idempotent request (conflict). Nothing is written') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The order is already dispatched under a different key, or is not packed — it reads accepted or cancelled (conflict, naming the status); story 3-7a — its picks drew a lot that is on an OPEN LIVE recall: release the lot from the recall (close it with the lot in releaseBatchIds) or cancel the order with restock (order-holds-recalled-batch, members batchCodes and recallCodes); a lot blocked for any other reason still ships; or a concurrent idempotent request (conflict). Nothing is written') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'orderId', format: 'uuid' })

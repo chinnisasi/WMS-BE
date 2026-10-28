@@ -85,6 +85,14 @@ export class ChannelWritebackDelivery implements OnModuleInit {
       // business — ack, no meter, no effect.
       return;
     }
+    if (type === 'order.packed' && order.status === 'cancelled') {
+      // Story 4-2b (decision 13) — a stale `order.packed` relayed after the
+      // order was cancelled with restock: creating a fulfillment now would
+      // tell the channel a cancelled order shipped. Ack without writing; the
+      // `order.cancelled` row settles the channel.
+      this.logger.log(`writeback ${event.eventId}: order ${order.id} was cancelled after it was packed — the stale packed writeback is acked, not written`);
+      return;
+    }
     const connectionId = order.integrationId;
     const row = await this.publish.integrationForDelivery(event.tenantId, connectionId);
     if (row === null) {

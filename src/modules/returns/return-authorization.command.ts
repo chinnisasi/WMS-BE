@@ -474,8 +474,9 @@ interface ReturnableLineFacts {
  * return, from facts only (nothing stored is a second source of truth):
  *
  * - `dispatched` is Σ `picks.qty` (`orderInvoiceFactsInTx` — the one
- *   definition, reused): dispatch is all-or-nothing and terminal, and picks
- *   are never reversed. An order that is not `dispatched` has dispatched
+ *   definition, reused): dispatch is all-or-nothing and terminal, and a
+ *   dispatched order's picks are never reversed — story 4-2b restocks only
+ *   undispatched orders. An order that is not `dispatched` has dispatched
  *   nothing yet, whatever it picked;
  * - `authorized` is Σ `authorized_qty` over this line on every authorization
  *   that is not cancelled (`RMA_COMMITTED_STATUSES` — story 13-2);

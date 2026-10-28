@@ -353,4 +353,8 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'webhook_endpoint.test_sent', targetType: 'webhook_endpoint' },
   { action: 'webhook_endpoint.redelivered', targetType: 'webhook_endpoint' },
   { action: 'webhook_endpoint.bulk_redelivered', targetType: 'webhook_endpoint' },
+  // Story 4-2b — the label of an order cancelled with restock, voided locally
+  // (`CancelRestockCommandService`). Targets the ORDER — the label precedent
+  // (`shipment.label-created`); the shipment id rides the snapshot.
+  { action: 'shipment.voided', targetType: 'order' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

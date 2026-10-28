@@ -653,6 +653,8 @@ describe('story 21-4: metering and storage snapshots', () => {
         'return.restocked': ['both'],
         // Story 4-7a — a scrap: a draw out of RETURNS (on-hand drops).
         'return.scrapped': ['from'],
+        // Story 4-2b — a cancelled order's restock: a pure intake into the destination (on-hand rises).
+        'pick.restocked': ['to'],
       };
 
       it('every registered type is classified, and each arm folds as the replay rule says', async () => {

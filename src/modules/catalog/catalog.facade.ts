@@ -29,6 +29,7 @@ import {
   markHandlingUnitsAdjustedInTx,
   markHandlingUnitsPackedInTx,
   settleHandlingUnitIntakeInTx,
+  unpackHandlingUnitsForLinesInTx,
   settleReturnedHandlingUnitsInTx,
 } from './handling-unit.store';
 import { getKitCompositionInTx, getKitSkuIdsInTx } from './kit.store';
@@ -1524,6 +1525,16 @@ export class CatalogFacade {
     assignments: readonly HandlingUnitPackAssignment[],
   ): Promise<HandlingUnitIdentity[]> {
     return markHandlingUnitsPackedInTx(tx, tenantId, assignments);
+  }
+
+  /** See `unpackHandlingUnitsForLinesInTx` — story 4-2b's `packed → active` for a cancelled order. */
+  async unpackHandlingUnitsForLinesInTx(
+    tx: TenantTx,
+    tenantId: string,
+    orderLineIds: readonly string[],
+    expectedIds: readonly string[],
+  ): Promise<HandlingUnitIdentity[]> {
+    return unpackHandlingUnitsForLinesInTx(tx, tenantId, orderLineIds, expectedIds);
   }
 
   /** See `settleReturnedHandlingUnitsInTx` — story 4-7a's `returned → active | rejected`. */

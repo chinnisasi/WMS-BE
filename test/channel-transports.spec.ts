@@ -602,8 +602,12 @@ describe('channel transports: the shopify arms against a local stub (story 7.2, 
       cancelledStub.close();
     }
 
+    // Story 4-2b: the arm now reads the order's fulfillments before the order
+    // cancel (a packed order carries one) — with none, the order cancel is the
+    // only write, as before.
     const liveStub = new ShopStub([
       { status: 200, body: { order: { cancelled_at: null } } }, // the read-back
+      { status: 200, body: { fulfillments: [] } }, // no fulfillment to cancel
       { status: 202, body: { order: { id: 9001 } } },
     ]);
     const liveDomain = await liveStub.start();
@@ -613,11 +617,105 @@ describe('channel transports: the shopify arms against a local stub (story 7.2, 
         lines: [],
       });
       expect(cancelled.action).toBe('cancelled');
-      expect(liveStub.requests).toHaveLength(2);
-      expect(liveStub.requests[1]!.method).toBe('POST');
-      expect(liveStub.requests[1]!.url).toBe('/admin/api/2026-01/orders/9001/cancel.json');
+      expect(liveStub.requests.map((r) => `${r.method} ${r.url}`)).toEqual([
+        'GET /admin/api/2026-01/orders/9001.json',
+        'GET /admin/api/2026-01/orders/9001/fulfillments.json',
+        'POST /admin/api/2026-01/orders/9001/cancel.json',
+      ]);
     } finally {
       liveStub.close();
+    }
+  });
+
+  it('story 4-2b: "cancelled" on a packed order cancels each live fulfillment FIRST, skipping settled ones, then the order', async () => {
+    const stub = new ShopStub([
+      { status: 200, body: { order: { cancelled_at: null } } },
+      {
+        status: 200,
+        body: {
+          fulfillments: [
+            { id: 51, status: 'success' },
+            { id: 52, status: 'cancelled' },
+            { id: 53, status: 'error' },
+            { id: 54, status: 'open' },
+          ],
+        },
+      },
+      { status: 201, body: { fulfillment: { id: 51, status: 'cancelled' } } },
+      { status: 201, body: { fulfillment: { id: 54, status: 'cancelled' } } },
+      { status: 202, body: { order: { id: 9001 } } },
+    ]);
+    const domain = await stub.start();
+    try {
+      const result = await shopifyOrderWritebackArm({ ...CREDENTIAL, shopDomain: domain } as ChannelCredential, {
+        tenantId: 't', integrationId: 'i', provider: 'shopify', orderRef: '9001', state: 'cancelled', lines: [],
+      });
+      expect(result.action).toBe('cancelled');
+      expect(stub.requests.map((r) => `${r.method} ${r.url}`)).toEqual([
+        'GET /admin/api/2026-01/orders/9001.json',
+        'GET /admin/api/2026-01/orders/9001/fulfillments.json',
+        'POST /admin/api/2026-01/fulfillments/51/cancel.json',
+        'POST /admin/api/2026-01/fulfillments/54/cancel.json',
+        'POST /admin/api/2026-01/orders/9001/cancel.json',
+      ]);
+    } finally {
+      stub.close();
+    }
+  });
+
+  it('story 4-2b: a partial failure — the fulfillment cancelled, the order cancel refused — re-delivers cleanly (the cancelled fulfillment is skipped)', async () => {
+    const first = new ShopStub([
+      { status: 200, body: { order: { cancelled_at: null } } },
+      { status: 200, body: { fulfillments: [{ id: 51, status: 'success' }] } },
+      { status: 201, body: { fulfillment: { id: 51, status: 'cancelled' } } },
+      { status: 422, body: { errors: 'order cannot be cancelled' } },
+    ]);
+    const firstDomain = await first.start();
+    try {
+      const attempt = shopifyOrderWritebackArm({ ...CREDENTIAL, shopDomain: firstDomain } as ChannelCredential, {
+        tenantId: 't', integrationId: 'i', provider: 'shopify', orderRef: '9001', state: 'cancelled', lines: [],
+      });
+      await expect(attempt).rejects.toBeDefined();
+      expect(first.requests).toHaveLength(4);
+    } finally {
+      first.close();
+    }
+    // The relay re-delivers: the channel now reads the fulfillment cancelled.
+    const again = new ShopStub([
+      { status: 200, body: { order: { cancelled_at: null } } },
+      { status: 200, body: { fulfillments: [{ id: 51, status: 'cancelled' }] } },
+      { status: 202, body: { order: { id: 9001 } } },
+    ]);
+    const againDomain = await again.start();
+    try {
+      const result = await shopifyOrderWritebackArm({ ...CREDENTIAL, shopDomain: againDomain } as ChannelCredential, {
+        tenantId: 't', integrationId: 'i', provider: 'shopify', orderRef: '9001', state: 'cancelled', lines: [],
+      });
+      expect(result.action).toBe('cancelled');
+      expect(again.requests.map((r) => `${r.method} ${r.url}`)).toEqual([
+        'GET /admin/api/2026-01/orders/9001.json',
+        'GET /admin/api/2026-01/orders/9001/fulfillments.json',
+        'POST /admin/api/2026-01/orders/9001/cancel.json',
+      ]);
+    } finally {
+      again.close();
+    }
+  });
+
+  it('story 4-2b: a live fulfillment without an id is the typed un-addressable failure — the order is not cancelled', async () => {
+    const stub = new ShopStub([
+      { status: 200, body: { order: { cancelled_at: null } } },
+      { status: 200, body: { fulfillments: [{ status: 'success' }] } },
+    ]);
+    const domain = await stub.start();
+    try {
+      const attempt = shopifyOrderWritebackArm({ ...CREDENTIAL, shopDomain: domain } as ChannelCredential, {
+        tenantId: 't', integrationId: 'i', provider: 'shopify', orderRef: '9001', state: 'cancelled', lines: [],
+      });
+      await expect(attempt).rejects.toThrow(WRITEBACK_UNTRACKED_ID);
+      expect(stub.requests).toHaveLength(2);
+    } finally {
+      stub.close();
     }
   });
 

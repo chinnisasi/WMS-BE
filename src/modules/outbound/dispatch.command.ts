@@ -304,7 +304,7 @@ export class DispatchCommandService {
           409,
           'Order holds a recalled lot',
           `Order "${order.clientOrderRef ?? order.externalEventId ?? order.id.slice(-8)}" holds units of lot ${codes.join(', ')} under recall ${recallCodes.join(', ')} — it cannot ship. ` +
-            `Release the lot from the recall (close ${recallCodes.join(', ')} with it in releaseBatchIds), or wait for the packed-order cancel/unpack (deferred from 4.2).`,
+            `Release the lot from the recall (close ${recallCodes.join(', ')} with it in releaseBatchIds), or cancel the order with restock (its units go back to stock; the lot stays blocked).`,
           { batchCodes: codes, recallCodes },
         );
       }

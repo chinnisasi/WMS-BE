@@ -61,6 +61,9 @@ import { ProblemException } from '../../shared/problem-details/problem.exception
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
 import { OrderCommandService } from './order.command';
 import { OrderImportCommand } from './order-import.command';
+import { CancelRestockCommandService } from './cancel-restock.command';
+import type { CancelOrderWithRestockCommand, CancelRestockSnapshot, RestockPlan } from './cancel-restock.command';
+export type { CancelOrderWithRestockCommand, CancelRestockSnapshot, RestockLineSnapshot, RestockPlan, RestockPlanLine, RestockedEntry } from './cancel-restock.command';
 import type {
   ImportOrdersCommand,
   ImportPortalOrdersCommand,
@@ -448,6 +451,9 @@ function toShipmentView(
     manifestId: row.manifestId,
     // Story 4-2a — the order's COD (immutable, so the read agrees with the label).
     codAmountPaise,
+    // Story 4-2b — the void stamps (null unless voided).
+    voidedAt: row.voidedAt === null ? null : canonicalInstant(row.voidedAt),
+    voidedBy: row.voidedBy,
   };
 }
 
@@ -472,6 +478,8 @@ export class OutboundFacade {
     @Inject(RateService) private readonly rateService: RateService,
     // Story 4-1c — the order import (both surfaces).
     @Inject(OrderImportCommand) private readonly orderImport: OrderImportCommand,
+    // Story 4-2b — cancel a picked or packed order with restock, and its plan read.
+    @Inject(CancelRestockCommandService) private readonly cancelRestock: CancelRestockCommandService,
   ) {}
 
   /**
@@ -584,6 +592,20 @@ export class OutboundFacade {
    */
   async importPortalOrders(command: ImportPortalOrdersCommand, idempotencyKey: string | null): Promise<PortalOrderImportResponse> {
     return this.orderImport.importPortalOrders(command, idempotencyKey);
+  }
+
+  /**
+   * Story 4-2b — `POST …/orders/{id}/cancel-with-restock`: cancels an
+   * accepted (any pick state) or packed order, restocking every drawn unit,
+   * voiding an unmanifested label, unpacking its cases and ending every hold.
+   */
+  async cancelOrderWithRestock(command: CancelOrderWithRestockCommand, idempotencyKey: string): Promise<CancelRestockSnapshot> {
+    return this.cancelRestock.cancelOrderWithRestock(command, idempotencyKey);
+  }
+
+  /** Story 4-2b — `GET …/orders/{id}/restock-plan`: what a cancel would put back, and what it did. Null → 404. */
+  async getRestockPlan(tenantId: string, orderId: string): Promise<RestockPlan | null> {
+    return this.cancelRestock.getRestockPlan(tenantId, orderId);
   }
 
   /** `POST .../outbound/orders/{id}/cancel` — releases every open hold. */

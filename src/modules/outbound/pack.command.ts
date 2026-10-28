@@ -440,6 +440,18 @@ export class PackCommandService {
           `Order "${order.id}" already reads "ready_to_dispatch" — an order reaches Ready-to-Dispatch once. Replay the original Idempotency-Key to re-read its packing slip.`,
         );
       }
+      if (order.status === 'cancelled') {
+        // Story 4-2b (decision 15): a pack queued at the bench against an
+        // order cancelled meanwhile gets its OWN code, so the handheld can
+        // name the cancel (the `rejected` fate, A7) instead of the generic
+        // conflict. Same status and title as the arm below.
+        throw new ProblemException(
+          'order-cancelled',
+          409,
+          'Order is not packable',
+          `Order "${order.id}" reads "cancelled" — only an accepted order is packed. It was cancelled while the parcel was at the bench: open the parcel and return its units to stock — the order's restock list is on the web.`,
+        );
+      }
       if (order.status !== 'accepted') {
         throw packConflict(
           'Order is not packable',

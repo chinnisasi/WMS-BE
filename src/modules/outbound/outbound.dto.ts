@@ -1803,7 +1803,7 @@ export class ShipmentDto {
   @ApiProperty({ format: 'uuid' })
   warehouseId!: string;
 
-  @ApiProperty({ enum: [...SHIPMENT_STATUSES], description: 'labelled or manifested' })
+  @ApiProperty({ enum: [...SHIPMENT_STATUSES], description: 'labelled, manifested, or (story 4-2b) voided — the label of an order cancelled with restock before it was manifested' })
   status!: string;
 
   @ApiProperty({ format: 'uuid', description: 'The connection the label generated through' })
@@ -1843,11 +1843,243 @@ export class ShipmentDto {
     description: `${COD_AMOUNT_DOC} Absent only on a replayed response stored before 4-2a — read absent as null.`,
   })
   codAmountPaise?: number | null;
+
+  @ApiProperty({ type: String, nullable: true, required: false, description: 'Story 4-2b — when the label was voided (status voided); null otherwise. Absent on a response stored before 4-2b — read absent as null.' })
+  voidedAt?: string | null;
+
+  @ApiProperty({ type: String, nullable: true, required: false, format: 'uuid', description: 'Story 4-2b — who voided it; null otherwise. Absent on a response stored before 4-2b.' })
+  voidedBy?: string | null;
 }
 
 export class ShipmentResponse {
   @ApiProperty({ type: ShipmentDto })
   shipment!: ShipmentDto;
+}
+
+// ── story 4-2b: cancel with restock ─────────────────────────────────────────
+
+/** `POST …/orders/{orderId}/cancel-with-restock` body. */
+export class CancelOrderWithRestockDto {
+  @ApiProperty({
+    required: false,
+    type: String,
+    nullable: true,
+    format: 'uuid',
+    description:
+      'ONE storage bin of the order’s warehouse every drawn unit goes back to. Absent (or null): each draw returns to the bin it was drawn from. The bin passes every placement gate (system, retired, blocked, storage class, dedicated client, secure, bulk, hazard, capacity, weight, volume, fit) and the reconcile-quarantine check',
+  })
+  @IsOptional()
+  @IsUUID()
+  restockBinId?: string | null;
+}
+
+/** One put-back line of a cancel-with-restock (base units). */
+export class RestockLineDto {
+  @ApiProperty({ format: 'uuid' })
+  orderLineId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty()
+  skuName!: string;
+
+  @ApiProperty({ description: 'The SKU’s base unit of measure' })
+  uom!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The bin the units were booked into' })
+  toBinId!: string;
+
+  @ApiProperty()
+  toBinCode!: string;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid' })
+  batchId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  batchCode!: string | null;
+
+  @ApiProperty({ description: 'Units put back, base UoM' })
+  qty!: number;
+
+  @ApiProperty({ description: 'Serial-tracked units among them (the serial numbers are on the ledger)' })
+  serialCount!: number;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The open live recall (RCL-…) the lot is on — its units stay blocked wherever they land; null otherwise' })
+  recallCode!: string | null;
+}
+
+export class VoidedShipmentDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty()
+  carrierName!: string;
+
+  @ApiProperty()
+  trackingNumber!: string;
+}
+
+export class RestockSummaryDto {
+  @ApiProperty({ format: 'uuid', description: 'The restock — every pick.restocked event of this cancel names it' })
+  restockId!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC' })
+  restockedAt!: string;
+
+  @ApiProperty({ enum: ['origin', 'bin'], description: 'origin — every draw went back to its own bin; bin — all into restockBinId' })
+  destination!: 'origin' | 'bin';
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid' })
+  restockBinId!: string | null;
+
+  @ApiProperty({ type: [RestockLineDto] })
+  lines!: RestockLineDto[];
+
+  @ApiProperty({ description: 'Σ lines[].qty, base units' })
+  totalUnits!: number;
+
+  @ApiProperty({ description: 'The order’s planned / unfulfillable pick lines withdrawn' })
+  cancelledPickLineCount!: number;
+
+  @ApiProperty({ type: [String] })
+  releasedReservationIds!: string[];
+
+  @ApiProperty({ type: [String] })
+  retiredReservationIds!: string[];
+
+  @ApiProperty({ type: [String], description: 'Catch-weight cases the pack consumed, now active again' })
+  handlingUnitIds!: string[];
+
+  @ApiProperty({ type: VoidedShipmentDto, nullable: true, description: 'The labelled, unmanifested shipment this cancel voided; null when there was none' })
+  voidedShipment!: VoidedShipmentDto | null;
+}
+
+export class CancelWithRestockResponse {
+  @ApiProperty({ type: OrderDto })
+  order!: OrderDto;
+
+  @ApiProperty({ type: RestockSummaryDto, nullable: true, description: 'null only when the order was already cancelled (the idempotent no-op)' })
+  restock!: RestockSummaryDto | null;
+}
+
+export class RestockPlanLineDto {
+  @ApiProperty({ format: 'uuid' })
+  orderLineId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty()
+  skuName!: string;
+
+  @ApiProperty()
+  uom!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The bin the units were drawn from' })
+  fromBinId!: string;
+
+  @ApiProperty()
+  fromBinCode!: string;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid' })
+  batchId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  batchCode!: string | null;
+
+  @ApiProperty({ description: 'Units still to put back, base UoM' })
+  qty!: number;
+
+  @ApiProperty({ type: [String], description: 'The serials to scan back' })
+  serialNumbers!: string[];
+
+  @ApiProperty({ type: String, nullable: true, description: 'The open live recall the lot is on; null otherwise' })
+  recallCode!: string | null;
+}
+
+export class RestockedEntryDto {
+  @ApiProperty({ format: 'uuid' })
+  orderLineId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty()
+  skuName!: string;
+
+  @ApiProperty()
+  uom!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  toBinId!: string;
+
+  @ApiProperty()
+  toBinCode!: string;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid' })
+  batchId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  batchCode!: string | null;
+
+  @ApiProperty({ description: 'Units put back, base UoM' })
+  qty!: number;
+
+  @ApiProperty()
+  serialCount!: number;
+
+  @ApiProperty({ description: 'ISO-8601 UTC' })
+  restockedAt!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  restockId!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  recallCode!: string | null;
+}
+
+export class RestockPlanShipmentDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ enum: [...SHIPMENT_STATUSES] })
+  status!: string;
+
+  @ApiProperty()
+  carrierName!: string;
+
+  @ApiProperty()
+  trackingNumber!: string;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid' })
+  manifestId!: string | null;
+}
+
+export class RestockPlanResponse {
+  @ApiProperty({ format: 'uuid' })
+  orderId!: string;
+
+  @ApiProperty({ enum: [...ORDER_STATUSES] })
+  orderStatus!: string;
+
+  @ApiProperty({ type: RestockPlanShipmentDto, nullable: true, description: 'The order’s shipment (any status); null before a label' })
+  shipment!: RestockPlanShipmentDto | null;
+
+  @ApiProperty({ type: [RestockPlanLineDto], description: 'The draws still to put back — empty unless the order is accepted or ready_to_dispatch' })
+  lines!: RestockPlanLineDto[];
+
+  @ApiProperty({ type: [RestockedEntryDto], description: 'What a cancel already put back (the "Put back" list)' })
+  restocked!: RestockedEntryDto[];
 }
 
 /**

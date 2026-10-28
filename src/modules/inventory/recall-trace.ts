@@ -237,14 +237,14 @@ export async function batchTraceEventsPageInTx(
 
 /**
  * Story 3-7a (A7) — the ledger types whose SIGNED sum is a batch's net pick
- * quantity on an order line. On this base exactly `pick.picked`: no
- * registered type reverses a pick (pack and dispatch carry the order line but
- * move nothing and close the batch arm). `test/architecture.spec.ts` fails
+ * quantity on an order line: `pick.picked` (a draw, negative) and — story
+ * 4-2b — `pick.restocked` (its exact reversal on a cancelled order, positive),
+ * so a restocked draw nets to 0. Pack and dispatch carry the order line but
+ * move nothing and close the batch arm. `test/architecture.spec.ts` fails
  * when a registered type that carries an order line with the batch arm OPEN
- * is missing here — the packed-order cancel/unpack (deferred from 4.2) must
- * join it.
+ * is missing here.
  */
-export const PICK_NETTING_TYPES = ['pick.picked'] as const;
+export const PICK_NETTING_TYPES = ['pick.picked', 'pick.restocked'] as const;
 
 export interface BatchOrderPickTotal {
   readonly batchId: string;

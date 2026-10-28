@@ -7193,6 +7193,7 @@
                   "putaway.placed",
                   "bin.merged",
                   "pick.picked",
+                  "pick.restocked",
                   "pack.packed",
                   "dispatch.dispatched",
                   "excursion.recorded",
@@ -10373,6 +10374,232 @@
         ]
       }
     },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/cancel-with-restock": {
+      "post": {
+        "operationId": "OutboundController_cancelOrderWithRestock",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelOrderWithRestockDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The cancelled order and what was put back (the idempotency snapshot — a replay re-serves it byte for byte)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CancelWithRestockResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key or path parameter, restockBinId not a uuid, or restockBinId a system bin (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks orders.manage (role-denied), or a secure destination bin without secure.move (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The order does not exist in this tenant, or restockBinId names no bin of the order’s warehouse (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The order is dispatched — receive it back as a return (order-dispatched); its shipment is manifested, naming the manifest (shipment-manifested); its label was booked with a real courier whose AWB this build cannot cancel (shipment-void-unsupported); a destination bin refuses the intake, naming the bin, with the gate’s own code (bin-retired, bin-blocked, bin-storage-mismatch, bin-client-mismatch, bin-occupancy-conflict, bin-segregation-conflict, hazard-segregation-conflict, bin-full, bin-overweight, bin-volume-exceeded, bin-item-oversize); a (SKU, destination) under an open reconcile quarantine (restock-scope-quarantined); a serial no longer this order’s draw — counted, adjusted or moved while in the tote (restock-serial-moved); a case the pack recorded is no longer packed into the order (handling-unit-not-packed); the order was picked while it was being cancelled, or a concurrent idempotent request (conflict). Nothing is written on any refusal",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload — including a key used on /cancel (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The reservation store is unreachable (reservation-store-unavailable)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-2b — cancels an accepted (any pick state) or packed order and RESTOCKS it (orders.manage), in one transaction: every drawn unit goes back to stock through a pick.restocked ledger intake that reverses its pick.picked draw exactly (quantity, batch, serial) — into the bin it was drawn from, or all into restockBinId; the order’s planned and unfulfillable pick lines are withdrawn; a labelled, unmanifested shipment is voided (locally — no carrier call); the pack’s catch-weight cases become active again; every held hold is released and every committed hold retired (ATP restored); the order reads cancelled. An order with no draws ends exactly as /cancel would. Already cancelled: the idempotent 200 no-op (restock null). /cancel is unchanged (the channel cancellation calls it)",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/restock-plan": {
+      "get": {
+        "operationId": "OutboundController_getRestockPlan",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The restock plan",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestockPlanResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed orderId path parameter (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No order with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-2b — what cancelling an order with restock would put back (lines: its draws not yet restocked, per order line, SKU, origin bin and batch, with the serials to scan back), and what a cancel already put back (restocked), plus its shipment. A READ: no capability, no key, nothing stored; answers for any status (lines are empty unless the order is accepted or ready_to_dispatch)",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
     "/tenants/{tenantId}/outbound/orders/{orderId}/pack": {
       "post": {
         "operationId": "OutboundController_packOrder",
@@ -10600,7 +10827,7 @@
             }
           },
           "409": {
-            "description": "The order is already dispatched under a different key, or is not packed — it reads accepted or cancelled (conflict, naming the status); story 3-7a — its picks drew a lot that is on an OPEN LIVE recall: release the lot from the recall (close it with the lot in releaseBatchIds) or wait for the packed-order cancel/unpack (order-holds-recalled-batch, members batchCodes and recallCodes); a lot blocked for any other reason still ships; or a concurrent idempotent request (conflict). Nothing is written",
+            "description": "The order is already dispatched under a different key, or is not packed — it reads accepted or cancelled (conflict, naming the status); story 3-7a — its picks drew a lot that is on an OPEN LIVE recall: release the lot from the recall (close it with the lot in releaseBatchIds) or cancel the order with restock (order-holds-recalled-batch, members batchCodes and recallCodes); a lot blocked for any other reason still ships; or a concurrent idempotent request (conflict). Nothing is written",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -45521,6 +45748,435 @@
         "type": "object",
         "properties": {}
       },
+      "CancelOrderWithRestockDto": {
+        "type": "object",
+        "properties": {
+          "restockBinId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "ONE storage bin of the order’s warehouse every drawn unit goes back to. Absent (or null): each draw returns to the bin it was drawn from. The bin passes every placement gate (system, retired, blocked, storage class, dedicated client, secure, bulk, hazard, capacity, weight, volume, fit) and the reconcile-quarantine check"
+          }
+        }
+      },
+      "RestockLineDto": {
+        "type": "object",
+        "properties": {
+          "orderLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "uom": {
+            "type": "string",
+            "description": "The SKU’s base unit of measure"
+          },
+          "toBinId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The bin the units were booked into"
+          },
+          "toBinCode": {
+            "type": "string"
+          },
+          "batchId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units put back, base UoM"
+          },
+          "serialCount": {
+            "type": "number",
+            "description": "Serial-tracked units among them (the serial numbers are on the ledger)"
+          },
+          "recallCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The open live recall (RCL-…) the lot is on — its units stay blocked wherever they land; null otherwise"
+          }
+        },
+        "required": [
+          "orderLineId",
+          "skuId",
+          "skuCode",
+          "skuName",
+          "uom",
+          "toBinId",
+          "toBinCode",
+          "batchId",
+          "batchCode",
+          "qty",
+          "serialCount",
+          "recallCode"
+        ]
+      },
+      "VoidedShipmentDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "carrierName": {
+            "type": "string"
+          },
+          "trackingNumber": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "carrierName",
+          "trackingNumber"
+        ]
+      },
+      "RestockSummaryDto": {
+        "type": "object",
+        "properties": {
+          "restockId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The restock — every pick.restocked event of this cancel names it"
+          },
+          "restockedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "destination": {
+            "type": "string",
+            "enum": [
+              "origin",
+              "bin"
+            ],
+            "description": "origin — every draw went back to its own bin; bin — all into restockBinId"
+          },
+          "restockBinId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RestockLineDto"
+            }
+          },
+          "totalUnits": {
+            "type": "number",
+            "description": "Σ lines[].qty, base units"
+          },
+          "cancelledPickLineCount": {
+            "type": "number",
+            "description": "The order’s planned / unfulfillable pick lines withdrawn"
+          },
+          "releasedReservationIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "retiredReservationIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "handlingUnitIds": {
+            "description": "Catch-weight cases the pack consumed, now active again",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "voidedShipment": {
+            "nullable": true,
+            "description": "The labelled, unmanifested shipment this cancel voided; null when there was none",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/VoidedShipmentDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "restockId",
+          "restockedAt",
+          "destination",
+          "restockBinId",
+          "lines",
+          "totalUnits",
+          "cancelledPickLineCount",
+          "releasedReservationIds",
+          "retiredReservationIds",
+          "handlingUnitIds",
+          "voidedShipment"
+        ]
+      },
+      "CancelWithRestockResponse": {
+        "type": "object",
+        "properties": {
+          "order": {
+            "$ref": "#/components/schemas/OrderDto"
+          },
+          "restock": {
+            "nullable": true,
+            "description": "null only when the order was already cancelled (the idempotent no-op)",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RestockSummaryDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "order",
+          "restock"
+        ]
+      },
+      "RestockPlanShipmentDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "labelled",
+              "manifested",
+              "voided"
+            ]
+          },
+          "carrierName": {
+            "type": "string"
+          },
+          "trackingNumber": {
+            "type": "string"
+          },
+          "manifestId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "carrierName",
+          "trackingNumber",
+          "manifestId"
+        ]
+      },
+      "RestockPlanLineDto": {
+        "type": "object",
+        "properties": {
+          "orderLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "uom": {
+            "type": "string"
+          },
+          "fromBinId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The bin the units were drawn from"
+          },
+          "fromBinCode": {
+            "type": "string"
+          },
+          "batchId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units still to put back, base UoM"
+          },
+          "serialNumbers": {
+            "description": "The serials to scan back",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "recallCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The open live recall the lot is on; null otherwise"
+          }
+        },
+        "required": [
+          "orderLineId",
+          "skuId",
+          "skuCode",
+          "skuName",
+          "uom",
+          "fromBinId",
+          "fromBinCode",
+          "batchId",
+          "batchCode",
+          "qty",
+          "serialNumbers",
+          "recallCode"
+        ]
+      },
+      "RestockedEntryDto": {
+        "type": "object",
+        "properties": {
+          "orderLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "uom": {
+            "type": "string"
+          },
+          "toBinId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "toBinCode": {
+            "type": "string"
+          },
+          "batchId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units put back, base UoM"
+          },
+          "serialCount": {
+            "type": "number"
+          },
+          "restockedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "restockId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "recallCode": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "orderLineId",
+          "skuId",
+          "skuCode",
+          "skuName",
+          "uom",
+          "toBinId",
+          "toBinCode",
+          "batchId",
+          "batchCode",
+          "qty",
+          "serialCount",
+          "restockedAt",
+          "restockId",
+          "recallCode"
+        ]
+      },
+      "RestockPlanResponse": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderStatus": {
+            "type": "string",
+            "enum": [
+              "accepted",
+              "ready_to_dispatch",
+              "dispatched",
+              "cancelled"
+            ]
+          },
+          "shipment": {
+            "nullable": true,
+            "description": "The order’s shipment (any status); null before a label",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RestockPlanShipmentDto"
+              }
+            ]
+          },
+          "lines": {
+            "description": "The draws still to put back — empty unless the order is accepted or ready_to_dispatch",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RestockPlanLineDto"
+            }
+          },
+          "restocked": {
+            "description": "What a cancel already put back (the \"Put back\" list)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RestockedEntryDto"
+            }
+          }
+        },
+        "required": [
+          "orderId",
+          "orderStatus",
+          "shipment",
+          "lines",
+          "restocked"
+        ]
+      },
       "PackScanLineDto": {
         "type": "object",
         "properties": {
@@ -46042,9 +46698,10 @@
             "type": "string",
             "enum": [
               "labelled",
-              "manifested"
+              "manifested",
+              "voided"
             ],
-            "description": "labelled or manifested"
+            "description": "labelled, manifested, or (story 4-2b) voided — the label of an order cancelled with restock before it was manifested"
           },
           "carrierConnectionId": {
             "type": "string",
@@ -46100,6 +46757,17 @@
             "type": "number",
             "nullable": true,
             "description": "Story 4-2a — the cash to collect on delivery, integer paise; null means prepaid (nothing to collect). Absent only on a replayed response stored before 4-2a — read absent as null."
+          },
+          "voidedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 4-2b — when the label was voided (status voided); null otherwise. Absent on a response stored before 4-2b — read absent as null."
+          },
+          "voidedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Story 4-2b — who voided it; null otherwise. Absent on a response stored before 4-2b."
           }
         },
         "required": [

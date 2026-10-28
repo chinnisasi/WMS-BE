@@ -406,6 +406,9 @@ export function referenceSummary(doc: LedgerReferenceDoc, grnCodes: ReadonlyMap<
     // Story 4-7a — a restock or scrap of a returned unit.
     case 'return-disposition':
       return `return ${doc.outcome} ${doc.rmaId}${doc.reasonCode === undefined ? '' : ` (${doc.reasonCode})`}`;
+    // Story 4-2b — a cancelled order's drawn units put back.
+    case 'restock':
+      return `restock order ${doc.orderId}`;
     default: {
       const unknown: never = doc;
       const kind = (unknown as { kind?: unknown }).kind;

@@ -14,6 +14,7 @@ import { RateService } from './rate.service';
 import { WAVE_CLOCK, SystemWaveClock } from './wave.clock';
 import { OutboundFacade } from './outbound.facade';
 import { OrderImportCommand } from './order-import.command';
+import { CancelRestockCommandService } from './cancel-restock.command';
 import { ValkeyModule } from '../../shared/valkey/valkey.module';
 
 /**
@@ -102,6 +103,7 @@ import { ValkeyModule } from '../../shared/valkey/valkey.module';
     ManifestCommandService,
     RateService,
     OrderImportCommand,
+    CancelRestockCommandService,
     { provide: WAVE_CLOCK, useClass: SystemWaveClock },
     OutboundFacade,
   ],

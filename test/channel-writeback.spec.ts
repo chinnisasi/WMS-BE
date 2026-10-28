@@ -376,7 +376,7 @@ describe('channel writeback: source filter, dedupe, convergence, echo, decouplin
   }
 
   /** Walks the wave → pick → pack → dispatch flow for one order. */
-  async function flowToFulfilment(orderId: string, codes: { code: string; quantity: number }[]): Promise<void> {
+  async function flowToFulfilment(orderId: string, codes: { code: string; quantity: number }[], options: { dispatch?: boolean } = {}): Promise<void> {
     const policyId = (
       await request(app.getHttpServer())
         .post(`${API}/${tenantId}/outbound/wave-policies`)
@@ -433,6 +433,7 @@ describe('channel writeback: source filter, dedupe, convergence, echo, decouplin
       .set(KEY_HEADER, ulid())
       .send({ scanned: codes.map(({ code, quantity }) => ({ skuId: skuIds.get(code)!, qty: quantity })) })
       .expect(201);
+    if (options.dispatch === false) return;
     await request(app.getHttpServer())
       .post(`${API}/${tenantId}/outbound/orders/${orderId}/dispatch`)
       .set('Authorization', `Bearer ${opsToken}`)
@@ -898,6 +899,29 @@ describe('channel writeback: source filter, dedupe, convergence, echo, decouplin
     } finally {
       await sql.end();
     }
+    await clearOutbox();
+  });
+
+  it('story 4-2b: a STALE order.packed relayed after a cancel-with-restock acks WITHOUT writing — no fulfillment, no meter row', async () => {
+    const ref = 8_300_000_000_011;
+    await putMappings(MAPPED_CODES.map((code) => ({ externalRef: code, skuId: skuIds.get(code)! }))).expect(200);
+    const orderId = await ingestRef(connId, 'test-writeback', ref, 'WB-A', 1);
+    await flowToFulfilment(orderId, [{ code: 'WB-A', quantity: 1 }], { dispatch: false });
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/outbound/orders/${orderId}/cancel-with-restock`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({})
+      .expect(200);
+    expect(await orderStatus(orderId)).toBe('cancelled');
+    // The relay's skew: the packed row is redelivered late, after the cancel
+    // (the cancellation row is cleared so the channel state cannot mask it).
+    await clearOutbox();
+    const before = (await writebackRows(connId)).length;
+    await handAppendPacked(orderId);
+    await drainAll();
+    expect(WRITEBACK_STATES.get(String(ref))?.fulfillments.size ?? 0).toBe(0);
+    expect((await writebackRows(connId)).length).toBe(before);
     await clearOutbox();
   });
 });
