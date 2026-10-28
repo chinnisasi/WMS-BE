@@ -18,6 +18,7 @@ import { EnrollmentCommand } from './enrollment.command';
 import { RegistrationCommand } from './registration.command';
 import { SignInCommand } from './sign-in.command';
 import { SecondFactorCommand } from './second-factor.command';
+import { PasswordResetCommand } from './password-reset.command';
 import { SessionCommand } from './session.command';
 import { SyncReportCommand } from './sync-report.command';
 import { TenancyController } from './tenancy.controller';
@@ -71,6 +72,7 @@ import { ZoneCommand } from './zone.command';
     RegistrationCommand,
     SignInCommand,
     SecondFactorCommand,
+    PasswordResetCommand,
     SessionCommand,
     WarehouseCommand,
     ZoneCommand,

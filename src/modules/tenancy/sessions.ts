@@ -23,7 +23,7 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 export const SESSION_KINDS = ['web', 'portal', 'badge'] as const;
 export type SessionKind = (typeof SESSION_KINDS)[number];
 
-/** The stored revoke reasons — pinned against `sessions_revoked_reason_check` (0074). */
+/** The stored revoke reasons — pinned against `sessions_revoked_reason_check` (0074; last re-added in 0103). */
 export const SESSION_REVOKE_REASONS = [
   'signed-out',
   'deactivated',
@@ -38,6 +38,9 @@ export const SESSION_REVOKE_REASONS = [
   'second-factor-changed',
   // Story 1-2a — the client departed: its portal sessions end at once.
   'client-departed',
+  // Story 6-1c — a completed password reset ends every session of the user
+  // (web, portal and badge).
+  'password-reset',
 ] as const;
 export type SessionRevokeReason = (typeof SESSION_REVOKE_REASONS)[number];
 
@@ -86,7 +89,10 @@ export type SecurityAuditAction =
   | 'user.backup_codes_regenerated'
   | 'user.backup_code_used'
   | 'user.second_factor_locked'
-  | 'user.second_factor_reset';
+  | 'user.second_factor_reset'
+  // Story 6-1c — the password reset (`password-reset.command.ts`).
+  | 'user.password_reset_requested'
+  | 'user.password_reset';
 
 export async function auditSecurityEventInTx(
   tx: TenantTx,

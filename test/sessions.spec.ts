@@ -217,7 +217,11 @@ describe('secure sessions (e2e, story 6-1a)', () => {
       const t = await registerTenant();
       const passwordStep = await signInReq(t.email, PASSWORD).expect(200);
       expect(passwordStep.body.challenge).toBe('enroll');
-      expect(passwordStep.headers['set-cookie']).toBeUndefined();
+      // Story 6-1c (A1) — the challenge still sets NO refresh cookie (no
+      // session exists); it now sets the device cookie a right password earns.
+      const challengeCookies = (passwordStep.headers['set-cookie'] as unknown as string[] | undefined) ?? [];
+      expect(challengeCookies.filter((line) => line.startsWith(`${REFRESH_COOKIE_NAME}=`))).toEqual([]);
+      expect(challengeCookies.map((line) => line.split('=')[0])).toEqual(['wms_device']);
       expect(await sql`select id from sessions where user_id = ${t.ownerId}`).toHaveLength(0);
       const res = await signInAs(app, t.email, PASSWORD, { ip: newIp() });
       expect(res.status).toBe(200);

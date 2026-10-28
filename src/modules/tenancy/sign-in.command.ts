@@ -20,13 +20,23 @@ import {
   TOTP_CHALLENGE_SECONDS,
 } from './second-factor';
 import {
+  ONE_HOUR_SECONDS,
   SIGNIN_LIMIT_PER_IP_PER_MINUTE,
+  SIGNIN_UNTRUSTED_LIMIT_PER_ACCOUNT_PER_HOUR,
+  SIGNIN_UNTRUSTED_LIMIT_PER_IP_PER_HOUR,
   clearSignInAttempts,
   countSignInAttempt,
+  deviceAttemptKey,
+  emailDigest,
   hitRateLimit,
+  ipKey,
+  refundRateLimit,
   settleSignInFailure,
   signInLocked,
+  type AttemptKey,
+  type RateLimitHit,
 } from './auth-attempts';
+import { issueDeviceCookie, verifyDeviceCookie } from './device-cookie';
 import { auditSecurityEventInTx, createSessionInTx, refreshCookieValue } from './sessions';
 import { DUMMY_HASH, verifyPassword } from './passwords';
 import { clientInactive, readSessionClientIn } from '../clients/clients.facade';
@@ -43,6 +53,14 @@ export interface SignInInput {
    * open tab with an old bundle never writes a broken session.
    */
   readonly secondFactorCapable?: boolean;
+  /** Story 6-1c (A1) — the `wms_device` cookie the browser sent, if any. */
+  readonly deviceCookie?: string | null;
+}
+
+/** Story 6-1c — the outcome, plus the `wms_device` cookie a right password earns (the controller sets it). */
+export interface SignInResult {
+  readonly outcome: SignInOutcome;
+  readonly deviceCookie: string;
 }
 
 /** Story 6-1a's sign-in body, unchanged, plus the cookie value the controller sets. */
@@ -175,19 +193,55 @@ export class SignInCommand {
     @Inject(DATABASE) private readonly db: Database,
   ) {}
 
-  async execute(command: SignInInput): Promise<SignInOutcome> {
+  async execute(command: SignInInput): Promise<SignInResult> {
     const email = command.email.trim().toLowerCase();
-    // Story 6-1a — the attempt limit, then this attempt is COUNTED before the
-    // password is checked (own committed statement; a lock answers 423 for
-    // any password, real or unknown email alike).
-    await hitRateLimit(this.db, `signin-ip:${command.ip}`, SIGNIN_LIMIT_PER_IP_PER_MINUTE);
-    const counted = await countSignInAttempt(this.db, email, command.ip);
+    const addressKey = ipKey(command.ip);
+    // Story 6-1a — the per-address minute limit, first, for every attempt.
+    await hitRateLimit(this.db, `signin-ip:${addressKey}`, SIGNIN_LIMIT_PER_IP_PER_MINUTE);
+    // Story 6-1c (A2) — the lookup moves before the counts: a trusted attempt
+    // is one whose `wms_device` cookie verifies against this account's
+    // CURRENT password hash. An unknown email has no valid cookie.
     const userRows = await this.authDb
       .select()
       .from(users)
       .where(eq(users.email, email))
       .limit(1);
     const user = userRows[0];
+    const trusted =
+      user === undefined ? null : verifyDeviceCookie(command.deviceCookie ?? null, email, user.passwordHash);
+    // A trusted attempt is counted on its own cookie (5 → 15 min, the 6-1a
+    // rule) and is exempt from the (email, address) lock and both hour
+    // buckets: nobody elsewhere can lock or throttle the holder of a valid
+    // cookie. An untrusted one meets the account-hour and address-hour
+    // buckets (each refunded on a right password, B7), then 6-1a's pair.
+    let attemptKey: AttemptKey;
+    const hits: RateLimitHit[] = [];
+    if (trusted !== null) {
+      attemptKey = deviceAttemptKey(trusted.nonce);
+    } else {
+      attemptKey = addressKey;
+      const account = await hitRateLimit(
+        this.db,
+        `signin-account:${emailDigest(email)}`,
+        SIGNIN_UNTRUSTED_LIMIT_PER_ACCOUNT_PER_HOUR,
+        ONE_HOUR_SECONDS,
+      );
+      hits.push(account);
+      try {
+        hits.push(
+          await hitRateLimit(this.db, `signin-ip-hour:${addressKey}`, SIGNIN_UNTRUSTED_LIMIT_PER_IP_PER_HOUR, ONE_HOUR_SECONDS),
+        );
+      } catch (error) {
+        // Refused here: the account bucket gives the hit back (a refused
+        // attempt never reached a password check).
+        await refundRateLimit(this.db, account);
+        throw error;
+      }
+    }
+    const refund = async () => {
+      for (const hit of hits) await refundRateLimit(this.db, hit);
+    };
+    const counted = await countSignInAttempt(this.db, email, attemptKey);
     if (counted.locked) {
       if (counted.newlyLocked && user !== undefined) await this.auditLock(user, command.ip);
       throw signInLocked(counted.retryAfterSeconds);
@@ -200,8 +254,9 @@ export class SignInCommand {
       // enumeration of pending invites via timing).
       await verifyPassword(command.password, DUMMY_HASH);
       // Code review — not a guess at a password (an invitee has none): this
-      // refusal never counts toward the lock.
-      await clearSignInAttempts(this.db, email, command.ip);
+      // refusal never counts toward the lock (nor, story 6-1c, the buckets).
+      await clearSignInAttempts(this.db, email, attemptKey);
+      await refund();
       throw new ProblemException(
         'invite-pending',
         403,
@@ -214,7 +269,7 @@ export class SignInCommand {
     const ok = await verifyPassword(command.password, user?.passwordHash ?? DUMMY_HASH);
     // Story 6-1a — a deactivated user answers exactly like a wrong password.
     if (user === undefined || !ok || user.status !== 'active') {
-      const locked = await settleSignInFailure(this.db, email, command.ip);
+      const locked = await settleSignInFailure(this.db, email, attemptKey);
       if (locked && user !== undefined) await this.auditLock(user, command.ip);
       // One message for unknown email and wrong password — no enumeration.
       throw new ProblemException(
@@ -224,6 +279,8 @@ export class SignInCommand {
         'Unknown email or wrong password.',
       );
     }
+    // Story 6-1c (B7) — a right password uses up nobody's untrusted budget.
+    await refund();
     const tenantRows = await this.authDb
       .select({ id: tenants.id, name: tenants.name, gstin: tenants.gstin })
       .from(tenants)
@@ -241,12 +298,16 @@ export class SignInCommand {
       if (facts === null || facts.status !== 'active') {
         // The password was right: a suspension is not a failed attempt.
         // Story 1-2a — a departed client answers `client-departed`.
-        await clearSignInAttempts(this.db, email, command.ip);
+        await clearSignInAttempts(this.db, email, attemptKey);
         throw clientInactive(facts?.status ?? null);
       }
       client = { id: facts.id, code: facts.code, name: facts.name };
     }
-    await clearSignInAttempts(this.db, email, command.ip);
+    await clearSignInAttempts(this.db, email, attemptKey);
+    // Story 6-1c (A1) — a right password earns the device cookie in every
+    // arm (session, `totp`, `enroll`): its holder knows the password, so the
+    // guessing limits protect nothing from them; 2FA still stands.
+    const deviceCookie = issueDeviceCookie(email, user.passwordHash);
 
     // Story 6-1b — the branch (sign-in is unchanged up to here). A staff
     // user who has enrolled gets the code step; an owner who has not gets
@@ -260,14 +321,16 @@ export class SignInCommand {
       (user.mfaEnabledAt !== null || secondFactorRequired(user.role) || user.mfaEnrolCodeHash !== null)
     ) {
       if (command.secondFactorCapable !== true) throw clientOutdated();
-      return withTenantTransaction(this.db, user.tenantId, (tx) =>
+      const challenge = await withTenantTransaction(this.db, user.tenantId, (tx) =>
         issueChallengeInTx(tx, { ...user, mfaEnabledAt: user.mfaEnabledAt }, tenant, command.ip),
       );
+      return { outcome: challenge, deviceCookie };
     }
 
     // Story 6-1a — the server-side session, written in the user's tenant
     // transaction (RLS); its id rides the access token as `sid`.
-    return withTenantTransaction(this.db, user.tenantId, (tx) => issueWebSessionInTx(tx, user, tenant, client));
+    const session = await withTenantTransaction(this.db, user.tenantId, (tx) => issueWebSessionInTx(tx, user, tenant, client));
+    return { outcome: session, deviceCookie };
   }
 
   /** Code review (C11) — the lock is audited once, when it is set, against the account (the system acted). */

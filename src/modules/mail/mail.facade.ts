@@ -9,7 +9,7 @@ import { addressAllowed, mailConfigFromEnv } from './mail.config';
 import { sealEmailSecret } from './mail-secrets';
 import { MailSender, type MailSendSummary } from './mail.sender';
 import { EMAIL_LIVE_STATUSES, type EmailStatus, type EmailTemplate } from './mail-rules';
-import type { InviteEmailParams } from './templates';
+import type { InviteEmailParams, PasswordChangedEmailParams, PasswordResetEmailParams } from './templates';
 
 /**
  * Story 5-1a — the mail module's ONLY seam (`test/architecture.spec.ts`:
@@ -28,10 +28,14 @@ import type { InviteEmailParams } from './templates';
 
 export { EMAIL_STATUSES, EMAIL_SENDING_STALE_MS, EMAIL_PENDING_EXPIRY_MS, EMAIL_RETENTION_DAYS, EMAIL_FINAL_STATUSES } from './mail-rules';
 export type { EmailStatus, EmailTemplate } from './mail-rules';
-export type { InviteEmailParams } from './templates';
+export type { InviteEmailParams, PasswordChangedEmailParams, PasswordResetEmailParams } from './templates';
 export type { MailSendSummary } from './mail.sender';
 
-/** What a command passes to queue one message. */
+/**
+ * What a command passes to queue one message — a union over the templates
+ * (story 6-1c), so each template's parameters are checked where they are
+ * queued.
+ */
 export type QueueEmailInput = {
   readonly tenantId: string;
   readonly to: string;
@@ -39,7 +43,11 @@ export type QueueEmailInput = {
   readonly secret?: string;
   /** What the message concerns: the users list reads the latest invite per user. */
   readonly sourceRef: { readonly userId: string | null };
-} & { readonly template: 'user-invite'; readonly params: InviteEmailParams };
+} & (
+  | { readonly template: 'user-invite'; readonly params: InviteEmailParams }
+  | { readonly template: 'password-reset'; readonly params: PasswordResetEmailParams }
+  | { readonly template: 'password-changed'; readonly params: PasswordChangedEmailParams }
+);
 
 export interface QueuedEmail {
   readonly id: string;
@@ -98,6 +106,32 @@ export async function cancelUserEmailsInTx(
         eq(emailMessages.tenantId, tenantId),
         eq(emailMessages.userId, userId),
         eq(emailMessages.template, template),
+        inArray(emailMessages.status, [...EMAIL_LIVE_STATUSES]),
+      ),
+    )
+    .returning({ id: emailMessages.id });
+  return cancelled.length;
+}
+
+/**
+ * Story 6-1c (A4) — cancels the named live messages (a reset token spent by a
+ * newer request: its mail must not deliver a dead link), wiping each secret.
+ * Rows already final are left as they are. Returns how many it cancelled.
+ */
+export async function cancelEmailMessagesInTx(
+  tx: TenantTx,
+  tenantId: string,
+  messageIds: readonly string[],
+  reason: 'superseded',
+): Promise<number> {
+  if (messageIds.length === 0) return 0;
+  const cancelled = await tx
+    .update(emailMessages)
+    .set({ status: 'cancelled', sealedSecret: null, errorCode: reason, updatedAt: sql`now()` })
+    .where(
+      and(
+        eq(emailMessages.tenantId, tenantId),
+        inArray(emailMessages.id, [...messageIds]),
         inArray(emailMessages.status, [...EMAIL_LIVE_STATUSES]),
       ),
     )

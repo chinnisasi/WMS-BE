@@ -315,7 +315,8 @@ describe('tenancy (e2e)', () => {
       .expect(200);
     expect(passwordStep.body).toMatchObject({ challenge: 'enroll', expiresInSeconds: 600 });
     expect(passwordStep.body.accessToken).toBeUndefined();
-    expect(passwordStep.headers['set-cookie']).toBeUndefined();
+    // Story 6-1c (A1) — still no refresh cookie (no session exists); only the device cookie a right password earns.
+    expect(((passwordStep.headers['set-cookie'] as unknown as string[] | undefined) ?? []).map((line) => line.split('=')[0])).toEqual(['wms_device']);
 
     const completed = await signInAs(app, email, 'correct-horse-battery');
     expect(completed.status).toBe(200);

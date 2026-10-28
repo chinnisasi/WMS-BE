@@ -27,6 +27,7 @@ import { ROLE_CAPABILITIES } from './permissions';
 import { emailDigest, signInLockedUntil } from './auth-attempts';
 import { revokeSessionsInTx } from './sessions';
 import { clearOpenChallengesInTx, clearSecondFactorLockInTx } from './second-factor';
+import { spendOpenResetsInTx } from './password-reset';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -840,6 +841,10 @@ export class UsersCommand {
           await cancelUserEmailsInTx(tx, command.tenantId, target.id, 'user-invite', 'deactivated');
           // Story 6-1b — and any sign-in in progress.
           await clearOpenChallengesInTx(tx, command.tenantId, target.id);
+          // Story 6-1c — and every reset link (the user row is locked above:
+          // the user-then-token order), with its still-queued mail.
+          await spendOpenResetsInTx(tx, command.tenantId, target.id);
+          await cancelUserEmailsInTx(tx, command.tenantId, target.id, 'password-reset', 'deactivated');
           await tx
             .update(devices)
             .set({

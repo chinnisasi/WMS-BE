@@ -1,4 +1,4 @@
-import { istDateOf } from '../../../shared/primitives/time';
+import { istDateOf, istWallClock } from '../../../shared/primitives/time';
 import { headerText, html, plainText } from './escape';
 
 /**
@@ -48,6 +48,11 @@ const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 
 export function istLongDate(instant: string): string {
   const [year, month, day] = istDateOf(instant).split('-') as [string, string, string];
   return `${Number(day)} ${MONTHS[Number(month) - 1]} ${year}`;
+}
+
+/** Story 6-1c (A17) — `2026-10-24T08:35:00Z` → `24 October 2026, 14:05`, the IST wall clock (the caller adds "(IST)"). */
+export function istLongDateTime(instant: string): string {
+  return `${istLongDate(instant)}, ${istWallClock(instant).slice(11, 16)}`;
 }
 
 /** The stored parameters, re-checked at send time (a row is jsonb — never trusted blind). */

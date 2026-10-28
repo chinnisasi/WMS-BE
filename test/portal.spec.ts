@@ -446,6 +446,10 @@ describe('client portal (e2e, story 21-7)', () => {
     // Origin + X-WMS-Session check replaces a bearer guard.
     'POST api/v1/tenants/session/refresh',
     'POST api/v1/tenants/session/sign-out',
+    // Story 6-1c — the password reset: no session exists (a token in the body is the credential, or nothing is).
+    'POST api/v1/tenants/password-reset',
+    'POST api/v1/tenants/password-reset/check',
+    'POST api/v1/tenants/password-reset/confirm',
     'POST api/v1/tenants/:tenantId/accept-invite',
     'POST api/v1/tenants/:tenantId/devices/enroll',
     'POST api/v1/tenants/:tenantId/webhooks/channels/:provider/:connectionId/orders',

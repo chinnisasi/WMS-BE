@@ -16,6 +16,7 @@ import {
   clearSignInAttempts,
   countSignInAttempt,
   hitRateLimit,
+  ipKey,
   settleSignInFailure,
   signInLocked,
   SIGNIN_LIMIT_PER_IP_PER_MINUTE,
@@ -402,7 +403,9 @@ export class SecondFactorCommand {
 
   /** The password proof (2FA off): counted before the scrypt check, like sign-in. */
   private async assertPassword(caller: SelfServiceCaller, password: string): Promise<void> {
-    await hitRateLimit(this.db, `signin-ip:${caller.ip}`, SIGNIN_LIMIT_PER_IP_PER_MINUTE);
+    // Story 6-1c (A11) — the same address key as sign-in (an IPv6 /64).
+    const key = ipKey(caller.ip);
+    await hitRateLimit(this.db, `signin-ip:${key}`, SIGNIN_LIMIT_PER_IP_PER_MINUTE);
     const rows = await withTenantTransaction(this.db, caller.tenantId, (tx) =>
       tx
         .select({ email: users.email, passwordHash: users.passwordHash })
@@ -411,16 +414,16 @@ export class SecondFactorCommand {
         .limit(1),
     );
     const user = rows[0]!;
-    const counted = await countSignInAttempt(this.db, user.email, caller.ip);
+    const counted = await countSignInAttempt(this.db, user.email, key);
     if (counted.locked) {
       if (counted.newlyLocked) await this.auditSignInLock(caller);
       throw signInLocked(counted.retryAfterSeconds);
     }
     if (!(await verifyPassword(password, user.passwordHash))) {
-      if (await settleSignInFailure(this.db, user.email, caller.ip)) await this.auditSignInLock(caller);
+      if (await settleSignInFailure(this.db, user.email, key)) await this.auditSignInLock(caller);
       throw new ProblemException('password-invalid', 422, 'Wrong password', 'That password is not right.');
     }
-    await clearSignInAttempts(this.db, user.email, caller.ip);
+    await clearSignInAttempts(this.db, user.email, key);
   }
 
   private async auditSignInLock(caller: SelfServiceCaller): Promise<void> {

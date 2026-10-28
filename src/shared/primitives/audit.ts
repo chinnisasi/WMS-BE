@@ -263,6 +263,11 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'user.backup_code_used', targetType: 'user' },
   { action: 'user.second_factor_locked', targetType: 'user' },
   { action: 'user.second_factor_reset', targetType: 'user' },
+  // Story 6-1c — the password reset: the request (actor the system, only
+  // when a mail is queued; reference `ip:<address>`) and the completion
+  // (actor the user; reference `reset:<token id>@<address>`).
+  { action: 'user.password_reset_requested', targetType: 'user' },
+  { action: 'user.password_reset', targetType: 'user' },
   // Story 1-2a — the client master record (`ClientsCommand`): departure, the
   // address patch, the contact list. Every one targets the client.
   { action: 'client.departed', targetType: 'client' },

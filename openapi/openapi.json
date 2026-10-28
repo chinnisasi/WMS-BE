@@ -166,7 +166,7 @@
             }
           },
           "423": {
-            "description": "Too many failed attempts for this email from this address (sign-in-locked; `retryAfterSeconds`)",
+            "description": "Too many failed attempts for this email from this address — or, story 6-1c, on this browser’s device cookie (sign-in-locked; `retryAfterSeconds`)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -176,7 +176,7 @@
             }
           },
           "429": {
-            "description": "Too many attempts from this address (rate-limited; `retryAfterSeconds`)",
+            "description": "Too many attempts from this address, or (story 6-1c) too many untrusted attempts for this account or from this address this hour (rate-limited; `retryAfterSeconds`)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -270,6 +270,195 @@
           }
         },
         "summary": "Story 6-1b — completes a sign-in with the second factor and opens the session",
+        "tags": [
+          "tenancy"
+        ]
+      }
+    },
+    "/tenants/password-reset": {
+      "post": {
+        "description": "Unauthenticated and unkeyed. Answers 202 with ONE body for every email: a link (single use, 60 minutes) is mailed only to an active user — and for a client-portal user, only while their client is active. An unknown, invited or deactivated email queues nothing. A user holds at most 5 live links (a sixth request spends the oldest); at most 5 links are mailed per user per rolling hour (past that, the same 202 and nothing queued). 20 requests an hour per client address answer 429.",
+        "operationId": "TenancyController_requestPasswordReset",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordResetRequestDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasswordResetRequestedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid body",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many reset requests from this address this hour (rate-limited; `retryAfterSeconds`)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Story 6-1c — asks for a password-reset link by email",
+        "tags": [
+          "tenancy"
+        ]
+      }
+    },
+    "/tenants/password-reset/check": {
+      "post": {
+        "description": "The reset page calls it on load (opening the link spends nothing). One 400 `reset-link-invalid` for a malformed, unknown, wrong, expired or spent token, a user who is not active and a client-portal user whose client is not active.",
+        "operationId": "TenancyController_checkPasswordReset",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordResetCheckDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasswordResetCheckResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid body, or the link is not valid (reset-link-invalid)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many reset attempts from this address (rate-limited; `retryAfterSeconds`)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Story 6-1c — validates a reset link; changes nothing",
+        "tags": [
+          "tenancy"
+        ]
+      }
+    },
+    "/tenants/password-reset/confirm": {
+      "post": {
+        "description": "Unkeyed; signs no one in and issues no session (the next sign-in runs the lockout and, for an enrolled user, the second step unchanged). An enrolled user must send `code` (TOTP or backup code); wrong codes are counted on the link (the 5th spends it), never on the user, and a live two-factor lock answers 423. On success every session of the user ends (`password-reset`), every link is spent, open sign-in steps end, every lockout for the email clears, and a password-changed notice is mailed. Sets the `wms_device` cookie (the browser that completed the reset is trusted at its next sign-in). A retry after success answers 400 `reset-link-invalid`.",
+        "operationId": "TenancyController_confirmPasswordReset",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordResetConfirmDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasswordResetConfirmResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid body (the password is 8–200 characters), or the link is not valid (reset-link-invalid)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The account uses two-factor sign-in and no code was sent, or its factor changed since the check (second-factor-needed — nothing counted); or the code is wrong (second-factor-invalid; `attemptsLeft`)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "423": {
+            "description": "Two-factor sign-in is locked for this account (second-factor-locked; `retryAfterSeconds`, null until an owner unlocks)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many reset attempts from this address, or too many codes tried on reset links for this account today (rate-limited; `retryAfterSeconds`)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The stored second-factor secret cannot be opened with the configured key (second-factor-unavailable); nothing was counted",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Story 6-1c — sets a new password from a reset link",
         "tags": [
           "tenancy"
         ]
@@ -38756,6 +38945,104 @@
           "tenant",
           "user",
           "client"
+        ]
+      },
+      "PasswordResetRequestDto": {
+        "type": "object",
+        "properties": {
+          "email": {
+            "type": "string",
+            "example": "priya@example.com",
+            "format": "email"
+          }
+        },
+        "required": [
+          "email"
+        ]
+      },
+      "PasswordResetRequestedResponse": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "example": "If an account exists for that email, we've sent a link to reset its password. It expires in 60 minutes."
+          }
+        },
+        "required": [
+          "message"
+        ]
+      },
+      "PasswordResetCheckDto": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "The token from the reset link (`#token=…`)"
+          }
+        },
+        "required": [
+          "token"
+        ]
+      },
+      "PasswordResetCheckResponse": {
+        "type": "object",
+        "properties": {
+          "email": {
+            "type": "string",
+            "example": "priya@example.com",
+            "description": "The account the link resets"
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the link stops working"
+          },
+          "secondFactorRequired": {
+            "type": "boolean",
+            "description": "The account uses two-factor sign-in: the confirm needs a code (TOTP or backup)"
+          }
+        },
+        "required": [
+          "email",
+          "expiresAt",
+          "secondFactorRequired"
+        ]
+      },
+      "PasswordResetConfirmDto": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "The token from the reset link (`#token=…`)"
+          },
+          "password": {
+            "type": "string",
+            "example": "correct-horse-battery",
+            "minLength": 8,
+            "maxLength": 200
+          },
+          "code": {
+            "type": "string",
+            "example": "123456",
+            "description": "Required when `secondFactorRequired`: a 6-digit code from the authenticator app, or a backup code `XXXXX-XXXXX`"
+          }
+        },
+        "required": [
+          "token",
+          "password"
+        ]
+      },
+      "PasswordResetConfirmResponse": {
+        "type": "object",
+        "properties": {
+          "email": {
+            "type": "string",
+            "example": "priya@example.com",
+            "description": "The account whose password was set — sign in with it"
+          }
+        },
+        "required": [
+          "email"
         ]
       },
       "RefreshResponse": {
