@@ -45,6 +45,7 @@ import { PutawayBinDto, PutawayTaskDto } from '../putaway/putaway.dto';
 import { PickTaskDto } from '../outbound/outbound.dto';
 // Story 2-3a — the gate-in link and the snapshot's open gate-ins.
 import { CatalogOpenGateInDto, GateInLinkDto } from './gate-in.dto';
+import { CatalogDockAppointmentDto } from './dock.dto';
 
 /** The fixed blind-receive reason enum (the I/O matrix). */
 export const BLIND_REASON_ENUM = ['unannounced-delivery', 'po-not-found', 'other'] as const;
@@ -1838,6 +1839,13 @@ export class CatalogSnapshotResponse {
       'Story 2-3a (additive): the warehouse\'s open gate-ins — not gated out, gated in within the last 7 days, at most 200, newest first (decision 15). The dock records their unload and receives against them. An older server omits it',
   })
   openGateIns!: readonly CatalogOpenGateInDto[];
+
+  @ApiProperty({
+    type: [CatalogDockAppointmentDto],
+    description:
+      "Story 2-3b (additive): the warehouse's BOOKED dock appointments starting today (IST, server clock), at most 100, by start — the Receive tab's read-only \"Expected today\". The device derives \"Not arrived\" from endsAt + graceMinutes against its own clock. An older server omits it",
+  })
+  dockAppointments!: readonly CatalogDockAppointmentDto[];
 
   @ApiProperty({
     enum: [...DAMAGE_REASON_CODES],

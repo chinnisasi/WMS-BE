@@ -5,10 +5,12 @@ import type { Database } from '../../shared/db/db';
 import {
   advanceShipmentNotices,
   auditEvents,
+  dockAppointments,
   gateInDocuments,
   gateIns,
   idempotencyKeys,
   purchaseOrders,
+  type DockAppointmentRow,
   type GateInRow,
 } from '../../shared/db/schema';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
@@ -17,7 +19,7 @@ import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { isInstant } from '../../shared/primitives/instant-range';
 import { PHONE_RE, normalizePhone } from '../../shared/primitives/phone';
-import { canonicalInstant, isIsoDate, istDateOf, nowIso } from '../../shared/primitives/time';
+import { addIsoDays, canonicalInstant, isIsoDate, istDateOf, istMidnightOf, nowIso } from '../../shared/primitives/time';
 import { EWB_NO_RE, VEHICLE_NO_RE, normalizeVehicleNo } from '../../shared/primitives/vehicle';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { assertTransporterInTx, type TransporterSnapshotV1 } from '../partners/partners.facade';
@@ -28,6 +30,8 @@ import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
 import { documentWarehouseMismatch } from './receiving.command';
 import { gateInViewInTx, outboxGateIn, type GateInView } from './gate-in.read';
+import { appointmentClosed, appointmentNotFound, windowLabel } from './dock-appointment.command';
+import { dockAppointmentViewInTx, outboxAppointment, type DockAppointmentView } from './dock.read';
 
 // ── the vocabularies (IMPLEMENTATION-GUIDE §4 — mirrored by 0086's CHECKs) ────
 
@@ -106,6 +110,15 @@ export interface GateInHeaderInput {
   /** Create: absent = now (after the replay lookup). Amend: absent = unchanged. */
   readonly gatedInAt?: string | null | undefined;
   readonly documents?: readonly GateInDocumentInput[] | null | undefined;
+  /**
+   * Story 2-3b (decision 8, A2) — the dock appointment this visit keeps. The
+   * ONE header field where absent ≠ null on an amend: `undefined` (an older
+   * client that never saw the field) leaves the link unchanged, `null`
+   * clears it (the appointment returns to `booked`), an id moves it. Hashed
+   * as received and LAST, so `JSON.stringify` drops an absent one and every
+   * pre-2-3b hash keeps its bytes.
+   */
+  readonly appointmentId?: string | null | undefined;
 }
 
 export interface CreateGateInCommand extends GateInHeaderInput {
@@ -408,7 +421,17 @@ function hashedHeader(input: GateInHeaderInput): Record<string, unknown> {
       poId: doc.poId ?? undefined,
       asnId: doc.asnId ?? undefined,
     })),
+    // Story 2-3b (A2) — LAST, as received: absent drops out of the JSON (the
+    // pre-2-3b bytes, pinned by the goldens in test/gate-ins.spec.ts); `null`
+    // (a clear) hashes as null, so a clear and an untouched amend never collide.
+    appointmentId: input.appointmentId,
   };
+}
+
+/** Story 2-3b — the link and release rows a gate-in writes beside its own (A24). */
+interface AppointmentEffect {
+  readonly action: 'dock_appointment.arrived' | 'dock_appointment.released';
+  readonly appointment: DockAppointmentView;
 }
 
 /**
@@ -461,6 +484,19 @@ export class GateInCommand {
           : await assertTransporterInTx(tx, command.tenantId, header.transporterPartnerId);
       // 6. Each document's PO or ASN in this warehouse (any status, any client — a plain read).
       await this.assertDocumentTargetsInTx(tx, command.tenantId, command.warehouseId, header.documents);
+      // 6b. Story 2-3b (decision 8, A1) — the appointment: lock it (404 only),
+      // replay again UNDER the lock (a same-key duplicate parked here wakes to
+      // the winner's snapshot), then the guards.
+      let claimed: DockAppointmentRow | null = null;
+      if (command.appointmentId !== undefined && command.appointmentId !== null) {
+        const locked = await this.lockAppointments(tx, command.tenantId, [command.appointmentId]);
+        const row = locked.get(String(command.appointmentId).toLowerCase());
+        if (row === undefined) throw appointmentNotFound();
+        const replayedUnderAppointment = await this.replay<GateInSnapshot>(tx, command.tenantId, idempotencyKey, payloadHash);
+        if (replayedUnderAppointment !== null) return replayedUnderAppointment;
+        await this.assertLinkable(tx, row, command.warehouseId, null, gatedInAt);
+        claimed = row;
+      }
       // 7. The write.
       const id = uuidv7();
       const code = await this.allocateGateInCode(tx, command.tenantId);
@@ -483,12 +519,17 @@ export class GateInCommand {
         throw err;
       }
       await this.insertDocumentsInTx(tx, command.tenantId, id, header.documents);
+      const appointments: AppointmentEffect[] = [];
+      if (claimed !== null) {
+        appointments.push({ action: 'dock_appointment.arrived', appointment: await this.claimInTx(tx, claimed, id, command.actorUserId) });
+      }
       const row = await this.lockedRow(tx, command.tenantId, id);
       const snapshot: GateInSnapshot = { gateIn: await gateInViewInTx(tx, row) };
       await this.finish(tx, command.tenantId, command.actorUserId, idempotencyKey, payloadHash, snapshot, {
         event: 'gate_in.recorded',
         audit: ['gate_in.recorded'],
         gateIn: snapshot.gateIn,
+        appointments,
       });
       return snapshot;
     });
@@ -558,6 +599,30 @@ export class GateInCommand {
         }
       }
       await this.assertDocumentTargetsInTx(tx, command.tenantId, current.warehouseId, header.documents);
+      // Story 2-3b (decision 8, A1, A2) — the appointment link: absent =
+      // unchanged; null = clear; another id = move. A change locks the old and
+      // the new appointment by id (the gate-in is already locked: gate-in →
+      // appointment(s) is the lock order), replays again under them, then
+      // guards the new one.
+      let link: { readonly released: DockAppointmentRow | null; readonly claimed: DockAppointmentRow | null } | null = null;
+      if (command.appointmentId !== undefined) {
+        const linked = await this.linkedAppointmentOf(tx, command.tenantId, current.id);
+        const wanted = command.appointmentId === null ? null : String(command.appointmentId).toLowerCase();
+        if (wanted !== (linked?.id ?? null)) {
+          const locked = await this.lockAppointments(
+            tx,
+            command.tenantId,
+            [linked?.id, wanted].filter((value): value is string => value !== null && value !== undefined),
+          );
+          const replayedUnderAppointments = await this.replay<GateInSnapshot>(tx, command.tenantId, idempotencyKey, payloadHash);
+          if (replayedUnderAppointments !== null) return replayedUnderAppointments;
+          const claimedRow = wanted === null ? null : (locked.get(wanted) ?? null);
+          if (wanted !== null && claimedRow === null) throw appointmentNotFound();
+          if (claimedRow !== null) await this.assertLinkable(tx, claimedRow, current.warehouseId, current.id, gatedInAt);
+          link = { released: linked === null ? null : (locked.get(linked.id) ?? linked), claimed: claimedRow };
+          changes.appointment = { before: linked?.code ?? null, after: claimedRow?.code ?? null };
+        }
+      }
       // Full replacement (D9) — and two desks editing at once is last write wins.
       await tx
         .update(gateIns)
@@ -567,6 +632,15 @@ export class GateInCommand {
         .delete(gateInDocuments)
         .where(and(eq(gateInDocuments.tenantId, command.tenantId), eq(gateInDocuments.gateInId, current.id)));
       await this.insertDocumentsInTx(tx, command.tenantId, current.id, header.documents);
+      const appointments: AppointmentEffect[] = [];
+      if (link !== null) {
+        if (link.released !== null) {
+          appointments.push({ action: 'dock_appointment.released', appointment: await this.releaseInTx(tx, link.released, current.id) });
+        }
+        if (link.claimed !== null) {
+          appointments.push({ action: 'dock_appointment.arrived', appointment: await this.claimInTx(tx, link.claimed, current.id, command.actorUserId) });
+        }
+      }
       const row = await this.lockedRow(tx, command.tenantId, current.id);
       const snapshot: GateInSnapshot = { gateIn: await gateInViewInTx(tx, row) };
       await this.finish(tx, command.tenantId, command.actorUserId, idempotencyKey, payloadHash, snapshot, {
@@ -575,6 +649,7 @@ export class GateInCommand {
         gateIn: snapshot.gateIn,
         // Decision 16 — the audit row records each changed field's before and after.
         changes,
+        appointments,
       });
       return snapshot;
     });
@@ -865,6 +940,108 @@ export class GateInCommand {
     return rows[0]!;
   }
 
+  // ── story 2-3b: the appointment link ─────────────────────────────────────
+
+  /** Lock the named appointments `FOR UPDATE` in id order — absent ones are simply missing (the caller answers 404). */
+  private async lockAppointments(tx: TenantTx, tenantId: string, ids: readonly string[]): Promise<Map<string, DockAppointmentRow>> {
+    const sorted = [...new Set(ids.map((id) => String(id).toLowerCase()).filter((id) => UUID_RE.test(id)))].sort();
+    if (sorted.length === 0) return new Map();
+    const rows = await tx
+      .select()
+      .from(dockAppointments)
+      .where(and(eq(dockAppointments.tenantId, tenantId), inArray(dockAppointments.id, sorted)))
+      .orderBy(dockAppointments.id)
+      .for('update');
+    return new Map(rows.map((row) => [row.id, row]));
+  }
+
+  /** The appointment this gate-in keeps (one at most — the partial unique index), unlocked. */
+  private async linkedAppointmentOf(tx: TenantTx, tenantId: string, gateInId: string): Promise<DockAppointmentRow | null> {
+    const rows = await tx
+      .select()
+      .from(dockAppointments)
+      .where(and(eq(dockAppointments.tenantId, tenantId), eq(dockAppointments.gateInId, gateInId)))
+      .limit(1);
+    return rows[0] ?? null;
+  }
+
+  /**
+   * Decision 8 + A14 — another warehouse's appointment is 409
+   * `appointment-warehouse-mismatch`; a cancelled one, or one another gate-in
+   * keeps, 409 `appointment-closed`; one starting outside the day before …
+   * the day after the VISIT's own IST date (its resolved `gatedInAt` — a
+   * backdated create or a later amend links the appointment it met) 409
+   * `appointment-not-due`. A no-show links (the visit reads late).
+   */
+  private async assertLinkable(
+    tx: TenantTx,
+    row: DockAppointmentRow,
+    warehouseId: string,
+    gateInId: string | null,
+    gatedInAt: string,
+  ): Promise<void> {
+    if (row.warehouseId !== warehouseId) {
+      throw new ProblemException(
+        'appointment-warehouse-mismatch',
+        409,
+        'Appointment is another warehouse’s',
+        `Dock appointment "${row.code}" is booked at another warehouse — pick an appointment of this gate.`,
+      );
+    }
+    if (row.status === 'cancelled') {
+      throw appointmentClosed(row, `Dock appointment "${row.code}" is cancelled — it cannot be linked to a gate-in.`);
+    }
+    if (row.status === 'arrived' && row.gateInId !== gateInId) {
+      const other = await tx
+        .select({ code: gateIns.code })
+        .from(gateIns)
+        .where(and(eq(gateIns.tenantId, row.tenantId), eq(gateIns.id, row.gateInId!)))
+        .limit(1);
+      throw appointmentClosed(
+        row,
+        `Dock appointment "${row.code}" is already linked to gate-in ${other[0]?.code ?? row.gateInId} — one appointment per visit.`,
+      );
+    }
+    const visitDay = istDateOf(gatedInAt);
+    const startsAt = canonicalInstant(row.startsAt);
+    if (startsAt < istMidnightOf(addIsoDays(visitDay, -1)) || startsAt >= istMidnightOf(addIsoDays(visitDay, 2))) {
+      throw new ProblemException(
+        'appointment-not-due',
+        409,
+        'Appointment not due',
+        `Dock appointment "${row.code}" (${windowLabel(startsAt, canonicalInstant(row.endsAt))}) is not due — only an appointment starting the day before, the day of or the day after the visit (IST) can be linked at the gate.`,
+      );
+    }
+  }
+
+  /** Link: the appointment `arrived`, with the gate-in, when and by whom. Returns its view. */
+  private async claimInTx(tx: TenantTx, row: DockAppointmentRow, gateInId: string, actorUserId: string): Promise<DockAppointmentView> {
+    const now = new Date(gateInClock.now()).toISOString();
+    await tx
+      .update(dockAppointments)
+      .set({ status: 'arrived', gateInId, linkedAt: now, linkedBy: actorUserId, updatedAt: nowIso() })
+      .where(and(eq(dockAppointments.tenantId, row.tenantId), eq(dockAppointments.id, row.id)));
+    return this.appointmentViewInTx(tx, row.tenantId, row.id);
+  }
+
+  /** Release: back to `booked`, the link columns cleared (only while this gate-in still holds it). */
+  private async releaseInTx(tx: TenantTx, row: DockAppointmentRow, gateInId: string): Promise<DockAppointmentView> {
+    await tx
+      .update(dockAppointments)
+      .set({ status: 'booked', gateInId: null, linkedAt: null, linkedBy: null, updatedAt: nowIso() })
+      .where(and(eq(dockAppointments.tenantId, row.tenantId), eq(dockAppointments.id, row.id), eq(dockAppointments.gateInId, gateInId)));
+    return this.appointmentViewInTx(tx, row.tenantId, row.id);
+  }
+
+  private async appointmentViewInTx(tx: TenantTx, tenantId: string, appointmentId: string): Promise<DockAppointmentView> {
+    const rows = await tx
+      .select()
+      .from(dockAppointments)
+      .where(and(eq(dockAppointments.tenantId, tenantId), eq(dockAppointments.id, appointmentId)))
+      .limit(1);
+    return dockAppointmentViewInTx(tx, rows[0]!, gateInClock.now());
+  }
+
   /**
    * The next `GI-<n>` under the tenant's sequence advisory lock (the
    * `allocateGrnCode` copy): only codes of the `GI-<digits>` shape take the
@@ -908,15 +1085,30 @@ export class GateInCommand {
       readonly extra?: Record<string, unknown>;
       /** Decision 16 — the amend's field-level diff, on its audit row. */
       readonly changes?: Record<string, unknown>;
+      /**
+       * Story 2-3b (A24) — the appointment link and release: each its own
+       * outbox event (the note dropped — A15) and audit row (target
+       * `dock_appointment`), beside the gate-in's, under the same key.
+       */
+      readonly appointments?: readonly AppointmentEffect[];
     },
   ): Promise<void> {
-    await this.outbox.append(tx, {
-      messageId: uuidv7(),
-      tenantId,
-      type: effect.event,
-      occurredAt: nowIso(),
-      payload: { ...(effect.extra ?? {}), gateIn: outboxGateIn(effect.gateIn) },
-    });
+    const events: { readonly type: string; readonly payload: Record<string, unknown> }[] = [
+      { type: effect.event, payload: { ...(effect.extra ?? {}), gateIn: outboxGateIn(effect.gateIn) } },
+      ...(effect.appointments ?? []).map((linked) => ({
+        type: linked.action,
+        payload: { appointment: outboxAppointment(linked.appointment) },
+      })),
+    ];
+    for (const event of events) {
+      await this.outbox.append(tx, {
+        messageId: uuidv7(),
+        tenantId,
+        type: event.type,
+        occurredAt: nowIso(),
+        payload: event.payload,
+      });
+    }
     for (const action of effect.audit) {
       await tx.insert(auditEvents).values({
         id: uuidv7(),
@@ -927,6 +1119,18 @@ export class GateInCommand {
         targetId: effect.gateIn.id,
         reference: idempotencyKey,
         ...(effect.changes === undefined ? {} : { changes: effect.changes }),
+        occurredAt: nowIso(),
+      });
+    }
+    for (const linked of effect.appointments ?? []) {
+      await tx.insert(auditEvents).values({
+        id: uuidv7(),
+        tenantId,
+        actorUserId,
+        action: linked.action,
+        targetType: 'dock_appointment',
+        targetId: linked.appointment.id,
+        reference: idempotencyKey,
         occurredAt: nowIso(),
       });
     }

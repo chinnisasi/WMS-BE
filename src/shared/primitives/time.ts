@@ -62,6 +62,31 @@ export function istMidnightOf(date: string): string {
   return new Date(Date.parse(`${date}T00:00:00Z`) - IST_OFFSET_MS).toISOString();
 }
 
+/**
+ * Story 2-3b — the IST minute of the day an instant falls on (0–1439, the
+ * seconds dropped): the dock schedule's slot grid and opening hours are IST
+ * wall-clock minutes. Throws a `RangeError` on an unparseable instant, like
+ * `istDateOf`.
+ */
+export function istMinuteOfDay(instant: string): number {
+  const ms = Date.parse(instant);
+  if (Number.isNaN(ms)) {
+    throw new RangeError(`unparseable instant "${instant}"`);
+  }
+  const ist = new Date(ms + IST_OFFSET_MS);
+  return ist.getUTCHours() * 60 + ist.getUTCMinutes();
+}
+
+/**
+ * Story 2-3b — the ISO weekday (1 = Monday … 7 = Sunday) of a `YYYY-MM-DD`
+ * calendar date (a date has no zone: pass the IST date, `istDateOf`). The
+ * caller has already checked `isIsoDate`.
+ */
+export function istWeekdayOf(date: string): number {
+  const day = new Date(Date.parse(`${date}T00:00:00Z`)).getUTCDay();
+  return day === 0 ? 7 : day;
+}
+
 /** `YYYY-MM-DD` plus `days` calendar days (UTC arithmetic on a date — no zone). */
 export function addIsoDays(date: string, days: number): string {
   return new Date(Date.parse(`${date}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);

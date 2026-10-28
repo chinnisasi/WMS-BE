@@ -20,6 +20,10 @@ import { VendorReturnCommand } from './vendor-return.command';
 import { VendorReturnFacade } from './vendor-return.facade';
 import { LpnCommand } from './lpn.command';
 import { LpnLabelsService } from './lpn-labels';
+import { DockDoorCommand } from './dock-door.command';
+import { DockScheduleCommand } from './dock-schedule.command';
+import { DockAppointmentCommand } from './dock-appointment.command';
+import { DockFacade } from './dock.facade';
 
 /**
  * Inbound module (Story 3.1): the purchase-order lifecycle — the upstream
@@ -82,7 +86,12 @@ import { LpnLabelsService } from './lpn-labels';
     // Story 2-10b — LPNs at receiving: mint / void, and their labels.
     LpnCommand,
     LpnLabelsService,
+    // Story 2-3b — dock appointments: the door master, the schedule, the appointments.
+    DockDoorCommand,
+    DockScheduleCommand,
+    DockAppointmentCommand,
+    DockFacade,
   ],
-  exports: [InboundFacade, ReceivingFacade, QcFacade, GateInFacade, VendorReturnFacade],
+  exports: [InboundFacade, ReceivingFacade, QcFacade, GateInFacade, VendorReturnFacade, DockFacade],
 })
 export class InboundModule {}

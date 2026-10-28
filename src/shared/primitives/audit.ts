@@ -81,6 +81,12 @@ export const AUDIT_TARGET_TYPES = [
   'count_variance',
   'count_variance_policy',
   'device',
+  // Story 2-3b — a dock appointment (`dock_appointment.booked | rescheduled |
+  // cancelled`, and the gate-in's `arrived | released` beside its own row)
+  // and a dock door (`dock_door.created | updated`); the schedule's
+  // `dock_schedule.updated` targets its `warehouse`.
+  'dock_appointment',
+  'dock_door',
   'eway_bill',
   'eway_gstin_setting',
   'eway_state_threshold',
@@ -400,4 +406,17 @@ export const AUDIT_NEW_ACTIONS = [
   // void the LPN.
   { action: 'lpn.minted', targetType: 'goods_receipt' },
   { action: 'lpn.voided', targetType: 'lpn' },
+  // Story 2-3b — dock appointments: the door master and the schedule
+  // (`DockDoorCommand`, `DockScheduleCommand` — the schedule targets its
+  // warehouse), the appointment's three verbs (`DockAppointmentCommand`), and
+  // the gate-in's link and release rows written beside its own
+  // `gate_in.recorded | amended` under the same key.
+  { action: 'dock_door.created', targetType: 'dock_door' },
+  { action: 'dock_door.updated', targetType: 'dock_door' },
+  { action: 'dock_schedule.updated', targetType: 'warehouse' },
+  { action: 'dock_appointment.booked', targetType: 'dock_appointment' },
+  { action: 'dock_appointment.rescheduled', targetType: 'dock_appointment' },
+  { action: 'dock_appointment.cancelled', targetType: 'dock_appointment' },
+  { action: 'dock_appointment.arrived', targetType: 'dock_appointment' },
+  { action: 'dock_appointment.released', targetType: 'dock_appointment' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

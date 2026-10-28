@@ -2735,6 +2735,145 @@ export const gateInDocuments = pgTable(
 export type GateInDocumentRow = typeof gateInDocuments.$inferSelect;
 
 /**
+ * Story 2-3b — a dock door: master data per warehouse (decision 1). `code` is
+ * uppercased (`^[A-Z0-9-]{1,20}$`), unique per warehouse among active and
+ * inactive doors; a door is never deleted, it is deactivated. Inbound-owned,
+ * written only by `inbound/dock-door.command.ts`. The gate-in's own
+ * `dock_door` stays typed text (decision 2 — no FK). CHECKs and RLS live
+ * ONLY in `drizzle/0110_dock_appointments.sql`.
+ */
+export const dockDoors = pgTable(
+  'dock_doors',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    code: text('code').notNull(),
+    name: text('name'),
+    active: boolean('active').notNull().default(true),
+    createdBy: uuid('created_by').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [uniqueIndex('dock_doors_tenant_warehouse_code_unique').on(table.tenantId, table.warehouseId, table.code)],
+);
+
+export type DockDoorRow = typeof dockDoors.$inferSelect;
+
+/**
+ * Story 2-3b — a warehouse's dock schedule (decision 3): the slot length, the
+ * IST opening hours as minutes of the day (`closes_minute` may be 1440 =
+ * 24:00), the open ISO weekdays as a bitmask (bit 0 = Monday … bit 6 =
+ * Sunday) and the on-time grace. A warehouse with no row reads the defaults
+ * (`configured: false`). Written only by `inbound/dock-schedule.command.ts`.
+ * CHECKs and RLS in 0110 only.
+ */
+export const dockSchedules = pgTable(
+  'dock_schedules',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    slotMinutes: integer('slot_minutes').notNull(),
+    opensMinute: integer('opens_minute').notNull(),
+    closesMinute: integer('closes_minute').notNull(),
+    openDays: smallint('open_days').notNull(),
+    graceMinutes: integer('grace_minutes').notNull(),
+    updatedBy: uuid('updated_by').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [uniqueIndex('dock_schedules_tenant_warehouse_unique').on(table.tenantId, table.warehouseId)],
+);
+
+export type DockScheduleRow = typeof dockSchedules.$inferSelect;
+
+/**
+ * Story 2-3b — a dock appointment: one door booked for 1–8 whole slots
+ * (decision 4), `booked → arrived | cancelled` (decision 7). `arrived` pairs
+ * with `gate_in_id` (one gate-in per appointment, one appointment per
+ * gate-in — the partial unique index). `grace_minutes` is frozen at booking.
+ * Punctuality and the no-show are DERIVED at read, never stored (decision 9).
+ * `client_id` is stamped when every document names one client (decision 6)
+ * and carries the AD-24 RLS arm (a null-client appointment is invisible to a
+ * portal session). Written by `inbound/dock-appointment.command.ts` and, for
+ * the link and release only, `inbound/gate-in.command.ts` (A25). CHECKs and
+ * RLS in 0110 only.
+ */
+export const dockAppointments = pgTable(
+  'dock_appointments',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    code: text('code').notNull(),
+    status: text('status').notNull().default('booked'),
+    dockDoorId: uuid('dock_door_id').notNull(),
+    startsAt: timestamp('starts_at', { withTimezone: true, mode: 'string' }).notNull(),
+    endsAt: timestamp('ends_at', { withTimezone: true, mode: 'string' }).notNull(),
+    graceMinutes: integer('grace_minutes').notNull(),
+    clientId: uuid('client_id'),
+    vehicleNo: text('vehicle_no'),
+    transporterName: text('transporter_name'),
+    note: text('note'),
+    gateInId: uuid('gate_in_id'),
+    linkedAt: timestamp('linked_at', { withTimezone: true, mode: 'string' }),
+    linkedBy: uuid('linked_by'),
+    bookedBy: uuid('booked_by').notNull(),
+    cancelledAt: timestamp('cancelled_at', { withTimezone: true, mode: 'string' }),
+    cancelledBy: uuid('cancelled_by'),
+    cancelReason: text('cancel_reason'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('dock_appointments_tenant_code_unique').on(table.tenantId, table.code),
+    uniqueIndex('dock_appointments_tenant_gate_in_unique')
+      .on(table.tenantId, table.gateInId)
+      .where(sql`${table.gateInId} IS NOT NULL`),
+    // The calendar window read and the gate desk's picker.
+    index('dock_appointments_tenant_warehouse_starts_idx').on(table.tenantId, table.warehouseId, table.startsAt),
+    // The overlap read (A16) and the door deactivation guard.
+    index('dock_appointments_tenant_door_starts_idx').on(table.tenantId, table.dockDoorId, table.startsAt),
+  ],
+);
+
+export type DockAppointmentRow = typeof dockAppointments.$inferSelect;
+
+/**
+ * Story 2-3b — the POs and ASNs an appointment's truck will carry (0–10,
+ * decision 6): exactly one of `po_id` / `asn_id` per row. Written only as a
+ * full set by the appointment's book and reschedule. Its RLS rides the parent
+ * appointment (the `asn_lines` shape). CHECKs and RLS in 0110 only.
+ */
+export const dockAppointmentDocuments = pgTable(
+  'dock_appointment_documents',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    appointmentId: uuid('appointment_id').notNull(),
+    position: integer('position').notNull(),
+    poId: uuid('po_id'),
+    asnId: uuid('asn_id'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('dock_appointment_documents_tenant_appointment_position_unique').on(
+      table.tenantId,
+      table.appointmentId,
+      table.position,
+    ),
+  ],
+);
+
+export type DockAppointmentDocumentRow = typeof dockAppointmentDocuments.$inferSelect;
+
+/**
  * GRN lines (Story 3.3): one row per received (sku, batch) line — **physical
  * truth**: `qty` is everything that physically arrived, `applied_qty` the
  * within-open-quantity portion that applied immediately (ledger +

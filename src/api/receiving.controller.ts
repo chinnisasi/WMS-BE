@@ -306,6 +306,9 @@ export class ReceivingController {
       // Story 1-5b: every bin's dedicated client, so the device can name the
       // client a dedicated bin belongs to when it refuses a scan against it.
       ...snapshot.bins.map((bin) => bin.dedicatedClientId).filter((id): id is string => id !== null),
+      // Story 2-3b (A26): every client an expected appointment's document names,
+      // so the device can prefix a colliding document code with its client's code.
+      ...snapshot.dockAppointments.flatMap((appointment) => appointment.documents.map((doc) => doc.clientId)).filter((id): id is string => id !== null),
     ]);
     return {
       ...snapshot,
@@ -337,7 +340,17 @@ export class ReceivingController {
       openVendorReturns: openVendorReturns.map((rtv) => ({ ...rtv, lines: rtv.lines.map((line) => ({ ...line })) })),
       clients,
       // Story 2-3a — the open gate-ins, copied key by key (a mutable DTO array).
-      openGateIns: snapshot.openGateIns.map((gateIn) => ({ ...gateIn, documents: gateIn.documents.map((doc) => ({ ...doc })) })),
+      openGateIns: snapshot.openGateIns.map((gateIn) => ({
+        ...gateIn,
+        documents: gateIn.documents.map((doc) => ({ ...doc })),
+        // Story 2-3b — the linked appointment, copied key by key.
+        appointment: gateIn.appointment === null ? null : { ...gateIn.appointment },
+      })),
+      // Story 2-3b — today's expected trucks, copied key by key.
+      dockAppointments: snapshot.dockAppointments.map((appointment) => ({
+        ...appointment,
+        documents: appointment.documents.map((doc) => ({ ...doc })),
+      })),
       // Story 3-1 — the move reason vocabulary, read through the movements
       // facade (inbound never imports the movements module).
       moveReasons: this.movements.moveReasons().map((reason) => ({ ...reason })),

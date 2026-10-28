@@ -68,8 +68,8 @@ export class GateInController {
   @ApiResponse({ status: 400, ...problemJsonResponse(WRITE_400) })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse(WRITE_403) })
-  @ApiResponse({ status: 404, ...problemJsonResponse("The warehouse, the transporter partner, or a document's purchase order or ASN does not exist in this tenant (not-found)") })
-  @ApiResponse({ status: 409, ...problemJsonResponse("The partner lacks the transporter role (partner-not-transporter) or is inactive (transporter-inactive); a document's PO or ASN is another warehouse's (document-warehouse-mismatch); or a concurrent idempotent request (conflict)") })
+  @ApiResponse({ status: 404, ...problemJsonResponse("The warehouse, the transporter partner, a document's purchase order or ASN, or the dock appointment does not exist in this tenant (not-found)") })
+  @ApiResponse({ status: 409, ...problemJsonResponse("The partner lacks the transporter role (partner-not-transporter) or is inactive (transporter-inactive); a document's PO or ASN is another warehouse's (document-warehouse-mismatch); the dock appointment is another warehouse's (appointment-warehouse-mismatch), cancelled or another gate-in's (appointment-closed), or does not start within a day of the visit's IST date (appointment-not-due); or a concurrent idempotent request (conflict)") })
   @ApiResponse({ status: 422, ...problemJsonResponse(WRITE_422) })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async create(
@@ -154,8 +154,8 @@ export class GateInController {
   @ApiResponse({ status: 400, ...problemJsonResponse(`${WRITE_400}; a malformed gateInId (validation-failed)`) })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse(WRITE_403) })
-  @ApiResponse({ status: 404, ...problemJsonResponse("The gate-in, the (new) transporter partner, or a document's PO or ASN does not exist in this tenant (not-found)") })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The gate-in is gated out (gate-in-closed); a different gated-in time once the unload started (gate-in-time-locked); a changed seal status, seal number or packages declared once the unload ended (gate-in-field-locked); a new transporter partner without the role (partner-not-transporter) or inactive (transporter-inactive); a document of another warehouse (document-warehouse-mismatch); or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse("The gate-in, the (new) transporter partner, a document's PO or ASN, or the new dock appointment does not exist in this tenant (not-found)") })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The gate-in is gated out (gate-in-closed); a different gated-in time once the unload started (gate-in-time-locked); a changed seal status, seal number or packages declared once the unload ended (gate-in-field-locked); a new transporter partner without the role (partner-not-transporter) or inactive (transporter-inactive); a document of another warehouse (document-warehouse-mismatch); a new dock appointment of another warehouse (appointment-warehouse-mismatch), cancelled or another gate-in\'s (appointment-closed), or not due (appointment-not-due); or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse(WRITE_422) })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'gateInId', format: 'uuid' })
@@ -324,6 +324,9 @@ function headerOf(dto: GateInHeaderDto): GateInHeaderInput {
       poId: doc.poId,
       asnId: doc.asnId,
     })),
+    // Story 2-3b (A2) — passed AS-IS: an absent key stays undefined (an amend
+    // leaves the link unchanged), null clears it.
+    appointmentId: dto.appointmentId,
   };
 }
 
@@ -336,7 +339,11 @@ function gateInBody(view: GateInView): GateInResponse['gateIn'] {
 }
 
 function entryBody(view: GateInEntryView): GateInListResponse['items'][number] {
-  return { ...view, transporterSnapshot: view.transporterSnapshot === null ? null : { ...view.transporterSnapshot } };
+  return {
+    ...view,
+    transporterSnapshot: view.transporterSnapshot === null ? null : { ...view.transporterSnapshot },
+    appointment: view.appointment === null ? null : { ...view.appointment },
+  };
 }
 
 function detailBody(view: GateInDetailView): GateInDetailResponse['gateIn'] {
@@ -345,6 +352,7 @@ function detailBody(view: GateInDetailView): GateInDetailResponse['gateIn'] {
     transporterSnapshot: view.transporterSnapshot === null ? null : { ...view.transporterSnapshot },
     documents: view.documents.map((doc) => ({ ...doc })),
     receipts: view.receipts.map((receipt) => ({ ...receipt, document: { ...receipt.document } })),
+    appointment: view.appointment === null ? null : { ...view.appointment },
   };
 }
 

@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import {
   advanceShipmentNotices,
+  dockAppointments,
   gateInDocuments,
   gateIns,
   goodsReceiptNotes,
@@ -17,6 +18,7 @@ import { canonicalInstant, fullPrecisionInstant } from '../../shared/primitives/
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import type { TransporterSnapshotV1 } from '../partners/partners.facade';
 import type { GateInDocumentKind, GateInStatus, SealStatus } from './gate-in.command';
+import { appointmentsOfGateInsInTx, type GateInAppointmentView } from './dock.read';
 
 /**
  * Story 2-3a — the gate-in's read side: the view every surface returns, the
@@ -89,6 +91,12 @@ export interface GateInHeaderView {
 /** A mutation's answer (and idempotency snapshot): the header plus its documents. */
 export interface GateInView extends GateInHeaderView {
   readonly documents: readonly GateInDocumentView[];
+  /**
+   * Story 2-3b — the dock appointment the visit keeps (null: unscheduled).
+   * OPTIONAL: a snapshot stored before 2-3b replays without them.
+   */
+  readonly appointmentId?: string | null;
+  readonly appointmentCode?: string | null;
 }
 
 export type PackagesFlag = 'short' | 'excess' | 'matches';
@@ -104,6 +112,8 @@ export interface GateInEntryView extends GateInHeaderView {
   readonly packagesDifference: number | null;
   /** Not gated out and gated in more than `STALE_OPEN_DAYS` days ago. */
   readonly staleOpen: boolean;
+  /** Story 2-3b — the linked dock appointment and the visit's punctuality against it; null = unscheduled. */
+  readonly appointment: GateInAppointmentView | null;
 }
 
 export interface GateInDetailDocumentView extends GateInDocumentView {
@@ -135,6 +145,8 @@ export interface OpenGateInView {
   readonly sealStatus: SealStatus;
   readonly unloadStartedAt: string | null;
   readonly documents: readonly { readonly kind: GateInDocumentKind; readonly number: string }[];
+  /** Story 2-3b (decision 12) — the linked appointment (no id: the device shows it, never acts on it); null = unscheduled. */
+  readonly appointment: Omit<GateInAppointmentView, 'id'> | null;
 }
 
 export function transporterLabelOf(row: Pick<GateInRow, 'transporterSnapshot' | 'transporterName'>): string {
@@ -224,7 +236,17 @@ async function documentsOfInTx(tx: TenantTx, tenantId: string, gateInId: string)
 /** A mutation's answer, read back on the caller's transaction — the phone masked (a stored snapshot never holds it in full). */
 export async function gateInViewInTx(tx: TenantTx, row: GateInRow): Promise<GateInView> {
   const documents = await documentsOfInTx(tx, row.tenantId, row.id);
-  return { ...gateInHeaderView(row, 'masked'), documents: documents.map(documentView) };
+  const linked = await tx
+    .select({ id: dockAppointments.id, code: dockAppointments.code })
+    .from(dockAppointments)
+    .where(and(eq(dockAppointments.tenantId, row.tenantId), eq(dockAppointments.gateInId, row.id)))
+    .limit(1);
+  return {
+    ...gateInHeaderView(row, 'masked'),
+    documents: documents.map(documentView),
+    appointmentId: linked[0]?.id ?? null,
+    appointmentCode: linked[0]?.code ?? null,
+  };
 }
 
 /**
@@ -331,6 +353,8 @@ async function entriesOfInTx(
       if (receipt.gateInId !== null) receiptCounts.set(receipt.gateInId, receipt.n);
     }
   }
+  // Story 2-3b — the linked appointments, folded over the page's ids.
+  const appointments = await appointmentsOfGateInsInTx(tx, tenantId, ids);
   return rows.map((row) => {
     const { flag, difference } = packagesFlagOf(row.packagesDeclared, row.packagesCounted);
     return {
@@ -340,6 +364,7 @@ async function entriesOfInTx(
       packagesFlag: flag,
       packagesDifference: difference,
       staleOpen: row.status !== 'gated_out' && Date.parse(canonicalInstant(row.gatedInAt)) < nowMs - STALE_OPEN_DAYS * DAY_MS,
+      appointment: appointments.get(row.id) ?? null,
     };
   });
 }
@@ -446,6 +471,8 @@ export async function openGateInsInTx(
     list.push({ kind: doc.kind as GateInDocumentKind, number: doc.number });
     byGateIn.set(doc.gateInId, list);
   }
+  // Story 2-3b (decision 12) — each visit's appointment, one read over the set.
+  const appointments = await appointmentsOfGateInsInTx(tx, tenantId, rows.map((row) => row.id));
   return rows.map((row) => ({
     id: row.id,
     code: row.code,
@@ -458,7 +485,20 @@ export async function openGateInsInTx(
     // Decision 17 — the dock counts blind: the declared figure never reaches the device.
     unloadStartedAt: instantOrNull(row.unloadStartedAt),
     documents: byGateIn.get(row.id) ?? [],
+    appointment: deviceAppointment(appointments.get(row.id)),
   }));
+}
+
+function deviceAppointment(view: GateInAppointmentView | undefined): Omit<GateInAppointmentView, 'id'> | null {
+  if (view === undefined) return null;
+  return {
+    code: view.code,
+    startsAt: view.startsAt,
+    endsAt: view.endsAt,
+    doorCode: view.doorCode,
+    punctuality: view.punctuality,
+    punctualityMinutes: view.punctualityMinutes,
+  };
 }
 
 // ── the receipt link ──────────────────────────────────────────────────────────

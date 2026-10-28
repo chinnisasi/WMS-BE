@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 import type { INestApplication } from '@nestjs/common';
@@ -6,7 +7,8 @@ import request, { type Test as SupertestTest } from 'supertest';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
-import { addIsoDays, istDateOf } from '../src/shared/primitives/time';
+import { addIsoDays, istDateOf, istMidnightOf } from '../src/shared/primitives/time';
+import { dockClock } from '../src/modules/inbound/dock.read';
 import { maskPhone, normalizePhone } from '../src/shared/primitives/phone';
 import { normalizeVehicleNo, VEHICLE_NO_RE } from '../src/shared/primitives/vehicle';
 import { VEHICLE_NO_RE as EWAY_VEHICLE_NO_RE } from '../src/modules/invoicing/eway-json';
@@ -19,7 +21,7 @@ import {
 } from '../src/modules/inbound/gate-in.command';
 import { REJECTED_OP_DECISIONS_BY_TYPE, REJECTED_OP_TYPES } from '../src/modules/tenancy/sync-report.command';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
-import { expectAuditRow, noOpIdempotencyKey } from './support/audit-guard';
+import { expectAuditRow, noOpIdempotencyKey, seededIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
 import { createLinkedVendor } from './support/linked-vendor';
@@ -1069,6 +1071,425 @@ describe('story 2-3a: gate-in and the receipt link', () => {
       const res = await receive({ poId: null, blindReasonCode: 'other', clientId: glowCo, lines: [{ poLineId: null, skuId, batchCode: null, mfgDate: null, qty: 1 }] }).expect(201);
       const keys = Object.keys(res.body.goodsReceipt as Record<string, unknown>);
       for (const key of ['gateInId', 'gateInCode', 'gateInLink']) expect(keys).not.toContain(key);
+    });
+  });
+
+  // ── story 2-3b: the dock appointment link (decision 8, A1, A2, A14, A24) ───
+
+  describe('story 2-3b: the dock appointment link', () => {
+    const realDock = dockClock.now;
+    /** Wednesday 4 Nov 2026 — the arrival day. */
+    const DAY = '2026-11-04';
+    const MINUTE = 60_000;
+    const at = (hhmm: string, date = DAY): string => {
+      const [h, m] = hhmm.split(':').map(Number);
+      return new Date(Date.parse(istMidnightOf(date)) + (h! * 60 + m!) * MINUTE).toISOString();
+    };
+    const doors: Record<string, string> = {};
+    let doorWh2: string;
+
+    interface LinkedAppointment {
+      id: string;
+      code: string;
+      status: string;
+      gateInId: string | null;
+      gateInCode: string | null;
+      punctuality: string | null;
+      punctualityMinutes: number | null;
+      noShow: boolean;
+    }
+
+    async function newDoor(warehouseId: string, code: string): Promise<string> {
+      return (
+        await http()
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/dock-doors`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code })
+          .expect(201)
+      ).body.dockDoor.id as string;
+    }
+
+    /** Books `doorCode` on DAY from–to (the dock clock set to 07:00 that day), optionally with an expected vehicle. */
+    async function appointment(doorCode: string, from: string, to: string, extra: Record<string, unknown> = {}, warehouseId = wh1): Promise<LinkedAppointment> {
+      const saved = dockClock.now;
+      // The current slot at booking: 07:00 that day, or the start itself when earlier.
+      dockClock.now = () => Math.min(Date.parse(at('07:00', extra.date as string | undefined)), Date.parse(at(from, extra.date as string | undefined)));
+      try {
+        const { date, ...rest } = extra;
+        return (
+          await http()
+            .post(`${API}/${tenantId}/receiving/dock-appointments`)
+            .set('Authorization', `Bearer ${ownerToken}`)
+            .set(KEY_HEADER, ulid())
+            .send({
+              warehouseId,
+              dockDoorId: warehouseId === wh1 ? doors[doorCode] : doorWh2,
+              startsAt: at(from, date as string | undefined),
+              endsAt: at(to, date as string | undefined),
+              ...rest,
+            })
+            .expect(201)
+        ).body.appointment as LinkedAppointment;
+      } finally {
+        dockClock.now = saved;
+      }
+    }
+
+    async function appointmentOf(id: string): Promise<LinkedAppointment> {
+      return (await http().get(`${API}/${tenantId}/receiving/dock-appointments/${id}`).set('Authorization', `Bearer ${ownerToken}`).expect(200)).body
+        .appointment as LinkedAppointment;
+    }
+
+    /** The gate desk at `hhmm` on DAY (both clocks). */
+    function clockAt(hhmm: string): void {
+      gateInClock.now = () => Date.parse(at(hhmm));
+      dockClock.now = () => Date.parse(at(hhmm));
+    }
+
+    const sha = (json: string): string => createHash('sha256').update(json, 'utf8').digest('hex');
+
+    async function storedHash(key: string): Promise<string> {
+      return ((await sql`select payload_hash from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`) as unknown as { payload_hash: string }[])[0]!
+        .payload_hash;
+    }
+
+    const amendBody = (extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+      vehicleNo: 'KA01AB1234',
+      transporterName: 'Typed Roadways',
+      sealStatus: 'none',
+      ...extra,
+    });
+
+    beforeAll(async () => {
+      for (const code of ['G1', 'G2', 'G3', 'G4', 'G5', 'G6']) doors[code] = await newDoor(wh1, code);
+      doorWh2 = await newDoor(wh2, 'W1');
+      // Every day open, 00:00–24:00, so the fixtures need no weekday care.
+      for (const warehouseId of [wh1, wh2]) {
+        await http()
+          .put(`${API}/${tenantId}/warehouses/${warehouseId}/dock-schedule`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ slotMinutes: 30, opensAt: '00:00', closesAt: '24:00', openDays: [1, 2, 3, 4, 5, 6, 7], graceMinutes: 15 })
+          .expect(200);
+      }
+    });
+
+    afterEach(() => {
+      dockClock.now = realDock;
+    });
+
+    afterAll(() => {
+      dockClock.now = realDock;
+    });
+
+    it('golden (A2): a create and an amend WITHOUT appointmentId hash exactly as before 2-3b; null hashes differently', async () => {
+      clockAt('09:00');
+      const key = ulid();
+      const created = (await create(baseBody({ dockDoor: 'D3', gatedInAt: at('09:00') }), key).expect(201)).body.gateIn as GateIn & {
+        appointmentId: string | null;
+        appointmentCode: string | null;
+      };
+      expect(created).toMatchObject({ appointmentId: null, appointmentCode: null });
+      // The pre-2-3b `hashedHeader`, written out key by key (absent keys drop out of the JSON).
+      expect(await storedHash(key)).toBe(
+        sha(
+          `{"arm":"gate-in-create","tenantId":"${tenantId}","actorUserId":"${ownerUserId}","warehouseId":"${wh1}",` +
+            `"vehicleNo":"KA01AB1234","transporterName":"Typed Roadways","sealStatus":"none","dockDoor":"D3","gatedInAt":"${at('09:00')}","documents":[]}`,
+        ),
+      );
+      const amendKey = ulid();
+      await amend(created.id, amendBody({ lrNumber: 'LR-9' }), amendKey).expect(200);
+      expect(await storedHash(amendKey)).toBe(
+        sha(
+          `{"arm":"gate-in-amend","tenantId":"${tenantId}","actorUserId":"${ownerUserId}","gateInId":"${created.id}",` +
+            `"vehicleNo":"KA01AB1234","transporterName":"Typed Roadways","lrNumber":"LR-9","sealStatus":"none","documents":[]}`,
+        ),
+      );
+      const clearKey = ulid();
+      await amend(created.id, amendBody({ lrNumber: 'LR-9', appointmentId: null }), clearKey).expect(200);
+      expect(await storedHash(clearKey)).toBe(
+        sha(
+          `{"arm":"gate-in-amend","tenantId":"${tenantId}","actorUserId":"${ownerUserId}","gateInId":"${created.id}",` +
+            `"vehicleNo":"KA01AB1234","transporterName":"Typed Roadways","lrNumber":"LR-9","sealStatus":"none","documents":[],"appointmentId":null}`,
+        ),
+      );
+    });
+
+    it('a snapshot stored before 2-3b replays as stored (no appointment fields)', async () => {
+      clockAt('09:00');
+      const key = seededIdempotencyKey(tenantId, ulid());
+      const body = baseBody({ gatedInAt: at('09:00') });
+      const hash = sha(
+        `{"arm":"gate-in-create","tenantId":"${tenantId}","actorUserId":"${ownerUserId}","warehouseId":"${wh1}",` +
+          `"vehicleNo":"KA01AB1234","transporterName":"Typed Roadways","sealStatus":"none","gatedInAt":"${at('09:00')}","documents":[]}`,
+      );
+      const legacy = { gateIn: { id: uuidv7(), code: 'GI-LEGACY', status: 'gated_in', documents: [] } };
+      await sql`insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot) values (${uuidv7()}, ${tenantId}, ${key}, ${hash}, ${sql.json(legacy)})`;
+      const replayed = (await create(body, key).expect(201)).body.gateIn as Record<string, unknown>;
+      expect(replayed.code).toBe('GI-LEGACY');
+      expect(Object.keys(replayed)).not.toContain('appointmentId');
+    });
+
+    it('Gate-in on time (AC2 shape): DA 10:30–11:30, gate-in 10:41 with appointmentId → linked, arrived, "on time" +11; audit alongside; outbox without the note; replay', async () => {
+      const da = await appointment('G1', '10:30', '11:30', { note: 'ring 98765 43210' });
+      clockAt('10:41');
+      const key = ulid();
+      const res = await create(baseBody({ gatedInAt: at('10:41'), appointmentId: da.id }), key).expect(201);
+      const gi = res.body.gateIn as GateIn & { appointmentId: string; appointmentCode: string };
+      expect(gi).toMatchObject({ appointmentId: da.id, appointmentCode: da.code });
+      expect(await appointmentOf(da.id)).toMatchObject({ status: 'arrived', gateInId: gi.id, gateInCode: gi.code, punctuality: 'on_time', punctualityMinutes: 11, noShow: false });
+      const expected = { tenantId, key, action: 'gate_in.recorded', targetType: 'gate_in', targetId: gi.id, actorUserId: ownerUserId };
+      const alongside = [{ action: 'dock_appointment.arrived', targetType: 'dock_appointment', targetId: da.id, actorUserId: ownerUserId }];
+      await expectAuditRow({ ...expected, alongside });
+      expect((await create(baseBody({ gatedInAt: at('10:41'), appointmentId: da.id }), key).expect(201)).body.gateIn).toEqual(gi);
+      await expectAuditRow({ ...expected, alongside });
+      // The same key's rows, named from the appointment's side.
+      await expectAuditRow({
+        tenantId,
+        key,
+        action: 'dock_appointment.arrived',
+        targetType: 'dock_appointment',
+        targetId: da.id,
+        actorUserId: ownerUserId,
+        alongside: [{ action: 'gate_in.recorded', targetType: 'gate_in', targetId: gi.id, actorUserId: ownerUserId }],
+      });
+      const events = (await sql`select payload from outbox_messages where tenant_id = ${tenantId} and type = 'dock_appointment.arrived'
+        and payload->'appointment'->>'id' = ${da.id}`) as unknown as { payload: { appointment: Record<string, unknown> } }[];
+      expect(events).toHaveLength(1);
+      expect(events[0]!.payload.appointment.status).toBe('arrived');
+      expect('note' in events[0]!.payload.appointment).toBe(false);
+      const entry = (await list(wh1)).find((row) => row.id === gi.id) as unknown as { appointment: Record<string, unknown> };
+      expect(entry.appointment).toEqual({
+        id: da.id,
+        code: da.code,
+        startsAt: at('10:30'),
+        endsAt: at('11:30'),
+        doorCode: 'G1',
+        punctuality: 'on_time',
+        punctualityMinutes: 11,
+      });
+      expect(((await detail(gi.id)) as unknown as { appointment: Record<string, unknown> }).appointment).toEqual(entry.appointment);
+      // Unscheduled visits read null.
+      expect(((await list(wh1)).find((row) => row.id !== gi.id) as unknown as { appointment: unknown }).appointment).toBeNull();
+    });
+
+    it('Early / late / grace edge: 10:10 → early −20; 10:50 → late +20; exactly 10:45 → on time', async () => {
+      for (const [doorCode, time, punctuality, minutes] of [
+        ['G2', '10:10', 'early', -20],
+        ['G3', '10:50', 'late', 20],
+        ['G4', '10:45', 'on_time', 15],
+      ] as const) {
+        const da = await appointment(doorCode, '10:30', '11:00');
+        clockAt(time);
+        await create(baseBody({ gatedInAt: at(time), appointmentId: da.id })).expect(201);
+        expect(await appointmentOf(da.id)).toMatchObject({ status: 'arrived', punctuality, punctualityMinutes: minutes });
+      }
+    });
+
+    it('Late no-show linked: unlinked at 12:00 (a no-show), the truck at 12:20 → links; late +110; no-show cleared', async () => {
+      const da = await appointment('G5', '10:30', '11:30');
+      clockAt('12:00');
+      expect((await appointmentOf(da.id)).noShow).toBe(true);
+      clockAt('12:20');
+      await create(baseBody({ gatedInAt: at('12:20'), appointmentId: da.id })).expect(201);
+      expect(await appointmentOf(da.id)).toMatchObject({ status: 'arrived', noShow: false, punctuality: 'late', punctualityMinutes: 110 });
+    });
+
+    it('Time corrected: the gate-in time amended 10:50 → 10:41 while gated_in → reads on time; an amend without appointmentId keeps the link (AC5)', async () => {
+      const da = await appointment('G6', '10:30', '11:00');
+      clockAt('10:55');
+      const gi = (await create(baseBody({ gatedInAt: at('10:50'), appointmentId: da.id })).expect(201)).body.gateIn as GateIn;
+      expect((await appointmentOf(da.id)).punctuality).toBe('late');
+      const key = ulid();
+      const amended = (await amend(gi.id, amendBody({ gatedInAt: at('10:41') }), key).expect(200)).body.gateIn as GateIn & { appointmentId: string };
+      expect(amended.appointmentId).toBe(da.id);
+      expect(await appointmentOf(da.id)).toMatchObject({ status: 'arrived', gateInId: gi.id, punctuality: 'on_time', punctualityMinutes: 11 });
+      // No appointment rows ride an amend that leaves the link alone.
+      await expectAuditRow({ tenantId, key, action: 'gate_in.amended', targetType: 'gate_in', targetId: gi.id, actorUserId: ownerUserId });
+      const changes = ((await sql`select changes from audit_events where tenant_id = ${tenantId} and reference = ${key}`)[0]!.changes ?? {}) as Record<string, unknown>;
+      expect(Object.keys(changes)).not.toContain('appointment');
+    });
+
+    it('Amend move / clear: DA-a → DA-b (released + arrived beside the amend, changes.appointment); then null → both booked', async () => {
+      const a = await appointment('G1', '13:00', '13:30');
+      const b = await appointment('G2', '13:00', '13:30');
+      clockAt('13:05');
+      const gi = (await create(baseBody({ gatedInAt: at('13:05'), appointmentId: a.id })).expect(201)).body.gateIn as GateIn;
+      const key = ulid();
+      await amend(gi.id, amendBody({ appointmentId: b.id }), key).expect(200);
+      expect((await appointmentOf(a.id)).status).toBe('booked');
+      expect(await appointmentOf(b.id)).toMatchObject({ status: 'arrived', gateInId: gi.id });
+      await expectAuditRow({
+        tenantId,
+        key,
+        action: 'gate_in.amended',
+        targetType: 'gate_in',
+        targetId: gi.id,
+        actorUserId: ownerUserId,
+        alongside: [
+          { action: 'dock_appointment.released', targetType: 'dock_appointment', targetId: a.id, actorUserId: ownerUserId },
+          { action: 'dock_appointment.arrived', targetType: 'dock_appointment', targetId: b.id, actorUserId: ownerUserId },
+        ],
+      });
+      const changes = (await sql`select changes from audit_events where tenant_id = ${tenantId} and reference = ${key} and action = 'gate_in.amended'`)[0]!
+        .changes as Record<string, unknown>;
+      expect(changes.appointment).toEqual({ before: a.code, after: b.code });
+      const clearKey = ulid();
+      const cleared = (await amend(gi.id, amendBody({ appointmentId: null }), clearKey).expect(200)).body.gateIn as GateIn & { appointmentId: unknown };
+      expect(cleared.appointmentId).toBeNull();
+      expect((await appointmentOf(a.id)).status).toBe('booked');
+      expect(await appointmentOf(b.id)).toMatchObject({ status: 'booked', gateInId: null });
+      await expectAuditRow({
+        tenantId,
+        key: clearKey,
+        action: 'gate_in.amended',
+        targetType: 'gate_in',
+        targetId: gi.id,
+        actorUserId: ownerUserId,
+        alongside: [{ action: 'dock_appointment.released', targetType: 'dock_appointment', targetId: b.id, actorUserId: ownerUserId }],
+      });
+      await expectAuditRow({
+        tenantId,
+        key: clearKey,
+        action: 'dock_appointment.released',
+        targetType: 'dock_appointment',
+        targetId: b.id,
+        actorUserId: ownerUserId,
+        alongside: [{ action: 'gate_in.amended', targetType: 'gate_in', targetId: gi.id, actorUserId: ownerUserId }],
+      });
+      // The same id resent is no change.
+      const sameKey = ulid();
+      await amend(gi.id, amendBody({ appointmentId: null }), sameKey).expect(200);
+      await expectAuditRow({ tenantId, key: sameKey, action: 'gate_in.amended', targetType: 'gate_in', targetId: gi.id, actorUserId: ownerUserId });
+    });
+
+    it('Link refused: cancelled / linked to another gate-in → 409 appointment-closed ×2; another warehouse → appointment-warehouse-mismatch; unknown → 404; 5 days out → appointment-not-due (A14)', async () => {
+      const cancelled = await appointment('G3', '14:00', '14:30');
+      await http()
+        .post(`${API}/${tenantId}/receiving/dock-appointments/${cancelled.id}/cancel`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ reason: 'Vendor postponed' })
+        .expect(200);
+      const taken = await appointment('G4', '14:00', '14:30');
+      clockAt('14:05');
+      const first = (await create(baseBody({ gatedInAt: at('14:05'), appointmentId: taken.id })).expect(201)).body.gateIn as GateIn;
+      const other = await appointment('W1', '14:00', '14:30', {}, wh2);
+      const later = await appointment('G5', '14:00', '14:30', { date: addIsoDays(DAY, 5) });
+      const closed = await create(baseBody({ appointmentId: cancelled.id }));
+      expectProblem(closed, 409, 'appointment-closed');
+      expect(closed.body.detail).toMatch(/cancelled/);
+      const elsewhere = await create(baseBody({ appointmentId: taken.id }));
+      expectProblem(elsewhere, 409, 'appointment-closed');
+      expect(elsewhere.body.detail).toContain(first.code);
+      expectProblem(await create(baseBody({ appointmentId: other.id })), 409, 'appointment-warehouse-mismatch');
+      expectProblem(await create(baseBody({ appointmentId: uuidv7() })), 404, 'not-found');
+      expectProblem(await create(baseBody({ appointmentId: later.id })), 409, 'appointment-not-due');
+      expectProblem(await create(baseBody({ appointmentId: 'not-a-uuid' })), 400, 'validation-failed');
+      // The amend refuses the same way, and changes nothing.
+      const plain = (await create(baseBody()).expect(201)).body.gateIn as GateIn;
+      expectProblem(await amend(plain.id, amendBody({ appointmentId: taken.id })), 409, 'appointment-closed');
+      expect((await appointmentOf(taken.id)).gateInId).toBe(first.id);
+    });
+
+    it('C6 / V4: the due window is the VISIT\'s IST day ±1 — the day before 00:00 and the day after 23:30 link; day+2 00:00 and just before the day before refuse', async () => {
+      const before = addIsoDays(DAY, -1);
+      const after = addIsoDays(DAY, 1);
+      const yesterday = await appointment('G1', '00:00', '00:30', { date: before });
+      const tomorrowLate = await appointment('G2', '23:30', '24:00', { date: after });
+      const dayPlus2 = await appointment('G3', '00:00', '00:30', { date: addIsoDays(DAY, 2) });
+      const tooEarly = await appointment('G4', '23:30', '24:00', { date: addIsoDays(DAY, -2) });
+      clockAt('12:00');
+      const visit = (extra: Record<string, unknown>) => create(baseBody({ gatedInAt: at('12:00'), ...extra }));
+      await visit({ appointmentId: yesterday.id }).expect(201);
+      await visit({ appointmentId: tomorrowLate.id }).expect(201);
+      expectProblem(await visit({ appointmentId: dayPlus2.id }), 409, 'appointment-not-due');
+      expectProblem(await visit({ appointmentId: tooEarly.id }), 409, 'appointment-not-due');
+    });
+
+    it('C6: a backdated create, and an amend days later, link the appointment the visit met (the window follows gatedInAt, not the clock)', async () => {
+      const met = await appointment('G5', '18:00', '18:30');
+      const metToo = await appointment('G6', '18:00', '18:30');
+      // Three days later the desk records the visit with its real (past) time.
+      gateInClock.now = () => Date.parse(at('10:00', addIsoDays(DAY, 3)));
+      dockClock.now = gateInClock.now;
+      await create(baseBody({ gatedInAt: at('18:05'), appointmentId: met.id })).expect(201);
+      expect(await appointmentOf(met.id)).toMatchObject({ status: 'arrived', punctuality: 'on_time', punctualityMinutes: 5 });
+      // An open visit amended later links against its own day too …
+      clockAt('18:10');
+      const open = (await create(baseBody({ gatedInAt: at('18:10') })).expect(201)).body.gateIn as GateIn;
+      gateInClock.now = () => Date.parse(at('09:00', addIsoDays(DAY, 4)));
+      dockClock.now = gateInClock.now;
+      await amend(open.id, amendBody({ appointmentId: metToo.id })).expect(200);
+      expect(await appointmentOf(metToo.id)).toMatchObject({ status: 'arrived', gateInId: open.id, punctualityMinutes: 10 });
+      // … and an appointment due on the CLOCK's day but not the visit's is refused.
+      const clockDay = await appointment('G1', '09:00', '09:30', { date: addIsoDays(DAY, 4) });
+      expectProblem(await amend(open.id, amendBody({ appointmentId: clockDay.id })), 409, 'appointment-not-due');
+    });
+
+    it('A1 same-key race: two creates, one key, appointmentId — both parked on the appointment lock answer the one gate-in snapshot', async () => {
+      const da = await appointment('G6', '15:00', '15:30');
+      clockAt('15:02');
+      const key = ulid();
+      const body = baseBody({ gatedInAt: at('15:02'), appointmentId: da.id });
+      const holder = postgres(process.env.DATABASE_URL!, { max: 1, onnotice: () => undefined });
+      let first: Promise<request.Response> | undefined;
+      let second: Promise<request.Response> | undefined;
+      try {
+        await holder.begin(async (tx) => {
+          const locked = (await tx`select pg_backend_pid() as pid from dock_appointments where id = ${da.id} for update`) as unknown as { pid: number }[];
+          first = (async () => create(body, key))();
+          second = (async () => create(body, key))();
+          const deadline = Date.now() + 10_000;
+          for (;;) {
+            const waiting = (await sql`select a.pid, pg_blocking_pids(a.pid) as blockers from pg_stat_activity a
+              where a.wait_event_type = 'Lock' and a.state = 'active' and a.query ilike '%"dock_appointments"%' and a.query ilike '%for update%'`) as unknown as {
+              pid: number;
+              blockers: number[];
+            }[];
+            const chain = new Set<number>([locked[0]!.pid]);
+            for (let grew = true; grew; ) {
+              grew = false;
+              for (const row of waiting) {
+                if (!chain.has(row.pid) && row.blockers.some((pid) => chain.has(pid))) {
+                  chain.add(row.pid);
+                  grew = true;
+                }
+              }
+            }
+            if (chain.size - 1 >= 2) break;
+            if (Date.now() > deadline) throw new Error('the two creates never parked on the appointment');
+            await new Promise((r) => setTimeout(r, 25));
+          }
+        });
+        const [a, b] = await Promise.all([first!, second!]);
+        expect([a.status, b.status]).toEqual([201, 201]);
+        expect(a.body).toEqual(b.body);
+      } finally {
+        await Promise.allSettled([first, second]);
+        await holder.end();
+      }
+      expect((await sql`select count(*)::int as n from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`)[0]!.n).toBe(1);
+      expect((await sql`select count(*)::int as n from gate_ins where tenant_id = ${tenantId} and id in (select gate_in_id from dock_appointments where id = ${da.id})`)[0]!.n).toBe(1);
+    });
+
+    it('Handheld: openGateIns entries carry the appointment (no id) or null', async () => {
+      const da = await appointment('G2', '16:00', '17:00');
+      clockAt('16:20');
+      const gi = (await create(baseBody({ gatedInAt: at('16:20'), appointmentId: da.id })).expect(201)).body.gateIn as GateIn;
+      const plain = (await create(baseBody({ gatedInAt: at('16:20') })).expect(201)).body.gateIn as GateIn;
+      const snap = (await snapshot()) as unknown as { openGateIns: { id: string; appointment: unknown }[]; dockAppointments: unknown[] };
+      expect(snap.openGateIns.find((row) => row.id === gi.id)!.appointment).toEqual({
+        code: da.code,
+        startsAt: at('16:00'),
+        endsAt: at('17:00'),
+        doorCode: 'G2',
+        punctuality: 'late',
+        punctualityMinutes: 20,
+      });
+      expect(snap.openGateIns.find((row) => row.id === plain.id)!.appointment).toBeNull();
+      expect(Array.isArray(snap.dockAppointments)).toBe(true);
     });
   });
 });

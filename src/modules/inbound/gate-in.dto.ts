@@ -20,6 +20,7 @@ import { RepeatableParam } from '../../shared/primitives/instant-range';
 import { VendorSnapshotDto } from '../partners/partners.dto';
 import { GATE_IN_DOCUMENT_KINDS, GATE_IN_LIMITS, GATE_IN_STATUSES, SEAL_STATUSES, UNLOAD_PHASES } from './gate-in.command';
 import { GATE_IN_LINK_REASONS } from './gate-in.read';
+import { CatalogGateInAppointmentDto, GateInAppointmentDto } from './dock.dto';
 
 /**
  * Story 2-3a — the gate-in's HTTP shapes. The DTO checks types, generous
@@ -188,6 +189,19 @@ export class GateInHeaderDto {
   @ValidateNested({ each: true })
   @Type(() => GateInDocumentInputDto)
   documents?: GateInDocumentInputDto[];
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    type: String,
+    format: 'uuid',
+    description:
+      "Story 2-3b — the dock appointment this visit keeps: a booked appointment of this warehouse starting the day before, the day of or the day after the visit's gated-in date (IST). Create: absent or null = unscheduled. Amend: ABSENT = the link unchanged (the one field where absent ≠ null), null = clear (the appointment returns to booked), an id = move. 404 unknown; 409 appointment-warehouse-mismatch, appointment-closed (cancelled, or another gate-in's), appointment-not-due",
+  })
+  @IsOptional()
+  @Nullable()
+  @IsUUID()
+  appointmentId?: string | null;
 }
 
 export class CreateGateInDto extends GateInHeaderDto {
@@ -380,6 +394,12 @@ class GateInHeaderFieldsDto {
 export class GateInDto extends GateInHeaderFieldsDto {
   @ApiProperty({ type: [GateInDocumentDto] })
   documents!: readonly GateInDocumentDto[];
+
+  @ApiProperty({ required: false, type: String, nullable: true, format: 'uuid', description: 'Story 2-3b — the linked dock appointment (null: unscheduled). Absent on an answer stored before 2-3b and replayed' })
+  appointmentId?: string | null;
+
+  @ApiProperty({ required: false, type: String, nullable: true, example: 'DA-0012', description: 'Story 2-3b — its code' })
+  appointmentCode?: string | null;
 }
 
 export class GateInResponse {
@@ -411,6 +431,9 @@ export class GateInEntryDto extends GateInHeaderFieldsDto {
 
   @ApiProperty({ description: 'Not gated out and gated in more than 7 days ago (the device no longer offers it)' })
   staleOpen!: boolean;
+
+  @ApiProperty({ type: GateInAppointmentDto, nullable: true, description: 'Story 2-3b — the linked dock appointment and the visit\'s punctuality against it (derived from the gated-in time); null = unscheduled' })
+  appointment!: GateInAppointmentDto | null;
 }
 
 export class GateInListResponse {
@@ -516,4 +539,7 @@ export class CatalogOpenGateInDto {
 
   @ApiProperty({ type: [CatalogOpenGateInDocumentDto] })
   documents!: readonly CatalogOpenGateInDocumentDto[];
+
+  @ApiProperty({ type: CatalogGateInAppointmentDto, nullable: true, description: 'Story 2-3b (additive) — the linked dock appointment, read-only; null = unscheduled. An older server omits it' })
+  appointment!: CatalogGateInAppointmentDto | null;
 }
