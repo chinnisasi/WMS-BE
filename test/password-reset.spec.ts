@@ -186,6 +186,28 @@ describe('password reset and login rate limits (e2e, story 6-1c)', () => {
     return new URLSearchParams(parsed.hash.slice(1)).get('token')!;
   }
 
+  /**
+   * Code review C6/C9/C18 — runs `before(n)` ahead of the n-th transaction the
+   * app's DATABASE opens, then calls through; the returned function puts the
+   * property back exactly (a jest spy's restore leaves drizzle's instance
+   * method answering undefined).
+   */
+  function hookTransactions(before: (n: number) => Promise<void>): () => void {
+    const db = app.get<Database>(DATABASE) as unknown as Record<string, unknown> & { transaction: (...args: unknown[]) => Promise<unknown> };
+    const own = Object.prototype.hasOwnProperty.call(db, 'transaction');
+    const previous = db.transaction;
+    let n = 0;
+    db.transaction = async (...args: unknown[]) => {
+      n += 1;
+      await before(n);
+      return previous.apply(db, args);
+    };
+    return () => {
+      if (own) db.transaction = previous;
+      else delete (db as { transaction?: unknown }).transaction;
+    };
+  }
+
   async function messages(tenantId: string, userId: string) {
     return sql<{ id: string; template: string; status: string; error_code: string | null; sealed_secret: string | null; params: Record<string, unknown> }[]>`
       select id, template, status, error_code, sealed_secret, params from email_messages
@@ -336,6 +358,40 @@ describe('password reset and login rate limits (e2e, story 6-1c)', () => {
       await confirm(token).expect(200);
       // The portal session path: the new password signs in to the portal.
       expect((await signInReq(p.email, NEW_PASSWORD).expect(200)).body.client).toMatchObject({ id: clientId });
+    });
+
+    it('code review C9 — a portal client suspended between the check and the confirm → 400; the password is unchanged', async () => {
+      const t = await registerTenant();
+      const clientId = await createClient(t);
+      const p = await createMember(t, 'client', { clientId });
+      await requestReset(p.email).expect(202);
+      const token = await linkFor(t.tenantId, p.email);
+      const restore = hookTransactions(async () => {
+        await sql`update clients set status = 'suspended' where id = ${clientId}`;
+      });
+      try {
+        expect((await confirm(token).expect(400)).body.code).toBe('reset-link-invalid');
+      } finally {
+        restore();
+      }
+      await sql`update clients set status = 'active' where id = ${clientId}`;
+      await signInReq(p.email, MEMBER_PASSWORD).expect(200);
+      expect((await resets(t.tenantId, p.userId))[0]!.consumed).toBe(false);
+    });
+
+    it('code review C18 — a failure while issuing still answers the same 202 (no 500 tells an active account apart); nothing is written', async () => {
+      const t = await registerTenant();
+      const m = await createMember(t, 'operator');
+      const restore = hookTransactions(async (n) => {
+        if (n === 1) throw new Error('simulated outage');
+      });
+      try {
+        const res = await requestReset(m.email).expect(202);
+        expect(res.body).toEqual({ message: RESET_REQUESTED_MESSAGE });
+      } finally {
+        restore();
+      }
+      expect(await resets(t.tenantId, m.userId)).toEqual([]);
     });
 
     it('past 20 requests an hour from one address → 429 in minutes', async () => {
@@ -539,6 +595,46 @@ describe('password reset and login rate limits (e2e, story 6-1c)', () => {
       expect((await resets(t.tenantId, t.ownerId)).pop()!.code_failures).toBe(0);
     });
 
+    it('code review C1 — a code already spent at sign-in is a reuse on the reset page: 422 counted on the TOKEN, the user’s counters untouched', async () => {
+      const t = await registerTenant();
+      await requestReset(t.email).expect(202);
+      const token = await linkFor(t.tenantId, t.email);
+      expect((await signInAs(app, t.email, PASSWORD, { ip: newIp() })).status).toBe(200);
+      const spent = enrolledFactorOf(t.email).lastStep;
+      const before = await userRow(t.ownerId);
+      const reuse = await confirm(token, { code: totpAt(enrolledFactorOf(t.email).secret, spent) }).expect(422);
+      expect(reuse.body).toMatchObject({ code: 'second-factor-invalid', attemptsLeft: 4 });
+      expect((await resets(t.tenantId, t.ownerId))[0]).toMatchObject({ code_failures: 1, consumed: false });
+      expect(await userRow(t.ownerId)).toEqual(before);
+    });
+
+    it('code review C6 — the A9 race arms: the user deactivated before tx1 → 400; deactivated before tx2 → 400; the factor changed before tx2 → 422 second-factor-needed; never a 401 or a 409', async () => {
+      const raceOn = (nth: number, before: () => Promise<unknown>) =>
+        hookTransactions(async (n) => {
+          if (n === nth) await before();
+        });
+      const cases: Array<{ nth: number; change: (userId: string) => Promise<unknown>; status: number; code: string }> = [
+        { nth: 1, change: (id) => sql`update users set status = 'deactivated', status_before_deactivation = 'active' where id = ${id}`, status: 400, code: 'reset-link-invalid' },
+        { nth: 2, change: (id) => sql`update users set status = 'deactivated', status_before_deactivation = 'active' where id = ${id}`, status: 400, code: 'reset-link-invalid' },
+        { nth: 2, change: (id) => sql`update users set mfa_enabled_at = mfa_enabled_at + interval '1 second' where id = ${id}`, status: 422, code: 'second-factor-needed' },
+      ];
+      for (const c of cases) {
+        const t = await registerTenant();
+        await requestReset(t.email).expect(202);
+        const token = await linkFor(t.tenantId, t.email);
+        const { code } = await nextTotpCode(t.email);
+        const restore = raceOn(c.nth, () => c.change(t.ownerId));
+        try {
+          const res = await confirm(token, { code });
+          expect([res.status, res.body.code]).toEqual([c.status, c.code]);
+        } finally {
+          restore();
+        }
+        // Nothing changed: the old password still verifies (the reset rolled back).
+        expect(await sql`select 1 from audit_events where target_id = ${t.ownerId} and action = 'user.password_reset'`).toHaveLength(0);
+      }
+    });
+
     it('a staff user who enrolled AFTER checking the link: the confirm without a code is 422 second-factor-needed', async () => {
       const t = await registerTenant();
       const m = await createMember(t, 'ops_manager');
@@ -664,6 +760,30 @@ describe('password reset and login rate limits (e2e, story 6-1c)', () => {
       expect(bucket!.count).toBe(0);
     });
 
+    it('code review C5 / C7 — an invitee’s 403 and a locked pair’s 423 give the hour buckets their hits back', async () => {
+      const t = await registerTenant();
+      const invitedEmail = `invited-${ulid().toLowerCase()}@example.com`;
+      await http()
+        .post(`${API}/${t.tenantId}/users`)
+        .set('Authorization', `Bearer ${t.ownerToken}`)
+        .set('Idempotency-Key', ulid())
+        .send({ email: invitedEmail, role: 'operator' })
+        .expect(201);
+      const ip = newIp();
+      for (let i = 0; i < 3; i += 1) await signInReq(invitedEmail, 'anything', ip).expect(403);
+      const account = async (email: string) =>
+        (await sql<{ count: number }[]>`select count from auth_rate_limits where bucket = ${`signin-account:${emailDigest(email)}`}`)[0]?.count ?? 0;
+      expect(await account(invitedEmail)).toBe(0);
+      const m = await createMember(t, 'operator');
+      const lockedIp = newIp();
+      for (let i = 0; i < 5; i += 1) await signInReq(m.email, 'wrong-password', lockedIp).expect(401);
+      expect(await account(m.email)).toBe(5);
+      for (let i = 0; i < 4; i += 1) await signInReq(m.email, 'wrong-password', lockedIp).expect(423);
+      expect(await account(m.email)).toBe(5);
+      const [hour] = await sql<{ count: number }[]>`select count from auth_rate_limits where bucket = ${`signin-ip-hour:${lockedIp}`}`;
+      expect(hour!.count).toBe(5);
+    });
+
     it('the address-hour bucket: past 200 untrusted attempts an hour → 429 in minutes, and the refused attempt gives the account bucket its hit back', async () => {
       const t = await registerTenant();
       const m = await createMember(t, 'operator');
@@ -727,6 +847,17 @@ describe('password reset and login rate limits (e2e, story 6-1c)', () => {
         expect.objectContaining({ reference: expect.stringMatching(/^ip:2001:db8:/) }),
       ]);
       expect(await sql`select ip from signin_attempts where ip = ${ipKey(`${prefix}::1`)}`).toHaveLength(1);
+      // Code review C2 — every per-address BUCKET keys on the /64 too.
+      const [hourRow] = await sql<{ count: number }[]>`select count from auth_rate_limits where bucket = ${`signin-ip-hour:${ipKey(`${prefix}::1`)}`}`;
+      // Three sign-ins; the 423 gave its hit back (C7).
+      expect(hourRow!.count).toBe(3);
+      expect(await sql`select 1 from auth_rate_limits where bucket like ${`signin-ip-hour:${prefix}:%`} and bucket <> ${`signin-ip-hour:${ipKey(`${prefix}::1`)}`}`).toHaveLength(0);
+      const [minuteRow] = await sql<{ count: number }[]>`select count from auth_rate_limits where bucket = ${`signin-ip:${ipKey(`${prefix}::1`)}`}`;
+      expect(minuteRow!.count).toBe(6);
+      await requestReset(m.email, `${prefix}::77`).expect(202);
+      await requestReset(m.email, `${prefix}:5::78`).expect(202);
+      const [resetRow] = await sql<{ count: number }[]>`select count from auth_rate_limits where bucket = ${`reset-request-ip:${ipKey(`${prefix}::1`)}`}`;
+      expect(resetRow!.count).toBe(2);
       // Another /64 is another key.
       await signInReq(m.email, MEMBER_PASSWORD, `2001:db8:ffff:b::1`).expect(200);
     });
@@ -797,6 +928,9 @@ describe('password reset and login rate limits (e2e, story 6-1c)', () => {
         select conname, pg_get_constraintdef(oid) as def from pg_constraint
          where conname in ('password_resets_code_failures_check', 'password_resets_expiry_check') order by conname`;
       expect(defs.map((d) => d.conname)).toEqual(['password_resets_code_failures_check', 'password_resets_expiry_check']);
+      // Code review C30 — the CHECK's ceiling is the verifier's limit.
+      const { MAX_SECOND_FACTOR_FAILURES } = await import('../src/modules/tenancy/second-factor');
+      expect(defs[0]!.def).toContain(`(code_failures <= ${MAX_SECOND_FACTOR_FAILURES})`);
     });
 
     it('the three routes are in the OpenAPI document, unguarded and unkeyed', () => {

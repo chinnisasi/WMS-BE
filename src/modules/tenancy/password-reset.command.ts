@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { sql } from 'drizzle-orm';
 import { AUTH_DATABASE, DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
@@ -72,6 +72,8 @@ export interface ResetConfirmed {
  */
 @Injectable()
 export class PasswordResetCommand {
+  private readonly logger = new Logger('PasswordReset');
+
   constructor(
     @Inject(AUTH_DATABASE) private readonly authDb: Database,
     @Inject(DATABASE) private readonly db: Database,
@@ -89,7 +91,17 @@ export class PasswordResetCommand {
     // An unknown, invited or deactivated email queues nothing — and answers
     // the same body and status.
     if (user !== undefined && user.status === 'active') {
-      await withTenantTransaction(this.db, user.tenant_id, (tx) => this.issueInTx(tx, user.tenant_id, user.id, input.ip));
+      try {
+        await withTenantTransaction(this.db, user.tenant_id, (tx) => this.issueInTx(tx, user.tenant_id, user.id, input.ip));
+      } catch (error) {
+        // Code review C18 — a failure here (a seal-key fault, a transient
+        // database error) must not answer differently for an active account
+        // than for an unknown email: logged by ids only, the same 202. The
+        // user asks again; nothing was queued (the transaction rolled back).
+        this.logger.error(
+          `Reset request for user ${user.id} (tenant ${user.tenant_id}) failed: ${error instanceof Error ? error.message : 'unknown error'}`,
+        );
+      }
     }
     return { message: RESET_REQUESTED_MESSAGE };
   }
@@ -199,6 +211,10 @@ export class PasswordResetCommand {
   }): Promise<ResetConfirmed> {
     await hitRateLimit(this.db, `reset-ip:${ipKey(input.ip)}`, RESET_LIMIT_PER_IP_PER_MINUTE);
     const located = await this.locate(input.token);
+    const code = input.code?.trim() ?? '';
+    // Code review C10 — an enrolled account without a code is refused before
+    // any scrypt round (nothing counted, nothing hashed).
+    if (located.mfaEnabled && code === '') throw secondFactorNeeded();
     // scrypt BEFORE any transaction (the accept-invite precedent).
     const passwordHash = await hashPassword(input.password);
     const { tenantId, userId } = located;
@@ -216,8 +232,6 @@ export class PasswordResetCommand {
       });
     }
 
-    const code = input.code?.trim() ?? '';
-    if (code === '') throw secondFactorNeeded();
     // A8 — every code tried on reset pages is bounded per user per day
     // (5 tokens × 5 wrong codes), across every token.
     await hitRateLimit(this.db, `reset-code:${userId}`, RESET_CODE_LIMIT_PER_USER_PER_DAY, ONE_DAY_SECONDS);
@@ -281,6 +295,18 @@ export class PasswordResetCommand {
     // longer active: 400, and the whole transaction rolls back (a backup
     // code checked by tx2 is not spent).
     if (token === undefined || !token.open || token.user_id !== userId || token.status !== 'active') throw resetLinkInvalid();
+    // Code review C9 — a portal user's client, share-locked in THIS
+    // transaction (the request's rule): suspended or departed since the
+    // check → the same 400, nothing changed.
+    if (located.clientId !== null) {
+      try {
+        const client = await shareLockClientInTx(tx, tenantId, located.clientId);
+        if (client.status !== 'active') throw resetLinkInvalid();
+      } catch (error) {
+        if (error instanceof ProblemException) throw resetLinkInvalid();
+        throw error;
+      }
+    }
     const changed = (await tx.execute(sql`
       update users set password_hash = ${passwordHash}, updated_at = now()
        where tenant_id = ${tenantId} and id = ${userId}

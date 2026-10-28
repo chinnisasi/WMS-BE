@@ -20,7 +20,9 @@ import { ProblemException } from '../../shared/problem-details/problem.exception
  *   own network.
  * - PIN (A1): keyed on the device — the PIN is the device's.
  * - Attempt limits (A2): sign-in per client IP, badge-in per device; fixed
- *   one-minute windows in `auth_rate_limits`.
+ *   windows in `auth_rate_limits` (one minute, or — story 6-1c — the hour and
+ *   day windows a bucket names; every window is epoch-aligned, so a day
+ *   window starts at 00:00 UTC = 05:30 IST).
  *
  * Story 6-1c — every per-address key is an `IpKey` (`ipKey`: an IPv4 address
  * as it is, an IPv6 address cut to its /64), so one host rotating through

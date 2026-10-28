@@ -243,6 +243,10 @@ export class SignInCommand {
     };
     const counted = await countSignInAttempt(this.db, email, attemptKey);
     if (counted.locked) {
+      // Code review C7 — a locked attempt never reaches scrypt: it gives the
+      // hour buckets their hits back (as an address-hour refusal does), so
+      // retries against a locked pair cannot drain the victim's account budget.
+      await refund();
       if (counted.newlyLocked && user !== undefined) await this.auditLock(user, command.ip);
       throw signInLocked(counted.retryAfterSeconds);
     }

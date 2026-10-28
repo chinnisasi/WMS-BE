@@ -4,6 +4,7 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { isUuid } from '../../shared/primitives/ids';
 import { hashSecret, sameHash } from './sessions';
+import { MAX_SECOND_FACTOR_FAILURES } from './second-factor';
 
 /**
  * Story 6-1c — the password-reset token and its store (`password_resets`).
@@ -81,7 +82,7 @@ export async function locateResetIn(
 ): Promise<LocatedReset | null> {
   const rows = (await authDb.execute(sql`
     select r.id, r.tenant_id, r.user_id, r.secret_hash, r.expires_at::text as expires_at,
-           (r.consumed_at is null and r.expires_at > now() and r.code_failures < 5) as open,
+           (r.consumed_at is null and r.expires_at > now() and r.code_failures < ${MAX_SECOND_FACTOR_FAILURES}) as open,
            u.email, u.status, u.client_id, (u.mfa_enabled_at is not null) as mfa_enabled
       from password_resets r
       join users u on u.id = r.user_id and u.tenant_id = r.tenant_id
