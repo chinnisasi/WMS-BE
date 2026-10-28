@@ -79,10 +79,10 @@ describe('the worker heartbeat (story 6-2c, A3)', () => {
       expect(noProgressBound(60 * MINUTE, { WORKER_HEARTBEAT_STALE_MS: String(15 * MINUTE) })).toBe(60 * MINUTE);
     });
 
-    it('the default bounds: 20 min, 60 min for audit-export and ledger-integrity, one entry per job', () => {
+    it('the default bounds: 20 min, 60 min for audit-export and ledger-integrity, 2 min for webhook-sender (5-2a A8), one entry per job', () => {
       expect(Object.keys(DEFAULT_NO_PROGRESS_MS).sort()).toEqual([...WORKER_JOBS].sort());
       for (const job of WORKER_JOBS) {
-        expect(DEFAULT_NO_PROGRESS_MS[job]).toBe(job === 'audit-export' || job === 'ledger-integrity' ? 60 * MINUTE : 20 * MINUTE);
+        expect(DEFAULT_NO_PROGRESS_MS[job]).toBe(job === 'audit-export' || job === 'ledger-integrity' ? 60 * MINUTE : job === 'webhook-sender' ? 2 * MINUTE : 20 * MINUTE);
       }
     });
 
@@ -307,6 +307,8 @@ describe('the worker heartbeat (story 6-2c, A3)', () => {
           'SessionPurgeWorker',
           'StorageSnapshotWorker',
           'WaveCutoffSweepWorker',
+          // Story 5-2a — per tenant and per completed send.
+          'WebhookSenderWorker',
         ].sort(),
       );
     });

@@ -24,6 +24,8 @@
     "loadtest:smoke": "bun scripts/loadtest-acceptance.ts --mode smoke",
     "seed:demo": "bun scripts/seed-demo.ts",
     "auth:unlock": "bun scripts/auth-unlock.ts",
+    "webhooks:reseal": "bun scripts/webhooks-reseal.ts",
+    "webhooks:smoke": "bun scripts/webhook-transport-smoke.ts",
     "auth:reset-2fa": "bun scripts/auth-reset-2fa.ts"
   },
   "dependencies": {
@@ -59,6 +61,7 @@
     "drizzle-kit": "0.31.10",
     "eslint": "9.30.0",
     "jest": "30.5.1",
+    "standardwebhooks": "1.1.1",
     "supertest": "7.2.2",
     "typescript": "6.0.3",
     "typescript-eslint": "8.70.0"

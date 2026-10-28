@@ -40,6 +40,10 @@ import {
   EMAIL_SENDING_STALE_MS,
   MailFacade,
 } from '../modules/mail/mail.facade';
+import { ClientWebhooksModule } from '../modules/client-webhooks/client-webhooks.module';
+import { ClientWebhooksFacade } from '../modules/client-webhooks/client-webhooks.facade';
+import { WEBHOOK_RETENTION_DAYS } from '../modules/client-webhooks/webhook-rules';
+import type { WebhookSendSummary, WebhookTenantRun, WebhookTick } from '../modules/client-webhooks/webhook.sender';
 import { LicenceFacade } from '../modules/compliance/licence.facade';
 import { licenceToday } from '../modules/compliance/licence.command';
 import { LICENCE_WARNING_LEAD_DAYS } from '../shared/primitives/licence';
@@ -1395,6 +1399,147 @@ export class EmailSenderWorker implements OnApplicationBootstrap, BeforeApplicat
   }
 }
 
+/** `WEBHOOK_SEND_POLL_MS` (story 5-2a): the client webhook sender's poll; unset/`0` = OFF. */
+export function parseWebhookSendPollMs(raw: string | undefined): number {
+  return parsePollMs('WEBHOOK_SEND_POLL_MS', raw);
+}
+
+/** What the webhook worker drives — the facade, or a suite's fake. */
+export interface WebhookSendDriver {
+  newTick(onSend?: () => void): WebhookTick;
+  sendDueWebhooks(tenantId: string, tick?: WebhookTick): Promise<WebhookTenantRun>;
+}
+
+/**
+ * Story 5-2a — the client webhook sender worker (the `EmailSenderWorker`
+ * shape, A3, A8). Each tick finds the tenants with webhook work cross-tenant
+ * on the read-only BYPASSRLS `AUTH_DATABASE` — any endpoint that is not
+ * deleted, or a deleted one past retention (every delivery and event hangs
+ * off an endpoint) — and visits them through a
+ * ROTATING window (the walk starts one tenant later each tick, so no backlog
+ * starves the rest). Per tenant, `ClientWebhooksFacade.sendDueWebhooks` runs
+ * the sweep and the claim and STARTS the sends in the tick's shared pool
+ * (`WEBHOOK_SEND_CONCURRENCY`, 8): the worker does not wait for one tenant's
+ * sends before claiming the next tenant's, so a hanging receiver costs its
+ * own two slots, never another tenant's tick. The tick budget is 60 s (no
+ * send starts after it). A failing tenant is logged and retried next tick;
+ * config faults are logged ONCE per tick. Env-gated OFF when
+ * `WEBHOOK_SEND_POLL_MS` is unset/`0`; single-flight; `unref`'d timer; the
+ * 6-2a shutdown drain; the 6-2c heartbeat (one beat per tenant and per send,
+ * 2-minute no-progress bound). Two instances are safe: the claim is `FOR
+ * UPDATE SKIP LOCKED`, commits `sending` before any send, caps two in flight
+ * per endpoint across processes, and every outcome is conditional on the
+ * claim stamp.
+ */
+@Injectable()
+export class WebhookSenderWorker implements OnApplicationBootstrap, BeforeApplicationShutdown, OnApplicationShutdown {
+  private readonly logger = new Logger('WebhookSenderWorker');
+  private readonly pollMs: number;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private running = false;
+  /** Ticks run so far — rotates where each tick's tenant walk starts. */
+  private tickCount = 0;
+  private readonly ticks = new InFlightTick();
+
+  constructor(
+    @Inject(AUTH_DATABASE) private readonly authDb: Database,
+    @Inject(ClientWebhooksFacade) private readonly webhooks: WebhookSendDriver,
+  ) {
+    this.pollMs = parseWebhookSendPollMs(process.env.WEBHOOK_SEND_POLL_MS);
+  }
+
+  onApplicationBootstrap(): void {
+    if (this.pollMs === 0) {
+      return; // env-gated off
+    }
+    this.logger.log(`Webhook sender worker started (poll every ${this.pollMs}ms)`);
+    this.ticks.track('webhook-sender', this.pollMs);
+    this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
+    this.timer.unref?.();
+  }
+
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (!(await this.ticks.settle())) {
+      this.logger.warn('A tick was still running at the shutdown drain deadline');
+    }
+  }
+
+  onApplicationShutdown(): void {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  /** One cycle; returns the tenants it drove (the plumbing test reads it). */
+  async tick(): Promise<string[]> {
+    if (this.running) {
+      return []; // shed: one cycle at a time in this process
+    }
+    this.running = true;
+    try {
+      // Code review C10 — discovery reads the small endpoints table only: a
+      // tenant with any live endpoint (its deliveries, held rows, departure
+      // and reconcile), or a deleted one past retention (whose purge also
+      // removes its deliveries, then the events left empty). Every delivery
+      // and event belongs to an endpoint, so no delivery-table scan is needed.
+      const tenants = (await this.authDb.execute(sql`
+        select distinct tenant_id as "tenantId" from webhook_endpoints
+         where status <> 'deleted' or deleted_at < now() - make_interval(days => ${WEBHOOK_RETENTION_DAYS})
+         order by 1 asc
+      `)) as unknown as { tenantId: string }[];
+      const start = tenants.length === 0 ? 0 : this.tickCount % tenants.length;
+      this.tickCount += 1;
+      const rotated = [...tenants.slice(start), ...tenants.slice(0, start)];
+      const tick = this.webhooks.newTick(() => this.ticks.beat());
+      const runs: { tenantId: string; done: Promise<WebhookSendSummary> }[] = [];
+      const driven: string[] = [];
+      for (const { tenantId } of rotated) {
+        this.ticks.beat(); // Story 6-2c (A3): one beat per tenant
+        try {
+          // Every tenant is still visited once the claim budget is spent: its
+          // sweep (expiry, purge, departure, reconcile) runs with no claim.
+          const run = await this.webhooks.sendDueWebhooks(tenantId, tick);
+          runs.push({ tenantId, done: run.done });
+          driven.push(tenantId);
+        } catch (error) {
+          this.logger.error(
+            `Webhook sender could not run for tenant ${tenantId} — retried next tick: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      const configCodes = new Set<string>();
+      for (const run of runs) {
+        try {
+          const summary = await run.done;
+          for (const code of summary.configCodes) configCodes.add(code);
+        } catch (error) {
+          this.logger.error(
+            `Webhook sends failed for tenant ${run.tenantId} — the stale sweep returns them: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      if (configCodes.size > 0) {
+        // ONCE per tick, across every tenant: the deployment is wrong.
+        this.logger.error(
+          `webhook signing secrets could not be opened (${[...configCodes].sort().join(', ')}) — check WEBHOOK_SEAL_KEY and WEBHOOK_SEAL_KEY_PREVIOUS; ` +
+            'rows retried without spending an attempt, expired after 72 hours',
+        );
+      }
+      return driven;
+    } catch (error) {
+      this.logger.error(`Webhook sender cycle failed: ${error instanceof Error ? error.message : String(error)}`);
+      return [];
+    } finally {
+      this.running = false;
+    }
+  }
+}
+
 /**
  * Story 9-2b — the wave cutoff sweep worker. Each tick finds the tenants with
  * a PLANNED wave under a policy that has a cutoff (cross-tenant, read-only,
@@ -2090,6 +2235,8 @@ export class AttachmentSweepWorker implements OnApplicationBootstrap, BeforeAppl
     MailModule,
     // Story 2-5a — the attachment retention sweep (attachments).
     AttachmentsModule,
+    // Story 5-2a — the client webhook sender (client-webhooks).
+    ClientWebhooksModule,
   ],
   providers: [
     OutboxRelayWorker,
@@ -2117,6 +2264,8 @@ export class AttachmentSweepWorker implements OnApplicationBootstrap, BeforeAppl
     EmailSenderWorker,
     // Story 2-5a — the attachment retention sweep (env-gated OFF by default).
     AttachmentSweepWorker,
+    // Story 5-2a — the client webhook sender (env-gated OFF by default).
+    WebhookSenderWorker,
     // Story 6-2c (A10): the worker role's health-only listener (idle in the api role).
     WorkerHealthServer,
   ],

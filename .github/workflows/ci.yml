@@ -60,6 +60,12 @@ jobs:
       - name: Test
         run: bun run test
 
+      # Story 5-2a (A13) — the guarded webhook transport under BUN (production's
+      # runtime; jest runs Node): the pinned-IP connect, the private-address and
+      # mixed-answer refusals, no redirect, a foreign certificate.
+      - name: Webhook transport smoke (Bun)
+        run: bun run webhooks:smoke
+
       - name: Typecheck (incl. tests)
         run: bun run typecheck
 

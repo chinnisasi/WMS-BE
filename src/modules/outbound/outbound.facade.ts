@@ -1480,6 +1480,39 @@ export class OutboundFacade {
   }
 
   /**
+   * Story 5-2a (shared with 5-2b, decision 2) — the client of each order, in
+   * the caller's transaction (the `order.dispatched` payload carries none).
+   * An id with no order row is absent from the map. Read-only.
+   */
+  async orderClientIdsInTx(tx: TenantTx, tenantId: string, orderIds: readonly string[]): Promise<Map<string, string>> {
+    const distinct = [...new Set(orderIds)].filter((id) => UUID_RE.test(id));
+    if (distinct.length === 0) return new Map();
+    const rows = (await tx.execute(sql`
+      select o.id::text as "orderId", o.client_id::text as "clientId"
+      from orders o
+      where o.tenant_id = ${tenantId}::uuid and o.id = any(${sql.param(distinct)}::uuid[])
+    `)) as unknown as { orderId: string; clientId: string }[];
+    return new Map(rows.map((row) => [row.orderId, row.clientId]));
+  }
+
+  /**
+   * Story 5-2a (A6; shared with 5-2b) — the kit PARENT lines among
+   * `orderLineIds`: a line another line names as its `parent_line_id`. A kit
+   * parent carries no picks, so a client-facing dispatch drops it and lists
+   * its components. Read-only, in the caller's transaction.
+   */
+  async kitParentLineIdsInTx(tx: TenantTx, tenantId: string, orderLineIds: readonly string[]): Promise<Set<string>> {
+    const distinct = [...new Set(orderLineIds)].filter((id) => UUID_RE.test(id));
+    if (distinct.length === 0) return new Set();
+    const rows = (await tx.execute(sql`
+      select distinct ol.parent_line_id::text as "id"
+      from order_lines ol
+      where ol.tenant_id = ${tenantId}::uuid and ol.parent_line_id = any(${sql.param(distinct)}::uuid[])
+    `)) as unknown as { id: string }[];
+    return new Set(rows.map((row) => row.id));
+  }
+
+  /**
    * Story 1-1 — the SKU of each order line, in the caller's transaction. A
    * SKU code is unique per (tenant, client) only, so a reader that must name
    * ONE SKU (invoicing's HSN hint) keys on the line's `sku_id`, never its

@@ -135,6 +135,11 @@ export const AUDIT_TARGET_TYPES = [
   'warehouse',
   'wave',
   'wave_policy',
+  // Story 5-2a — a client webhook endpoint (`webhook_endpoint.created |
+  // updated | deleted | secret_rotated | secret_revoked | test_sent |
+  // redelivered | bulk_redelivered`, and the sender's unkeyed
+  // `webhook_endpoint.auto_disabled`, system actor).
+  'webhook_endpoint',
   'zone',
 ] as const;
 
@@ -318,4 +323,15 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'receipt_photo.added', targetType: 'attachment' },
   { action: 'receipt_photo.removed', targetType: 'attachment' },
   { action: 'receipt_photo.ref-skipped', targetType: 'goods_receipt' },
+  // Story 5-2a — the webhook endpoint commands (`ClientWebhooksCommand`). The
+  // sender's `webhook_endpoint.auto_disabled` is an unkeyed system row
+  // (`SYSTEM_ACTOR_ID`), outside this list.
+  { action: 'webhook_endpoint.created', targetType: 'webhook_endpoint' },
+  { action: 'webhook_endpoint.updated', targetType: 'webhook_endpoint' },
+  { action: 'webhook_endpoint.deleted', targetType: 'webhook_endpoint' },
+  { action: 'webhook_endpoint.secret_rotated', targetType: 'webhook_endpoint' },
+  { action: 'webhook_endpoint.secret_revoked', targetType: 'webhook_endpoint' },
+  { action: 'webhook_endpoint.test_sent', targetType: 'webhook_endpoint' },
+  { action: 'webhook_endpoint.redelivered', targetType: 'webhook_endpoint' },
+  { action: 'webhook_endpoint.bulk_redelivered', targetType: 'webhook_endpoint' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

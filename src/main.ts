@@ -1,6 +1,7 @@
 import { API_PREFIX, createApp, parsePort } from './app.factory';
 import { assertSecondFactorKeyConfigured } from './modules/tenancy/second-factor-secrets';
 import { assertMailConfigured } from './modules/mail/mail.config';
+import { assertWebhooksConfigured } from './modules/client-webhooks/webhook-config';
 import { assertFileStoreConfigured } from './modules/attachments/file-store';
 import { parseAttachmentPurgeDays } from './modules/attachments/attachments.facade';
 import { assertDatabaseTlsConfig } from './shared/db/pg-tls';
@@ -53,6 +54,9 @@ async function bootstrap(): Promise<void> {
   try {
     assertSecondFactorKeyConfigured();
     assertMailConfigured();
+    // Story 5-2a — a malformed WEBHOOK_* value, or WEBHOOK_GATEWAY=https
+    // without a usable WEBHOOK_SEAL_KEY (and the stale-bound assert, A3).
+    assertWebhooksConfigured();
     // Story 2-5a — FILE_STORE=local|s3 needs its bucket, region (and endpoint).
     assertFileStoreConfigured();
     parseAttachmentPurgeDays(process.env.ATTACHMENT_PURGE_DAYS);

@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { bigint, boolean, customType, date, index, integer, jsonb, numeric, pgEnum, pgTable, primaryKey, text, timestamp, unique, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { bigint, boolean, customType, date, index, integer, jsonb, numeric, pgEnum, pgTable, primaryKey, smallint, text, timestamp, unique, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import { uuidv7 } from '../primitives/ids';
 
 /**
@@ -6597,3 +6597,136 @@ export const attachments = pgTable(
 );
 
 export type AttachmentRow = typeof attachments.$inferSelect;
+
+/**
+ * Story 5-2a — a client's outbound webhook endpoint (client-webhooks module,
+ * module-exclusive writes — pinned by `test/architecture.spec.ts`). Staff
+ * configure it on the client's behalf (`clients.manage`). `url` is stored
+ * normalised (https, lower-case host, default port stripped); the signing
+ * secret is sealed under `WEBHOOK_SEAL_KEY` (AAD `tenant_id:id`) — only
+ * `webhook-secrets.ts` opens it — and `secret_hint` is its last four
+ * characters for display. A rotation keeps the old secret for 24 hours in
+ * `previous_secret_sealed`. `consecutive_failures` / `failing_since` count
+ * FINAL delivery failures toward auto-disable (`failing`, with a
+ * `disabled_episode_id` the notifications panel keys on); `gone` is a 410.
+ * A delete is SOFT (`status = 'deleted'`, `deleted_at`) — the row and its
+ * deliveries stay readable until the 30-day retention arm removes them.
+ * `rate_window_*` is the manual-send limiter (test and redeliver, 10 a
+ * minute). Every CHECK and the RLS policy (the tenant + client clause) live
+ * only in `drizzle/0100_client_webhooks.sql`.
+ */
+export const webhookEndpoints = pgTable(
+  'webhook_endpoints',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    url: text('url').notNull(),
+    description: text('description'),
+    eventTypes: text('event_types').array().notNull(),
+    status: text('status').notNull().default('active'),
+    disabledReason: text('disabled_reason'),
+    disabledAt: timestamp('disabled_at', { withTimezone: true, mode: 'string' }),
+    disabledEpisodeId: uuid('disabled_episode_id'),
+    schemaVersion: smallint('schema_version').notNull().default(1),
+    secretSealed: text('secret_sealed').notNull(),
+    secretHint: text('secret_hint').notNull(),
+    previousSecretSealed: text('previous_secret_sealed'),
+    previousSecretExpiresAt: timestamp('previous_secret_expires_at', { withTimezone: true, mode: 'string' }),
+    consecutiveFailures: integer('consecutive_failures').notNull().default(0),
+    failingSince: timestamp('failing_since', { withTimezone: true, mode: 'string' }),
+    lastSuccessAt: timestamp('last_success_at', { withTimezone: true, mode: 'string' }),
+    rateWindowStart: timestamp('rate_window_start', { withTimezone: true, mode: 'string' }),
+    rateWindowCount: integer('rate_window_count').notNull().default(0),
+    deletedAt: timestamp('deleted_at', { withTimezone: true, mode: 'string' }),
+    createdBy: uuid('created_by').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('webhook_endpoints_client_url_unique')
+      .on(table.tenantId, table.clientId, table.url)
+      .where(sql`status <> 'deleted'`),
+    index('webhook_endpoints_tenant_client_idx').on(table.tenantId, table.clientId, table.createdAt),
+  ],
+);
+
+export type WebhookEndpointRow = typeof webhookEndpoints.$inferSelect;
+
+/**
+ * Story 5-2a — one client-facing business fact, frozen at enqueue as the
+ * exact bytes every delivery sends (`body`, the v1 envelope). One per
+ * subject: `(tenant_id, event_type, subject_id)` is unique — the subject is
+ * the GRN id or the order id (a GRN records once, an order dispatches once),
+ * so a relay redelivery, the quarantine reconcile and an operator replay all
+ * dedupe. Created only when the client has a subscribed endpoint. CHECKs and
+ * RLS in `drizzle/0100_client_webhooks.sql`.
+ */
+export const webhookEvents = pgTable(
+  'webhook_events',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    eventType: text('event_type').notNull(),
+    subjectId: uuid('subject_id').notNull(),
+    body: text('body').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('webhook_events_subject_unique').on(table.tenantId, table.eventType, table.subjectId),
+    index('webhook_events_tenant_created_idx').on(table.tenantId, table.createdAt),
+  ],
+);
+
+export type WebhookEventRow = typeof webhookEvents.$inferSelect;
+
+/**
+ * Story 5-2a — one event to one endpoint: `pending → sending → succeeded |
+ * failed`, or `held` while its endpoint is auto-disabled for failing. At
+ * least once: a `sending` row older than five minutes returns to `pending`.
+ * `pending_since` is the 72-hour expiry clock (reset by a redeliver, a
+ * release and a stale return); `last_error_code` is a bounded code, never a
+ * message, and no response body is stored. CHECKs and RLS in
+ * `drizzle/0100_client_webhooks.sql`.
+ */
+export const webhookDeliveries = pgTable(
+  'webhook_deliveries',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    eventId: uuid('event_id').notNull(),
+    endpointId: uuid('endpoint_id').notNull(),
+    status: text('status').notNull().default('pending'),
+    attempts: integer('attempts').notNull().default(0),
+    nextAttemptAt: timestamp('next_attempt_at', { withTimezone: true, mode: 'string' }).notNull(),
+    pendingSince: timestamp('pending_since', { withTimezone: true, mode: 'string' }).notNull(),
+    claimedAt: timestamp('claimed_at', { withTimezone: true, mode: 'string' }),
+    lastAttemptAt: timestamp('last_attempt_at', { withTimezone: true, mode: 'string' }),
+    lastStatusCode: integer('last_status_code'),
+    lastErrorCode: text('last_error_code'),
+    lastDurationMs: integer('last_duration_ms'),
+    succeededAt: timestamp('succeeded_at', { withTimezone: true, mode: 'string' }),
+    redeliveryCount: integer('redelivery_count').notNull().default(0),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('webhook_deliveries_event_endpoint_unique').on(table.tenantId, table.eventId, table.endpointId),
+    index('webhook_deliveries_log_idx').on(table.tenantId, table.endpointId, table.createdAt.desc(), table.id.desc()),
+    index('webhook_deliveries_due_idx').on(table.nextAttemptAt).where(sql`status in ('pending', 'sending')`),
+    index('webhook_deliveries_purge_idx')
+      .on(table.tenantId, sql`coalesce(succeeded_at, last_attempt_at, created_at)`)
+      .where(sql`status in ('succeeded', 'failed')`),
+    index('webhook_deliveries_held_idx').on(table.tenantId, table.endpointId, table.createdAt).where(sql`status = 'held'`),
+    // Code review C10 — the sweep's expiry arm (`pending_since` + 72 h).
+    index('webhook_deliveries_pending_since_idx').on(table.tenantId, table.pendingSince).where(sql`status = 'pending'`),
+  ],
+);
+
+export type WebhookDeliveryRow = typeof webhookDeliveries.$inferSelect;

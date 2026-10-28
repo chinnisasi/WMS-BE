@@ -369,6 +369,8 @@ describe('graceful shutdown (story 6-2a)', () => {
         'EMAIL_SEND_POLL_MS',
         // Story 2-5a — the attachment retention sweep.
         'ATTACHMENT_SWEEP_POLL_MS',
+        // Story 5-2a — the client webhook sender.
+        'WEBHOOK_SEND_POLL_MS',
       ];
       for (const name of POLLS) process.env[name] = '20';
       let app: INestApplication;
@@ -380,7 +382,7 @@ describe('graceful shutdown (story 6-2a)', () => {
       const workerClasses = (Reflect.getMetadata('providers', JobsModule) as (new (...args: never[]) => unknown)[]).filter(
         (provider) => typeof provider === 'function' && /Worker$|Reaper$/.test(provider.name),
       );
-      expect(workerClasses).toHaveLength(15); // 5-1a added EmailSenderWorker; 2-5a AttachmentSweepWorker
+      expect(workerClasses).toHaveLength(16); // 5-1a added EmailSenderWorker; 2-5a AttachmentSweepWorker; 5-2a WebhookSenderWorker
       type Worker = { tick: () => Promise<unknown>; beforeApplicationShutdown: () => Promise<void> };
       const rows = workerClasses.map((cls) => {
         const worker = app.get(cls) as unknown as Worker;
@@ -419,7 +421,7 @@ describe('graceful shutdown (story 6-2a)', () => {
         'OUTBOX_RELAY_POLL_MS', 'OUTBOX_RECONCILE_POLL_MS', 'RESERVATION_REAPER_POLL_MS', 'COUNT_SCHEDULER_POLL_MS',
         'REPLENISHMENT_SCHEDULER_POLL_MS', 'CHANNELS_SYNC_POLL_MS', 'STORAGE_SNAPSHOT_POLL_MS', 'PUSH_SENDER_POLL_MS',
         'WAVE_CUTOFF_SWEEP_POLL_MS', 'AUDIT_EXPORT_POLL_MS', 'LEDGER_INTEGRITY_POLL_MS', 'SESSION_PURGE_POLL_MS',
-        'LICENCE_EXPIRY_POLL_MS', 'EMAIL_SEND_POLL_MS', 'ATTACHMENT_SWEEP_POLL_MS',
+        'LICENCE_EXPIRY_POLL_MS', 'EMAIL_SEND_POLL_MS', 'ATTACHMENT_SWEEP_POLL_MS', 'WEBHOOK_SEND_POLL_MS',
       ];
       expect([...POLLS].sort()).toEqual([...JOB_POLL_VARIABLES].sort());
       // Names ↔ variables, from the source: per worker class, the variable its constructor parses and the name it tracks.
@@ -429,7 +431,7 @@ describe('graceful shutdown (story 6-2a)', () => {
         .slice(1)
         .map((body) => [/this\.pollMs = parse\w+\(process\.env\.([A-Z_]+)\)/.exec(body)?.[1], /this\.ticks\.track\('([a-z-]+)'/.exec(body)?.[1]] as const)
         .filter(([variable, job]) => variable !== undefined || job !== undefined);
-      expect(pairs).toHaveLength(15);
+      expect(pairs).toHaveLength(16);
       expect(pairs.every(([variable, job]) => variable !== undefined && job !== undefined)).toBe(true);
       expect(pairs.map(([variable]) => variable).sort()).toEqual([...JOB_POLL_VARIABLES].sort());
       expect(pairs.map(([, job]) => job).sort()).toEqual([...WORKER_JOBS].sort());

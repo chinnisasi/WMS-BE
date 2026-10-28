@@ -1185,7 +1185,15 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // Story 5-5a: + two (0099) — one operator-only FOR ALL tenant policy
       // each for client_charges and client_charge_policies (the
       // client_invoice_series shape, A7). Retargeted 138 → 140.
-      expect(policies).toHaveLength(140);
+      // Story 5-2a: + three (0100) — webhook_endpoints, webhook_events and
+      // webhook_deliveries, each client-bound on both arms (the 0077
+      // client_contacts shape). Retargeted 140 → 143.
+      expect(policies).toHaveLength(143);
+      for (const name of ['webhook_endpoints_tenant_isolation', 'webhook_events_tenant_isolation', 'webhook_deliveries_tenant_isolation']) {
+        const policy = policies.find((row) => row.policyname === name)!;
+        expect(policy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+        expect(policy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+      }
       for (const name of ['client_charges_tenant_isolation', 'client_charge_policies_tenant_isolation']) {
         const policy = policies.find((row) => row.policyname === name)!;
         expect(policy.qual).toContain("current_setting('app.client_id'");

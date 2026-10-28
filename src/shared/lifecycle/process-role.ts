@@ -58,6 +58,8 @@ export const JOB_POLL_VARIABLES = [
   'LICENCE_EXPIRY_POLL_MS',
   'EMAIL_SEND_POLL_MS',
   'ATTACHMENT_SWEEP_POLL_MS',
+  // Story 5-2a — the client webhook sender.
+  'WEBHOOK_SEND_POLL_MS',
 ] as const;
 
 /** The job switches set to anything other than off (unset, empty or a numeric 0). */

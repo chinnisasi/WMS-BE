@@ -44,6 +44,10 @@ export const NOTIFICATION_SOURCE_TYPES = [
   // compliance sweep). Owner only (`licences.manage`), one entry per
   // warning — each raise a fresh warning id — never pushed.
   'licence-expiry',
+  // Story 5-2a — a client webhook endpoint auto-disabled by the sender (ten
+  // final failures over 24 h, or a 410). Owner only (`clients.manage`), one
+  // entry per disable episode, never pushed.
+  'webhook-disabled',
 ] as const;
 
 export type NotificationSourceType = (typeof NOTIFICATION_SOURCE_TYPES)[number];
@@ -89,6 +93,10 @@ export const SOURCE_RESOLUTIONS = {
   // the open upcoming entry (`expired`). Pinned to the emitter's
   // `LICENCE_WARNING_OUTCOMES` by test/licences.spec.ts.
   'licence-expiry': ['renewed', 'withdrawn', 'expired'],
+  // Story 5-2a (A10) — staff re-enabled it, deleted it, or disabled it by
+  // hand. Pinned to the emitter's `WEBHOOK_RESOLUTIONS` by
+  // test/client-webhooks.spec.ts.
+  'webhook-disabled': ['re-enabled', 'deleted', 'manually-disabled'],
 } as const satisfies Record<NotificationSourceType, readonly string[]>;
 
 // ── the summaries — a per-source allowlist, built key by key ────────────────
@@ -210,6 +218,25 @@ export interface LedgerChainBreakSummary {
   readonly detectedBy: (typeof CHAIN_BREAK_DETECTORS)[number];
 }
 
+/**
+ * Story 5-2a — client-webhooks' event types and disable reasons, repeated
+ * here (AD-6) and pinned equal by test/client-webhooks.spec.ts.
+ */
+export const WEBHOOK_ENDPOINT_DISABLED_EVENT_TYPE = 'webhook_endpoint.disabled';
+export const WEBHOOK_ENDPOINT_ENABLED_EVENT_TYPE = 'webhook_endpoint.enabled';
+export const WEBHOOK_ENDPOINT_DELETED_EVENT_TYPE = 'webhook_endpoint.deleted';
+export const WEBHOOK_ENDPOINT_MANUALLY_DISABLED_EVENT_TYPE = 'webhook_endpoint.manually_disabled';
+export const WEBHOOK_AUTO_DISABLE_REASONS = ['failing', 'gone'] as const;
+
+/** Story 5-2a — one auto-disabled webhook endpoint. */
+export interface WebhookDisabledSummary {
+  readonly endpointId: string;
+  readonly clientId: string;
+  /** The URL's host only — never its path or query. */
+  readonly host: string;
+  readonly reason: (typeof WEBHOOK_AUTO_DISABLE_REASONS)[number];
+}
+
 export type NotificationSummary =
   | StockAdjustmentSummary
   | CountVarianceSummary
@@ -222,7 +249,8 @@ export type NotificationSummary =
   | AuditExportSummary
   | LedgerChainBreakSummary
   | QcReceiptSummary
-  | LicenceExpirySummary;
+  | LicenceExpirySummary
+  | WebhookDisabledSummary;
 
 /** A raise decoded: the entry's identity, its warehouse, its summary and (9-3b) its recipient. */
 export interface DecodedRaise {
@@ -349,6 +377,17 @@ interface SourceSpec {
 function withWarehouse<T>(payload: Payload, build: (warehouseId: string | null) => T | null): T | null {
   const warehouseId = optionalWarehouse(payload);
   return warehouseId === undefined ? null : build(warehouseId);
+}
+
+/** Story 5-2a — a webhook resolve: keyed on the pre-clear episode; none → ignored (no entry was raised). */
+function webhookResolve(resolution: (typeof SOURCE_RESOLUTIONS)['webhook-disabled'][number]): ResolveDecoder {
+  return (payload) => {
+    if (uuid(payload, 'endpointId') === null) return null;
+    if (payload.episodeId === null) return 'ignore';
+    const sourceId = uuid(payload, 'episodeId');
+    if (sourceId === null) return null;
+    return { sourceId, warehouseId: null, resolution };
+  };
 }
 
 /** A resolve whose resolution is fixed by the event type itself. */
@@ -601,6 +640,29 @@ export const NOTIFICATION_SOURCES: Readonly<Record<NotificationSourceType, Sourc
       },
     ],
   },
+  'webhook-disabled': {
+    // Story 5-2a (client-webhooks' sender). The entry is the disable
+    // EPISODE's id; a resolve carries the pre-clear episode, and one with
+    // none (an endpoint that was never auto-disabled) is acked silently —
+    // no tombstone (A10).
+    raise: {
+      type: WEBHOOK_ENDPOINT_DISABLED_EVENT_TYPE,
+      decode: (payload) => {
+        const sourceId = uuid(payload, 'episodeId');
+        const endpointId = uuid(payload, 'endpointId');
+        const clientId = uuid(payload, 'clientId');
+        const host = text(payload, 'host');
+        const reason = oneOf(payload, 'reason', WEBHOOK_AUTO_DISABLE_REASONS);
+        if (sourceId === null || endpointId === null || clientId === null || host === null || reason === null) return null;
+        return { sourceId, warehouseId: null, summary: { endpointId, clientId, host, reason } satisfies WebhookDisabledSummary };
+      },
+    },
+    resolves: [
+      { type: WEBHOOK_ENDPOINT_ENABLED_EVENT_TYPE, decode: webhookResolve('re-enabled') },
+      { type: WEBHOOK_ENDPOINT_DELETED_EVENT_TYPE, decode: webhookResolve('deleted') },
+      { type: WEBHOOK_ENDPOINT_MANUALLY_DISABLED_EVENT_TYPE, decode: webhookResolve('manually-disabled') },
+    ],
+  },
   'channel-sync': {
     raise: {
       type: 'channel.sync.degraded',
@@ -772,6 +834,8 @@ export const SOURCE_AUDIENCE: Readonly<Record<NotificationSourceType, SourceAudi
   'qc-receipt': { capability: 'qc.manage' },
   // Story 1-6c — who renews or withdraws a licence (`licences.manage`): owner-only.
   'licence-expiry': { capability: 'licences.manage' },
+  // Story 5-2a — who re-enables or deletes an endpoint (`clients.manage`): owner-only.
+  'webhook-disabled': { capability: 'clients.manage' },
 };
 
 /** The source types a role sees — an allowlist; an unknown role sees none. */

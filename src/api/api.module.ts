@@ -52,6 +52,8 @@ import { ReturnsModule } from '../modules/returns/returns.module';
 import { SharedModule } from '../shared/shared.module';
 import { ValkeyModule } from '../shared/valkey/valkey.module';
 import { ReadinessService } from './readiness.service';
+import { ClientWebhooksController } from './client-webhooks.controller';
+import { ClientWebhooksModule } from '../modules/client-webhooks/client-webhooks.module';
 
 /**
  * api shell: the only HTTP surface of the monolith. Story 1.1 exposes
@@ -91,7 +93,7 @@ import { ReadinessService } from './readiness.service';
   // Story 21-7 — SharedModule: Nest instantiates a route guard in the
   // CONTROLLER's module, so `PortalSessionGuard`'s DATABASE dependency must
   // resolve here too.
-  imports: [SharedModule, ValkeyModule, InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule, ClientsModule, BillingModule, NotificationsModule, ReturnsModule, PartnersModule],
+  imports: [SharedModule, ValkeyModule, InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule, ClientsModule, BillingModule, NotificationsModule, ReturnsModule, PartnersModule, ClientWebhooksModule],
   controllers: [
     HealthController,
     EchoController,
@@ -141,6 +143,8 @@ import { ReadinessService } from './readiness.service';
     // by the root; the mutations go through `ClientsCommand`, the list
     // through `ClientsFacade`.
     ClientsController,
+    // Story 5-2a — a client's outbound webhooks (staff-configured, clients.manage).
+    ClientWebhooksController,
     // Story 1-3 — the business partner master (list, create, edit, status,
     // client links): `PartnersModule` is a spine-singleton already imported
     // by the root; the mutations go through `PartnersCommand`, the list

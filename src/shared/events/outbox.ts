@@ -1,5 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { and, asc, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, gte, inArray, sql } from 'drizzle-orm';
 import type { Sql } from 'postgres';
 import { AUTH_DATABASE, DATABASE } from '../db/tokens';
 import type { Database } from '../db/db';
@@ -276,7 +276,54 @@ export class PostgresOutboxRelay implements OutboxRelay {
       `Outbox publish failed (attempts=${attempts}${quarantined ? ', quarantined' : ''}) ` +
         `type=${row.type} tenant=${row.tenantId} message=${row.id}`,
     );
+    if (quarantined) {
+      // Story 5-2a (A1) — one structured error line per quarantine, the shape
+      // 6.3's log alerting matches on (type, tenant and event only — never a
+      // payload: event bodies can carry PII).
+      this.logger.error(`outbox.quarantined type=${row.type} tenant=${row.tenantId} event=${row.id}`);
+    }
   }
+}
+
+/** One quarantined outbox row, as the read seam returns it. */
+export interface QuarantinedOutboxMessage {
+  readonly id: string;
+  readonly type: string;
+  readonly occurredAt: string;
+  readonly payload: unknown;
+}
+
+/**
+ * Story 5-2a (A1) — the READ-ONLY seam over quarantined rows: a tenant's
+ * `quarantined` rows of `types` appended at or after `since` (the row id is a
+ * uuidv7 minted at append; `created_at` is the append), oldest first, at most
+ * `limit`. A quarantined row is the only way a subscriber can have missed an
+ * event (an acked row was seen by every handler — the relay deletes it), so
+ * the client-webhooks sender reconciles from here. Touches neither `drain`
+ * nor `append`, and writes nothing.
+ */
+export async function quarantinedMessagesInTx(
+  tx: TenantTx,
+  tenantId: string,
+  types: readonly string[],
+  since: string,
+  limit = 500,
+): Promise<QuarantinedOutboxMessage[]> {
+  if (types.length === 0) return [];
+  const rows = await tx
+    .select({ id: outboxMessages.id, type: outboxMessages.type, occurredAt: outboxMessages.occurredAt, payload: outboxMessages.payload })
+    .from(outboxMessages)
+    .where(
+      and(
+        eq(outboxMessages.tenantId, tenantId),
+        eq(outboxMessages.status, 'quarantined'),
+        inArray(outboxMessages.type, [...types]),
+        gte(outboxMessages.createdAt, since),
+      ),
+    )
+    .orderBy(asc(outboxMessages.createdAt), asc(outboxMessages.id))
+    .limit(limit);
+  return rows.map((row) => ({ id: row.id, type: row.type, occurredAt: new Date(row.occurredAt).toISOString(), payload: row.payload }));
 }
 
 function errorMessage(error: unknown): string {
