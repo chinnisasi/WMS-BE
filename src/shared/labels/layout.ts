@@ -153,6 +153,19 @@ export interface BinLabel {
 }
 
 /**
+ * Story 2-10b — what the shared renderers draw, whatever the label is for:
+ * the large `code` text, the barcode `payload` (the RAW code, byte for byte —
+ * `isBarcodable` and the encoder check it; never the folded text), and two
+ * small lines. Every text field is already ASCII-folded; `line2` may be empty.
+ */
+export interface LabelLines {
+  readonly code: string;
+  readonly payload: string;
+  readonly line1: string;
+  readonly line2: string;
+}
+
+/**
  * The three text lines a bin label prints, ASCII-folded: the code, then
  * `<ZONE> - <WAREHOUSE>`, then the small line — the storage class when it is
  * not `ambient` and `CLIENT <code>` when the bin is dedicated (empty when
@@ -167,4 +180,59 @@ export function binLabelText(label: BinLabel): { code: string; line1: string; li
     line1: asciiFold(`${label.zoneCode} - ${label.warehouseCode}`),
     line2: asciiFold(extras.join(' | ')),
   };
+}
+
+/** A bin label as the shared renderers take it: `binLabelText` plus the raw code as the payload. */
+export function binLabelLines(label: BinLabel): LabelLines {
+  return { ...binLabelText(label), payload: label.code };
+}
+
+/** Story 2-10b — one LPN label's facts, as the renderer takes them (codes, never names). */
+export interface LpnLabel {
+  /** The LPN code (`LPN-000042`) — the barcode payload byte for byte, and the large text. */
+  readonly code: string;
+  readonly skuCode: string;
+  /** The declared quantity in BASE units (printed without trailing zeros: `12.5`, `40`). */
+  readonly qty: number;
+  /** The SKU's UoM code. */
+  readonly uom: string;
+  readonly grnCode: string;
+  /** The batch code, or null for an untracked SKU. */
+  readonly batchCode: string | null;
+  /** The batch expiry as an IST calendar date (`YYYY-MM-DD`), or null when unset. */
+  readonly expiryDate: string | null;
+  /** The SKU's client's code, or null when it is the tenant's own goods. */
+  readonly clientCode: string | null;
+}
+
+/**
+ * Story 2-10b (decision 5, A9) — an LPN label's lines, ASCII-folded:
+ * - the code;
+ * - line 1: `<SKU> x <qty> <uom>`;
+ * - line 2: `<GRN>`, then ` | B <batch>` (with ` EXP <YYYY-MM-DD>` when the
+ *   batch has an expiry) when batched, then ` | CLIENT <code>` when the SKU's
+ *   client is not the tenant's own.
+ * Overflow is the renderers' (`...` truncation in ZPL, the measured shrink
+ * then `...` in PDF).
+ */
+export function lpnLabelText(label: LpnLabel): LabelLines {
+  let line2 = label.grnCode;
+  if (label.batchCode !== null) {
+    line2 += ` | B ${label.batchCode}`;
+    if (label.expiryDate !== null) line2 += ` EXP ${label.expiryDate}`;
+  }
+  if (label.clientCode !== null) line2 += ` | CLIENT ${label.clientCode}`;
+  return {
+    code: asciiFold(label.code),
+    payload: label.code,
+    line1: asciiFold(`${label.skuCode} x ${formatLabelQuantity(label.qty)} ${label.uom}`),
+    line2: asciiFold(line2),
+  };
+}
+
+/** A base-unit quantity as a label prints it: plain decimal, no trailing zeros, never exponent notation. */
+export function formatLabelQuantity(qty: number): string {
+  // Quantities are exact to the milli-unit (3 dp) and bounded at ~9e12, so a
+  // fixed 3-dp rendering with the zeros trimmed is exact and never exponential.
+  return qty.toFixed(3).replace(/\.?0+$/, '');
 }

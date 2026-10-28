@@ -1,6 +1,7 @@
 import type { INestApplication } from '@nestjs/common';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import postgres from 'postgres';
 import request from 'supertest';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { istDateOf } from '../src/shared/primitives/time';
@@ -364,6 +365,29 @@ describe('bin labels (e2e, story 2-10a)', () => {
       expect({ body: Object.keys(body), code: problem.code }).toEqual({ body: Object.keys(body), code: 'validation-failed' });
     }
     expect(await refusal(print({ zoneId: zoneA, format: 'zpl' }, ownerToken, 'not-a-uuid'), 400)).toMatchObject({ code: 'validation-failed' });
+  });
+
+  it('story 2-10b (decision 10): dedicated-client codes come from one by-ids read — a client beyond the 500-row list prints; an unresolvable client id prints no client line, never a 404', async () => {
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1, onnotice: () => undefined });
+    try {
+      // 500 clients that sort before the dedicated one (the old list read stopped at 500, by code).
+      await sql`insert into clients (id, tenant_id, code, name)
+        select gen_random_uuid(), ${tenantId}::uuid, 'AAA' || lpad(g::text, 4, '0'), 'Filler ' || g from generate_series(1, 500) g`;
+      const beyond = (
+        await http().post(`${API}/${tenantId}/clients`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid()).send({ code: 'ZZBEYOND', name: 'Beyond the cap' }).expect(201)
+      ).body.client.id as string;
+      const binId = await createBin('D-500', zoneA, { dedicatedClientId: beyond });
+      const res = await print({ binIds: [binId], format: 'zpl' }).expect(200);
+      expect((res.body as Buffer).toString('ascii')).toContain('^FDCLIENT ZZBEYOND^FS');
+      // A dedicated id that names no client row (written past the commands): the label prints without a client line.
+      const orphan = await createBin('D-ORPHAN');
+      await sql`update bins set dedicated_client_id = ${uuidv7()} where id = ${orphan}`;
+      const orphaned = (await print({ binIds: [orphan], format: 'zpl' }).expect(200)).body as Buffer;
+      expect(parseZplLabels(orphaned.toString('ascii')).map((l) => l.payload)).toEqual(['D-ORPHAN']);
+      expect(orphaned.toString('ascii')).not.toContain('CLIENT');
+    } finally {
+      await sql.end();
+    }
   });
 
   it('access: owner, ops manager and operator print; the accountant gets 403 role-denied; a portal token is fenced', async () => {

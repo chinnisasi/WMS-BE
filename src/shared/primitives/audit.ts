@@ -99,6 +99,8 @@ export const AUDIT_TARGET_TYPES = [
   // Story 1-6d — the tenant's licence enforcement switch (`licence.enforcement_enabled | disabled`).
   'licence_policy',
   'ledger_event',
+  // Story 2-10b — a licence plate (`lpn.voided`; the mint targets its goods receipt).
+  'lpn',
   'manifest',
   'order',
   // Story 4-1c — one order-import file's run (`order_import.executed`; each
@@ -393,4 +395,9 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'stock_take.closed', targetType: 'stock_take' },
   { action: 'stock_take.abandoned', targetType: 'stock_take' },
   { action: 'count.cancelled', targetType: 'count_task' },
+  // Story 2-10b — LPNs at receiving (`LpnCommand`): the mint targets the
+  // goods receipt it labels (one row per mint, however many labels), the
+  // void the LPN.
+  { action: 'lpn.minted', targetType: 'goods_receipt' },
+  { action: 'lpn.voided', targetType: 'lpn' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

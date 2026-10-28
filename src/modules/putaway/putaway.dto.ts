@@ -80,6 +80,19 @@ export class PlacePutawayDto {
   @IsString({ each: true })
   @Length(1, 64, { each: true })
   serials?: string[];
+
+  @ApiProperty({
+    required: false,
+    type: String,
+    nullable: true,
+    maxLength: 32,
+    description:
+      "Story 2-10b — the LPN (licence plate) the operator scanned for this placement: it must be an ACTIVE LPN of this GRN line holding at least `qty`, and the placement consumes it (`placed`). Absent, null or blank = no LPN (the payload hashes exactly as before)",
+  })
+  @IsOptional()
+  @IsString()
+  @Length(0, 64)
+  lpnCode?: string | null;
 }
 
 // ── putaway placement responses ──────────────────────────────────────────────
@@ -201,6 +214,15 @@ export class SuggestedBinDto {
   binCode!: string;
 }
 
+/** Story 2-10b — one active LPN (licence plate) riding its putaway task. */
+export class PutawayTaskLpnDto {
+  @ApiProperty({ description: 'The LPN code — what the pallet or carton label\'s barcode encodes, byte for byte' })
+  code!: string;
+
+  @ApiProperty({ description: 'The declared quantity on the label, base units' })
+  qty!: number;
+}
+
 /** One derived putaway task of the tasks read / device snapshot. */
 export class PutawayTaskDto {
   @ApiProperty({ format: 'uuid' })
@@ -240,6 +262,13 @@ export class PutawayTaskDto {
       "Story 2-6a — present only on a SERIAL-TRACKED task: the GRN line's booked serial numbers still in the Receiving bin, in capture order (qty is their count). The handheld verifies each scan against this list offline; a serial task without it (an older server, a legacy anonymous line) cannot be placed from the handheld",
   })
   serialNumbers?: readonly string[];
+
+  @ApiProperty({
+    type: [PutawayTaskLpnDto],
+    description:
+      "Story 2-10b — the GRN line's ACTIVE LPNs (licence plates) in code order; empty when none. A handheld scan of one chooses this task, verified, with the quantity prefilled (min of the LPN's and the task's). Placed and voided LPNs never appear",
+  })
+  lpns!: readonly PutawayTaskLpnDto[];
 }
 
 export class PutawayTaskListQuery {

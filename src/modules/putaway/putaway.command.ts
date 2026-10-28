@@ -78,6 +78,9 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
+// Story 2-10b — the LPN seam (free functions over this transaction, guide §7h):
+// inbound owns `lpns`; importing its module would cycle (inbound imports putaway).
+import { LPN_CODE_MAX, lockLpnByCodeInTx, markLpnPlacedInTx, type LockedLpn } from '../inbound/lpn.store';
 
 // ── command inputs ───────────────────────────────────────────────────────────
 
@@ -121,6 +124,14 @@ export interface PlacePutawayCommand {
    * catalog identities inside the command transaction.
    */
   readonly serials?: readonly string[] | undefined;
+  /**
+   * Story 2-10b (A1) — the LPN the operator scanned, when the placement came
+   * from an LPN scan. Optional, and hashed only when present (the
+   * conditional-key exception, guide §4): trimmed, a blank value is absent.
+   * Present, it must be an ACTIVE LPN of this GRN line holding at least the
+   * placed quantity, and the placement consumes it.
+   */
+  readonly lpnCode?: string | null | undefined;
 }
 
 // ── snapshots ────────────────────────────────────────────────────────────────
@@ -187,6 +198,18 @@ export interface ListPlacementsQuery {
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
+/** Story 2-10b (A1) — trimmed; absent, null or blank is no LPN. */
+export function normaliseLpnCode(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed === '' ? null : trimmed;
+}
+
+/** Story 2-10b (A1) — 400 `lpn-not-placeable`, naming why (unknown, another line, placed or voided). */
+function lpnNotPlaceable(code: string, why: string): ProblemException {
+  return new ProblemException('lpn-not-placeable', 400, 'LPN cannot be placed', `${code} cannot be placed: ${why}.`, { lpnCode: code });
+}
+
 /**
  * The line-quantity ceiling, in milli-units (story 10.1): the column is
  * `bigint`, but the binding limit is the 2⁵³ exact-integer ceiling every
@@ -252,6 +275,9 @@ export class PutawayCommand {
     // guard in `test/picking.spec.ts`, so it is a recorded break and not a
     // surprise. No compatibility branch exists; there is nothing to be
     // compatible with.
+    // Story 2-10b (A1) — the LPN, normalised BEFORE deciding presence (a
+    // blank value hashes as absent, never as a different key).
+    const lpnCode = normaliseLpnCode(command.lpnCode);
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       deviceId: command.deviceId,
@@ -268,6 +294,10 @@ export class PutawayCommand {
       // The RAW serial numbers fingerprint (never the resolved ids) — a
       // retry of the same request body replays regardless of current state.
       serials: command.serials === undefined ? undefined : [...command.serials],
+      // Story 2-10b (A1) — the conditional key, LAST (after `serials`): a
+      // request without an LPN hashes byte for byte as before (pinned by a
+      // golden in test/lpns.spec.ts).
+      ...(lpnCode === null ? {} : { lpnCode }),
     });
 
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
@@ -527,6 +557,37 @@ export class PutawayCommand {
         throw putawayValidation(
           `Only ${fromMilli(remaining)} of this (sku, batch) remain in the Receiving bin for GRN line "${command.grnLineId}" — ${fromMilli(scaled.qty)} cannot be placed.`,
         );
+      }
+
+      // ── story 2-10b (A1): the scanned LPN, locked BEFORE the target bin ──
+      // Lock order: the LPN row, then the bin row, then the serial advisory,
+      // then the warehouse advisory. The mint takes only the ':lpn-seq'
+      // advisory and locks no bin, so it cannot form a cycle with this.
+      // Every refusal is a 400: the device's fault, the key consumed.
+      let lpn: LockedLpn | null = null;
+      if (lpnCode !== null) {
+        if (lpnCode.length > LPN_CODE_MAX) {
+          throw lpnNotPlaceable(lpnCode, `the code is longer than ${LPN_CODE_MAX} characters — it is not an LPN of this tenant`);
+        }
+        lpn = await lockLpnByCodeInTx(tx, command.tenantId, lpnCode);
+        if (lpn === null) {
+          throw lpnNotPlaceable(lpnCode, 'no LPN with this code exists in this tenant');
+        }
+        if (lpn.grnLineId !== command.grnLineId) {
+          throw lpnNotPlaceable(lpnCode, 'it labels another GRN line, not the one this placement moves');
+        }
+        if (lpn.status !== 'active') {
+          throw lpnNotPlaceable(lpnCode, lpn.status === 'placed' ? 'it was already put away' : 'it was voided');
+        }
+        if (scaled.qty > lpn.qty) {
+          throw new ProblemException(
+            'lpn-quantity-exceeded',
+            400,
+            'More than the LPN holds',
+            `${lpnCode} holds ${fromMilli(lpn.qty)} — ${fromMilli(scaled.qty)} cannot be placed from it.`,
+            { lpnCode, lpnQty: fromMilli(lpn.qty) },
+          );
+        }
       }
 
       // ── the target bin (server-side truth, mirrored on-device) ──────────
@@ -938,6 +999,10 @@ export class PutawayCommand {
         placedAt,
         deviceId: command.deviceId,
       });
+      // Story 2-10b (A1) — the placement consumes its LPN (server clock).
+      if (lpn !== null) {
+        await markLpnPlacedInTx(tx, { tenantId: command.tenantId, lpnId: lpn.id, placementId, placedAt: recordedAt });
+      }
 
       const snapshot: PutawayPlacementSnapshot = {
         placement: {

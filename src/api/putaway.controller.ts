@@ -103,6 +103,8 @@ export class PutawayController {
         // mobile op payload always carries it) — normalize to absent so the
         // command's payload hash spreads an array, never null.
         serials: dto.serials ?? undefined,
+        // Story 2-10b (A1) — the scanned LPN; null/blank = none (hashed only when present).
+        lpnCode: dto.lpnCode ?? null,
       },
       key,
     );

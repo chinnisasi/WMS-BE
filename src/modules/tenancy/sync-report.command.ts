@@ -1666,6 +1666,8 @@ export class SyncReportCommand {
             reasonCode: (payload.reasonCode ?? null) as string | null,
             occurredAt: opTime,
             serials: payload.serials as string[] | undefined,
+            // Story 2-10b (A1) — the stored op's LPN, when it carried one.
+            lpnCode: typeof payload.lpnCode === 'string' ? payload.lpnCode : null,
           },
           idempotencyKey,
         )) as unknown as Record<string, unknown>;

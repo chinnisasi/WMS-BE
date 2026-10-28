@@ -18,7 +18,7 @@ import {
 } from '../../shared/labels/layout';
 import { renderBinLabelsPdf } from '../../shared/labels/pdf';
 import { renderBinLabelsZpl } from '../../shared/labels/zpl';
-import { getClientInTx, listClientsInTx } from '../clients/clients.facade';
+import { getClientsInTx } from '../clients/clients.facade';
 import { assertPermission } from './permissions';
 import { getMemberRoleIn, getWarehouseCodeInTx } from './tenancy.service';
 
@@ -204,16 +204,12 @@ export class BinLabelsService {
               .where(and(eq(zones.tenantId, tenantId), inArray(zones.id, zoneIds)));
       const zoneCodes = new Map(zoneRows.map((z) => [z.id, z.code]));
 
-      // The dedicated clients' codes through the clients facade (AD-6).
-      const clientCodes = new Map<string, string>();
+      // The dedicated clients' codes through ONE by-ids clients facade read
+      // (AD-6; story 2-10b decision 10 — the 500-capped list plus a per-id
+      // fallback that could 404 the whole print is gone). An id the read
+      // does not return prints no client line.
       const clientIds = [...new Set(rows.map((r) => r.dedicatedClientId).filter((id): id is string => id !== null))];
-      if (clientIds.length > 0) {
-        for (const client of await listClientsInTx(tx, tenantId)) clientCodes.set(client.id, client.code);
-        // The list is capped; a client beyond the cap is read one by one.
-        for (const id of clientIds) {
-          if (!clientCodes.has(id)) clientCodes.set(id, (await getClientInTx(tx, tenantId, id)).code);
-        }
-      }
+      const clientCodes = new Map([...(await getClientsInTx(tx, tenantId, clientIds)).values()].map((client) => [client.id, client.code]));
       return { warehouseCode, rows, zoneCodes, clientCodes };
     });
 

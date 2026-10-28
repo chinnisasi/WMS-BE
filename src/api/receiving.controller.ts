@@ -1,4 +1,5 @@
-import { Body, Controller, createParamDecorator, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, UploadedFile, UseFilters, UseGuards, UseInterceptors } from '@nestjs/common';
+import { Body, Controller, createParamDecorator, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, Res, UploadedFile, UseFilters, UseGuards, UseInterceptors } from '@nestjs/common';
+import type { Response } from 'express';
 import type { ExecutionContext } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 // Pulls in @types/multer's `Express.Multer.File` namespace augmentation.
@@ -12,7 +13,7 @@ import {
   RemoveReceiptPhotoDto,
   UploadReceiptPhotoFieldsDto,
 } from '../modules/inbound/receipt-photo.dto';
-import { ApiBearerAuth, ApiBody, ApiConsumes, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiBody, ApiConsumes, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiProduces, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
 import { istDateOf } from '../shared/primitives/time';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
@@ -58,6 +59,15 @@ import {
   ReleaseReceiptHoldsResponse,
 } from '../modules/inbound/qc.dto';
 import { assertInstantRange } from '../shared/primitives/instant-range';
+import {
+  LpnLabelsRequestDto,
+  LpnListResponse,
+  LpnResponse,
+  MintLpnsRequestDto,
+  MintLpnsResponse,
+  VoidLpnRequestDto,
+} from '../modules/inbound/lpn.dto';
+import { DEFAULT_LABEL_SIZE } from '../shared/labels/layout';
 /**
  * Story 2-5a — the raw `x-op-operator` header (the capturing operator). A
  * custom decorator, not `@Headers`, so the OpenAPI document carries exactly
@@ -408,6 +418,203 @@ export class ReceivingController {
     assertUuidParam(grnId, 'grnId');
     const items = await this.receiving.listGoodsReceiptLines(tenantId, grnId);
     return { items: items.map((item) => ({ ...item })) };
+  }
+
+  // ── story 2-10b: LPNs (licence plates) at receiving ──────────────────────
+  // Four routes beside the lines read. `lpns/labels` and `lpns/:lpnId/void`
+  // differ in depth, so no route-order pin is needed (design review K8).
+
+  @Get(':tenantId/receiving/goods-receipts/:grnId/lpns')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Story 2-10b — one goods receipt's LPNs (licence plates) in code order, every status, with SKU and batch codes — open to any member",
+  })
+  @ApiOkResponse({ type: LpnListResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed grnId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No such goods receipt in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'grnId', format: 'uuid', description: 'The goods receipt' })
+  async listLpns(
+    @Param('tenantId') tenantId: string,
+    @Param('grnId') grnId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<LpnListResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(grnId, 'grnId');
+    const items = await this.receiving.listLpns(tenantId, grnId);
+    return { items: items.map((item) => ({ ...item })) };
+  }
+
+  @Post(':tenantId/receiving/goods-receipts/:grnId/lpns')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Story 2-10b — mints LPNs for lines of a recorded goods receipt: one per declared quantity (labels.execute; audited). Moves no stock',
+    description:
+      'Each label is `LPN-<n>` (the tenant number, zero-padded to 6 digits). For each line, the labelled total (its active and placed LPNs) never exceeds the line\'s putaway quantity — applied units plus approved over-receipt excess, minus units that failed a QC inspection (pending excess is not labellable until approved). A line holds at most 5000 labels that are not voided; one mint creates at most 1000.',
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiBody({ type: MintLpnsRequestDto })
+  @ApiResponse({ status: HttpStatus.CREATED, type: MintLpnsResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed grnId or body, a line named twice, more than 1000 labels, or a quantity finer than the SKU\'s unit allows (validation-failed naming `quantities`)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), the caller lacks labels.execute (role-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No such goods receipt, or a line that is not of this receipt (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse), more than the line can carry on labels (lpn-quantity-exceeds-line, with `remaining`, `putawayQty` and `labelled` in base units), or more than 5000 labels on a line (too-many-labels, with `count`)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'grnId', format: 'uuid', description: 'The goods receipt' })
+  async mintLpns(
+    @Param('tenantId') tenantId: string,
+    @Param('grnId') grnId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: MintLpnsRequestDto,
+  ): Promise<MintLpnsResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(grnId, 'grnId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.receiving.mintLpns(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        grnId,
+        lines: dto.lines.map((line) => ({ grnLineId: line.grnLineId, quantities: [...line.quantities] })),
+      },
+      key,
+    );
+    return { grnId: snapshot.grnId, lpns: snapshot.lpns.map((lpn) => ({ ...lpn })) };
+  }
+
+  /**
+   * Story 2-10b — LPN labels as a file download (ZPL or PDF), the
+   * IMPLEMENTATION-GUIDE §6 binary pattern (the `tenancy.controller.ts`
+   * bin-labels route): authority before every body and path 400, every
+   * refusal thrown before the first header (problem+json), then the headers
+   * and `res.end(buffer)`. A read — no idempotency key, no audit row.
+   */
+  @Post(':tenantId/receiving/goods-receipts/:grnId/lpns/labels')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Story 2-10b — prints LPN labels: ZPL (Zebra, 203 dpi) or PDF, the barcode a Code 128 of exactly the LPN code',
+    description:
+      'labels.execute (owner, ops manager, operator). Send `lpnIds` (1–1000 distinct LPNs of this receipt — a reprint), or `grnLineId` (the line\'s LPNs that are not voided), or neither (every LPN of the receipt that is not voided; more than 1000 is refused — print in parts). ' +
+      'Labels come out in code order. Each carries the code in large text, a Code 128 (start B) of exactly the code, `<SKU> x <qty> <uom>`, and `<GRN> | B <batch> EXP <date> | CLIENT <code>` (the batch part when batched, the expiry when set, the client when not the tenant\'s own). A placed LPN still prints. ' +
+      '`layout=label` prints one label per page / per ^XA…^XZ at `size` 4x2 (default) or 2x1 in; `layout=a4` (PDF only) prints 24 per A4 sheet. ' +
+      'The listing refusals carry `lpnCodes` (the first 50 offenders). The `Content-Disposition` filename (`lpn-labels-<GRN>-<YYYYMMDD>.<ext>`, the IST date) is not readable cross-origin — a client builds the same name itself.',
+  })
+  @ApiBody({ type: LpnLabelsRequestDto })
+  @ApiProduces('text/plain', 'application/pdf')
+  @ApiResponse({
+    status: 200,
+    description: 'The labels: ZPL as `text/plain; charset=us-ascii`, or a PDF',
+    content: {
+      'text/plain': { schema: { type: 'string', format: 'binary' } },
+      'application/pdf': { schema: { type: 'string', format: 'binary' } },
+    },
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Invalid body (validation-failed): both lpnIds and grnLineId, more than 1000 or duplicate ids, size with the a4 layout, the a4 layout with zpl, or a malformed grnId') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), the caller lacks labels.execute (role-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The goods receipt, the line or a listed LPN is not in this tenant and receipt (not-found), or nothing to print (no-lpns-to-print)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('A listed LPN is voided (lpn-voided), or a code too long for the size or A4 cell at a 2-dot bar (lpn-code-too-long-for-label) — each with `lpnCodes`; or more than 1000 labels (too-many-labels, with `count`)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'grnId', format: 'uuid', description: 'The goods receipt' })
+  async printLpnLabels(
+    @Param('tenantId') tenantId: string,
+    @Param('grnId') grnId: string,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: LpnLabelsRequestDto,
+    @Res() res: Response,
+  ): Promise<void> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    // Authority before every body and path 400 (the DTO's own shape checks
+    // run earlier, in the ValidationPipe).
+    await this.receiving.assertCanPrintLpnLabels(tenantId, session.userId);
+    assertUuidParam(grnId, 'grnId');
+    // `@IsOptional` lets null through: null counts as absent.
+    const lpnIds = dto.lpnIds ?? undefined;
+    const grnLineId = dto.grnLineId ?? undefined;
+    if (lpnIds !== undefined && grnLineId !== undefined) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'Send lpnIds or grnLineId',
+        'Send at most one of `lpnIds` (the LPNs to print) or `grnLineId` (a line\'s LPNs) — neither prints the whole receipt.',
+      );
+    }
+    const lowerIds = lpnIds?.map((id) => id.toLowerCase());
+    if (lowerIds !== undefined && new Set(lowerIds).size !== lowerIds.length) {
+      throw new ProblemException('validation-failed', 400, 'Duplicate LPN ids', 'lpnIds lists the same LPN more than once (uuids compare case-insensitively).');
+    }
+    const layout = dto.layout ?? 'label';
+    if (layout === 'a4' && dto.size !== undefined) {
+      throw new ProblemException('validation-failed', 400, 'size does not apply to a4', 'The A4 sheet has fixed 70 × 36 mm cells — omit `size` with `layout: a4`.');
+    }
+    if (layout === 'a4' && dto.format !== 'pdf') {
+      throw new ProblemException('validation-failed', 400, 'a4 is PDF only', 'The A4 sheet layout is a PDF — send `format: pdf`, or `layout: label` for ZPL.');
+    }
+    const file = await this.receiving.printLpnLabels({
+      tenantId,
+      actorUserId: session.userId,
+      grnId,
+      lpnIds: lowerIds,
+      grnLineId,
+      format: dto.format,
+      layout,
+      size: dto.size ?? DEFAULT_LABEL_SIZE,
+    });
+    res.status(200);
+    res.setHeader('Content-Type', file.contentType);
+    res.setHeader('Content-Length', String(file.body.length));
+    res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(file.body);
+  }
+
+  @Post(':tenantId/receiving/goods-receipts/:grnId/lpns/:lpnId/void')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Story 2-10b — voids an active LPN, freeing its quantity (labels.execute; audited). Terminal: a voided LPN never prints; there is no edit — void and mint again',
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiBody({ type: VoidLpnRequestDto })
+  @ApiResponse({ status: HttpStatus.OK, type: LpnResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed grnId or lpnId, an unknown reasonCode, a note over 200 characters, or `other` without a note (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), the caller lacks labels.execute (role-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No such LPN on this goods receipt (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The LPN is already voided or was put away (lpn-not-active, with `lpnCode` and `lpnStatus`), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'grnId', format: 'uuid', description: 'The goods receipt' })
+  @ApiParam({ name: 'lpnId', format: 'uuid', description: 'The LPN' })
+  async voidLpn(
+    @Param('tenantId') tenantId: string,
+    @Param('grnId') grnId: string,
+    @Param('lpnId') lpnId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: VoidLpnRequestDto,
+  ): Promise<LpnResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(grnId, 'grnId');
+    assertUuidParam(lpnId, 'lpnId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.receiving.voidLpn(
+      { tenantId, actorUserId: session.userId, grnId, lpnId, reasonCode: dto.reasonCode, note: dto.note ?? null },
+      key,
+    );
+    return { lpn: { ...snapshot.lpn } };
   }
 
   @Get(':tenantId/receiving/over-receipts')
@@ -929,7 +1136,7 @@ export class ReceivingController {
 }
 
 /** Receiving uuid path/query params fail 400 (not a 500 from the `::uuid` cast). */
-function assertUuidParam(value: string, name: 'overReceiptId' | 'holdId' | 'warehouseId' | 'grnId' | 'lineId' | 'attachmentId'): void {
+function assertUuidParam(value: string, name: 'overReceiptId' | 'holdId' | 'warehouseId' | 'grnId' | 'lineId' | 'attachmentId' | 'lpnId' | 'grnLineId'): void {
   if (!UUID_RE.test(value)) {
     throw new ProblemException(
       'validation-failed',

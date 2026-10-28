@@ -3305,6 +3305,64 @@ export const putawayPlacements = pgTable(
 export type PutawayPlacement = typeof putawayPlacements.$inferSelect;
 
 /**
+ * Story 2-10b — a licence plate (LPN): one labelled pallet or carton of ONE
+ * GRN line. Inbound-owned; written only by `inbound/lpn.command.ts` (mint,
+ * void) and `inbound/lpn.store.ts` (the placement's lock and mark — the
+ * free-function seam putaway imports). An LPN is a label identity, not a
+ * stock record: no ledger event names it, and it does not track location.
+ *
+ * - `seq` is the tenant's LPN number (`max(seq) + 1` under the tenant
+ *   `':lpn-seq'` advisory lock); `code` is `LPN-` + the number zero-padded to
+ *   6 digits (longer past 999,999) — the barcode payload byte for byte.
+ * - `qty` is milli-units (AD-9 as amended by 10.1); `client_id` is the SKU's
+ *   client at mint (AD-23).
+ * - `status` is `active | placed | voided` (`LPN_STATUSES`); the placement
+ *   columns pair with `placed`, the void columns with `voided`.
+ *
+ * CHECKs and RLS live **only in the migration SQL** (0109).
+ */
+export const lpns = pgTable(
+  'lpns',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    grnId: uuid('grn_id').notNull(),
+    grnLineId: uuid('grn_line_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    batchId: uuid('batch_id'),
+    clientId: uuid('client_id').notNull(),
+    seq: bigint('seq', { mode: 'number' }).notNull(),
+    code: text('code').notNull(),
+    /** Milli-units — base UoM × 10³. */
+    qty: bigint('qty', { mode: 'number' }).notNull(),
+    status: text('status').notNull().default('active'),
+    createdBy: uuid('created_by').notNull(),
+    // ── the placement (A1) ───────────────────────────────────────────────
+    placedAt: timestamp('placed_at', { withTimezone: true, mode: 'string' }),
+    placementId: uuid('placement_id'),
+    // ── the void (decision 7, A10) ───────────────────────────────────────
+    voidedAt: timestamp('voided_at', { withTimezone: true, mode: 'string' }),
+    voidedBy: uuid('voided_by'),
+    voidReasonCode: text('void_reason_code'),
+    voidNote: text('void_note'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('lpns_tenant_seq_unique').on(table.tenantId, table.seq),
+    uniqueIndex('lpns_tenant_code_unique').on(table.tenantId, table.code),
+    // One GRN's LPNs in code order (the list, the print).
+    index('lpns_tenant_grn_seq_idx').on(table.tenantId, table.grnId, table.seq),
+    // One line's LPNs (the cap, the putaway task's `lpns`).
+    index('lpns_tenant_grn_line_idx').on(table.tenantId, table.grnLineId),
+  ],
+);
+
+export type Lpn = typeof lpns.$inferSelect;
+
+/**
  * Orders (Story 4.1 — the outbound module's first tables): the accepted
  * order aggregate. Warehouse-scoped like the PO tables; `status` is the
  * order state machine the outbound module exclusively owns (AD-6) —
