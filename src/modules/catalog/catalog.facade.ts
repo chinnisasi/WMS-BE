@@ -147,7 +147,18 @@ export interface BatchFacts {
   readonly mfgDate: string | null;
   readonly expiryDate: string | null;
   readonly createdAt: string;
+  /** Story 2-4b — where the expiry came from (`typed` | `derived`), null on older and non-receipt batches. */
+  readonly expirySource: BatchExpirySource | null;
 }
+
+/**
+ * Story 2-4b — `batches.expiry_source`: a receipt's typed label date, or one
+ * the receipt derived from mfg + the SKU's shelf life. Mirrored by the
+ * `batches_expiry_source_check` CHECK (0108, migration SQL only), pinned by
+ * test/receipt-expiry-derivation.spec.ts.
+ */
+export const BATCH_EXPIRY_SOURCES = ['typed', 'derived'] as const;
+export type BatchExpirySource = (typeof BATCH_EXPIRY_SOURCES)[number];
 
 /** Batch identity (catalog-owned) — location/quantity live in inventory (AD-6). */
 export interface BatchIdentity {
@@ -156,6 +167,8 @@ export interface BatchIdentity {
   readonly mfgDate: string | null;
   readonly expiryDate: string | null;
   readonly status: string;
+  /** Story 2-4b — set by `batchesByCodesInTx` only (the receipt's pre-ensure read). */
+  readonly expirySource?: BatchExpirySource | null;
 }
 
 /**
@@ -203,6 +216,13 @@ export interface EnsureBatchInput {
   readonly code: string;
   readonly mfgDate?: string | undefined;
   readonly expiryDate?: string | undefined;
+  /**
+   * Story 2-4b — receiving only, beside `expiryDate`: where the expiry came
+   * from. Written to `expiry_source` on insert and on a fill; a `typed`
+   * input under `fillNullExpiry` also REPLACES a `derived` expiry. Absent
+   * (every other caller) writes NULL and fills only a null, as before.
+   */
+  readonly expirySource?: BatchExpirySource | undefined;
 }
 
 /**
@@ -313,6 +333,13 @@ export interface SkuSummary {
    * SKU reads a class.
    */
   readonly storageClass: string;
+  /**
+   * Story 2-4b: the SKU's total shelf life in days from manufacture (1–3650)
+   * or null — the device previews the expiry the receipt will derive (mfg +
+   * this) when a batch line carries a mfg date and no typed expiry.
+   * Eleventh mirror of the arm.
+   */
+  readonly shelfLifeDays: number | null;
   /**
    * Story 1-4: every NON-primary barcode of the SKU with its level and the
    * level's factor in base units (1 when the level is the base uom — an
@@ -586,6 +613,7 @@ export class CatalogFacade {
         mfgDate: batches.mfgDate,
         expiryDate: batches.expiryDate,
         status: batches.status,
+        expirySource: batches.expirySource,
       })
       .from(batches)
       .where(and(eq(batches.tenantId, tenantId), inArray(batches.skuId, skuIds), inArray(batches.code, codes)));
@@ -594,7 +622,15 @@ export class CatalogFacade {
     for (const row of rows) {
       const key = `${row.skuId}:${row.code}`;
       if (wanted.has(key)) {
-        result.set(key, { id: row.id, code: row.code, mfgDate: row.mfgDate, expiryDate: row.expiryDate, status: row.status });
+        result.set(key, {
+          id: row.id,
+          code: row.code,
+          mfgDate: row.mfgDate,
+          expiryDate: row.expiryDate,
+          status: row.status,
+          // Story 2-4b — a derived expiry a typed line may replace.
+          expirySource: row.expirySource as BatchExpirySource | null,
+        });
       }
     }
     return result;
@@ -629,7 +665,8 @@ export class CatalogFacade {
       select b.id::text as "id", b.code as "code",
              to_char(b.mfg_date at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "mfgDate",
              to_char(b.expiry_date at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "expiryDate",
-             to_char(b.created_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt"
+             to_char(b.created_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt",
+             b.expiry_source as "expirySource"
       from batches b
       where b.tenant_id = ${tenantId}::uuid and b.id = any(${sql.param(ids)}::uuid[])
     `)) as unknown as BatchFacts[];
@@ -830,6 +867,8 @@ export class CatalogFacade {
         // the device's offline conformance mirror reads both arms (SKU here,
         // bin on the putaway facade) beside the fields it already gates on.
         storageClass: skus.storageClass,
+        // Story 2-4b — the device's derived-expiry preview.
+        shelfLifeDays: skus.shelfLifeDays,
         // Story 1-1: the owner client — a barcode may be shared across
         // clients, so the device needs it to resolve within a document's
         // client.
@@ -1274,6 +1313,8 @@ export class CatalogFacade {
               code,
               mfgDate: input.mfgDate ?? null,
               expiryDate: input.expiryDate ?? null,
+              // Story 2-4b — only beside a date (receiving's inputs).
+              expirySource: input.expiryDate === undefined ? null : (input.expirySource ?? null),
             };
           }),
         )
@@ -1284,20 +1325,35 @@ export class CatalogFacade {
         });
       if (options.fillNullExpiry === true) {
         for (const code of codes) {
-          const expiryDate = inputs.find((candidate) => candidate.code === code && candidate.expiryDate !== undefined)?.expiryDate;
-          if (expiryDate === undefined) {
+          const input = inputs.find((candidate) => candidate.code === code && candidate.expiryDate !== undefined);
+          if (input === undefined || input.expiryDate === undefined) {
             continue;
           }
+          const source = input.expirySource ?? null;
           // Fill a null, never overwrite: the predicate is the guarantee.
+          // Story 2-4b — a TYPED input also replaces a DERIVED expiry (the
+          // label corrects the derivation; never a typed or NULL-source
+          // one). A DERIVED input fills only a null, and fills a null mfg
+          // with the instant it derived from (fill-a-null, never overwrite),
+          // so the batch's stored mfg always explains its derived expiry.
           await tx
             .update(batches)
-            .set({ expiryDate, updatedAt: sql`now()` })
+            .set({
+              expiryDate: input.expiryDate,
+              ...(source === null ? {} : { expirySource: source }),
+              ...(source === 'derived' && input.mfgDate !== undefined
+                ? { mfgDate: sql`coalesce(${batches.mfgDate}, ${input.mfgDate}::timestamptz)` }
+                : {}),
+              updatedAt: sql`now()`,
+            })
             .where(
               and(
                 eq(batches.tenantId, tenantId),
                 eq(batches.skuId, skuId),
                 eq(batches.code, code),
-                sql`${batches.expiryDate} is null`,
+                source === 'typed'
+                  ? sql`(${batches.expiryDate} is null or ${batches.expirySource} = 'derived')`
+                  : sql`${batches.expiryDate} is null`,
               ),
             );
         }

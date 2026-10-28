@@ -48,8 +48,8 @@ import {
   MAX_HANDLING_UNITS_PER_REQUEST,
   assertCatchWeightGrams,
 } from '../catalog/handling-unit';
-import type { CreateHandlingUnitInput } from '../catalog/catalog.facade';
-import { assertUtcIso, isIsoDate, istDateOf, istDaysBetween, istMidnightOf, nowIso } from '../../shared/primitives/time';
+import type { BatchExpirySource, CreateHandlingUnitInput } from '../catalog/catalog.facade';
+import { addIsoDays, assertUtcIso, isIsoDate, istDateOf, istDaysBetween, istMidnightOf, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
@@ -276,6 +276,45 @@ export interface DecideOverReceiptCommand {
 
 // ── snapshots ─────────────────────────────────────────────────────────────────
 
+/**
+ * Story 2-4b — an expiry the receipt DERIVED (mfg + the SKU's shelf life)
+ * because no line typed one and the batch had none: the derived IST date, the
+ * mfg IST date it came from, and the shelf life used.
+ */
+export interface DerivedExpiry {
+  readonly expiryDate: string;
+  readonly mfgDate: string;
+  readonly shelfLifeDays: number;
+}
+
+/**
+ * Story 2-4b (A2) — a mfg instant is DATE-SHAPED when its time part is
+ * exactly midnight UTC (`YYYY-MM-DDT00:00:00Z` / `….000Z`): the bytes every
+ * date-only entry sends. Only a date-shaped mfg (the line's, or the existing batch's stored one) feeds a derivation — a
+ * pre-2-4b handheld's US-order misread arrives as an IST-midnight instant
+ * (`…T18:30:00.000Z`) and never derives.
+ */
+export function isDateShapedInstant(value: string | null | undefined): value is string {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T00:00:00(\.000)?Z$/.test(value);
+}
+
+/** Story 2-4b — what the expiry phase decided, per batch key `${skuId}:${code}`. */
+interface ExpiryPhase {
+  readonly refused: ClientRefusedLine[];
+  /** The receipt's merged expiry per key (an IST date), or absent when none. */
+  readonly batchExpiry: Map<string, string | null>;
+  /** Where THIS receipt's expiry for the key came from — absent when the batch's own expiry stands. */
+  readonly sourceOf: Map<string, BatchExpirySource>;
+  /** The keys whose expiry this receipt derived (step 3b). */
+  readonly derived: Map<string, DerivedExpiry>;
+  /** The mfg instant each derived key came from — the ensure stores it (A3). */
+  readonly derivedMfg: Map<string, string>;
+  /** A5 — keys whose existing derived expiry a typed line replaces: the old IST date. */
+  readonly replaced: Map<string, string>;
+  /** A7 — keys a client policy judged (an `expiryRequired` line with good units). */
+  readonly judgedKeys: Set<string>;
+}
+
 /** One GRN line as every surface returns it — physical + applied + excess. */
 export interface GoodsReceiptLineSnapshot {
   readonly id: string;
@@ -327,6 +366,17 @@ export interface GoodsReceiptLineSnapshot {
   readonly pendingSerials?: readonly string[];
   readonly unreadableSerialQty?: number;
   readonly qcSkipped?: 'serial-tracked';
+  /**
+   * Story 2-4b — present only when this receipt DERIVED the line's batch
+   * expiry (no typed expiry, the batch had none): a receipt without a
+   * derivation is byte-identical.
+   */
+  readonly derivedExpiry?: DerivedExpiry;
+  /**
+   * Story 2-4b (A5) — present only when a typed expiry on this receipt
+   * REPLACED the batch's earlier derived one: that derived IST date.
+   */
+  readonly replacedDerivedExpiry?: string;
 }
 
 /**
@@ -445,6 +495,8 @@ interface ClientRefusedLine {
   readonly missing?: readonly MissingLicence[];
   /** Story 1-6d — `licence-not-covered` only: the receipt's site code (the refusal names it). */
   readonly siteCode?: string;
+  /** Story 2-4b — the judged expiry was DERIVED (`shelf-life-short`, or a raced `batch-expiry-mismatch`). */
+  readonly derivedExpiry?: DerivedExpiry;
 }
 
 /** Story 1-6d — one need of a refused line that no valid licence covers, and the holder lacking it. */
@@ -532,6 +584,12 @@ export interface RejectedGrnLine {
   readonly serialsOnly?: true;
   readonly serialDetails?: readonly RefusedSerialDetail[];
   readonly unreadableSerialQty?: number;
+  /**
+   * Story 2-4b — present only on an expiry refusal whose judged expiry the
+   * receipt DERIVED from mfg + shelf life (`shelf-life-short`, or a raced
+   * `batch-expiry-mismatch`), so every other entry is unchanged.
+   */
+  readonly derivedExpiry?: DerivedExpiry;
 }
 
 /**
@@ -1362,6 +1420,8 @@ export class ReceivingCommand {
        */
       /** Story 1-2b — the lines a concurrent writer beat to their batch's expiry (refused per line after the ensure). */
       const racedLineIndexes = new Set<number>();
+      /** Story 2-4b (A7) — derived keys a concurrent filler beat, unjudged: the filler's date stands. */
+      const raceAcceptedKeys = new Set<string>();
       /** Story 2-6a (code review C24) — the serial lines the fold will reject (an unknown or non-open document line): nothing of theirs books. */
       const foldRejectIndexes = new Set<number>();
       /**
@@ -1596,12 +1656,7 @@ export class ReceivingCommand {
       // Story 1-2b: one input per (sku, code), carrying the receipt's merged
       // expiry; an existing batch with a NULL expiry is filled (never
       // overwritten — `fillNullExpiry`).
-      const batchIdentity = await this.ensureBatchIdentity(
-        tx,
-        { ...command, lines: receivable },
-        skuById,
-        expiryPhase.batchExpiry,
-      );
+      const batchIdentity = await this.ensureBatchIdentity(tx, { ...command, lines: receivable }, skuById, expiryPhase);
       // ── story 1-2b: a concurrent writer beat this receipt to the expiry ──
       // After the ensure, a batch whose resolved expiry is not the one this
       // receipt judged its lines against (another receipt filled the null
@@ -1618,9 +1673,25 @@ export class ReceivingCommand {
         }
         const resolved = batchIdentity.get(key)?.expiryDate ?? null;
         if (resolved === null || istDateOf(canonicalInstant(resolved)) !== expected) {
+          const derivedExpiry = expiryPhase.derived.get(key);
+          // Story 2-4b (A7) — a DERIVED expiry is a default: when no line of
+          // the batch was judged by a client policy, the concurrent filler's
+          // date stands and the line books against it (nothing was judged
+          // against the date it will not hold). A judged one is refused as a
+          // typed one is, and says the date was derived.
+          if (derivedExpiry !== undefined && resolved !== null && !expiryPhase.judgedKeys.has(key)) {
+            raceAcceptedKeys.add(key);
+            continue;
+          }
           const index = settlingIndexes[receivableIndex]!;
           racedLineIndexes.add(index);
-          clientRefused.push({ index, line: effectiveInput[index]!, code: 'batch-expiry-mismatch', expiryDate: input.expiryDate ?? expected });
+          clientRefused.push({
+            index,
+            line: effectiveInput[index]!,
+            code: 'batch-expiry-mismatch',
+            expiryDate: input.expiryDate ?? expected,
+            ...(derivedExpiry === undefined || (input.expiryDate ?? null) !== null ? {} : { derivedExpiry }),
+          });
         }
       }
       if (racedLineIndexes.size > 0) {
@@ -2410,6 +2481,16 @@ export class ReceivingCommand {
       }));
 
       // ── the snapshot (the outbox payload and idempotency replay carry it) ─
+      /** Story 2-4b — a settled line's derivation keys (present only when they apply). */
+      const derivationSnapshotFields = (key: string | null): { derivedExpiry?: DerivedExpiry; replacedDerivedExpiry?: string } => {
+        if (key === null) return {};
+        const derivedExpiry = raceAcceptedKeys.has(key) ? undefined : expiryPhase.derived.get(key);
+        const replacedDerivedExpiry = expiryPhase.replaced.get(key);
+        return {
+          ...(derivedExpiry === undefined ? {} : { derivedExpiry }),
+          ...(replacedDerivedExpiry === undefined ? {} : { replacedDerivedExpiry }),
+        };
+      };
       const snapshot: GoodsReceiptSnapshot = {
         goodsReceipt: {
           id: grnId,
@@ -2467,6 +2548,9 @@ export class ReceivingCommand {
             // Story 2-6a: present only on a serial line, so a line without
             // serials is byte-identical to its pre-2-6a shape.
             ...serialSnapshotFields(entry.input, entry.applied, policyOfSku(entry.input.skuId).qcOnReceipt),
+            // Story 2-4b: present only when this receipt derived the batch's
+            // expiry, or a typed one replaced a derived one.
+            ...derivationSnapshotFields(entry.batchId === null ? null : `${entry.input.skuId}:${entry.input.batchCode}`),
           })),
           ...(rejected.length === 0 ? {} : { rejectedLines: rejected }),
           ...(unmatched.length === 0 ? {} : { unmatchedLines: unmatched }),
@@ -2562,6 +2646,14 @@ export class ReceivingCommand {
 
       // Story 9-3a — the audit row (step 10). The actor is the operator the
       // op was recorded by — on a replayed handheld op, the original one.
+      // Story 2-4b (A5) — a typed expiry that replaced a derived one is
+      // listed in `changes` (the batch, the old date and the new one).
+      const replacedExpiries = [...expiryPhase.replaced]
+        .filter(([key]) => settled.some((entry) => entry.batchId !== null && `${entry.input.skuId}:${entry.input.batchCode}` === key))
+        .map(([key, before]) => {
+          const identity = batchIdentity.get(key)!;
+          return { batchId: identity.id, batchCode: identity.code, skuId: key.slice(0, key.indexOf(':')), before, after: expiryPhase.batchExpiry.get(key)! };
+        });
       await tx.insert(auditEvents).values({
         id: uuidv7(),
         tenantId: command.tenantId,
@@ -2570,6 +2662,7 @@ export class ReceivingCommand {
         targetType: 'goods_receipt',
         targetId: grnId,
         reference: idempotencyKey,
+        ...(replacedExpiries.length === 0 ? {} : { changes: { replacedDerivedExpiry: replacedExpiries } }),
         occurredAt: nowIso(),
       });
       // Story 2-6a (A6) — a serial received again after a write-off: one row
@@ -3587,10 +3680,11 @@ export class ReceivingCommand {
     tx: TenantTx,
     command: SubmitGoodsReceiptCommand,
     skuById: Map<string, typeof skus.$inferSelect>,
-    batchExpiry: ReadonlyMap<string, string | null>,
+    phase: Pick<ExpiryPhase, 'batchExpiry' | 'sourceOf' | 'derivedMfg'>,
   ): Promise<Map<string, { id: string; code: string; expiryDate: string | null }>> {
+    const { batchExpiry } = phase;
     const result = new Map<string, { id: string; code: string; expiryDate: string | null }>();
-    const inputsBySku = new Map<string, { code: string; mfgDate?: string; expiryDate?: string }[]>();
+    const inputsBySku = new Map<string, { code: string; mfgDate?: string; expiryDate?: string; expirySource?: BatchExpirySource }[]>();
     let fillsExpiry = false;
     for (const line of command.lines) {
       const sku = skuById.get(line.skuId)!;
@@ -3604,12 +3698,20 @@ export class ReceivingCommand {
           // merged expiry (a line without one and a line with one on the
           // same batch merge, taking the non-null one), stored as the
           // instant its IST date begins.
-          const expiry = batchExpiry.get(`${line.skuId}:${line.batchCode}`) ?? null;
+          const key = `${line.skuId}:${line.batchCode}`;
+          const expiry = batchExpiry.get(key) ?? null;
           fillsExpiry ||= expiry !== null;
+          // Story 2-4b — where this receipt's expiry came from (absent when
+          // the batch's own expiry stands), and (A3) for a DERIVED key the
+          // mfg instant it derived from, so the batch's stored mfg always
+          // explains its expiry.
+          const source = phase.sourceOf.get(key);
+          const mfgDate = source === 'derived' ? (phase.derivedMfg.get(key) ?? line.mfgDate) : line.mfgDate;
           inputs.push({
             code: line.batchCode,
-            ...(line.mfgDate === null ? {} : { mfgDate: line.mfgDate }),
+            ...(mfgDate === null ? {} : { mfgDate }),
             ...(expiry === null ? {} : { expiryDate: istMidnightOf(expiry) }),
+            ...(expiry === null || source === undefined ? {} : { expirySource: source }),
           });
           inputsBySku.set(line.skuId, inputs);
         }
@@ -3644,6 +3746,11 @@ export class ReceivingCommand {
    *    IST date, from the existing batch's non-null expiry, or from an
    *    earlier line of this receipt naming the same batch (later lines are
    *    refused). A line without an expiry merges with one that has it.
+   *    Story 2-4b (A5): an existing DERIVED expiry is replaced by the first
+   *    typed line, never refused against.
+   * 3b. Story 2-4b — a batch with no expiry after (3) gets a DERIVED one,
+   *    mfg + the SKU's shelf life (see the step), judged below like a typed
+   *    one.
    * 4. `expiry-required` — the client requires expiry, the SKU is
    *    batch-tracked, and the EFFECTIVE expiry (the line's, else its
    *    batch's) is null.
@@ -3652,8 +3759,9 @@ export class ReceivingCommand {
    *    (0 when none — so an already expired batch is refused whenever
    *    expiry is required). Skipped under the review's waiver only.
    *
-   * No query at all when no line carries an expiry and no line's client
-   * requires one — the default policy reads nothing more than before.
+   * No query at all when no line carries an expiry, no line's client
+   * requires one and no tracked line could derive one (2-4b: its SKU has a
+   * shelf life) — the default policy reads nothing more than before.
    */
   private async expiryRefusalsInTx(
     tx: TenantTx,
@@ -3667,23 +3775,41 @@ export class ReceivingCommand {
       readonly receiptDate: string;
       readonly waived: boolean;
     },
-  ): Promise<{ refused: ClientRefusedLine[]; batchExpiry: Map<string, string | null> }> {
+  ): Promise<ExpiryPhase> {
     const refused: ClientRefusedLine[] = [];
     const batchExpiry = new Map<string, string | null>();
+    const sourceOf = new Map<string, BatchExpirySource>();
+    const derived = new Map<string, DerivedExpiry>();
+    const derivedMfg = new Map<string, string>();
+    const replaced = new Map<string, string>();
+    const judgedKeys = new Set<string>();
+    const phase = (): ExpiryPhase => ({ refused, batchExpiry, sourceOf, derived, derivedMfg, replaced, judgedKeys });
     const candidates = args.inputLines
       .map((line, index) => ({ index, line }))
       .filter(({ index }) => !args.alreadyRefused.has(index));
+    const tracked = (line: GrnLineInput): boolean => args.skuById.get(line.skuId)!.batchTracked;
     const anyExpiry = candidates.some(({ line }) => (line.expiryDate ?? null) !== null);
     const anyRequired = candidates.some(({ line }) => args.policyOfSku(line.skuId).expiryRequired);
-    if (!anyExpiry && !anyRequired) {
-      return { refused, batchExpiry };
+    // Story 2-4b — a tracked line without a typed expiry whose SKU has a
+    // shelf life (and whose client derives) may get a derived one: the only
+    // widening of the short-circuit, so a receipt of SKUs without a shelf
+    // life still reads nothing more than before.
+    const anyDerivable = candidates.some(
+      ({ line }) =>
+        tracked(line) &&
+        line.batchCode !== null &&
+        (line.expiryDate ?? null) === null &&
+        args.skuById.get(line.skuId)!.shelfLifeDays !== null &&
+        args.policyOfSku(line.skuId).deriveExpiry,
+    );
+    if (!anyExpiry && !anyRequired && !anyDerivable) {
+      return phase();
     }
     const out = new Set<number>();
     const refuse = (entry: ClientRefusedLine): void => {
       refused.push(entry);
       out.add(entry.index);
     };
-    const tracked = (line: GrnLineInput): boolean => args.skuById.get(line.skuId)!.batchTracked;
     const batchKey = (line: GrnLineInput): string | null =>
       tracked(line) && line.batchCode !== null ? `${line.skuId}:${line.batchCode}` : null;
 
@@ -3703,9 +3829,12 @@ export class ReceivingCommand {
       .filter(({ index, line }) => !out.has(index) && batchKey(line) !== null)
       .map(({ line }) => ({ skuId: line.skuId, code: line.batchCode! }));
     const existing = await this.catalog.batchesByCodesInTx(tx, tenantId, pairs);
+    /** Story 2-4b (A5) — existing batches whose expiry was DERIVED: a typed line replaces it. */
+    const derivedExisting = new Set<string>();
     for (const [key, batch] of existing) {
       if (batch.expiryDate !== null) {
         batchExpiry.set(key, istDateOf(canonicalInstant(batch.expiryDate)));
+        if (batch.expirySource === 'derived') derivedExisting.add(key);
       }
     }
     // (2) again, against the EXISTING batch's mfg date when the line carries
@@ -3720,17 +3849,68 @@ export class ReceivingCommand {
       }
     }
 
-    // (3): one expiry per batch — the existing one, else the first line's.
+    // (3): one expiry per batch — the existing one, else the first typed
+    // line's (request order). Story 2-4b (A5): an existing DERIVED expiry is
+    // not a known one against a typed line — the first typed line replaces it.
     for (const { index, line } of candidates) {
       const key = batchKey(line);
       const expiry = line.expiryDate ?? null;
       if (out.has(index) || key === null || expiry === null) continue;
+      if (derivedExisting.has(key)) {
+        derivedExisting.delete(key);
+        const old = batchExpiry.get(key)!;
+        batchExpiry.set(key, expiry);
+        sourceOf.set(key, 'typed');
+        if (old !== expiry) replaced.set(key, old);
+        continue;
+      }
       const known = batchExpiry.get(key) ?? null;
       if (known === null) {
         batchExpiry.set(key, expiry);
+        sourceOf.set(key, 'typed');
       } else if (known !== expiry) {
         refuse({ index, line, code: 'batch-expiry-mismatch', expiryDate: expiry });
       }
+    }
+
+    // (3b) Story 2-4b: DERIVE the expiry of a batch that has none — no line
+    // typed one, the batch has none (A1: `batchExpiry` holds only keys with
+    // an expiry) — from mfg + the SKU's shelf life. The mfg is the existing
+    // batch's (as stored), else the first line in request order naming the
+    // batch with a DATE-SHAPED mfg (A2 — a pre-2-4b handheld's misread
+    // instant never derives). No derivation when the client turned it off,
+    // the mfg is after the receipt's IST date, or the result falls outside
+    // the typed-expiry range (years 2000–2199). One derivation per key; the
+    // later lines of the key read it through `batchExpiry`.
+    const tried = new Set<string>();
+    for (const { index, line } of candidates) {
+      const key = batchKey(line);
+      if (out.has(index) || key === null || (line.expiryDate ?? null) !== null) continue;
+      if ((batchExpiry.get(key) ?? null) !== null || tried.has(key)) continue;
+      tried.add(key);
+      const shelfLifeDays = args.skuById.get(line.skuId)!.shelfLifeDays;
+      if (shelfLifeDays === null || !args.policyOfSku(line.skuId).deriveExpiry) continue;
+      const batchMfg = existing.get(key)?.mfgDate ?? null;
+      // A2 + A3 — an existing batch's stored mfg derives only when it is
+      // date-shaped (a pre-2-4b handheld's misread is an IST-midnight
+      // instant); otherwise the key derives nothing — never a line's mfg,
+      // which the batch's stored mfg would not explain.
+      if (batchMfg !== null && !isDateShapedInstant(canonicalInstant(batchMfg))) continue;
+      const mfg =
+        batchMfg !== null
+          ? canonicalInstant(batchMfg)
+          : (candidates.find(
+              (other) => !out.has(other.index) && batchKey(other.line) === key && isDateShapedInstant(other.line.mfgDate),
+            )?.line.mfgDate ?? null);
+      if (mfg === null) continue;
+      const mfgDate = istDateOf(mfg);
+      if (mfgDate > args.receiptDate) continue;
+      const expiryDate = addIsoDays(mfgDate, shelfLifeDays);
+      if (!/^2[01]\d\d-/.test(expiryDate)) continue;
+      batchExpiry.set(key, expiryDate);
+      sourceOf.set(key, 'derived');
+      derived.set(key, { expiryDate, mfgDate, shelfLifeDays });
+      derivedMfg.set(key, mfg);
     }
 
     // (4) + (5): the client's policy, against the EFFECTIVE expiry.
@@ -3746,6 +3926,8 @@ export class ReceivingCommand {
       const policy = args.policyOfSku(line.skuId);
       if (!policy.expiryRequired) continue;
       const key = batchKey(line);
+      // Story 2-4b (A7) — this key's expiry was judged by the client's policy.
+      if (key !== null) judgedKeys.add(key);
       const effective = line.expiryDate ?? (key === null ? null : (batchExpiry.get(key) ?? null));
       if (effective === null) {
         refuse({ index, line, code: 'expiry-required', expiryDate: null });
@@ -3755,10 +3937,19 @@ export class ReceivingCommand {
       const minimum = policy.minShelfLifeDays ?? 0;
       const remainingDays = istDaysBetween(args.receiptDate, effective);
       if (remainingDays < minimum) {
-        refuse({ index, line, code: 'shelf-life-short', expiryDate: effective, minShelfLifeDays: minimum, remainingDays });
+        const derivedExpiry = (line.expiryDate ?? null) === null && key !== null ? derived.get(key) : undefined;
+        refuse({
+          index,
+          line,
+          code: 'shelf-life-short',
+          expiryDate: effective,
+          minShelfLifeDays: minimum,
+          remainingDays,
+          ...(derivedExpiry === undefined ? {} : { derivedExpiry }),
+        });
       }
     }
-    return { refused, batchExpiry };
+    return phase();
   }
 
   /**
@@ -3833,6 +4024,8 @@ export class ReceivingCommand {
           expiryDate: entry.expiryDate ?? null,
           ...(entry.minShelfLifeDays === undefined ? {} : { minShelfLifeDays: entry.minShelfLifeDays }),
           ...lineConditionFields(line),
+          // Story 2-4b — only when the judged expiry was derived.
+          ...(entry.derivedExpiry === undefined ? {} : { derivedExpiry: entry.derivedExpiry }),
         };
       }
       return {
@@ -3914,6 +4107,8 @@ export class ReceivingCommand {
               expiryDate: entry.expiryDate ?? null,
               ...(entry.minShelfLifeDays === undefined ? {} : { minShelfLifeDays: entry.minShelfLifeDays }),
               ...(entry.remainingDays === undefined ? {} : { remainingDays: entry.remainingDays }),
+              // Story 2-4b — only when the judged expiry was derived.
+              ...(entry.derivedExpiry === undefined ? {} : { derivedExpiry: entry.derivedExpiry }),
             }
           : {}),
         // Story 2-6a — a serial refusal names its serials (and where each is).
@@ -4238,17 +4433,22 @@ export { istDaysBetween };
 /** Story 1-2b — the operator-facing reason of one expiry refusal (the device shows its own words by code). */
 function expiryRefusalReason(entry: ClientRefusedLine, skuCode: string, batchCode: string | null, clientLabel: string): string {
   const batch = batchCode === null ? '' : ` batch "${batchCode}"`;
+  // Story 2-4b — a derived judged expiry says where it came from.
+  const derived =
+    entry.derivedExpiry === undefined
+      ? ''
+      : ` (derived from mfg ${entry.derivedExpiry.mfgDate} + ${entry.derivedExpiry.shelfLifeDays} days' shelf life)`;
   switch (entry.code) {
     case 'expiry-on-untracked':
       return `SKU "${skuCode}" is not batch-tracked — an expiry date (${entry.expiryDate}) lives on a batch, so this line was not booked. Receive it again without the expiry date.`;
     case 'expiry-before-mfg':
       return `SKU "${skuCode}"${batch}: the expiry date ${entry.expiryDate} is before the line's mfg date — check the label and receive it again.`;
     case 'batch-expiry-mismatch':
-      return `SKU "${skuCode}"${batch}: the expiry date ${entry.expiryDate} differs from the batch's — one batch has one expiry. Check the label; receive it with the batch's expiry or under its own batch code.`;
+      return `SKU "${skuCode}"${batch}: the expiry date ${entry.expiryDate}${derived} differs from the batch's — one batch has one expiry. Check the label; receive it with the batch's expiry or under its own batch code.`;
     case 'expiry-required':
       return `SKU "${skuCode}"${batch}: client ${clientLabel} requires an expiry date on batch-tracked goods and none was given — receive it again with the label's expiry date.`;
     case 'shelf-life-short':
-      return `SKU "${skuCode}"${batch} expires ${entry.expiryDate} — ${entry.remainingDays} day(s) of shelf life left, below client ${clientLabel}'s minimum of ${entry.minShelfLifeDays} — not booked; it is in review (accept anyway, or discard).`;
+      return `SKU "${skuCode}"${batch} expires ${entry.expiryDate}${derived} — ${entry.remainingDays} day(s) of shelf life left, below client ${clientLabel}'s minimum of ${entry.minShelfLifeDays} — not booked; it is in review (accept anyway, or discard).`;
     default:
       return `SKU "${skuCode}" was refused (${entry.code}).`;
   }

@@ -33,11 +33,11 @@ import type {
   RefusedReceiptSnapshot,
   SubmitGoodsReceiptCommand,
 } from './receiving.command';
-import { CatalogFacade } from '../catalog/catalog.facade';
+import { CatalogFacade, type BatchFacts } from '../catalog/catalog.facade';
 import type { PurchaseOrderLineSnapshot } from './po.command';
 import { lineSnapshot } from './po.command';
 import type { OverReceiptEntry } from './receiving.command';
-import { canonicalInstant, fullPrecisionInstant } from '../../shared/primitives/time';
+import { canonicalInstant, fullPrecisionInstant, istDateOf } from '../../shared/primitives/time';
 import { fromMilli } from '../../shared/primitives/quantity';
 import { OPEN_ASN_STATUSES, asnLineSnapshot, type AsnLineSnapshot } from './asn.command';
 import { partnerNamesInTx, type VendorSnapshotV1 } from '../partners/partners.facade';
@@ -93,6 +93,15 @@ export interface GoodsReceiptEntry {
   readonly photoCount: number;
 }
 
+/** Story 2-4b — a GRN line's batch dates as IST calendar dates, and the expiry's source. */
+function batchDateFields(facts: BatchFacts | undefined): Pick<GoodsReceiptLineEntry, 'batchMfgDate' | 'batchExpiryDate' | 'expirySource'> {
+  return {
+    batchMfgDate: facts?.mfgDate == null ? null : istDateOf(facts.mfgDate),
+    batchExpiryDate: facts?.expiryDate == null ? null : istDateOf(facts.expiryDate),
+    expirySource: facts?.expiryDate == null ? null : (facts.expirySource ?? null),
+  };
+}
+
 /**
  * Story 2-4a — one line of a GRN as the web's expandable row reads it: the
  * SKU and batch named, the good units and what applied, and the line's
@@ -105,6 +114,14 @@ export interface GoodsReceiptLineEntry {
   readonly skuName: string;
   readonly batchId: string | null;
   readonly batchCode: string | null;
+  /**
+   * Story 2-4b — the batch's mfg and expiry as IST calendar dates (null when
+   * unset or no batch), and where the expiry came from (`derived` = mfg +
+   * the SKU's shelf life; `typed`; null = older or unknown).
+   */
+  readonly batchMfgDate: string | null;
+  readonly batchExpiryDate: string | null;
+  readonly expirySource: 'typed' | 'derived' | null;
   readonly qty: number;
   readonly appliedQty: number;
   readonly damagedQty?: number;
@@ -194,6 +211,12 @@ export interface CatalogSnapshot {
      * `ambient` (0035_storage_class.sql).
      */
     readonly storageClass: string;
+    /**
+     * Story 2-4b: the SKU's total shelf life in days from manufacture, or
+     * null — the device previews the expiry a receipt will derive. Eleventh
+     * mirror of the `SkuSummary` arm.
+     */
+    readonly shelfLifeDays: number | null;
     /**
      * Story 1-1: the SKU's client — code and barcode are unique per (tenant,
      * client), so the device resolves within the document's client. Fifth
@@ -596,7 +619,8 @@ export class ReceivingFacade {
         .innerJoin(skusTable, and(eq(skusTable.tenantId, goodsReceiptLines.tenantId), eq(skusTable.id, goodsReceiptLines.skuId)))
         .where(and(eq(goodsReceiptLines.tenantId, tenantId), eq(goodsReceiptLines.grnId, grnId)))
         .orderBy(goodsReceiptLines.createdAt, goodsReceiptLines.id);
-      const batchCodes = await this.catalog.batchCodesByIdsInTx(
+      // Story 2-4b — the batch's facts (code, mfg, expiry and its source).
+      const batchFacts = await this.catalog.batchFactsByIdsInTx(
         tx,
         tenantId,
         [...new Set(rows.map((row) => row.batchId).filter((id): id is string => id !== null))],
@@ -665,7 +689,8 @@ export class ReceivingFacade {
         skuCode: row.skuCode,
         skuName: row.skuName,
         batchId: row.batchId,
-        batchCode: row.batchId === null ? null : (batchCodes.get(row.batchId) ?? null),
+        batchCode: row.batchId === null ? null : (batchFacts.get(row.batchId)?.code ?? null),
+        ...batchDateFields(row.batchId === null ? undefined : batchFacts.get(row.batchId)),
         // Read model — base units at the edge (story 10.1).
         qty: fromMilli(row.qty),
         appliedQty: fromMilli(row.appliedQty),

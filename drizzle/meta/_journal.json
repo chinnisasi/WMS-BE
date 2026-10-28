@@ -757,6 +757,13 @@
       "when": 1793189104118,
       "tag": "0107_stock_take_freeze",
       "breakpoints": true
+    },
+    {
+      "idx": 108,
+      "version": "7",
+      "when": 1793191702960,
+      "tag": "0108_expiry_from_shelf_life",
+      "breakpoints": true
     }
   ]
 }

@@ -375,6 +375,8 @@ export class ClientsController {
         qcOnReceipt: dto.qcOnReceipt,
         expiryRequired: dto.expiryRequired,
         minShelfLifeDays: dto.minShelfLifeDays ?? null,
+        // Story 2-4b — optional: absent keeps the client's current switch.
+        deriveExpiry: dto.deriveExpiry,
       },
       key,
     );

@@ -224,6 +224,13 @@ export interface UpdateReceivingPolicyCommand {
   readonly qcOnReceipt: boolean;
   readonly expiryRequired: boolean;
   readonly minShelfLifeDays: number | null;
+  /**
+   * Story 2-4b — the shelf-life derivation switch. OPTIONAL (the one
+   * exception to the full replace): absent keeps the current value, so a
+   * pre-2-4b policy edit means what it meant and hashes byte for byte as
+   * before.
+   */
+  readonly deriveExpiry?: boolean | undefined;
 }
 
 /** Story 4-3a — the allocation policy PUT: a FULL replace, both keys required (A11). */
@@ -719,6 +726,9 @@ export class ClientsCommand {
       qcOnReceipt: command.qcOnReceipt,
       expiryRequired: command.expiryRequired,
       minShelfLifeDays: command.minShelfLifeDays,
+      // Story 2-4b — hashed only when sent, right after `minShelfLifeDays`:
+      // a pre-2-4b edit (no key) hashes byte for byte as before.
+      deriveExpiry: command.deriveExpiry ?? undefined,
     });
 
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
@@ -732,12 +742,14 @@ export class ClientsCommand {
       if (replayedUnderLock !== null) {
         return replayedUnderLock;
       }
-      const valid = assertReceivingPolicy(command);
-      const changed =
-        valid.receivingToleranceBps !== current.receivingToleranceBps ||
-        valid.qcOnReceipt !== current.qcOnReceipt ||
-        valid.expiryRequired !== current.expiryRequired ||
-        valid.minShelfLifeDays !== current.minShelfLifeDays;
+      const shape = assertReceivingPolicy(command);
+      // Story 2-4b — absent keeps the client's current switch.
+      const valid = { ...shape, deriveExpiry: assertDeriveExpiry(command.deriveExpiry) ?? current.deriveExpiry };
+      const changes: Record<string, { before: unknown; after: unknown }> = {};
+      for (const field of ['receivingToleranceBps', 'qcOnReceipt', 'expiryRequired', 'minShelfLifeDays', 'deriveExpiry'] as const) {
+        if (valid[field] !== current[field]) changes[field] = { before: current[field], after: valid[field] };
+      }
+      const changed = Object.keys(changes).length > 0;
       if (!changed) {
         // A declared no-op (`clients.receivingPolicy:unchanged`): nothing
         // written or audited, the key stored — so a late retry after another
@@ -752,7 +764,7 @@ export class ClientsCommand {
         .where(and(eq(clients.tenantId, command.tenantId), eq(clients.id, current.id)))
         .returning();
       const snapshot: ClientMutationSnapshot = { client: toClientSnapshot(rows[0]!) };
-      await this.audit(tx, command.tenantId, command.actorUserId, 'client.receiving_policy_updated', current.id, idempotencyKey);
+      await this.audit(tx, command.tenantId, command.actorUserId, 'client.receiving_policy_updated', current.id, idempotencyKey, changes);
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
       return snapshot;
     });
@@ -1175,6 +1187,8 @@ export class ClientsCommand {
       | 'client.contact_removed',
     clientId: string,
     reference: string,
+    /** Story 2-4b — `{field: {before, after}}`, written only when given (the receiving policy edit). */
+    changes?: Record<string, { before: unknown; after: unknown }>,
   ): Promise<void> {
     await tx.insert(auditEvents).values({
       id: uuidv7(),
@@ -1184,6 +1198,7 @@ export class ClientsCommand {
       targetType: 'client',
       targetId: clientId,
       reference,
+      ...(changes === undefined ? {} : { changes }),
       occurredAt: nowIso(),
     });
   }
@@ -1426,6 +1441,20 @@ export function assertReceivingPolicy(command: {
     expiryRequired: command.expiryRequired,
     minShelfLifeDays: days,
   };
+}
+
+/**
+ * Story 2-4b — the optional derivation switch: absent (undefined or null)
+ * keeps the current value; anything but a boolean is a 400 naming the field.
+ */
+export function assertDeriveExpiry(value: unknown): boolean | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'boolean') {
+    throw new ProblemException('validation-failed', 400, 'Invalid receiving policy', `deriveExpiry must be true or false (got ${JSON.stringify(value)}).`, {
+      field: 'deriveExpiry',
+    });
+  }
+  return value;
 }
 
 /**

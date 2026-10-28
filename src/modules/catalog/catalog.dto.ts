@@ -357,7 +357,7 @@ export class SkuResponse {
     nullable: true,
     example: 365,
     description:
-      'Story 1-4 — total shelf life in days from manufacture (1–3650), or null when unset. Not the client policy\'s minimum REMAINING shelf life.',
+      'Story 1-4 — total shelf life in days from manufacture (1–3650), or null when unset. Not the client policy\'s minimum REMAINING shelf life. Story 2-4b — a received batch with a mfg date and no typed expiry gets its expiry set from it (mfg + this many days), unless the client\'s receiving policy turns that off.',
   })
   shelfLifeDays!: number | null;
 
@@ -751,7 +751,7 @@ export class CreateSkuDto extends GoodsTypeFieldsDto {
     example: 365,
     minimum: MIN_SHELF_LIFE_DAYS,
     maximum: MAX_SHELF_LIFE_DAYS,
-    description: 'Total shelf life in days from manufacture',
+    description: 'Total shelf life in days from manufacture. Story 2-4b — a received batch with a mfg date and no typed expiry gets its expiry set from it (mfg + this many days), unless the client\'s receiving policy turns that off.',
   })
   @IsOptional()
   @IsInt()
@@ -1031,7 +1031,7 @@ export class PatchSkuDto extends GoodsTypeFieldsDto {
     example: 365,
     minimum: MIN_SHELF_LIFE_DAYS,
     maximum: MAX_SHELF_LIFE_DAYS,
-    description: 'Total shelf life in days from manufacture (1–3650). Omit to leave unchanged; null to clear.',
+    description: 'Total shelf life in days from manufacture (1–3650). Omit to leave unchanged; null to clear. Story 2-4b — a received batch with a mfg date and no typed expiry gets its expiry set from it (mfg + this many days), unless the client\'s receiving policy turns that off. Editing it never re-dates a batch already received.',
   })
   @IsOptional()
   @IsInt()

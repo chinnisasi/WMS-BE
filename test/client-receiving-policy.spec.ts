@@ -491,6 +491,8 @@ describe('story 1-2b: the client receiving policy (e2e)', () => {
         qcOnReceipt: false,
         expiryRequired: false,
         minShelfLifeDays: null,
+        // Story 2-4b — the read gains the derivation switch (default on): an explicit pin update.
+        deriveExpiry: true,
         untrackedSkuCount: 0,
       });
       const exp = await http()
@@ -502,14 +504,16 @@ describe('story 1-2b: the client receiving policy (e2e)', () => {
       // The clients list carries it too.
       const list = await http().get(`${API}/${tenantId}/clients`).set('Authorization', `Bearer ${opsToken}`).expect(200);
       const tol = (list.body.items as { id: string; receivingPolicy?: unknown }[]).find((c) => c.id === client('TOL'));
-      expect(tol!.receivingPolicy).toEqual({ receivingToleranceBps: 500, qcOnReceipt: false, expiryRequired: false, minShelfLifeDays: null });
+      // Story 2-4b — plus the derivation switch (explicit pin update).
+      expect(tol!.receivingPolicy).toEqual({ receivingToleranceBps: 500, qcOnReceipt: false, expiryRequired: false, minShelfLifeDays: null, deriveExpiry: true });
     });
 
     it('an owner replaces it whole; audited; a replay re-serves; the same policy again is a no-op that stores its key', async () => {
       const policy = { receivingToleranceBps: 250, qcOnReceipt: false, expiryRequired: false, minShelfLifeDays: null };
       const key = ulid();
       const res = await putPolicy(client('PLAIN'), policy, key).expect(200);
-      expect(res.body.client.receivingPolicy).toEqual(policy);
+      // Story 2-4b — a PUT without `deriveExpiry` keeps the client's switch (on): an explicit pin update.
+      expect(res.body.client.receivingPolicy).toEqual({ ...policy, deriveExpiry: true });
       await expectAuditRow({ tenantId, key, action: 'client.receiving_policy_updated', targetType: 'client', targetId: client('PLAIN'), actorUserId: ownerUserId });
       const replay = await putPolicy(client('PLAIN'), policy, key).expect(200);
       expect(replay.body).toEqual(res.body);
@@ -519,7 +523,8 @@ describe('story 1-2b: the client receiving policy (e2e)', () => {
 
       const noOpKey = noOpIdempotencyKey(tenantId, ulid(), 'clients.receivingPolicy:unchanged');
       const unchanged = await putPolicy(client('PLAIN'), policy, noOpKey).expect(200);
-      expect(unchanged.body.client.receivingPolicy).toEqual(policy);
+      // Story 2-4b — plus the kept switch (explicit pin update).
+      expect(unchanged.body.client.receivingPolicy).toEqual({ ...policy, deriveExpiry: true });
       expect(await sql`select 1 from audit_events where tenant_id = ${tenantId} and reference = ${noOpKey}`).toHaveLength(0);
       expect(await sql`select 1 from idempotency_keys where tenant_id = ${tenantId} and key = ${noOpKey}`).toHaveLength(1);
 
@@ -568,7 +573,8 @@ describe('story 1-2b: the client receiving policy (e2e)', () => {
         .set('Authorization', `Bearer ${operatorToken}`)
         .expect(200);
       const exp = (res.body.clients as { id: string; receivingPolicy?: unknown }[]).find((c) => c.id === client('EXP'));
-      expect(exp!.receivingPolicy).toEqual({ receivingToleranceBps: 0, qcOnReceipt: false, expiryRequired: true, minShelfLifeDays: 90 });
+      // Story 2-4b — the device snapshot's policy carries the switch (explicit pin update).
+      expect(exp!.receivingPolicy).toEqual({ receivingToleranceBps: 0, qcOnReceipt: false, expiryRequired: true, minShelfLifeDays: 90, deriveExpiry: true });
     });
 
     it('the CHECKs back the command (0078)', async () => {

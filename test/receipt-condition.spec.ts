@@ -858,6 +858,11 @@ describe('story 2-4a: damaged and short receipt quantities (e2e)', () => {
         skuName: 'P-B name',
         batchId: expect.any(String),
         batchCode: 'B-READ',
+        // Story 2-4b (A13) — the read gains the batch's IST dates and the
+        // expiry's source (none here: no mfg, no expiry): an explicit pin update.
+        batchMfgDate: null,
+        batchExpiryDate: null,
+        expirySource: null,
         qty: 4,
         appliedQty: 4,
         damagedQty: 2,
@@ -868,7 +873,7 @@ describe('story 2-4a: damaged and short receipt quantities (e2e)', () => {
         photoCount: 0,
         pendingPhotoCount: 0,
       },
-      { id: grn.lines[1]!.id, skuId: sku('PLAIN', 'P-A'), skuCode: 'P-A', skuName: 'P-A name', batchId: null, batchCode: null, qty: 3, appliedQty: 3, photoCount: 0, pendingPhotoCount: 0 },
+      { id: grn.lines[1]!.id, skuId: sku('PLAIN', 'P-A'), skuCode: 'P-A', skuName: 'P-A name', batchId: null, batchCode: null, batchMfgDate: null, batchExpiryDate: null, expirySource: null, qty: 3, appliedQty: 3, photoCount: 0, pendingPhotoCount: 0 },
     ]);
     await http().get(`${API}/${tenantId}/receiving/goods-receipts/${uuidv7()}/lines`).set('Authorization', `Bearer ${ownerToken}`).expect(404);
     await http().get(`${API}/${tenantId}/receiving/goods-receipts/not-a-uuid/lines`).set('Authorization', `Bearer ${ownerToken}`).expect(400);
