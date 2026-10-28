@@ -91,6 +91,8 @@ export const AUDIT_NO_OP_ARMS = {
   'partners.status:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'partner'),
   /** Story 1-3 — `PartnersCommand.updateLink` with nothing changed (stores the key). */
   'partners.linkUpdate:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'partner'),
+  // Story 4-3b — the consignee shelf-life PUT with the stored values.
+  'partners.linkShelfLife:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'partner'),
   /** Story 1-4 — `SkuCommand.replacePackaging` with both sets equal to the stored ones (stores the key with `{ sku }`). */
   'skus.packaging:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'sku'),
   /** Story 1-4b — `SkuCommand.updateStatus` to the status (and reason) already in place (stores the key with `{ sku }`). */

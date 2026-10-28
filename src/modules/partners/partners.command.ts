@@ -36,6 +36,12 @@ import { assertPermission } from '../tenancy/permissions';
 import { getMemberRoleIn } from '../tenancy/tenancy.service';
 import { assertClientTakesWorkInTx, clientDeparted, clientNotFound, getClientLabelsInTx, lockClientInTx } from '../clients/clients.facade';
 import { linksOfInTx, toPartnerSnapshot, type PartnerMutationSnapshot } from './partners.facade';
+import {
+  CONSIGNEE_MIN_SHELF_LIFE_DAYS_MAX,
+  CONSIGNEE_MIN_SHELF_LIFE_DAYS_MIN,
+  CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MAX,
+  CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MIN,
+} from '../../shared/primitives/batch-allocation';
 
 /** The PAN shape: five letters, four digits, a letter (the 0079 CHECK). */
 export const PAN_RE = /^[A-Z]{5}\d{4}[A-Z]$/;
@@ -100,6 +106,21 @@ export interface UpdatePartnerLinkCommand {
   readonly clientCode?: string | null | undefined;
   readonly active?: boolean | undefined;
   readonly isDefault?: boolean | undefined;
+}
+
+/**
+ * Story 4-3b — `PUT /partners/{id}/links/{linkId}/shelf-life`: a FULL replace
+ * of a consignee link's two minimums (both keys required; `null` = none). The
+ * values arrive RAW (the hash is over them as sent); the command re-checks
+ * each behind the replay lookup.
+ */
+export interface UpdatePartnerLinkShelfLifeCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly partnerId: string;
+  readonly linkId: string;
+  readonly minShelfLifeDays: unknown;
+  readonly minShelfLifePercent: unknown;
 }
 
 /** The fields in their fixed order — the hash and the merge both use it. */
@@ -787,6 +808,85 @@ export class PartnersCommand {
     });
   }
 
+  /**
+   * Story 4-3b — `PUT /partners/{id}/links/{linkId}/shelf-life`: a consignee
+   * link's own minimum remaining shelf life for the client's orders, in IST
+   * days and/or percent of each SKU's total shelf life (both keys required;
+   * `null` = none). The `updateLink` skeleton: hash over the RAW body (`arm:
+   * 'link-shelf-life'`) → authority (`vendor.manage`) → replay → partner
+   * `FOR NO KEY UPDATE` (404) → link `FOR NO KEY UPDATE` (404 — another
+   * partner's link is the same 404, A9) → replay again under the locks → the
+   * values (400 `validation-failed` naming the field) → a vendor link 400
+   * `link-role-invalid` → unchanged = a no-op that STORES the key
+   * (`partners.linkShelfLife:unchanged`) → the write → audit
+   * `partner.link_shelf_life_updated` (target the link; `changes` carry the
+   * before/after of both minimums, the client and the partner) → the key
+   * LAST. Allowed on an inactive partner or link and a departed client — a
+   * policy, not work, so no client lock. It applies to waves generated after
+   * it (picklist lines freeze the rule they were planned under).
+   */
+  async updateLinkShelfLife(command: UpdatePartnerLinkShelfLifeCommand, idempotencyKey: string): Promise<PartnerMutationSnapshot> {
+    const payloadHash = hashCommandPayload({
+      arm: 'link-shelf-life',
+      tenantId: command.tenantId,
+      partnerId: command.partnerId,
+      linkId: command.linkId,
+      minShelfLifeDays: command.minShelfLifeDays,
+      minShelfLifePercent: command.minShelfLifePercent,
+    });
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'vendor.manage');
+      const replayed = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) return replayed;
+      const partner = await this.lockPartner(tx, command.tenantId, command.partnerId, 'no key update');
+      const link = await this.readLink(tx, command.tenantId, partner.id, command.linkId, 'no key update');
+      const replayedUnderLock = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) return replayedUnderLock;
+
+      const minShelfLifeDays = assertShelfLifeValue(
+        'minShelfLifeDays',
+        command.minShelfLifeDays,
+        CONSIGNEE_MIN_SHELF_LIFE_DAYS_MIN,
+        CONSIGNEE_MIN_SHELF_LIFE_DAYS_MAX,
+        'a whole number of days',
+      );
+      const minShelfLifePercent = assertShelfLifeValue(
+        'minShelfLifePercent',
+        command.minShelfLifePercent,
+        CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MIN,
+        CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MAX,
+        'a whole percent',
+      );
+      if (link.role !== 'consignee') {
+        throw linkRoleInvalid(
+          `A shelf-life rule belongs on a consignee link — this is partner "${partner.code}"'s ${link.role} link. A vendor's goods are judged at receiving (the client's receiving policy).`,
+        );
+      }
+      if (minShelfLifeDays === link.minShelfLifeDays && minShelfLifePercent === link.minShelfLifePercent) {
+        // A declared no-op (`partners.linkShelfLife:unchanged`): nothing
+        // written or audited, the key stored — a late retry after another
+        // edit replays this answer rather than reverting it.
+        const unchanged = await this.snapshotInTx(tx, command.tenantId, partner);
+        await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, unchanged);
+        return unchanged;
+      }
+      await tx
+        .update(partnerClientLinks)
+        .set({ minShelfLifeDays, minShelfLifePercent, updatedAt: nowIso() })
+        .where(and(eq(partnerClientLinks.tenantId, command.tenantId), eq(partnerClientLinks.id, link.id)));
+      const snapshot = await this.snapshotInTx(tx, command.tenantId, partner);
+      await this.audit(tx, command.tenantId, command.actorUserId, 'partner.link_shelf_life_updated', 'partner_link', link.id, idempotencyKey, {
+        clientId: link.clientId,
+        partnerId: partner.id,
+        minShelfLifeDays: { before: link.minShelfLifeDays, after: minShelfLifeDays },
+        minShelfLifePercent: { before: link.minShelfLifePercent, after: minShelfLifePercent },
+      });
+      await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+      return snapshot;
+    });
+  }
+
   /** The partner row locked in `mode`, 404 when absent (a lock helper checks no state — 21-11a). */
   private async lockPartner(
     tx: TenantTx,
@@ -944,10 +1044,12 @@ export class PartnersCommand {
       | 'partner.linked'
       | 'partner.link_updated'
       | 'partner.link_deactivated'
-      | 'partner.link_reactivated',
+      | 'partner.link_reactivated'
+      | 'partner.link_shelf_life_updated',
     targetType: 'partner' | 'partner_link',
     targetId: string,
     reference: string,
+    changes?: Record<string, unknown>,
   ): Promise<void> {
     await tx.insert(auditEvents).values({
       id: uuidv7(),
@@ -957,6 +1059,7 @@ export class PartnersCommand {
       targetType,
       targetId,
       reference,
+      ...(changes === undefined ? {} : { changes }),
       occurredAt: nowIso(),
     });
   }
@@ -988,6 +1091,26 @@ export class PartnersCommand {
       throw err;
     }
   }
+}
+
+/**
+ * Story 4-3b — one minimum of a consignee link's shelf-life rule, re-checked
+ * behind the replay lookup: `null` (none), or a whole number in
+ * `[min, max]`. A missing key (`undefined`) is refused — the PUT is a full
+ * replace and `null` is the explicit "none".
+ */
+function assertShelfLifeValue(field: string, value: unknown, min: number, max: number, what: string): number | null {
+  if (value === null) return null;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) {
+    throw new ProblemException(
+      'validation-failed',
+      400,
+      'Invalid shelf-life rule',
+      `${field} must be null or ${what} from ${min} to ${max} (got ${value === undefined ? 'nothing' : JSON.stringify(value)}).`,
+      { field },
+    );
+  }
+  return value;
 }
 
 function assertLinkClientCode(clientCode: string | null): void {

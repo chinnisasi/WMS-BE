@@ -56,14 +56,19 @@ import { orderPriorityRankSql, orderUrgencyOrderBy, type OrderPriority } from '.
 import { isBatchExpiredAt } from '../../shared/primitives/batch-expiry';
 // Story 4-3a — THE allocation rule and THE allocatability predicate (A6).
 import {
+  consigneeArmOf,
   effectiveLineRule,
   isBatchAllocatableAt,
+  meetsConsigneeShelfLife,
   meetsMinimumShelfLife,
   minimumJudgementDate,
   rankSlots,
   type AllocationRule,
+  type FrozenConsigneeArm,
 } from '../../shared/primitives/batch-allocation';
 import { allocationPoliciesInTx, getClientLabelsInTx } from '../clients/clients.facade';
+// Story 4-3b (A10) — the consignee's display name, through the partners seam.
+import { partnerNamesInTx } from '../partners/partners.facade';
 
 /**
  * The fixed short-pick reason enum (story 4.4): required on EVERY short pick,
@@ -318,6 +323,14 @@ export interface PickTask {
   readonly batchReceivedOn: string | null;
   readonly allocationRule: AllocationRule | null;
   readonly minOutboundShelfLifeDays: number | null;
+  /**
+   * Story 4-3b — the consignee shelf-life rule the line was planned under
+   * (frozen): the consignee's display name and its effective minimum in IST
+   * days. Null when none. Display only (the hint's "· {consignee} needs ≥ N
+   * days") — the server judges the draw.
+   */
+  readonly consigneeName: string | null;
+  readonly consigneeMinShelfLifeDays: number | null;
 }
 
 /** The AD-14 taxonomy's two SUCCESS arms, plus "no conflict at all". */
@@ -1099,7 +1112,7 @@ export class PickCommandService {
         scaled.qty === 0
           ? { arms: [] as { batchId: string | null; qty: number }[] }
           : sku.batchTracked
-            ? await this.deriveBatchArms(tx, scaled, occurredAt, line, found.picklistCreatedAt)
+            ? await this.deriveBatchArms(tx, scaled, occurredAt, line, found.picklistCreatedAt, sku.batchTracked)
             : { arms: [{ batchId: null, qty: scaled.qty }] };
       if ('drawable' in batchDraw) {
         // Cases 3 vs today: a bin that cannot cover the draw is `409
@@ -1109,17 +1122,15 @@ export class PickCommandService {
         // did not (which is also every pre-upgrade device's behaviour).
         // Story 4-3a (A16) — the detail names the units the line's minimum
         // excluded and the client (the label read on the refusal path only).
+        // Story 4-3b (A10) — whenever EITHER arm excluded units, and it names
+        // the owner of the BINDING minimum (a tie goes to the consignee).
         throw binCannotCover(
           epochMoved,
           drawBin.code,
           batchDraw.drawable,
           scaled.qty,
-          batchDraw.shelfLifeExcluded > 0 && batchDraw.minDays !== null
-            ? {
-                excludedMilli: batchDraw.shelfLifeExcluded,
-                minDays: batchDraw.minDays,
-                clientLabel: await this.skuClientLabelInTx(tx, command.tenantId, command.skuId),
-              }
+          batchDraw.shelfLifeExcluded > 0
+            ? await this.shelfLifeShortfallInTx(tx, command, sku.code, batchDraw)
             : undefined,
         );
       }
@@ -1402,6 +1413,9 @@ export class PickCommandService {
             line.allocationRule === null
               ? await this.currentPolicyOfSkuInTx(tx, command.tenantId, command.skuId)
               : { allocationRule: effectiveLineRule(line.allocationRule), minDays: line.minOutboundShelfLifeDays };
+          // Story 4-3b — the new slices are planned with the short line's
+          // FROZEN consignee arm too (a pre-4-3b line stays null), copied
+          // onto them below.
           const candidates = await findReplanSlices(
             tx,
             { inventory: this.inventory, catalog: this.catalog },
@@ -1418,6 +1432,8 @@ export class PickCommandService {
                 istDateOf(canonicalInstant(found.picklistCreatedAt)),
                 istDateOf(occurredAt),
               ),
+              consignee: consigneeArmOf(line),
+              batchTracked: sku.batchTracked,
             },
           );
           replanned = await this.insertReplanSlices(tx, {
@@ -1721,6 +1737,13 @@ export class PickCommandService {
       status: 'planned',
       allocationRule: input.policy.allocationRule,
       minOutboundShelfLifeDays: input.policy.minDays,
+      // Story 4-3b — the short line's consignee columns, COPIED (a pre-4-3b
+      // line stays null); a re-planned stop is never a shortfall (A5: every
+      // row carries every key).
+      consigneePartnerId: line.consigneePartnerId,
+      consigneeMinShelfLifeDays: line.consigneeMinShelfLifeDays,
+      consigneeMinShelfLifePercent: line.consigneeMinShelfLifePercent,
+      shortfallCause: null,
     }));
     await tx.insert(picklistLines).values(rows);
     return rows.map((row) => ({
@@ -1757,9 +1780,15 @@ export class PickCommandService {
     occurredAt: string,
     line: PicklistLine,
     planCreatedAt: string,
+    batchTracked: boolean,
   ): Promise<
     | { arms: { batchId: string | null; qty: number }[] }
-    | { drawable: number; shelfLifeExcluded: number; minDays: number | null }
+    | {
+        drawable: number;
+        shelfLifeExcluded: number;
+        minDays: number | null;
+        consignee: FrozenConsigneeArm | null;
+      }
   > {
     const [batchStock, identities] = await Promise.all([
       // Bin-scoped in SQL: this runs inside the command transaction while
@@ -1782,9 +1811,23 @@ export class PickCommandService {
     const rule = effectiveLineRule(line.allocationRule);
     const minDays = line.allocationRule === null ? null : line.minOutboundShelfLifeDays;
     const minJudgedOn = minimumJudgementDate(istDateOf(canonicalInstant(planCreatedAt)), istDateOf(occurredAt));
+    // Story 4-3b — the line's FROZEN consignee arm (A3: read through the one
+    // helper; independent of `allocation_rule`, A4), judged on the same
+    // one-day-grace date as the client minimum; all must hold.
+    const consignee = consigneeArmOf(line);
+    const meetsConsignee = (batchId: string): boolean => {
+      const batch = byId.get(batchId);
+      return meetsConsigneeShelfLife(
+        { batchId, expiryDate: batch?.expiryDate ?? null },
+        batchTracked,
+        at,
+        consignee,
+        minJudgedOn,
+      );
+    };
     const allocatable = (batchId: string): boolean => {
       const batch = byId.get(batchId);
-      return batch !== undefined && isBatchAllocatableAt(batch, at, minDays, minJudgedOn);
+      return batch !== undefined && isBatchAllocatableAt(batch, at, minDays, minJudgedOn) && meetsConsignee(batchId);
     };
     const named =
       line.batchId === null
@@ -1812,16 +1855,49 @@ export class PickCommandService {
       // A shortfall is REPORTED, never thrown from here: story 4.3b's caller
       // decides between the re-plannable 409 and the unchanged 422 by whether
       // the bin's epoch moved, and that is not this helper's business.
-      // Story 4-3a (A16): the units the MINIMUM alone kept out (active, not
-      // expired, below the line's minimum), for the refusal's suffix.
+      // Story 4-3a (A16): the units the MINIMUMS alone kept out (active, not
+      // expired, below the line's client minimum — or, 4-3b, not meeting its
+      // consignee rule), for the refusal's suffix (A10: the combined test).
       const shelfLifeExcluded = batchStock.reduce((sum, row) => {
         const batch = byId.get(row.batchId);
         if (batch === undefined || batch.status !== 'active' || isBatchExpiredAt(batch.expiryDate, at)) return sum;
-        return meetsMinimumShelfLife(batch.expiryDate, at, minDays, minJudgedOn) ? sum : sum + row.quantity;
+        return meetsMinimumShelfLife(batch.expiryDate, at, minDays, minJudgedOn) && meetsConsignee(row.batchId)
+          ? sum
+          : sum + row.quantity;
       }, 0);
-      return { drawable: command.qty - need, shelfLifeExcluded, minDays };
+      return { drawable: command.qty - need, shelfLifeExcluded, minDays, consignee };
     }
     return { arms };
+  }
+
+  /**
+   * Story 4-3b (A10) — the refusal suffix's facts, read on the refusal path
+   * only: the owner of the BINDING minimum. The consignee's when its arm is
+   * unjudgeable, or its minimum is ≥ the client's (a tie goes to the
+   * consignee — the stricter promise is the buyer's); else the client's
+   * (4-3a's label). The consignee is named by its display name.
+   */
+  private async shelfLifeShortfallInTx(
+    tx: TenantTx,
+    command: RecordPickCommand,
+    skuCode: string,
+    draw: { readonly shelfLifeExcluded: number; readonly minDays: number | null; readonly consignee: FrozenConsigneeArm | null },
+  ): Promise<ShelfLifeShortfall | undefined> {
+    const { consignee, minDays } = draw;
+    if (consignee !== null && (!consignee.judgeable || consignee.days === null || minDays === null || consignee.days >= minDays)) {
+      const consigneeName =
+        (await partnerNamesInTx(tx, command.tenantId, [consignee.partnerId])).get(consignee.partnerId) ?? 'the consignee';
+      return !consignee.judgeable || consignee.days === null
+        ? { owner: 'consignee', excludedMilli: draw.shelfLifeExcluded, unjudgeable: true, consigneeName, skuCode }
+        : { owner: 'consignee', excludedMilli: draw.shelfLifeExcluded, unjudgeable: false, consigneeName, minDays: consignee.days };
+    }
+    if (minDays === null) return undefined;
+    return {
+      owner: 'client',
+      excludedMilli: draw.shelfLifeExcluded,
+      minDays,
+      clientLabel: await this.skuClientLabelInTx(tx, command.tenantId, command.skuId),
+    };
   }
 
   /** Story 4-3a — the label of a SKU's client, for the A16 refusal suffix (refusal path only). */
@@ -1971,6 +2047,8 @@ export class PickCommandService {
         walkSeq: picklistLines.walkSeq,
         allocationRule: picklistLines.allocationRule,
         minOutboundShelfLifeDays: picklistLines.minOutboundShelfLifeDays,
+        consigneePartnerId: picklistLines.consigneePartnerId,
+        consigneeMinShelfLifeDays: picklistLines.consigneeMinShelfLifeDays,
         kitParentSkuCode: parentSkus.code,
         orderPriority: taskOrders.priority,
         orderShipByDate: taskOrders.shipByDate,
@@ -2041,6 +2119,13 @@ export class PickCommandService {
       warehouseId,
       rows.map((row) => row.binId!),
     );
+    // Story 4-3b (A10) — the consignees' display names through the partners
+    // seam (never a join to `business_partners`), read once.
+    const consigneeNames = await partnerNamesInTx(
+      tx,
+      tenantId,
+      rows.flatMap((row) => (row.consigneePartnerId === null ? [] : [row.consigneePartnerId])),
+    );
     return rows.map((row) => {
       const batch = row.batchId === null ? undefined : batchCodes.get(row.batchId);
       return {
@@ -2066,6 +2151,9 @@ export class PickCommandService {
       batchReceivedOn: batch === undefined ? null : istDateOf(canonicalInstant(batch.createdAt)),
       allocationRule: (row.allocationRule as AllocationRule | null) ?? null,
       minOutboundShelfLifeDays: row.minOutboundShelfLifeDays,
+      // Story 4-3b — the frozen consignee rule (display).
+      consigneeName: row.consigneePartnerId === null ? null : (consigneeNames.get(row.consigneePartnerId) ?? null),
+      consigneeMinShelfLifeDays: row.consigneePartnerId === null ? null : row.consigneeMinShelfLifeDays,
       // Base units at the response edge (story 10.1).
       qty: fromMilli(row.qty),
       sliceSeq: row.sliceSeq,
@@ -2239,16 +2327,40 @@ export function insufficientOnHand(
  * remaining shelf life alone kept out of the draw, and whose minimum. The
  * refusal's code, status and routing are unchanged; only its detail grows.
  */
-export interface ShelfLifeShortfall {
-  /** Milli-units. */
-  readonly excludedMilli: number;
-  readonly minDays: number;
-  readonly clientLabel: string;
-}
+export type ShelfLifeShortfall =
+  | {
+      readonly owner: 'client';
+      /** Milli-units. */
+      readonly excludedMilli: number;
+      readonly minDays: number;
+      readonly clientLabel: string;
+    }
+  /** Story 4-3b (A10) — the consignee's minimum is the binding one. */
+  | {
+      readonly owner: 'consignee';
+      readonly excludedMilli: number;
+      readonly unjudgeable: false;
+      readonly minDays: number;
+      readonly consigneeName: string;
+    }
+  /** Story 4-3b (A10) — a percent rule over a SKU with no total shelf life. */
+  | {
+      readonly owner: 'consignee';
+      readonly excludedMilli: number;
+      readonly unjudgeable: true;
+      readonly consigneeName: string;
+      readonly skuCode: string;
+    };
 
 function shelfLifeSuffix(shelfLife: ShelfLifeShortfall | undefined): string {
   if (shelfLife === undefined || shelfLife.excludedMilli <= 0) return '';
-  return ` — ${fromMilli(shelfLife.excludedMilli)} more are below client ${shelfLife.clientLabel}'s minimum remaining shelf life of ${shelfLife.minDays} days`;
+  const units = fromMilli(shelfLife.excludedMilli);
+  if (shelfLife.owner === 'client') {
+    return ` — ${units} more are below client ${shelfLife.clientLabel}'s minimum remaining shelf life of ${shelfLife.minDays} days`;
+  }
+  return shelfLife.unjudgeable
+    ? ` — ${units} more cannot be shown to meet ${shelfLife.consigneeName}'s shelf-life rule (${shelfLife.skuCode} has no total shelf life)`
+    : ` — ${units} more are below consignee ${shelfLife.consigneeName}'s minimum remaining shelf life of ${shelfLife.minDays} days`;
 }
 
 /**

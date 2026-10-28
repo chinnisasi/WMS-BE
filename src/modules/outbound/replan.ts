@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
 import { bins, picklistLines } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { InventoryFacade } from '../inventory/inventory.facade';
@@ -10,8 +10,10 @@ import { storageClassSatisfies } from '../../shared/primitives/storage-class';
 // with the pick's batch re-derivation and the ATP hook (A6 pins the import).
 import {
   isBatchAllocatableAt,
+  meetsConsigneeShelfLife,
   rankSlots,
   type AllocationRule,
+  type ConsigneeArm,
 } from '../../shared/primitives/batch-allocation';
 
 /**
@@ -284,6 +286,13 @@ export async function findReplanSlices(
     readonly minDays: number | null;
     /** Story 4-3a (A3) — the IST date the minimum is judged on (the one-day grace). */
     readonly minJudgedOn: string;
+    /**
+     * Story 4-3b — the short line's FROZEN consignee arm (null = none, every
+     * pre-4-3b line) and whether the SKU is batch-tracked (an untracked SKU
+     * is never limited by it). Judged on the same `minJudgedOn`.
+     */
+    readonly consignee?: ConsigneeArm | null;
+    readonly batchTracked?: boolean;
   },
 ): Promise<ReplanSlice[]> {
   if (scope.need <= 0) {
@@ -337,11 +346,29 @@ export async function findReplanSlices(
     }
   }
 
+  // Story 4-3b (A12) — the consignee arm is applied AFTER the claim spend:
+  // the claims are spent against every slot in rank order (what a pick would
+  // draw), and only then is a non-qualifying slot skipped. Folding the arm
+  // into `policyOf` instead would spend claims against qualifying slots only.
+  const consignee = scope.consignee ?? null;
+  const batchById = new Map(batchIdentities.map((batch) => [batch.id, batch]));
   const slices: ReplanSlice[] = [];
   let need = scope.need;
   for (const slot of slots) {
     if (need === 0) break;
     if (slot.remaining <= 0) continue;
+    if (
+      consignee !== null &&
+      !meetsConsigneeShelfLife(
+        { batchId: slot.batchId, expiryDate: slot.batchId === null ? null : (batchById.get(slot.batchId)?.expiryDate ?? null) },
+        scope.batchTracked ?? true,
+        scope.at,
+        consignee,
+        scope.minJudgedOn,
+      )
+    ) {
+      continue;
+    }
     const take = Math.min(need, slot.remaining);
     need -= take;
     slices.push({ binId: slot.binId, binCode: slot.binCode, batchId: slot.batchId, qty: take, rankIndex: slices.length });
@@ -360,11 +387,13 @@ export async function findReplanSlices(
  * lines are terminal records of draws that already happened, `unfulfillable`
  * names no bin, and `cancelled` lines were withdrawn.
  */
-async function openClaimsInTx(
+export async function openClaimsInTx(
   tx: TenantTx,
   tenantId: string,
   skuId: string,
   binIds: readonly string[],
+  /** Story 4-3b (A8) — the order read leaves out its OWN order's claims. */
+  excludeOrderId?: string,
 ): Promise<Map<string, number>> {
   if (binIds.length === 0) {
     return new Map();
@@ -382,6 +411,7 @@ async function openClaimsInTx(
         eq(picklistLines.skuId, skuId),
         eq(picklistLines.status, 'planned'),
         inArray(picklistLines.binId, [...binIds]),
+        excludeOrderId === undefined ? undefined : ne(picklistLines.orderId, excludeOrderId),
       ),
     )
     .groupBy(picklistLines.binId);

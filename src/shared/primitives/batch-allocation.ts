@@ -158,3 +158,134 @@ export function rankSlots<T extends RankableSlot>(
 export function effectiveLineRule(rule: string | null): AllocationRule {
   return rule === 'fifo' ? 'fifo' : 'fefo';
 }
+
+// ── Story 4-3b — a consignee's own minimum remaining shelf life ───────────────
+
+/**
+ * Story 4-3b — the bounds of a consignee link's shelf-life rule, mirrored by
+ * migration 0111's `partner_client_links_min_shelf_life_days_range` /
+ * `…_percent_range` and the `picklist_lines_consignee_min_shelf_life_*`
+ * CHECKs, and by the PUT's DTO; pinned against the CHECKs by
+ * `test/consignee-shelf-life.spec.ts`.
+ */
+export const CONSIGNEE_MIN_SHELF_LIFE_DAYS_MIN = 1;
+export const CONSIGNEE_MIN_SHELF_LIFE_DAYS_MAX = 3650;
+export const CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MIN = 1;
+export const CONSIGNEE_MIN_SHELF_LIFE_PERCENT_MAX = 100;
+
+/**
+ * Story 4-3b (A6) — why the planner left part of a line `unfulfillable`,
+ * frozen on the line (`picklist_lines.shortfall_cause`, mirrored by
+ * `picklist_lines_shortfall_cause_check`, NOT VALID). Null = no stock at all
+ * (the pre-4-3b meaning).
+ *   - `consignee-shelf-life`: client-allocatable stock existed, but not
+ *     enough of it met the consignee's minimum;
+ *   - `consignee-unjudgeable`: a percent rule on a SKU with no total shelf
+ *     life — no dated batch can be shown to meet it.
+ */
+export const SHORTFALL_CAUSES = ['consignee-shelf-life', 'consignee-unjudgeable'] as const;
+export type ShortfallCause = (typeof SHORTFALL_CAUSES)[number];
+
+/** A consignee link's rule as stored: each minimum optional, every one set must hold. */
+export interface ConsigneeShelfLifeRule {
+  readonly minShelfLifeDays: number | null;
+  readonly minShelfLifePercent: number | null;
+}
+
+/**
+ * The consignee arm one order line is judged with:
+ *   - `days`: the consignee's EFFECTIVE minimum in IST days —
+ *     `max(minShelfLifeDays, ceil(percent × skuShelfLifeDays / 100))` over
+ *     whichever are set; null exactly when the line is unjudgeable;
+ *   - `judgeable`: false when a percent rule meets a SKU with no total shelf
+ *     life (decision 3) — then no dated batch qualifies (fail closed).
+ */
+export interface ConsigneeArm {
+  readonly days: number | null;
+  readonly judgeable: boolean;
+}
+
+/**
+ * Decision 3 — the consignee's effective minimum for one SKU. Percent is of
+ * the SKU's TOTAL shelf life (`skus.shelf_life_days`), converted at plan:
+ * `ceil(percent × shelfLifeDays / 100)` (33 % of 7 → 3; 1 % of 1 → 1).
+ * A percent rule over a SKU with no shelf life cannot be converted: the arm
+ * is unjudgeable (`days: null`), whatever the days rule says.
+ */
+export function consigneeMinimumDays(rule: ConsigneeShelfLifeRule, skuShelfLifeDays: number | null): ConsigneeArm {
+  if (rule.minShelfLifePercent !== null) {
+    if (skuShelfLifeDays === null) return { days: null, judgeable: false };
+    // Integer arithmetic: percent × days is exact, and the ceiling of an
+    // integer quotient needs no float.
+    const converted = Math.floor((rule.minShelfLifePercent * skuShelfLifeDays + 99) / 100);
+    return { days: Math.max(rule.minShelfLifeDays ?? 0, converted), judgeable: true };
+  }
+  return { days: rule.minShelfLifeDays, judgeable: true };
+}
+
+/** The unit of stock the consignee arm judges: a pool slot's or a bin row's batch. */
+export interface ConsigneeJudgedUnit {
+  /** Null = batch-less (unattributed) units. */
+  readonly batchId: string | null;
+  /** The batch's stored expiry instant; null = an undated batch (or no batch). */
+  readonly expiryDate: string | null;
+}
+
+/**
+ * Story 4-3b (decision 4, A1) — does one unit of stock meet the consignee's
+ * rule for a line? `consignee` null = no rule: always true. Otherwise:
+ *   - an UNTRACKED SKU (no lot identity, nothing to judge) is never limited;
+ *   - for a batch-tracked SKU, what cannot be proven is refused: batch-less
+ *     (unattributed) units, an undated batch, and — on an unjudgeable line —
+ *     any dated batch;
+ *   - a dated batch meets it when `meetsMinimumShelfLife` holds with the
+ *     arm's days on the same judgement date as the client minimum
+ *     (`minJudgedOn` — the pick's and the re-plan's one-day grace; absent →
+ *     `opAtMs`'s IST date, the wave plan).
+ * The client minimum (4-3a) keeps its own posture (dated only); this arm is
+ * judged IN ADDITION to `isBatchAllocatableAt` — all must hold.
+ */
+export function meetsConsigneeShelfLife(
+  unit: ConsigneeJudgedUnit,
+  batchTracked: boolean,
+  opAtMs: number,
+  consignee: ConsigneeArm | null,
+  minJudgedOn?: string,
+): boolean {
+  if (consignee === null || !batchTracked) return true;
+  if (unit.batchId === null || unit.expiryDate === null) return false;
+  if (!consignee.judgeable || consignee.days === null) return false;
+  return meetsMinimumShelfLife(unit.expiryDate, opAtMs, consignee.days, minJudgedOn);
+}
+
+/** The frozen consignee columns of a picklist line (`picklist_lines`, migration 0111). */
+export interface ConsigneeLineColumns {
+  readonly consigneePartnerId: string | null;
+  readonly consigneeMinShelfLifeDays: number | null;
+  readonly consigneeMinShelfLifePercent: number | null;
+}
+
+/** A line's frozen consignee arm, with the partner it was planned for. */
+export interface FrozenConsigneeArm extends ConsigneeArm {
+  readonly partnerId: string;
+  readonly percent: number | null;
+}
+
+/**
+ * Story 4-3b (A3) — THE reading of a picklist line's frozen consignee columns,
+ * used by the pick, the re-plan and the order read. Null when the line was
+ * planned with no consignee rule (every pre-4-3b line). A line is
+ * UNJUDGEABLE exactly when the partner and the percent are set and the days
+ * are null; otherwise a consignee line always carries its days. "Days null
+ * means no minimum" is never read off a consignee line.
+ */
+export function consigneeArmOf(line: ConsigneeLineColumns): FrozenConsigneeArm | null {
+  if (line.consigneePartnerId === null) return null;
+  const judgeable = !(line.consigneeMinShelfLifePercent !== null && line.consigneeMinShelfLifeDays === null);
+  return {
+    partnerId: line.consigneePartnerId,
+    days: judgeable ? line.consigneeMinShelfLifeDays : null,
+    percent: line.consigneeMinShelfLifePercent,
+    judgeable,
+  };
+}

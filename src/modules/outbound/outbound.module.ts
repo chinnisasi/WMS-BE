@@ -16,6 +16,7 @@ import { WAVE_CLOCK, SystemWaveClock } from './wave.clock';
 import { OutboundFacade } from './outbound.facade';
 import { OrderImportCommand } from './order-import.command';
 import { CancelRestockCommandService } from './cancel-restock.command';
+import { OrderShelfLifeReader } from './order-shelf-life';
 import { ValkeyModule } from '../../shared/valkey/valkey.module';
 
 /**
@@ -105,6 +106,8 @@ import { ValkeyModule } from '../../shared/valkey/valkey.module';
     RateService,
     OrderImportCommand,
     CancelRestockCommandService,
+    // Story 4-3b — the order's customer shelf life read.
+    OrderShelfLifeReader,
     // Story 4-2c — the backorder allocation (the verb, the sweep, the
     // after-dispatch attempt).
     AllocationCommandService,
