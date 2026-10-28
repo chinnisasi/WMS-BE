@@ -3024,6 +3024,126 @@ export const qcInspectionLines = pgTable(
 export type QcInspectionLine = typeof qcInspectionLines.$inferSelect;
 
 /**
+ * Story 2-8b — the return-to-vendor (RTV) document: units that sit in the
+ * warehouse's system DAMAGED bin (2-4a receipt damage, 2-8a QC fail) go back
+ * to the vendor under the brand's challan or invoice. One warehouse, one
+ * client (derived from the SKUs), one vendor; code `RTV-NNNN` per tenant.
+ *
+ * Lifecycle `draft` → `picked` (the handheld's scan-verified `rtv.pick`, no
+ * stock movement) → `dispatched` (the web; the ONE moment stock leaves,
+ * through `rtv.dispatched`), plus `draft | picked` → `cancelled`. No edit,
+ * no un-pick, no partial dispatch.
+ *
+ * Every party the dispatch note prints is FROZEN on the row: the vendor and
+ * the brand at create (`vendor_snapshot` — partners' `VendorSnapshotV1`;
+ * `client_snapshot` — clients' `ClientPartySnapshotV1`), the transporter
+ * (`transporter_snapshot`) and the warehouse (`warehouse_snapshot`) at
+ * dispatch. The status vocabulary, the pairing CHECKs and the capture
+ * formats live ONLY in the migration SQL (0105). No FK (guide §3).
+ */
+export const vendorReturns = pgTable(
+  'vendor_returns',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    vendorId: uuid('vendor_id').notNull(),
+    code: text('code').notNull(),
+    status: text('status').notNull().default('draft'),
+    /** Which frozen vendor address is the consignee: `dispatch` | `registered` (A7). */
+    consigneeAddressKind: text('consignee_address_kind').notNull(),
+    vendorSnapshot: jsonb('vendor_snapshot').notNull(),
+    clientSnapshot: jsonb('client_snapshot').notNull(),
+    note: text('note'),
+    createdBy: uuid('created_by').notNull(),
+    // ── the pick (the handheld) ──────────────────────────────────────────
+    pickedBy: uuid('picked_by'),
+    pickedAt: timestamp('picked_at', { withTimezone: true, mode: 'string' }),
+    pickedDeviceId: uuid('picked_device_id'),
+    // ── the dispatch (the web) ───────────────────────────────────────────
+    dispatchedBy: uuid('dispatched_by'),
+    dispatchedAt: timestamp('dispatched_at', { withTimezone: true, mode: 'string' }),
+    brandDocumentType: text('brand_document_type'),
+    brandDocumentNumber: text('brand_document_number'),
+    brandDocumentDate: date('brand_document_date', { mode: 'string' }),
+    /** The brand registration the challan names (A7); defaults to the frozen client GSTIN. */
+    consignorGstin: text('consignor_gstin'),
+    debitNoteNumber: text('debit_note_number'),
+    ewayBillNumber: text('eway_bill_number'),
+    ewayBillDate: date('eway_bill_date', { mode: 'string' }),
+    ewayValidUntil: date('eway_valid_until', { mode: 'string' }),
+    transporterId: uuid('transporter_id'),
+    transporterSnapshot: jsonb('transporter_snapshot'),
+    carrierName: text('carrier_name'),
+    trackingRef: text('tracking_ref'),
+    vehicleNumber: text('vehicle_number'),
+    packageCount: integer('package_count'),
+    warehouseSnapshot: jsonb('warehouse_snapshot'),
+    // ── the cancel ───────────────────────────────────────────────────────
+    cancelledBy: uuid('cancelled_by'),
+    cancelledAt: timestamp('cancelled_at', { withTimezone: true, mode: 'string' }),
+    cancelReason: text('cancel_reason'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('vendor_returns_tenant_code_unique').on(table.tenantId, table.code),
+    // The list's keyset, and its client filter (§7b, the 0081 model).
+    index('vendor_returns_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
+    index('vendor_returns_tenant_client_created_at_id_idx').on(table.tenantId, table.clientId, table.createdAt, table.id),
+    // The open claims on the DAMAGED pool and the device snapshot.
+    index('vendor_returns_tenant_warehouse_status_idx').on(table.tenantId, table.warehouseId, table.status),
+  ],
+);
+
+export type VendorReturn = typeof vendorReturns.$inferSelect;
+
+/**
+ * Story 2-8b — one line of an RTV: a DAMAGED arm `(sku, batch | null)`, the
+ * quantity (milli-units, > 0), the reason and, optionally, the GRN line the
+ * units came from (`grn_line_id` — the vendor's debit-note source). While
+ * the RTV is open its lines CLAIM the DAMAGED pool: a draft line its `qty`,
+ * a picked line its `picked_qty` (NULL until the pick; `0 ≤ picked ≤ qty`).
+ * `item_snapshot` freezes what the note prints (`{skuCode, name, hsn, uom,
+ * batchCode, batchExpiry}`). CHECKs only in the migration SQL (0105).
+ */
+export const vendorReturnLines = pgTable(
+  'vendor_return_lines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    vendorReturnId: uuid('vendor_return_id').notNull(),
+    lineNo: integer('line_no').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    batchId: uuid('batch_id'),
+    grnLineId: uuid('grn_line_id'),
+    /** Milli-units (story 10.1), > 0. */
+    qty: bigint('qty', { mode: 'number' }).notNull(),
+    /** Milli-units; NULL on a draft RTV's lines, set by the pick. */
+    pickedQty: bigint('picked_qty', { mode: 'number' }),
+    reasonCode: text('reason_code').notNull(),
+    itemSnapshot: jsonb('item_snapshot').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('vendor_return_lines_line_no_unique').on(table.vendorReturnId, table.lineNo),
+    unique('vendor_return_lines_arm_unique')
+      .on(table.vendorReturnId, table.skuId, table.batchId, table.grnLineId)
+      .nullsNotDistinct(),
+    // The source cap: every RTV line naming one GRN line.
+    index('vendor_return_lines_tenant_grn_line_idx')
+      .on(table.tenantId, table.grnLineId)
+      .where(sql`grn_line_id IS NOT NULL`),
+  ],
+);
+
+export type VendorReturnLine = typeof vendorReturnLines.$inferSelect;
+
+/**
  * Putaway placements (Story 3.5): one row per completed placement — the
  * decision record a device operator produced by moving received stock from
  * the system Receiving bin into a storage bin. Never a stock write (the

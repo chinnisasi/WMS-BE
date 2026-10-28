@@ -367,6 +367,14 @@ export const CAPABILITIES = [
   // vendor or client claim, so an operator cannot take it back. Mirrored
   // into wms-fe `src/lib/users.ts` (CAPABILITIES).
   'receipt.photo-remove',
+  // Story 2-8b — create and cancel a return to vendor (an RTV of DAMAGED
+  // stock: receipt damage and QC fails). Owner + Ops Manager: deciding what
+  // goes back to which vendor is a planner act, `returns.manage`'s rationale.
+  // The floor's pick needs `picks.execute` (the handheld) and the dispatch
+  // `dispatch.execute` (the order-dispatch precedent) — both held by the
+  // operator. Accountant absent (reads only), never a client. Mirrored into
+  // wms-fe `src/lib/users.ts` (CAPABILITIES — ops_manager is derived there).
+  'rtv.manage',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -461,6 +469,8 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     // Story 5-5a — the floor records the extra work it did (its charges pend
     // for a billing.invoice holder).
     'billing.charge',
+    // Story 2-8b — the return to vendor (owner holds everything).
+    'rtv.manage',
   ]),
   operator: new Set<Capability>([
     'putaway.execute',

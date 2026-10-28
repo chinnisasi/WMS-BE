@@ -655,6 +655,8 @@ describe('story 21-4: metering and storage snapshots', () => {
         'return.scrapped': ['from'],
         // Story 4-2b — a cancelled order's restock: a pure intake into the destination (on-hand rises).
         'pick.restocked': ['to'],
+        // Story 2-8b — a return to vendor: a draw out of DAMAGED (on-hand drops; storage stops).
+        'rtv.dispatched': ['from'],
       };
 
       it('every registered type is classified, and each arm folds as the replay rule says', async () => {

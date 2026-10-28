@@ -2033,6 +2033,86 @@ export class InventoryFacade {
   }
 
   /**
+   * Story 2-8b (A4) — the DAMAGED ARMS of one bin (the system DAMAGED bin):
+   * per `(skuId, batchId | null)` the positive on-hand, milli-units, in the
+   * caller's transaction, optionally for a set of SKUs. A batch-tracked SKU
+   * answers its BATCH rows only — never a batch-less remainder (every unit
+   * `grn.damaged` / `qc.failed` books carries its batch; a legacy batch-less
+   * remainder leaves by write-off, PENDING); an untracked SKU answers its
+   * `stock_on_hand` row. One statement per projection, ordered for a
+   * deterministic read.
+   */
+  async damagedArmsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    binId: string,
+    filter: { readonly skuIds?: readonly string[] | null; readonly clientId?: string | null },
+  ): Promise<readonly DamagedArm[]> {
+    const skuIds = filter.skuIds ?? null;
+    const clientId = filter.clientId ?? null;
+    if (skuIds !== null && skuIds.length === 0) return [];
+    const skuFilterBatch = skuIds === null ? sql`` : sql`and bo.sku_id = any(${sql.param([...new Set(skuIds)])}::uuid[])`;
+    const skuFilterStock = skuIds === null ? sql`` : sql`and so.sku_id = any(${sql.param([...new Set(skuIds)])}::uuid[])`;
+    const clientFilter = clientId === null ? sql`` : sql`and s.client_id = ${clientId}::uuid`;
+    const batchRows = (await tx.execute(sql`
+      select bo.sku_id::text as "skuId", bo.batch_id::text as "batchId", bo.quantity::text as "quantity"
+      from batch_on_hand bo
+      join skus s on s.tenant_id = bo.tenant_id and s.id = bo.sku_id
+      where bo.tenant_id = ${tenantId}::uuid and bo.warehouse_id = ${warehouseId}::uuid and bo.bin_id = ${binId}::uuid
+        and bo.quantity > 0 and s.batch_tracked
+        ${skuFilterBatch} ${clientFilter}
+      order by bo.sku_id, bo.batch_id
+    `)) as unknown as { skuId: string; batchId: string; quantity: string }[];
+    const stockRows = (await tx.execute(sql`
+      select so.sku_id::text as "skuId", so.quantity::text as "quantity"
+      from stock_on_hand so
+      join skus s on s.tenant_id = so.tenant_id and s.id = so.sku_id
+      where so.tenant_id = ${tenantId}::uuid and so.warehouse_id = ${warehouseId}::uuid and so.bin_id = ${binId}::uuid
+        and so.quantity > 0 and not s.batch_tracked
+        ${skuFilterStock} ${clientFilter}
+      order by so.sku_id
+    `)) as unknown as { skuId: string; quantity: string }[];
+    return [
+      ...batchRows.map((row) => ({ skuId: row.skuId, batchId: row.batchId, quantity: Number(row.quantity) })),
+      ...stockRows.map((row) => ({ skuId: row.skuId, batchId: null, quantity: Number(row.quantity) })),
+    ];
+  }
+
+  /**
+   * Story 2-8b — where a DAMAGED arm's units came from, as the ledger records
+   * it: the GRN lines whose `grn.damaged` intake or receipt-hold `qc.failed`
+   * relocation landed units of these SKUs in this DAMAGED bin (only those
+   * events carry `grnLineId`; a manual or return hold's failed units, and an
+   * ASN-less legacy event, carry none). Distinct per (GRN line, sku, batch),
+   * newest first — the return-to-vendor's source candidates. Rides the
+   * `(tenant, warehouse, sku, seq)` index; the quantities are inbound's
+   * (`damaged_qty` + the inspected receipt holds' failed rows), never summed
+   * here.
+   */
+  async damagedIntakeGrnLinesInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    binId: string,
+    skuIds: readonly string[],
+  ): Promise<readonly { grnLineId: string; skuId: string; batchId: string | null; lastAt: string }[]> {
+    if (skuIds.length === 0) return [];
+    const rows = (await tx.execute(sql`
+      select le.reference_doc ->> 'grnLineId' as "grnLineId", le.sku_id::text as "skuId", le.batch_ref as "batchId",
+             to_char(max(le.recorded_at) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "lastAt"
+      from ledger_events le
+      where le.tenant_id = ${tenantId}::uuid and le.warehouse_id = ${warehouseId}::uuid
+        and le.sku_id = any(${sql.param([...new Set(skuIds)])}::uuid[])
+        and le.type in ('grn.damaged', 'qc.failed') and le.to_bin_id = ${binId}::uuid
+        and le.reference_doc ? 'grnLineId'
+      group by 1, 2, 3
+      order by max(le.recorded_at) desc, 1
+    `)) as unknown as { grnLineId: string; skuId: string; batchId: string | null; lastAt: string }[];
+    return rows.filter((row) => UUID_RE.test(row.grnLineId));
+  }
+
+  /**
    * Story 6.2 — the expiry scan's enumeration read: per (sku, batch) SUMMED
    * on-hand for ONE warehouse, positive rows only, in the CALLER's
    * transaction (the `batchOnHandByBinsInTx` seam-fix shape — the projection
@@ -2932,6 +3012,13 @@ function binItemOversizeFacade(
 }
 
 interface QcScopeBatch {
+  readonly batchId: string | null;
+  readonly quantity: number;
+}
+
+/** Story 2-8b — one DAMAGED arm's on-hand (milli-units). */
+export interface DamagedArm {
+  readonly skuId: string;
   readonly batchId: string | null;
   readonly quantity: number;
 }

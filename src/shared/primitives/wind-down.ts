@@ -18,6 +18,9 @@ export const WIND_DOWN_BLOCKER_KINDS = [
   'pending-over-receipts',
   'open-orders',
   'open-rmas',
+  // Story 2-8b — open returns to vendor (draft or picked): the units are
+  // claimed for a shipment the departure would orphan.
+  'open-vendor-returns',
   // Story 3-7a (A16) — open LIVE recalls of its goods (a mock never blocks).
   'open-recalls',
   'pending-adjustments',

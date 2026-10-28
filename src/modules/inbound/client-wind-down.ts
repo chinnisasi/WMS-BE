@@ -14,10 +14,14 @@ import { windDownBlockerInTx, type WindDownBlocker } from '../../shared/primitiv
  * - `open-asns` — ASNs `announced` or `partially_received` (`OPEN_ASN_STATUSES`);
  * - `pending-over-receipts` — over-receipts awaiting a decision, on ANY
  *   document, for one of its SKUs (`codes` = the GRN codes).
+ * - `open-vendor-returns` — story 2-8b: returns to vendor still `draft` or
+ *   `picked` (`codes` = the RTV codes); pinned against
+ *   `VENDOR_RETURN_STATUSES` by test/client-master.spec.ts.
  */
 export const PO_OPEN_STATUSES = ['open'] as const;
 export const ASN_OPEN_STATUSES = ['announced', 'partially_received'] as const;
 export const OVER_RECEIPT_PENDING_STATUSES = ['pending'] as const;
+export const VENDOR_RETURN_OPEN_STATUSES = ['draft', 'picked'] as const;
 
 export async function clientWindDownBlockersInTx(
   tx: TenantTx,
@@ -52,5 +56,13 @@ export async function clientWindDownBlockersInTx(
           and o.status in ${[...OVER_RECEIPT_PENDING_STATUSES]}`,
     true,
   );
-  return [...pos, ...asns, ...overReceipts];
+  const vendorReturns = await windDownBlockerInTx(
+    tx,
+    'open-vendor-returns',
+    sql`select count(*)::bigint as n, (array_agg(code order by code))[1:5] as codes
+        from vendor_returns
+        where tenant_id = ${tenantId} and client_id = ${clientId} and status in ${[...VENDOR_RETURN_OPEN_STATUSES]}`,
+    true,
+  );
+  return [...pos, ...asns, ...overReceipts, ...vendorReturns];
 }

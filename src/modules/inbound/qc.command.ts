@@ -616,7 +616,7 @@ export class QcCommand {
     // path to a sellable bin.
     if (originBin.systemOwned && originBin.code === DAMAGED_BIN_CODE) {
       throw qcValidation(
-        'The system DAMAGED bin cannot be a hold origin — its contents are units received damaged, which leave only by a write-off.',
+        'The system DAMAGED bin cannot be a hold origin — its contents are units received damaged or failed at QC, which leave by a write-off or a return to vendor.',
       );
     }
     // ── story 12-3: the secure-bin authority gate (FR-42) — on the locked

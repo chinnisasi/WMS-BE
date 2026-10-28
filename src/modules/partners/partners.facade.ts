@@ -210,6 +210,9 @@ export async function assertVendorLinkedInTx(
   tenantId: string,
   vendorId: string,
   clientId: string,
+  // Story 2-8b (A14) — what the refusal names ("a new return to vendor");
+  // the codes are unchanged and the PO wording is the default.
+  subject: string = 'a new purchase order',
 ): Promise<VendorSnapshotV1> {
   const partnerRows = UUID_RE.test(vendorId)
     ? await tx
@@ -236,7 +239,7 @@ export async function assertVendorLinkedInTx(
       'vendor-inactive',
       409,
       'Vendor is inactive',
-      `Vendor "${partner.code}" is inactive — it cannot go on a new purchase order. Reactivate it in Settings → Partners, or choose another vendor.`,
+      `Vendor "${partner.code}" is inactive — it cannot go on ${subject}. Reactivate it in Settings → Partners, or choose another vendor.`,
     );
   }
   const linkRows = await tx
@@ -290,6 +293,8 @@ export async function assertTransporterInTx(
   tx: TenantTx,
   tenantId: string,
   partnerId: string,
+  // Story 2-8b (A14) — what the refusal names; the gate-in wording is the default.
+  subject: string = 'a new gate-in',
 ): Promise<TransporterSnapshotV1> {
   const partnerRows = UUID_RE.test(partnerId)
     ? await tx
@@ -316,7 +321,7 @@ export async function assertTransporterInTx(
       'transporter-inactive',
       409,
       'Transporter is inactive',
-      `Transporter "${partner.code}" is inactive — it cannot go on a new gate-in. Reactivate it in Settings → Partners, choose another transporter, or type the name.`,
+      `Transporter "${partner.code}" is inactive — it cannot go on ${subject}. Reactivate it in Settings → Partners, choose another transporter, or type the name.`,
     );
   }
   return vendorSnapshotOf(partner);

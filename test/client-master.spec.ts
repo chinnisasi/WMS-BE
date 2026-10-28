@@ -19,7 +19,8 @@ import { PO_STATUSES } from '../src/modules/inbound/po.command';
 import { RECEIVABLE_RMA_STATUSES } from '../src/modules/returns/return-receipt.command';
 import { CLIENT_INVOICE_STATUSES } from '../src/modules/billing/client-invoices';
 import { ORDER_OPEN_STATUSES } from '../src/modules/outbound/client-wind-down';
-import { ASN_OPEN_STATUSES, OVER_RECEIPT_PENDING_STATUSES, PO_OPEN_STATUSES } from '../src/modules/inbound/client-wind-down';
+import { ASN_OPEN_STATUSES, OVER_RECEIPT_PENDING_STATUSES, PO_OPEN_STATUSES, VENDOR_RETURN_OPEN_STATUSES } from '../src/modules/inbound/client-wind-down';
+import { VENDOR_RETURN_STATUSES } from '../src/modules/inbound/vendor-return.command';
 import { RMA_OPEN_STATUSES } from '../src/modules/returns/client-wind-down';
 import { CLIENT_INVOICE_UNSETTLED_STATUSES } from '../src/modules/billing/client-wind-down';
 import { REJECTED_OP_OPEN_STATUSES, SKU_NAMING_OP_TYPES } from '../src/modules/tenancy/client-wind-down';
@@ -397,6 +398,9 @@ describe('story 1-2a: the client master record', () => {
       expect(COUNT_VARIANCE_OPEN_STATUSES.every((status) => (COUNT_VARIANCE_STATUSES as readonly string[]).includes(status))).toBe(true);
       expect(REJECTED_OP_OPEN_STATUSES.every((status) => (REJECTED_OP_STATUSES as readonly string[]).includes(status))).toBe(true);
       expect(OVER_RECEIPT_PENDING_STATUSES).toEqual(['pending']);
+      // Story 2-8b — the open RTVs are the claiming statuses of the vocabulary.
+      expect([...VENDOR_RETURN_OPEN_STATUSES]).toEqual(['draft', 'picked']);
+      expect(VENDOR_RETURN_OPEN_STATUSES.every((status) => (VENDOR_RETURN_STATUSES as readonly string[]).includes(status))).toBe(true);
       // Decision 8 — an issued invoice not yet settled also blocks departure.
       expect([...CLIENT_INVOICE_UNSETTLED_STATUSES]).toEqual(['draft', 'issued', 'disputed']);
       // The review-item read covers every SKU-naming op type the queue holds.
@@ -413,6 +417,9 @@ describe('story 1-2a: the client master record', () => {
         // Story 2-5a — a refused damage photo names no SKU (its payload is the
         // photo's ref and the receipt op it belongs to).
         'receipt-photo.stage',
+        // Story 2-8b — a refused RTV pick names lines, not SKUs (its payload
+        // is the RTV and its line ids); the RTV is its own blocker.
+        'rtv.pick',
         'transfer.confirm',
       ]);
     });
@@ -774,6 +781,10 @@ describe('story 1-2a: the client master record', () => {
         values (${uuidv7()}, ${tenantId}, ${windId}, 'RCL-900001', 'live', 'open', 'probe recall', now(), ${ownerUserId}),
                (${uuidv7()}, ${tenantId}, ${windId}, 'RCL-900002', 'mock', 'open', 'probe drill', now(), ${ownerUserId})`;
 
+      // Story 2-8b — an open (draft) return to vendor of its goods.
+      await sql`insert into vendor_returns (id, tenant_id, warehouse_id, client_id, vendor_id, code, status, consignee_address_kind, vendor_snapshot, client_snapshot, created_by)
+        values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${windId}, ${uuidv7()}, 'RTV-9001', 'draft', 'registered', ${sql.json({})}, ${sql.json({})}, ${ownerUserId})`;
+
       const res = await setStatus(windId, 'departed');
       expectProblem(res, 409, 'client-not-wound-down');
       const blockers = res.body.blockers as { kind: string; count: number; codes?: string[] }[];
@@ -781,6 +792,7 @@ describe('story 1-2a: the client master record', () => {
       expect(blockers.find((b) => b.kind === 'open-purchase-orders')).toEqual({ kind: 'open-purchase-orders', count: 1, codes: ['PO-WIND-1'] });
       expect(blockers.find((b) => b.kind === 'open-asns')).toEqual({ kind: 'open-asns', count: 1, codes: ['ASN-WIND-1'] });
       expect(blockers.find((b) => b.kind === 'open-rmas')).toEqual({ kind: 'open-rmas', count: 1, codes: ['RMA-WIND-1'] });
+      expect(blockers.find((b) => b.kind === 'open-vendor-returns')).toEqual({ kind: 'open-vendor-returns', count: 1, codes: ['RTV-9001'] });
       expect(blockers.find((b) => b.kind === 'open-recalls')).toEqual({ kind: 'open-recalls', count: 1, codes: ['RCL-900001'] });
       expect(blockers.find((b) => b.kind === 'unsettled-invoices')).toEqual({ kind: 'unsettled-invoices', count: 1, codes: ['2026-09'] });
       expect(blockers.find((b) => b.kind === 'open-counts')).toEqual({ kind: 'open-counts', count: 1 });

@@ -286,7 +286,7 @@ export class RecallsController {
   @ApiBearerAuth()
   @ApiOperation({
     summary:
-      'Story 3-7a — the client recall report as a FILE: one table with a `section` column (meta, figure_live, figure_at_close, on_hand, in_transit, held_in_open_order, planned_pick_in_recalled_bin — staff only —, dispatched, received, received_damaged, returned, return_scrapped, adjusted_out, end). CSV streams every row and ends in a `section=end` row carrying the count (a file without it was cut short); XLSX is built whole (a "Recall" facts sheet and a "Trace" sheet), at most 200,000 rows. Every download is audited',
+      'Story 3-7a — the client recall report as a FILE: one table with a `section` column (meta, figure_live, figure_at_close, on_hand, in_transit, held_in_open_order, planned_pick_in_recalled_bin — staff only —, dispatched, received, received_damaged, returned, return_scrapped, returned_to_vendor — story 2-8b, adjusted_out, end). CSV streams every row and ends in a `section=end` row carrying the count (a file without it was cut short); XLSX is built whole (a "Recall" facts sheet and a "Trace" sheet), at most 200,000 rows. Every download is audited',
   })
   @ApiProduces('text/csv', XLSX_CONTENT_TYPE)
   @ApiOkResponse({ description: 'The file', content: { 'text/csv': { schema: { type: 'string', format: 'binary' } }, [XLSX_CONTENT_TYPE]: { schema: { type: 'string', format: 'binary' } } } })

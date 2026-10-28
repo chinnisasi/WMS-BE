@@ -522,7 +522,7 @@ export class LedgerReferenceDocDto {
     required: false,
     format: 'uuid',
     description:
-      "The GRN line the movement belongs to: on a `putaway.placed` event the line whose received stock moved; (story 2-4a) on a `grn.damaged` event the line whose damaged units were booked into DAMAGED; (story 2-8a) on a `qc.failed` event of a receipt hold the line whose failed units moved to DAMAGED (they stay credited on the line). Absent on every `grn.received` event",
+      "The GRN line the movement belongs to: on a `putaway.placed` event the line whose received stock moved; (story 2-4a) on a `grn.damaged` event the line whose damaged units were booked into DAMAGED; (story 2-8a) on a `qc.failed` event of a receipt hold the line whose failed units moved to DAMAGED (they stay credited on the line); (story 2-8b) on an `rtv.dispatched` event the GRN line the returned units came from, when the return-to-vendor line names one. Absent on every `grn.received` event",
   })
   grnLineId?: string;
 
@@ -564,6 +564,14 @@ export class LedgerReferenceDocDto {
 
   @ApiProperty({ required: false, format: 'uuid', description: 'Story 13-2 — the authorization line credited (return-receipt arm only)' })
   rmaLineId?: string;
+
+  // ── Story 2-8b: the vendor-return arm (additive) ──────────────────────────
+
+  @ApiProperty({ required: false, format: 'uuid', description: 'Story 2-8b — the return-to-vendor document the units left under (vendor-return arm: rtv.dispatched)' })
+  vendorReturnId?: string;
+
+  @ApiProperty({ required: false, format: 'uuid', description: 'Story 2-8b — the return-to-vendor line dispatched (vendor-return arm only)' })
+  vendorReturnLineId?: string;
 }
 
 /** One event-timeline row. */

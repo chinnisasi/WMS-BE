@@ -431,6 +431,25 @@ export async function ensureDamagedBinInTx(
 }
 
 /**
+ * Story 2-8b (A13) — the warehouse's system DAMAGED bin, READ ONLY: its id,
+ * or null when the warehouse never booked damage (nothing to claim). Never
+ * ensures — a read-path or a create that only checks the pool must not write
+ * a bin. Matched on code + system-owned (the ATP hook's identity).
+ */
+export async function findDamagedBinInTx(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+): Promise<{ binId: string } | null> {
+  const rows = await tx
+    .select({ id: bins.id })
+    .from(bins)
+    .where(and(eq(bins.tenantId, tenantId), eq(bins.warehouseId, warehouseId), eq(bins.code, DAMAGED_BIN_CODE), eq(bins.systemOwned, true)))
+    .limit(1);
+  return rows[0] === undefined ? null : { binId: rows[0].id };
+}
+
+/**
  * The shared body of the reserved system-bin ensures (RETURNS, DAMAGED) —
  * extracted unchanged from story 13-2's `ensureReturnsBinInTx`. Zones carry
  * no system flag, so the system zone is recognised by what the ensure itself

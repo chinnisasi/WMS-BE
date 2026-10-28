@@ -27,6 +27,7 @@ import { OutboundFacade } from '../modules/outbound/outbound.facade';
 import { QcFacade } from '../modules/inbound/qc.facade';
 import { MovementsFacade } from '../modules/movements/transfer.facade';
 import { ClientsFacade } from '../modules/clients/clients.facade';
+import { VendorReturnFacade } from '../modules/inbound/vendor-return.facade';
 import { ReturnsFacade } from '../modules/returns/returns.facade';
 import { InventoryFacade } from '../modules/inventory/inventory.facade';
 // Constructor params are types here but must stay value imports: Nest
@@ -103,6 +104,8 @@ export class ReceivingController {
     // Story 13-2: the snapshot's `openReturns` arm — the same composition
     // (the returns module is imported only by the api shell).
     @Inject(ReturnsFacade) private readonly returns: ReturnsFacade,
+    // Story 2-8b — the snapshot's draft returns to vendor.
+    @Inject(VendorReturnFacade) private readonly vendorReturns: VendorReturnFacade,
     // Story 1-1: the snapshot's `clients` arm — read through the clients
     // facade (inbound does not own the table), composed here like the others.
     @Inject(ClientsFacade) private readonly clients: ClientsFacade,
@@ -275,6 +278,9 @@ export class ReceivingController {
     // partially received RMAs. A plain facade call in its own transaction,
     // composed beside the task lists (never nested).
     const openReturns = await this.returns.getOpenReturns(tenantId, query.warehouseId);
+    // Story 2-8b: the Returns out arm — the warehouse's draft returns to
+    // vendor. Same sequential composition (never nested).
+    const openVendorReturns = await this.vendorReturns.openVendorReturns(tenantId, query.warehouseId);
     // Story 1-1: every client a SKU or an open document references — the
     // names the device shows when a scan is another client's, and the blind
     // receipt's picker. Same sequential composition.
@@ -283,6 +289,7 @@ export class ReceivingController {
       ...snapshot.openPurchaseOrders.map((po) => po.clientId),
       ...snapshot.openAsns.map((asn) => asn.clientId),
       ...openReturns.map((rma) => rma.clientId),
+      ...openVendorReturns.map((rtv) => rtv.clientId),
       // Story 1-5b: every bin's dedicated client, so the device can name the
       // client a dedicated bin belongs to when it refuses a scan against it.
       ...snapshot.bins.map((bin) => bin.dedicatedClientId).filter((id): id is string => id !== null),
@@ -310,6 +317,8 @@ export class ReceivingController {
         ...rma,
         lines: rma.lines.map((line) => ({ ...line, batchCodes: [...line.batchCodes], serials: line.serials.map((serial) => ({ ...serial })) })),
       })),
+      // Story 2-8b — copied key by key (a mutable DTO array).
+      openVendorReturns: openVendorReturns.map((rtv) => ({ ...rtv, lines: rtv.lines.map((line) => ({ ...line })) })),
       clients,
       // Story 2-3a — the open gate-ins, copied key by key (a mutable DTO array).
       openGateIns: snapshot.openGateIns.map((gateIn) => ({ ...gateIn, documents: gateIn.documents.map((doc) => ({ ...doc })) })),
