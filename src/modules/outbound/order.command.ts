@@ -472,6 +472,27 @@ export class OrderCommandService {
    * `test/issuance-gate-parity.spec.ts`).
    */
   async createOrder(command: CreateOrderCommand, idempotencyKey: string): Promise<OrderSnapshot> {
+    const plan = this.staffOrderPlan(command);
+    return this.placeOrder(plan.command, idempotencyKey, plan.hashes, plan.surface);
+  }
+
+  /**
+   * Story 4-1c — the order import's Check file: `createOrder`'s phase 1 —
+   * every rule up to the grants (authority, the address, the GSTIN, the
+   * client order number, the 4-2a fields, the SKUs, the client, the
+   * licences) — with NO key: nothing is replayed and nothing is written.
+   * It reserves nothing, so it cannot promise stock.
+   */
+  async checkOrder(command: CreateOrderCommand): Promise<OrderCheck> {
+    return this.checkPlan(this.staffOrderPlan(command));
+  }
+
+  /**
+   * Story 4-1c — the staff surface and the hash stage `createOrder` builds
+   * (extracted unchanged, so `createOrder` and `checkOrder` run one plan).
+   * The cheap request-shape refusals run here, above any transaction.
+   */
+  private staffOrderPlan(command: CreateOrderCommand): OrderPlan<OrderSnapshot> {
     // Story 1-6d (D18) — ONE IST date for the licence check, captured here and
     // used by both phases, so an order straddling IST midnight is judged once.
     const licenceDate = licenceToday();
@@ -639,10 +660,9 @@ export class OrderCommandService {
       respond: async (_tx, snapshot) => snapshot,
     };
 
-    return this.placeOrder(
+    return {
       command,
-      idempotencyKey,
-      {
+      hashes: {
         integrationId,
         externalEventId,
         consigneeGstin,
@@ -653,8 +673,8 @@ export class OrderCommandService {
         sourcePayloadHash,
         payloadHash,
       },
-      staff,
-    );
+      surface: staff,
+    };
   }
 
   /**
@@ -704,6 +724,27 @@ export class OrderCommandService {
    *   answers 409 `conflict` (the key's unique index, as on every command).
    */
   async placePortalOrder(command: PlacePortalOrderCommand, idempotencyKey: string): Promise<PortalPlacedOrder> {
+    const plan = this.portalOrderPlan(command);
+    return this.placeOrder(plan.command, idempotencyKey, plan.hashes, plan.surface);
+  }
+
+  /**
+   * Story 4-1c — the portal order import's Check file: `placePortalOrder`'s
+   * phase 1 (the gate, every rule up to the grants, and the portal's licence
+   * judgement through its unstamped seam) with NO key — nothing replayed,
+   * nothing written, nothing reserved (a shortage is found only at Import).
+   */
+  async checkPortalOrder(command: PlacePortalOrderCommand): Promise<OrderCheck> {
+    return this.checkPlan(this.portalOrderPlan(command));
+  }
+
+  /**
+   * Story 4-1c — the portal surface and the hash stage `placePortalOrder`
+   * builds (extracted unchanged). The surface's transaction opener is THE
+   * client stamp of the portal order: every transaction the pipeline opens
+   * for it goes through `{ clientId: command.clientId }`.
+   */
+  private portalOrderPlan(command: PlacePortalOrderCommand): OrderPlan<PortalPlacedOrder> {
     const licenceDate = licenceToday();
     const lines = command.lines.map(({ skuId, quantity }) => ({ skuId, quantity }));
     const normalizedDestination = normalizeAddressInput(command.destination);
@@ -731,32 +772,10 @@ export class OrderCommandService {
       lines,
     });
 
-    const gate = async (tx: TenantTx): Promise<void> => {
-      assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'orders.place');
-      const actor = await getMemberPortalFactsIn(tx, command.tenantId, command.actorUserId);
-      if (actor === null || actor.status !== 'active') {
-        throw new ProblemException(
-          'unauthenticated',
-          401,
-          'Authentication required',
-          'The session no longer describes an active client-portal user — sign in again.',
-        );
-      }
-      if (actor.clientId !== command.clientId) {
-        throw new ProblemException(
-          'role-denied',
-          403,
-          'Role lacks the required capability',
-          'Only a client-portal user of this client may place its orders.',
-        );
-      }
-      // FOR SHARE (21-10): a suspend committing mid-phase either waits for
-      // this transaction or is re-read here once it commits.
-      const client = await shareLockClientInTx(tx, command.tenantId, command.clientId);
-      if (client.status !== 'active') {
-        throw clientInactive(client.status);
-      }
-    };
+    // Story 4-1c (A9) — the portal gate is one exported function, shared with
+    // the portal order import's own transactions.
+    const gate = (tx: TenantTx): Promise<void> =>
+      assertPortalOrderGateInTx(tx, { tenantId: command.tenantId, clientId: command.clientId, actorUserId: command.actorUserId });
 
     const lineSkuCount = new Set(lines.map((line) => line.skuId)).size;
     const portal: OrderSurface<PortalPlacedOrder> = {
@@ -808,8 +827,8 @@ export class OrderCommandService {
       }),
     };
 
-    return this.placeOrder(
-      {
+    return {
+      command: {
         tenantId: command.tenantId,
         actorUserId: command.actorUserId,
         warehouseId: command.warehouseId,
@@ -821,8 +840,7 @@ export class OrderCommandService {
         ...(command.clientOrderRef === undefined ? {} : { clientOrderRef: command.clientOrderRef }),
         backorderPolicy: 'reject',
       },
-      idempotencyKey,
-      {
+      hashes: {
         integrationId: null,
         externalEventId: null,
         consigneeGstin,
@@ -833,8 +851,21 @@ export class OrderCommandService {
         sourcePayloadHash: null,
         payloadHash,
       },
-      portal,
-    );
+      surface: portal,
+    };
+  }
+
+  /**
+   * Story 4-1c — a Check file over a plan: phase 1 with no key (no replay,
+   * nothing written). The client the order derives and its top-level line
+   * count, or the refusal phase 1 throws.
+   */
+  private async checkPlan<R>(plan: OrderPlan<R>): Promise<OrderCheck> {
+    const preflight = await this.preflightPhase(plan.command, null, plan.hashes, plan.surface);
+    if (preflight.replayed) {
+      throw new Error('checkOrder: a keyless preflight cannot replay');
+    }
+    return { clientId: preflight.clientId, lineCount: plan.command.lines.length };
   }
 
   /**
@@ -987,18 +1018,26 @@ export class OrderCommandService {
    */
   private async preflightPhase<R>(
     command: CreateOrderCommand,
-    idempotencyKey: string,
+    idempotencyKey: string | null,
     hashes: OrderHashStage,
     surface: OrderSurface<R>,
   ): Promise<Preflight<R>> {
     const { integrationId, externalEventId, consigneeGstin, consigneeLegalName, clientOrderRef, sourcePayloadHash, payloadHash } = hashes;
+    // Story 4-1c — a keyless preflight (the import's Check file) replays
+    // nothing and must write nothing: only a manual order, whose phase 1
+    // never reaches the channel-dedup branch (the one phase-1 write).
+    if (idempotencyKey === null && command.source !== 'manual') {
+      throw new Error('preflightPhase: a keyless check is for a manual order only');
+    }
     // ── phase 1 (read tx): authority → replay → validation → dedup ────────
     const preflight = await surface.transaction(async (tx): Promise<Preflight<R>> => {
       await surface.authorize(tx);
 
-      const replay = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
-      if (replay !== null) {
-        return { replayed: true, snapshot: replay as R };
+      if (idempotencyKey !== null) {
+        const replay = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+        if (replay !== null) {
+          return { replayed: true, snapshot: replay as R };
+        }
       }
 
       // ── input validation (400 before any write) ─────────────────────────
@@ -1188,7 +1227,7 @@ export class OrderCommandService {
           await this.writeIdempotencyKey(
             tx,
             command.tenantId,
-            idempotencyKey,
+            idempotencyKey!,
             payloadHash,
             snapshot,
           );
@@ -2467,6 +2506,59 @@ interface OrderSurface<R> {
   readonly duplicateClientOrderRef: (tx: TenantTx, ref: string, clash: LiveOrderClash | null) => Promise<ProblemException>;
   /** The response and the stored idempotency snapshot, built in the write transaction. */
   readonly respond: (tx: TenantTx, snapshot: OrderSnapshot) => Promise<R>;
+}
+
+/**
+ * Story 4-1c (A9) — the portal order gate, one function for `placePortalOrder`
+ * (phase 1 and again at the start of phase 3) and the portal order import's
+ * own transactions (before its replay and again before its key): `orders.place`
+ * → the actor re-read (not active 401, another client 403 `role-denied`, which
+ * also refuses an owner, who holds every capability) → the client `FOR SHARE`
+ * (departed or suspended 403). Behaviour and wording are 4-1a's.
+ */
+export async function assertPortalOrderGateInTx(
+  tx: TenantTx,
+  scope: { readonly tenantId: string; readonly clientId: string; readonly actorUserId: string },
+): Promise<void> {
+  assertPermission(await getMemberRoleIn(tx, scope.tenantId, scope.actorUserId), 'orders.place');
+  const actor = await getMemberPortalFactsIn(tx, scope.tenantId, scope.actorUserId);
+  if (actor === null || actor.status !== 'active') {
+    throw new ProblemException(
+      'unauthenticated',
+      401,
+      'Authentication required',
+      'The session no longer describes an active client-portal user — sign in again.',
+    );
+  }
+  if (actor.clientId !== scope.clientId) {
+    throw new ProblemException(
+      'role-denied',
+      403,
+      'Role lacks the required capability',
+      'Only a client-portal user of this client may place its orders.',
+    );
+  }
+  // FOR SHARE (21-10): a suspend committing mid-phase either waits for
+  // this transaction or is re-read here once it commits.
+  const client = await shareLockClientInTx(tx, scope.tenantId, scope.clientId);
+  if (client.status !== 'active') {
+    throw clientInactive(client.status);
+  }
+}
+
+/** Story 4-1c — what a keyless Check (`checkOrder` / `checkPortalOrder`) answers. */
+export interface OrderCheck {
+  /** The client the order derives from its SKUs. */
+  readonly clientId: string;
+  /** Top-level lines (as given). */
+  readonly lineCount: number;
+}
+
+/** Story 4-1c — one surface's plan: the pipeline command, its hash stage and its surface. */
+interface OrderPlan<R> {
+  readonly command: CreateOrderCommand;
+  readonly hashes: OrderHashStage;
+  readonly surface: OrderSurface<R>;
 }
 
 /** Phase 1's outcome when the order goes on to the grants. */

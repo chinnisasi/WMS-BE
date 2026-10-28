@@ -1786,6 +1786,64 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
   });
 
   // ──────────────────────────────────────────────────────────────────────────
+  // Story 4-1c (A10) — the PORTAL ORDER IMPORT's own transactions. Each
+  // order is placed through `placePortalOrder` (its write set is proved
+  // above); the import itself reads the derived and import keys in bulk, the
+  // warehouse codes, the session client's SKUs by code (the explicit
+  // predicate REMOVED here — RLS alone) and the kit lookup, then writes its
+  // `order_import.executed` audit row and its key, all under client A's
+  // stamp. Positive control: the same SKU read returns both clients' rows
+  // unstamped. Everything rolled back.
+  // ──────────────────────────────────────────────────────────────────────────
+  describe('story 4-1c: the portal order import write set and reads under a client stamp', () => {
+    let probe: postgres.Sql<Record<string, unknown>>;
+    const ROLLBACK = 'probe-rollback';
+
+    beforeAll(async () => {
+      await ensureProbeRole();
+      probe = postgres(probeUrl(), { max: 1 });
+    });
+
+    afterAll(async () => {
+      await probe?.end();
+    });
+
+    it('the import’s reads and writes run under client A’s stamp — keys, warehouses, A’s SKUs only, audit row, key, read-back — with a positive control, all rolled back', async () => {
+      const key = ulid();
+      const importId = uuidv7();
+      const seen: Record<string, unknown> = {};
+      const run = probe.begin(async (tx) => {
+        await tx`select set_config('app.tenant_id', ${tenantId}, true)`;
+        await tx`select set_config('app.client_id', ${clientA}, true)`;
+        seen.keys = (await tx`select key from idempotency_keys where tenant_id = ${tenantId} and key in (${key}, ${ulid()})`).length;
+        seen.warehouse = (await tx`select code from warehouses where tenant_id = ${tenantId} and id = ${warehouseId}`).length;
+        seen.otherWarehouses = (await tx`select code from warehouses where tenant_id = ${tenantId} and upper(code) in ('NOWHERE')`).length;
+        // `getClientSkusByCodesInTx` MINUS its `client_id = $client`.
+        seen.skus = (await tx`select id from skus where tenant_id = ${tenantId} and code in ('CI-SKU-A', 'CI-SKU-B') order by code, client_id`).map((row) => row.id);
+        seen.kits = (await tx`select kit_sku_id from kit_compositions where tenant_id = ${tenantId} and kit_sku_id in (${skuAId})`).length;
+        await tx`insert into audit_events (id, tenant_id, actor_user_id, action, target_type, target_id, reference, occurred_at)
+          values (${uuidv7()}, ${tenantId}, ${uuidv7()}, 'order_import.executed', 'order_import', ${importId}, ${key}, now())`;
+        await tx`insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
+          values (${uuidv7()}, ${tenantId}, ${key}, 'probe', ${tx.json({ importId })})`;
+        seen.readBack = (await tx`select key from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`).length;
+        seen.audit = (await tx`select target_id from audit_events where tenant_id = ${tenantId} and reference = ${key}`).map((row) => row.target_id);
+        throw new Error(ROLLBACK);
+      });
+      await expect(run).rejects.toThrow(ROLLBACK);
+      expect(seen).toEqual({ keys: 0, warehouse: 1, otherWarehouses: 0, skus: [skuAId], kits: 0, readBack: 1, audit: [importId] });
+
+      // Positive control: unstamped (the operator shape), the same read sees both clients' SKUs.
+      const unstamped = await probe.begin(async (tx) => {
+        await tx`select set_config('app.tenant_id', ${tenantId}, true)`;
+        return (await tx`select id from skus where tenant_id = ${tenantId} and code in ('CI-SKU-A', 'CI-SKU-B') order by code, client_id`).map((row) => row.id as string);
+      });
+      expect(unstamped).toEqual([skuAId, skuBId]);
+      await expectCount((t) => t`select count(*)::int as n from ${t('idempotency_keys')} where key = ${key}`, 0);
+      await expectCount((t) => t`select count(*)::int as n from ${t('audit_events')} where target_id = ${importId}`, 0);
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
   // Story 21-8 — the SERVICE REPORT's query shapes (`reporting/service.ts`),
   // proved at the database. `portalServiceReport` runs them in a transaction
   // stamped with the session's client; here each runs as `wms_rls_probe`

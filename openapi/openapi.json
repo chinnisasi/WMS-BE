@@ -10060,6 +10060,180 @@
         ]
       }
     },
+    "/tenants/{tenantId}/outbound/order-imports": {
+      "post": {
+        "operationId": "OutboundController_importOrders",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key — required for an import, ignored on a dry run; a replay returns the stored response, and a retry of an unfinished import with the same file creates only the orders still missing",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "CSV or XLSX — header row required (sku, quantity, order_ref, ship_to_name, ship_to_phone, ship_to_line1, ship_to_city, ship_to_state, ship_to_pincode; optional rate, client, warehouse, ship_to_line2, consignee_gstin, consignee_legal_name, order_type, priority, ship_by, cod_amount; other columns ignored)"
+                  },
+                  "warehouseId": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "The warehouse every order is for"
+                  },
+                  "dryRun": {
+                    "type": "string",
+                    "enum": [
+                      "true",
+                      "false"
+                    ],
+                    "description": "`true`: Check file — nothing written, no Idempotency-Key needed"
+                  }
+                },
+                "required": [
+                  "file",
+                  "warehouseId"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Check file (dryRun=true): what would be created and every refused row — nothing written; or an Import the time budget stopped (complete: false, notAttemptedCount > 0, nothing stored for the import itself)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderImportResponseDto"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Import, complete: the created orders and every refused row (a 201 can carry refusals) — the idempotency snapshot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderImportResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key on an import, no file, a malformed warehouseId or dryRun (validation-failed), a file that cannot be read (file-unreadable), or a header without a required column (missing-columns, naming each)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks orders.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "This import is still running under the same Idempotency-Key (import-in-progress — wait, then Import again to read its result), or a concurrent import with the same key committed first (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Not a .csv/.xlsx file (unsupported-file-type)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "More than 5 MB, 300 data rows or 100 orders (import-too-large), or the Idempotency-Key reused with a different file or warehouse (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The stock reservation store is unreachable (reservation-store-unavailable) — the detail says how many orders were created; Import again with the same file to finish without duplicates",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Imports orders from a CSV/XLSX file (orders.manage) — one row per order line, grouped by client + order_ref; each order is created exactly as the create form would (its own derived key, its own reservations, backorders as usual), and an order with any bad row is refused whole. dryRun=true checks the file through the create's rules and writes nothing (no stock is promised). ≤ 300 rows, ≤ 100 orders, ≤ 200 lines per order, ≤ 5 MB; a run stops starting orders after 15 s (complete: false — Import again with the same file; a Check stopped so leaves the rest unchecked)",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
     "/tenants/{tenantId}/outbound/orders/{orderId}/cancel": {
       "post": {
         "operationId": "OutboundController_cancelOrder",
@@ -24558,6 +24732,7 @@
                 "ledger_event",
                 "manifest",
                 "order",
+                "order_import",
                 "over_receipt",
                 "partner",
                 "partner_link",
@@ -33164,6 +33339,180 @@
           }
         ],
         "summary": "Places an outbound order for this client's own active SKUs (orders.place; the client is the session's). Every line must be reserved in full — a shortage refuses the whole order. The result is an ordinary order the warehouse picks and ships",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/order-imports": {
+      "post": {
+        "operationId": "PortalController_importOrders",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key — required for an import, ignored on a dry run; a retry of an unfinished import with the same file places only the orders still missing",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "CSV or XLSX — header row required (sku, quantity, order_ref, ship_to_name, ship_to_phone, ship_to_line1, ship_to_city, ship_to_state, ship_to_pincode; optional warehouse, ship_to_line2, consignee_gstin, consignee_legal_name, order_type, priority, ship_by, cod_amount; other columns ignored)"
+                  },
+                  "warehouseId": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "The warehouse every order is placed into"
+                  },
+                  "dryRun": {
+                    "type": "string",
+                    "enum": [
+                      "true",
+                      "false"
+                    ],
+                    "description": "`true`: Check file — nothing written, no Idempotency-Key needed"
+                  }
+                },
+                "required": [
+                  "file",
+                  "warehouseId"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Check file (dryRun=true) — nothing written; or an Import the time budget stopped (complete: false)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalOrderImportResponseDto"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Import, complete: the placed orders and every refused row (the stored replay)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalOrderImportResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key on an import, no file, a malformed warehouseId or dryRun (validation-failed), a file that cannot be read (file-unreadable), or a header without a required column (missing-columns)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a); or the user may not place orders for this client (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse is not the tenant's (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "This import is still running under the same Idempotency-Key (import-in-progress), or a concurrent import with the same key committed first (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Not a .csv/.xlsx file (unsupported-file-type)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "More than 5 MB, 300 data rows or 100 orders (import-too-large), or the Idempotency-Key reused with a different file or warehouse (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The stock reservation store is unreachable (reservation-store-unavailable) — Import again with the same file to finish without duplicates",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Imports this client's orders from a CSV/XLSX file (orders.place) — one row per order line, grouped by order_ref; each order is placed exactly as Place order would (your own active SKUs, every line reserved in full or that order is refused), and an order with any bad row is refused whole. dryRun=true checks the file and writes nothing (it cannot promise stock). A run stops starting orders after 15 s (complete: false — Import again with the same file; a Check stopped so leaves the rest unchecked). ≤ 300 rows, ≤ 100 orders, ≤ 200 lines per order, ≤ 5 MB",
         "tags": [
           "portal"
         ]
@@ -44964,6 +45313,208 @@
         },
         "required": [
           "order"
+        ]
+      },
+      "OrderImportOrderDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "The created order; null on a dry run"
+          },
+          "clientOrderRef": {
+            "type": "string",
+            "example": "SO-1042",
+            "description": "The client order number (the order_ref cell, trimmed)"
+          },
+          "lineCount": {
+            "type": "number",
+            "example": 3,
+            "description": "Top-level lines (a kit line counts once)"
+          },
+          "firstRow": {
+            "type": "number",
+            "example": 2,
+            "description": "The spreadsheet row of the order’s first line"
+          },
+          "replayed": {
+            "type": "boolean",
+            "description": "True when an earlier run of the same import created this order (it replayed)"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientLabel": {
+            "type": "string",
+            "example": "ACME",
+            "description": "The client as people read it (the tenant’s own: \"<name> (your company)\")"
+          },
+          "backorderedLineCount": {
+            "type": "number",
+            "nullable": true,
+            "example": 1,
+            "description": "Top-level lines left backordered (a kit counts once); null on a dry run"
+          }
+        },
+        "required": [
+          "orderId",
+          "clientOrderRef",
+          "lineCount",
+          "firstRow",
+          "replayed",
+          "clientId",
+          "clientLabel",
+          "backorderedLineCount"
+        ]
+      },
+      "OrderImportRowErrorDto": {
+        "type": "object",
+        "properties": {
+          "rowNumber": {
+            "type": "number",
+            "example": 7,
+            "description": "The spreadsheet row — the header is row 1"
+          },
+          "orderRef": {
+            "type": "string",
+            "nullable": true,
+            "example": "SO-1042",
+            "description": "The row’s order_ref (trimmed); null when blank"
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "missing-value",
+              "unknown-client",
+              "unknown-warehouse",
+              "wrong-warehouse",
+              "unknown-sku",
+              "sku-client-mismatch",
+              "mixed-client",
+              "client-required",
+              "invalid-quantity",
+              "quantity-precision",
+              "invalid-rate",
+              "invalid-cod-amount",
+              "invalid-ship-by",
+              "order-rows-disagree",
+              "duplicate-sku-in-order",
+              "duplicate-order-in-file",
+              "too-many-lines",
+              "validation-failed",
+              "not-found",
+              "duplicate-client-order-ref",
+              "client-departed",
+              "client-suspended",
+              "sku-inactive",
+              "licence-not-covered",
+              "order-catalog-changed",
+              "order-backorder-rejected",
+              "order-changed-since-first-run",
+              "order-refused"
+            ],
+            "description": "Why the row (and with it its whole order) was refused — the file’s rules, the create’s own refusal passed through with its detail (an order’s refusal sits on its first row), order-changed-since-first-run, or order-refused (any other code, named in the detail)"
+          },
+          "detail": {
+            "type": "string",
+            "example": "No SKU with code \"GLOW-SERUM-X\" exists in this tenant."
+          },
+          "sku": {
+            "type": "string",
+            "nullable": true,
+            "example": "GLOW-SERUM-X",
+            "description": "The row’s sku cell as written; null when blank"
+          },
+          "quantity": {
+            "type": "string",
+            "nullable": true,
+            "example": "12",
+            "description": "The row’s quantity cell as written; null when blank"
+          }
+        },
+        "required": [
+          "rowNumber",
+          "orderRef",
+          "code",
+          "detail",
+          "sku",
+          "quantity"
+        ]
+      },
+      "OrderImportResponseDto": {
+        "type": "object",
+        "properties": {
+          "importId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "The import (its audit row’s target); null on a dry run and on an incomplete run"
+          },
+          "dryRun": {
+            "type": "boolean"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "fileSha256": {
+            "type": "string",
+            "description": "SHA-256 of the uploaded file (hex) — with the warehouse, the import’s idempotency fingerprint"
+          },
+          "rowCount": {
+            "type": "number",
+            "description": "Data rows read (blank rows not counted)"
+          },
+          "orderCount": {
+            "type": "number",
+            "description": "Orders the file describes"
+          },
+          "acceptedCount": {
+            "type": "number",
+            "description": "Orders created — on a dry run, ready to create"
+          },
+          "refusedCount": {
+            "type": "number",
+            "description": "Orders refused whole (an order with any bad row)"
+          },
+          "complete": {
+            "type": "boolean",
+            "description": "False when the 15-second budget stopped the run before every order was tried (answered 200, nothing stored) — Import again with the same file to finish; on a Check, the orders not reached were not checked"
+          },
+          "notAttemptedCount": {
+            "type": "number",
+            "description": "Orders the run did not reach (0 when complete)"
+          },
+          "orders": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrderImportOrderDto"
+            }
+          },
+          "errors": {
+            "description": "Every refused row, in sheet order",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrderImportRowErrorDto"
+            }
+          }
+        },
+        "required": [
+          "importId",
+          "dryRun",
+          "warehouseId",
+          "fileSha256",
+          "rowCount",
+          "orderCount",
+          "acceptedCount",
+          "refusedCount",
+          "complete",
+          "notAttemptedCount",
+          "orders",
+          "errors"
         ]
       },
       "CancelOrderDto": {
@@ -57734,6 +58285,7 @@
               "ledger_event",
               "manifest",
               "order",
+              "order_import",
               "over_receipt",
               "partner",
               "partner_link",
@@ -57836,6 +58388,7 @@
               "ledger_event",
               "manifest",
               "order",
+              "order_import",
               "over_receipt",
               "partner",
               "partner_link",
@@ -63132,6 +63685,116 @@
           "warehouseName",
           "lineCount",
           "placedAt"
+        ]
+      },
+      "PortalOrderImportOrderDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "The placed order; null on a dry run"
+          },
+          "clientOrderRef": {
+            "type": "string",
+            "example": "SO-1042",
+            "description": "Your order number (the order_ref cell, trimmed)"
+          },
+          "lineCount": {
+            "type": "number",
+            "example": 3,
+            "description": "Lines on the order"
+          },
+          "firstRow": {
+            "type": "number",
+            "example": 2,
+            "description": "The spreadsheet row of the order’s first line"
+          },
+          "replayed": {
+            "type": "boolean",
+            "description": "True when an earlier run of the same import placed this order (it replayed)"
+          }
+        },
+        "required": [
+          "orderId",
+          "clientOrderRef",
+          "lineCount",
+          "firstRow",
+          "replayed"
+        ]
+      },
+      "PortalOrderImportResponseDto": {
+        "type": "object",
+        "properties": {
+          "importId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "The import; null on a dry run and on an incomplete run"
+          },
+          "dryRun": {
+            "type": "boolean"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "fileSha256": {
+            "type": "string",
+            "description": "SHA-256 of the uploaded file (hex)"
+          },
+          "rowCount": {
+            "type": "number",
+            "description": "Data rows read (blank rows not counted)"
+          },
+          "orderCount": {
+            "type": "number",
+            "description": "Orders the file describes"
+          },
+          "acceptedCount": {
+            "type": "number",
+            "description": "Orders placed — on a dry run, ready to place"
+          },
+          "refusedCount": {
+            "type": "number",
+            "description": "Orders refused whole (an order with any bad row)"
+          },
+          "complete": {
+            "type": "boolean",
+            "description": "False when the 15-second budget stopped the run before every order was tried — Import again with the same file to finish; on a Check, the orders not reached were not checked"
+          },
+          "notAttemptedCount": {
+            "type": "number",
+            "description": "Orders the run did not reach (0 when complete)"
+          },
+          "orders": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalOrderImportOrderDto"
+            }
+          },
+          "errors": {
+            "description": "Every refused row, in sheet order",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrderImportRowErrorDto"
+            }
+          }
+        },
+        "required": [
+          "importId",
+          "dryRun",
+          "warehouseId",
+          "fileSha256",
+          "rowCount",
+          "orderCount",
+          "acceptedCount",
+          "refusedCount",
+          "complete",
+          "notAttemptedCount",
+          "orders",
+          "errors"
         ]
       },
       "PortalOrderComponentDto": {

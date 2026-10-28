@@ -458,6 +458,8 @@ describe('client portal (e2e, story 21-7)', () => {
     'POST api/v1/tenants/:tenantId/portal/inbound/asns',
     // Story 4-1a — the portal order.
     'POST api/v1/tenants/:tenantId/portal/orders',
+    // Story 4-1c — the portal order import.
+    'POST api/v1/tenants/:tenantId/portal/order-imports',
   ]);
 
   const SESSION_GUARDS = [TenantSessionGuard, DeviceSessionGuard, AnySessionGuard, PortalSessionGuard];
@@ -727,8 +729,9 @@ describe('client portal (e2e, story 21-7)', () => {
       // 21-7's ten reads, plus 21-7b's announce and its two form reads, plus
       // 21-8's service report, plus 4-1a's order, plus 2-5a's two goods-receipt reads,
       // plus 4-7a's two returns reads, plus 5-6a's two credit/debit note reads,
-      // plus 3-7a's three recall reads (the list, one recall, its report).
-      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(24);
+      // plus 3-7a's three recall reads (the list, one recall, its report),
+      // plus 4-1c's order import.
+      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(25);
     });
 
     it('a portal token is refused on EVERY operator route — reads and writes — with the exact fence detail', async () => {
@@ -1195,6 +1198,8 @@ describe('client portal (e2e, story 21-7)', () => {
           '/tenants/{tenantId}/portal/invoices/{invoiceId}',
           '/tenants/{tenantId}/portal/invoices/{invoiceId}/notes',
           '/tenants/{tenantId}/portal/me',
+          // Story 4-1c — the portal order import.
+          '/tenants/{tenantId}/portal/order-imports',
           '/tenants/{tenantId}/portal/orders',
           '/tenants/{tenantId}/portal/orders/{orderId}',
         '/tenants/{tenantId}/portal/recalls',
