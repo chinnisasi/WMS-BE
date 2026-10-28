@@ -198,7 +198,8 @@ export function dispatchedOrderFixtures(context: () => DispatchedOrderContext) {
    * can pick them. Answers the cases' handling-unit ids (weight order) — a
    * catch-weight pack names them.
    */
-  async function seedCatchWeightCases(skuId: string, binId: string, weights: number[]): Promise<string[]> {
+  /** Story 4-2b — `reasonCode`: the putaway's mismatch reason when `binId` is not the suggested bin (absent: none sent). */
+  async function seedCatchWeightCases(skuId: string, binId: string, weights: number[], reasonCode?: string): Promise<string[]> {
     const ctx = context();
     const received = await request(ctx.app.getHttpServer())
       .post(`${API}/${ctx.tenantId}/receiving/goods-receipts`)
@@ -218,7 +219,7 @@ export function dispatchedOrderFixtures(context: () => DispatchedOrderContext) {
       .post(`${API}/${ctx.tenantId}/putaway/placements`)
       .set('Authorization', `Bearer ${ctx.operatorToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ warehouseId: ctx.warehouseId, grnId: grn.id, grnLineId: line.id, skuId, toBinId: binId, qty: weights.length, occurredAt: now() })
+      .send({ warehouseId: ctx.warehouseId, grnId: grn.id, grnLineId: line.id, skuId, toBinId: binId, qty: weights.length, occurredAt: now(), ...(reasonCode === undefined ? {} : { reasonCode }) })
       .expect(201);
     return line.handlingUnitIds;
   }

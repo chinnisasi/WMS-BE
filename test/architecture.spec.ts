@@ -3689,6 +3689,8 @@ describe('architecture: batch recalls are recalls-module-owned (story 3-7a)', ()
   const SEAM_CALLERS = [
     ['outbound', 'dispatch.command.ts'],
     ['outbound', 'pick.command.ts'],
+    // Story 4-2b — the restock plan and the cancel name a recalled lot's recall.
+    ['outbound', 'cancel-restock.command.ts'],
     ['catalog', 'batch-block.command.ts'],
     ['inbound', 'receiving.command.ts'],
     ['inbound', 'receiving.facade.ts'],
@@ -3781,12 +3783,14 @@ describe('architecture: batch recalls are recalls-module-owned (story 3-7a)', ()
     const kindsWithOrderLine = [...registry.matchAll(/readonly kind: '([\w-]+)';([\s\S]*?)\n {4}\}/g)]
       .filter((match) => /readonly orderLineId: string/.test(match[2]!))
       .map((match) => match[1]!);
-    expect(kindsWithOrderLine.sort()).toEqual(['dispatch', 'pack', 'pick']);
+    // Story 4-2b adds `restock` (the reversal of one draw names its order line).
+    expect(kindsWithOrderLine.sort()).toEqual(['dispatch', 'pack', 'pick', 'restock']);
     const carriers = registeredLedgerEventTypes().filter((type) => {
       const definition = getLedgerEventType(type)!;
       return definition.allowsBatchArm && definition.referenceKinds.some((kind) => kindsWithOrderLine.includes(kind));
     });
-    // On this base exactly `pick.picked`; a packed-order cancel/unpack must join the list.
+    // `pick.picked` and — story 4-2b — its reversal `pick.restocked`.
+    expect(carriers.sort()).toEqual(['pick.picked', 'pick.restocked']);
     expect(carriers.sort()).toEqual([...PICK_NETTING_TYPES].sort());
   });
 });

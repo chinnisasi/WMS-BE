@@ -1132,6 +1132,9 @@ describe('story 3-7a: batch recall (e2e)', () => {
         move('bin.merged', 1, binA, binB, { kind: 'bin-merge', mergeId: uuidv7() }),
         move('stock.moved', 1, binB, binA, { kind: 'bin-move', moveId: uuidv7(), reasonCode: 'consolidate' }),
         move('pick.picked', 1, binA, null, { kind: 'pick', picklistId: uuidv7(), picklistLineId: uuidv7(), waveId: uuidv7(), orderId, orderLineId }),
+        // Story 4-2b — the draw's exact reversal (a cancel-with-restock) nets it: on hand again.
+        move('pick.restocked', 1, null, binA, { kind: 'restock', restockId: uuidv7(), orderId, orderLineId, picklistLineId: uuidv7(), drawEventId: uuidv7() }),
+        move('pick.picked', 1, binA, null, { kind: 'pick', picklistId: uuidv7(), picklistLineId: uuidv7(), waveId: uuidv7(), orderId, orderLineId }),
         move('pack.packed', 0, null, null, { kind: 'pack', orderId, orderLineId, packedQty: 1 }, null),
         move('dispatch.dispatched', 0, null, null, { kind: 'dispatch', orderId, orderLineId, dispatchedQty: 1 }, null),
         move('excursion.recorded', 0, null, null, { kind: 'excursion', excursionId: uuidv7(), binId: binA, readingC: 9 }, null),
@@ -1157,12 +1160,13 @@ describe('story 3-7a: batch recall (e2e)', () => {
       adjustedOut: 1,
       unaccounted: 0,
     });
-    // The transfer type registered here is one of the 18 — every registered type ran above but the inbound leg.
+    // The transfer type registered here is one of the 19 (4-2b added pick.restocked) — every registered type ran above but the inbound leg.
     const types = (await sql`select distinct type from ledger_events where tenant_id = ${tenantId} and (batch_ref = ${lot.id} or sku_id = ${sku('RC-ALL')})`) as unknown as { type: string }[];
     expect(types.map((row) => row.type).sort()).toEqual(
       [
         'bin.merged', 'dispatch.dispatched', 'excursion.recorded', 'grn.damaged', 'grn.received', 'pack.packed', 'pick.picked', 'putaway.placed',
         'qc.failed', 'qc.held', 'qc.released', 'return.received', 'return.restocked', 'return.scrapped', 'stock.adjusted', 'stock.moved', 'transfer.outbound',
+        'pick.restocked',
       ].sort(),
     );
   });

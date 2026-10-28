@@ -38,10 +38,12 @@ const LABEL_COMMAND_KIND = 'outbound.label';
  * The shipment lifecycle (Story 4.6c), additive per the repo convention —
  * `labelled` = the adapter's label exists (dispatch may auto-stamp from it,
  * the manifest command may pick it up); `manifested` = closed onto a
- * manifest, the terminal arm (no un-manifest). Pinned to the DB CHECK
- * `shipments_status_check` by the label.spec drift guard.
+ * manifest, the terminal arm (no un-manifest); `voided` (story 4-2b) = the
+ * label of an order cancelled with restock before it was manifested, voided
+ * locally (`voided_at` / `voided_by`), terminal. Pinned to the DB CHECK
+ * `shipments_status_check` (0102) by the label.spec drift guard.
  */
-export const SHIPMENT_STATUSES = ['labelled', 'manifested'] as const;
+export const SHIPMENT_STATUSES = ['labelled', 'manifested', 'voided'] as const;
 export type ShipmentStatus = (typeof SHIPMENT_STATUSES)[number];
 
 // ── command inputs ───────────────────────────────────────────────────────────
@@ -94,6 +96,9 @@ export interface ShipmentSnapshot {
      * 4-2a lacks it (read absent as null).
      */
     readonly codAmountPaise?: number | null;
+    /** Story 4-2b — set on a voided label; absent on a label snapshot (read absent as null). */
+    readonly voidedAt?: string | null;
+    readonly voidedBy?: string | null;
   };
 }
 

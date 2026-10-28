@@ -608,7 +608,7 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
   // ── the grammar, the capability and the drift guards ──────────────────────
 
   it('the shipment lifecycle, the DB CHECK, the partial unique index and the capability are registered (the drift guards)', async () => {
-    expect([...SHIPMENT_STATUSES]).toEqual(['labelled', 'manifested']);
+    expect([...SHIPMENT_STATUSES]).toEqual(['labelled', 'manifested', 'voided']);
 
     // The DB CHECK is the additive backstop to the TS constant (0024).
     const defs = await sql`

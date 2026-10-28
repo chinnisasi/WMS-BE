@@ -280,6 +280,9 @@ export const shopifyRevokeArm: ChannelRevokeArm = async (args) => {
  *                reordering convergence — RD-7/T5);
  *   cancelled  — channel already cancelled → noop; else POST cancel.
  */
+/** Story 4-2b — fulfillment statuses that need no cancel before the order's (never fulfilled, or already cancelled). */
+const SETTLED_FULFILLMENT_STATUSES: ReadonlySet<string> = new Set(['cancelled', 'error', 'failure']);
+
 export async function shopifyOrderWritebackArm(
   credential: ChannelCredential,
   request: ChannelOrderWritebackRequest,
@@ -303,10 +306,43 @@ export async function shopifyOrderWritebackArm(
     return JSON.parse(response.body) as T;
   };
 
+  type Fulfillment = {
+    readonly id?: number;
+    readonly tracking_number?: string | null;
+    readonly carrier_service?: string | null;
+    /** Story 4-2b (A13) — `pending | open | success | cancelled | error | failure` (Admin REST 2026-01). */
+    readonly status?: string | null;
+  };
+  type FulfillmentsResponse = { fulfillments?: Fulfillment[] };
+
   if (request.state === 'cancelled') {
     const order = await readJson<{ order?: { cancelled_at?: string | null } }>(`orders/${request.orderRef}.json`);
     if ((order.order?.cancelled_at ?? null) !== null) {
       return { settledAt: new Date().toISOString(), action: 'noop' };
+    }
+    // Story 4-2b (decision 13): the `packed` writeback created a fulfillment
+    // at pack, and Shopify refuses to cancel an order that carries one — so a
+    // packed-then-cancelled order cancels each live fulfillment FIRST
+    // (`POST fulfillments/{id}/cancel.json`, Admin REST 2026-01 — verified
+    // against the Fulfillment resource), then the order. Re-delivery is
+    // idempotent: a fulfillment already `cancelled` (or `error` / `failure`,
+    // which never fulfilled) is skipped, so a delivery whose order cancel
+    // failed after its fulfillment cancels landed simply retries the order.
+    const live = ((await readJson<FulfillmentsResponse>(`orders/${request.orderRef}/fulfillments.json`)).fulfillments ?? []).filter(
+      (fulfillment) => !SETTLED_FULFILLMENT_STATUSES.has(fulfillment.status ?? ''),
+    );
+    for (const fulfillment of live) {
+      if (typeof fulfillment.id !== 'number' || !Number.isSafeInteger(fulfillment.id)) {
+        throw new Error(
+          `${WRITEBACK_UNTRACKED_ID}: the channel's read-back fulfillment carries no id — its cancel is un-addressable; not retried with a guessed path.`,
+        );
+      }
+      await channelHttpRequest({
+        method: 'POST',
+        url: `${base}/fulfillments/${fulfillment.id}/cancel.json`,
+        headers,
+        body: {},
+      });
     }
     await channelHttpRequest({
       method: 'POST',
@@ -317,12 +353,6 @@ export async function shopifyOrderWritebackArm(
     return { settledAt: new Date().toISOString(), action: 'cancelled' };
   }
 
-  type Fulfillment = {
-    readonly id?: number;
-    readonly tracking_number?: string | null;
-    readonly carrier_service?: string | null;
-  };
-  type FulfillmentsResponse = { fulfillments?: Fulfillment[] };
   const fulfillments = (await readJson<FulfillmentsResponse>(`orders/${request.orderRef}/fulfillments.json`))
     .fulfillments ?? [];
 

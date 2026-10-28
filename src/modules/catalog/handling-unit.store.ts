@@ -238,9 +238,12 @@ export async function markHandlingUnitsAdjustedInTx(
  * one written-later column in this schema, and the one transition that decides
  * what a customer is invoiced.
  *
- * It is a SET-ONCE link with no precedent here to lean on (`serials.status`
+ * It is a set-at-pack link with no precedent here to lean on (`serials.status`
  * exists but nothing updates it), so it stands on its merits: a case ships
- * exactly once, so a link table would add a join for nothing, and the single
+ * exactly once, so a link table would add a join for nothing — story 4-2b's
+ * cancel-with-restock is the ONE writer that clears it again
+ * (`unpackHandlingUnitsForLinesInTx`, for an order cancelled before it
+ * shipped) — and the single
  * `active → packed` transition is exactly the conditional terminal write the
  * command skeleton already prescribes — `.where(status = 'active')`, an empty
  * result being the caller's 409.
@@ -283,6 +286,48 @@ export async function markHandlingUnitsPackedInTx(
     }
   }
   return packed;
+}
+
+/**
+ * Story 4-2b — `packed → active` for the cases a cancelled order's pack
+ * consumed: the ONE reversal of `markHandlingUnitsPackedInTx`, written only by
+ * the outbound cancel-with-restock in its own transaction (the order is
+ * cancelled before it shipped, so its cases are live stock again and
+ * packable on another order).
+ *
+ * Conditional three ways — `status = 'packed'`, `packed_order_line_id` one of
+ * THIS order's lines, and the id one the pack's own `pack.packed` events
+ * recorded (`expectedIds`) — so a case packed into another order, already
+ * returned or written off can never be reverted by it. The rows are locked
+ * first in id order (the `lockHandlingUnitsInTx` rule, so two commands naming
+ * overlapping sets queue rather than deadlock); the caller compares what came
+ * back with `expectedIds` and refuses a short count (409
+ * `handling-unit-not-packed`), rolling the whole cancel back.
+ */
+export async function unpackHandlingUnitsForLinesInTx(
+  tx: TenantTx,
+  tenantId: string,
+  orderLineIds: readonly string[],
+  expectedIds: readonly string[],
+): Promise<HandlingUnitIdentity[]> {
+  const lines = [...new Set(orderLineIds)];
+  const ids = [...new Set(expectedIds)].sort();
+  if (lines.length === 0 || ids.length === 0) {
+    return [];
+  }
+  const predicate = and(
+    eq(handlingUnits.tenantId, tenantId),
+    inArray(handlingUnits.id, ids),
+    inArray(handlingUnits.packedOrderLineId, lines),
+    eq(handlingUnits.status, 'packed'),
+  );
+  await tx.select({ id: handlingUnits.id }).from(handlingUnits).where(predicate).orderBy(handlingUnits.id).for('update');
+  const rows = await tx
+    .update(handlingUnits)
+    .set({ status: 'active', packedOrderLineId: null, updatedAt: nowIso() })
+    .where(predicate)
+    .returning();
+  return rows.map(toHandlingUnitIdentity).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
 /**

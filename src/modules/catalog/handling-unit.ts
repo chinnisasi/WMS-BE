@@ -32,7 +32,9 @@ import { ProblemException } from '../../shared/problem-details/problem.exception
  *   EXISTS (the physical case is on the dock) but is not yet live stock
  * - `rejected` — the over-receipt was refused, or the unit was named in a
  *   write-off adjustment. Terminal
- * - `packed` — consumed into an order line at the bench. Terminal
+ * - `packed` — consumed into an order line at the bench. Terminal, except
+ *   for story 4-2b's cancel-with-restock, which reverts the cases of an
+ *   order cancelled before it shipped to `active`
  * - `returned` — story 13-2: a case a customer RETURNED, received against a
  *   return authorization into the RETURNS bin and awaiting disposition. NOT
  *   packable (pack admits only `active`), so a returned case cannot ship on

@@ -382,6 +382,8 @@ export interface BatchLedgerEntry {
  * negative `stock.adjusted` — written off).
  */
 export interface SerialLatestEvent {
+  /** Story 4-2b — the event's id (the cancel-with-restock proves a serial's latest event IS the draw it reverses). */
+  readonly eventId: string;
   readonly type: string;
   readonly warehouseId: string;
   readonly fromBinId: string | null;
@@ -1554,11 +1556,13 @@ export class InventoryFacade {
         and(
           eq(ledgerEvents.tenantId, tenantId),
           eq(ledgerEvents.warehouseId, warehouseId),
-          // A deliberate choice of the two types whose docs name this
-          // order's pick/dispatch facts — NOT the set of orderId-carrying
-          // types (`pack.packed`'s doc carries orderId too; the trace reads
-          // neither its facts nor its line linkage).
-          inArray(ledgerEvents.type, ['pick.picked', 'dispatch.dispatched']),
+          // The order's pick, pack, restock and dispatch facts. Story 4-2b
+          // added `pack.packed` (the cancel reads the handling units the pack
+          // recorded) and `pick.restocked` (the restock plan subtracts what
+          // was already put back). EVERY caller filters by type (cold chain,
+          // the RMA returnable read, the return receipt, the cancel) — a new
+          // caller must too.
+          inArray(ledgerEvents.type, ['pick.picked', 'pack.packed', 'pick.restocked', 'dispatch.dispatched']),
           // The 0039 partial index's own predicate — repeated here so the
           // planner can use the index (see the doc comment above).
           sql`${ledgerEvents.referenceDoc} ? 'orderId'`,
@@ -1626,6 +1630,7 @@ export class InventoryFacade {
     const rows = await tx
       .selectDistinctOn([ledgerEvents.serialRef], {
         serialRef: ledgerEvents.serialRef,
+        eventId: ledgerEvents.id,
         type: ledgerEvents.type,
         warehouseId: ledgerEvents.warehouseId,
         fromBinId: ledgerEvents.fromBinId,
@@ -1639,6 +1644,7 @@ export class InventoryFacade {
     for (const row of rows) {
       if (row.serialRef === null) continue;
       latest.set(row.serialRef, {
+        eventId: row.eventId,
         type: row.type,
         warehouseId: row.warehouseId,
         fromBinId: row.fromBinId,

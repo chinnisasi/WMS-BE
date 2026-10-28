@@ -1318,8 +1318,10 @@ export type Serial = typeof serials.$inferSelect;
  * `weight_grams > 0 AND <= MAX_HANDLING_UNIT_WEIGHT_GRAMS` are CHECKs in the
  * migration DDL (repo convention — never in this file), as is the RLS policy,
  * which is single-dimension on `tenant_id` alone like every other one.
- * `packed_order_line_id` is set ONCE, at pack, by a conditional write on
- * `status = 'active'`.
+ * `packed_order_line_id` is set at pack, by a conditional write on
+ * `status = 'active'`, and cleared only by story 4-2b's cancel-with-restock
+ * (`packed → active`, conditional on `status = 'packed'`) — the one reversal
+ * of the link, for an order cancelled before it shipped.
  */
 export const handlingUnits = pgTable(
   'handling_units',
@@ -1344,7 +1346,10 @@ export const handlingUnits = pgTable(
     /** Integer GRAMS, captured once at receipt. Immutable. Never a quantity. */
     weightGrams: integer('weight_grams').notNull(),
     status: text('status').notNull().default('active'),
-    /** Written once, at pack, by the conditional `status = 'active'` write. */
+    /**
+     * Written at pack, by the conditional `status = 'active'` write; cleared
+     * (with `packed → active`) only by 4-2b's cancel-with-restock.
+     */
     packedOrderLineId: uuid('packed_order_line_id'),
     ...tenantTimestamps,
   },
@@ -3820,6 +3825,10 @@ export type LicencePolicyRow = typeof licencePolicies.$inferSelect;
  *   the manifest command may pick it up;
  * - `manifested` — the shipment closed onto a manifest (`manifest_id`
  *   names it); it can no longer be picked up.
+ * - `voided` (story 4-2b, 0102) — the label of an order cancelled before it
+ *   was manifested, voided locally (`voided_at` / `voided_by`, the pairing
+ *   CHECK `shipments_voided_pairing`). It stops covering the order's
+ *   one-labelled index; no reader treats it as live.
  *
  * One `labelled` shipment per order is the DATABASE-level partial unique
  * index on `(tenant_id, order_id) where status = 'labelled'` (the race
@@ -3871,6 +3880,10 @@ export const shipments = pgTable(
     labelledAt: timestamp('labelled_at', { withTimezone: true, mode: 'string' }).notNull(),
     /** Set when the shipment closes onto a manifest (status flips to `manifested`). */
     manifestId: uuid('manifest_id'),
+    /** Story 4-2b — when the label was voided by a cancel-with-restock (`status = 'voided'`). */
+    voidedAt: timestamp('voided_at', { withTimezone: true, mode: 'string' }),
+    /** Story 4-2b — who voided it (the cancelling user). */
+    voidedBy: uuid('voided_by'),
     ...tenantTimestamps,
   },
   (table) => [
