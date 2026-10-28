@@ -1,5 +1,6 @@
-import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Inject, Param, Post, Put, Query, UseGuards } from '@nestjs/common';
-import { ApiBearerAuth, ApiBody, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags, getSchemaPath } from '@nestjs/swagger';
+import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Inject, Param, Post, Put, Query, Res, UseGuards } from '@nestjs/common';
+import type { Response } from 'express';
+import { ApiBearerAuth, ApiBody, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiProduces, ApiResponse, ApiTags, getSchemaPath } from '@nestjs/swagger';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
 import { ProblemException } from '../shared/problem-details/problem.exception';
@@ -10,6 +11,8 @@ import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/
 import { UUID_RE } from '../shared/primitives/ids';
 import { MovementsFacade } from '../modules/movements/transfer.facade';
 import { blindSubmitResponse } from '../modules/movements/count.command';
+import type { StockTakeSummary } from '../modules/movements/stock-take.command';
+import type { StockTakeSummaryDto } from '../modules/movements/stock-take.dto';
 import { ABC_CLASSES } from '../shared/primitives/abc-class';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import {
@@ -55,7 +58,25 @@ import {
   SetVariancePolicyDto,
   VariancePolicyResponse,
   CountVarianceListQuery,
+  CancelCountTaskResponse,
 } from '../modules/movements/count.dto';
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import {
+  AbandonStockTakeDto,
+  AbandonStockTakeResponse,
+  CloseStockTakeDto,
+  CloseStockTakeResponse,
+  RecountStockTakeBinsDto,
+  RecountStockTakeResponse,
+  StartStockTakeDto,
+  StartStockTakeResponse,
+  StockTakeDetailResponse,
+  StockTakeListQuery,
+  StockTakeListResponse,
+  StockTakeReportQuery,
+  StockTakeVarianceListResponse,
+  StockTakeVariancesQuery,
+} from '../modules/movements/stock-take.dto';
 const IDEMPOTENCY_HEADER = [
   {
     name: 'Idempotency-Key',
@@ -243,6 +264,8 @@ export class MovementsController {
         destBinId: dto.destBinId ?? undefined,
         binStateEpoch: dto.binStateEpoch ?? undefined,
         occurredAt: dto.occurredAt,
+        // Story 3-5b (A1/K3) — from the session family, never the body.
+        surface: session.family === 'device' ? 'device' : 'web',
       },
       key,
     );
@@ -385,7 +408,7 @@ export class MovementsController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks counts.manage (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse, the zone or a bin does not exist in this tenant — including a bin deleted between the listing and the create (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The single bin already has a pending count task (count-task-open), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The single bin is frozen by a stock take (bin-in-stock-take — checked first), already has a pending count task (count-task-open), or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse), or more than 500 bins named or in the zone (too-many-bins)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async createCount(
@@ -532,7 +555,7 @@ export class MovementsController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token of either family, or a device token without a badge-in session (unauthenticated)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks counts.execute (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('The count task, a named SKU, or the count task\'s bin does not exist in this tenant — the bin may have been deleted while the count was in progress ("The count task\'s bin no longer exists in this tenant.") (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The task is already completed (count-task-completed), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The task is already completed (count-task-completed) or was cancelled (count-task-cancelled), or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'taskId', format: 'uuid' })
@@ -578,6 +601,323 @@ export class MovementsController {
       variances: [],
       recountTaskId: blind.recountTaskId,
     };
+  }
+
+  // ── story 3-5b: cancel a count task ─────────────────────────────────────
+
+  @Post(':tenantId/movements/counts/:taskId/cancel')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Cancels a PENDING count task (counts.manage — story 3-5b). A stock take\'s task is refused (abandon the take); a device submit that lands later answers 409 count-task-cancelled; the scheduler may mint the bin again at its next due tick',
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: CancelCountTaskResponse, description: 'The task cancelled (the idempotency snapshot)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or a malformed taskId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid web session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks counts.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The count task does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The task is completed (count-task-completed) or already cancelled (count-task-cancelled), it belongs to a stock take (stock-take-task), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'taskId', format: 'uuid' })
+  async cancelCountTask(
+    @Param('tenantId') tenantId: string,
+    @Param('taskId') taskId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<CancelCountTaskResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(taskId, 'taskId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.movements.cancelCountTask({ tenantId, actorUserId: session.userId, taskId }, key);
+    return { countTask: { ...snapshot.countTask } };
+  }
+
+  // ── story 3-5b: the stock take ───────────────────────────────────────────
+  // Literal segments (`stock-takes`, `…/variances`, `…/report`) never sit
+  // beside a sibling `:param` of the same depth here (§6 route order).
+
+  @Post(':tenantId/movements/warehouses/:warehouseId/stock-takes')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Starts a stock take (counts.manage — story 3-5b): freezes every storage bin of the warehouse (or of the named zones) — every stock movement into or out of them is refused (409 bin-frozen) until the take is closed or abandoned, except a handheld op and a quarantine — and creates one count task per bin (adopting a pending one), empty bins included. At most 3,000 frozen bins per warehouse',
+  })
+  @ApiBody({ type: StartStockTakeDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: StartStockTakeResponse, description: 'The take counting (the idempotency snapshot)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or an invalid body — no zones, more than 50, a repeated zone, a note over 200 characters (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid web session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks counts.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse or a zone does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A bin is already frozen by another take (stock-take-overlap, naming it), a count task was created on a bin while the take started (conflict — retry), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('No storage bin in scope (stock-take-empty), more than 3,000 bins frozen in the warehouse (too-many-bins), or the key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  async startStockTake(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: StartStockTakeDto,
+  ): Promise<StartStockTakeResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(warehouseId, 'warehouseId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.movements.startStockTake(
+      { tenantId, actorUserId: session.userId, warehouseId, zoneIds: dto.zoneIds ?? null, note: dto.note ?? null },
+      key,
+    );
+    return { ...snapshot, stockTake: stockTakeDto(snapshot.stockTake) };
+  }
+
+  @Get(':tenantId/movements/stock-takes')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Lists stock takes (story 3-5b — newest first, keyset cursor; warehouse and status filters; any staff role, no quantities)' })
+  @ApiOkResponse({ type: StockTakeListResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed filter, cursor or limit (validation-failed / invalid-cursor)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid web session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse filter names a warehouse outside this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async listStockTakes(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: StockTakeListQuery,
+  ): Promise<StockTakeListResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    const page = await this.movements.listStockTakes(tenantId, {
+      warehouseId: query.warehouseId,
+      status: query.status,
+      cursor: query.cursor,
+      limit: query.limit,
+    });
+    return {
+      items: page.items.map((entry) => ({ stockTake: stockTakeDto(entry.stockTake), progress: { ...entry.progress } })),
+      nextCursor: page.nextCursor,
+    };
+  }
+
+  @Get(':tenantId/movements/stock-takes/:stockTakeId')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'One stock take (story 3-5b): the dashboard — totals, per-zone progress, the bins that need a recount, the handheld writes admitted after the freeze, and the openVarianceDigest the close sends back. No quantities; any staff role',
+  })
+  @ApiOkResponse({ type: StockTakeDetailResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed stockTakeId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid web session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The stock take does not exist in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'stockTakeId', format: 'uuid' })
+  async getStockTake(
+    @Param('tenantId') tenantId: string,
+    @Param('stockTakeId') stockTakeId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<StockTakeDetailResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(stockTakeId, 'stockTakeId');
+    const detail = await this.movements.getStockTake(tenantId, stockTakeId);
+    return {
+      stockTake: stockTakeDto(detail.stockTake),
+      totals: { ...detail.totals },
+      zones: detail.zones.map((zone) => ({ ...zone })),
+      recountRequiredBins: detail.recountRequiredBins.map((entry) => ({ ...entry })),
+      recountRequiredCount: detail.recountRequiredCount,
+      openVarianceDigest: detail.openVarianceDigest,
+    };
+  }
+
+  @Get(':tenantId/movements/stock-takes/:stockTakeId/variances')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "A stock take's variances (story 3-5b): expected beside counted, the owner-only flag, the unposted refusal once closed — keyset by bin code. A GATED read: counts.manage or variances.resolve (an operator is 403); web staff sessions only",
+  })
+  @ApiOkResponse({ type: StockTakeVarianceListResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed stockTakeId, status, cursor or limit (validation-failed / invalid-cursor)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid web session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), a client-portal session, or a role with neither counts.manage nor variances.resolve (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The stock take does not exist in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'stockTakeId', format: 'uuid' })
+  async listStockTakeVariances(
+    @Param('tenantId') tenantId: string,
+    @Param('stockTakeId') stockTakeId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: StockTakeVariancesQuery,
+  ): Promise<StockTakeVarianceListResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(stockTakeId, 'stockTakeId');
+    const page = await this.movements.listStockTakeVariances(tenantId, session.userId, stockTakeId, {
+      status: query.status,
+      cursor: query.cursor,
+      limit: query.limit,
+    });
+    return { items: page.items.map((entry) => ({ ...entry })), nextCursor: page.nextCursor };
+  }
+
+  @Get(':tenantId/movements/stock-takes/:stockTakeId/report')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "A stock take's client report as CSV or Excel (story 3-5b): one row per (SKU, bin) of each bin's latest count — book, counted, variance and the outcome as of the close (matched | adjusted | unposted:<code> | open). Optionally one client. Counted bins only. Allowed while counting, marked provisional (a first column status). Gated: counts.manage or variances.resolve",
+    description: 'The `Content-Disposition` filename is not readable cross-origin — a client names the file itself.',
+  })
+  @ApiProduces('text/csv', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+  @ApiResponse({
+    status: 200,
+    description: 'The report file',
+    content: {
+      'text/csv': { schema: { type: 'string', format: 'binary' } },
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': { schema: { type: 'string', format: 'binary' } },
+    },
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed stockTakeId or clientId, or a missing/unknown format (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid web session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), a client-portal session, or a role with neither counts.manage nor variances.resolve (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The stock take or the client does not exist in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'stockTakeId', format: 'uuid' })
+  async downloadStockTakeReport(
+    @Param('tenantId') tenantId: string,
+    @Param('stockTakeId') stockTakeId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: StockTakeReportQuery,
+    @Res() res: Response,
+  ): Promise<void> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(stockTakeId, 'stockTakeId');
+    const file = await this.movements.stockTakeReport(tenantId, session.userId, stockTakeId, {
+      format: query.format,
+      clientId: query.clientId ?? null,
+    });
+    res.status(200);
+    res.setHeader('Content-Type', file.contentType);
+    res.setHeader('Content-Length', String(file.body.length));
+    res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(file.body);
+  }
+
+  @Post(':tenantId/movements/stock-takes/:stockTakeId/recount')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Recounts selected bins of a counting stock take (variances.resolve — story 3-5b): a take-stamped recount task per bin (never pushed), and the bin's open variances in the take marked recounted",
+  })
+  @ApiBody({ type: RecountStockTakeBinsDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: RecountStockTakeResponse, description: 'The recounts (the idempotency snapshot)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, no bins, more than 500, a repeated bin, or a bin outside the take (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid web session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks variances.resolve (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The stock take does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The take is not counting (stock-take-not-counting), a named bin already has a pending task (count-task-open), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'stockTakeId', format: 'uuid' })
+  async recountStockTakeBins(
+    @Param('tenantId') tenantId: string,
+    @Param('stockTakeId') stockTakeId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: RecountStockTakeBinsDto,
+  ): Promise<RecountStockTakeResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(stockTakeId, 'stockTakeId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.movements.recountStockTakeBins({ tenantId, actorUserId: session.userId, stockTakeId, binIds: dto.binIds }, key);
+    return {
+      stockTake: stockTakeDto(snapshot.stockTake),
+      recounts: snapshot.recounts.map((entry) => ({ ...entry })),
+      recountedVarianceCount: snapshot.recountedVarianceCount,
+    };
+  }
+
+  @Post(':tenantId/movements/stock-takes/:stockTakeId/close')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Posts and closes a stock take (variances.resolve — story 3-5b): approved once against the openVarianceDigest (owner when any open variance is over its frozen threshold), then each open variance is posted as a stock.adjusted correction in batches of 200, the freeze lifted bin by bin; a variance the adjustment guards refuse stays open and is listed unposted. A retry, or any close on a posting take, resumes the batches",
+  })
+  @ApiBody({ type: CloseStockTakeDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: CloseStockTakeResponse, description: 'The take closed (the idempotency snapshot)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or a malformed openVarianceDigest (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid web session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), the caller lacks variances.resolve (role-denied), or an open variance is over its frozen threshold and the caller is not the owner (variance-owner-required, naming them)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The stock take does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The take is closed or abandoned (stock-take-not-counting), bins are still pending (stock-take-incomplete), counted bins moved since their count (stock-take-recount-required, listing up to 20 and the total), the open variances changed since they were reviewed (stock-take-changed), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'stockTakeId', format: 'uuid' })
+  async closeStockTake(
+    @Param('tenantId') tenantId: string,
+    @Param('stockTakeId') stockTakeId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: CloseStockTakeDto,
+  ): Promise<CloseStockTakeResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(stockTakeId, 'stockTakeId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.movements.closeStockTake(
+      { tenantId, actorUserId: session.userId, stockTakeId, openVarianceDigest: dto.openVarianceDigest },
+      key,
+    );
+    return {
+      stockTake: stockTakeDto(snapshot.stockTake),
+      postedCount: snapshot.postedCount,
+      unposted: snapshot.unposted.map((entry) => ({ ...entry })),
+    };
+  }
+
+  @Post(':tenantId/movements/stock-takes/:stockTakeId/abandon')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Abandons a counting stock take (counts.manage — story 3-5b): its pending tasks are cancelled and the freeze lifted. Nothing is posted; the variances stay open on the variance queue',
+  })
+  @ApiBody({ type: AbandonStockTakeDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: AbandonStockTakeResponse, description: 'The take abandoned (the idempotency snapshot)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or a note over 200 characters (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid web session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks counts.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The stock take does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The take is posting, closed or abandoned (stock-take-not-counting), a recount was created meanwhile (conflict — retry), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'stockTakeId', format: 'uuid' })
+  async abandonStockTake(
+    @Param('tenantId') tenantId: string,
+    @Param('stockTakeId') stockTakeId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: AbandonStockTakeDto,
+  ): Promise<AbandonStockTakeResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(stockTakeId, 'stockTakeId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.movements.abandonStockTake({ tenantId, actorUserId: session.userId, stockTakeId, note: dto.note ?? null }, key);
+    return { stockTake: stockTakeDto(snapshot.stockTake), cancelledTaskCount: snapshot.cancelledTaskCount, releasedTaskCount: snapshot.releasedTaskCount };
   }
 
   @Put(':tenantId/movements/warehouses/:warehouseId/count-policies')
@@ -810,7 +1150,7 @@ export class MovementsController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), the caller lacks variances.resolve (role-denied), or an over-threshold variance resolved by a role below owner (variance-owner-required)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('The variance, its count task, or its bin does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The variance is already resolved (variance-resolved), the task\'s frozen bin epoch no longer matches (variance-basis-moved — recount is the remedy), the bin already has an open count task on the RECOUNT arm (count-task-open — approve_adjust under an open sibling task is legal), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The variance belongs to a counting or posting stock take (variance-in-stock-take — the take\'s own verbs resolve it), is already resolved (variance-resolved), the task\'s frozen bin epoch no longer matches (variance-basis-moved — recount is the remedy), the bin already has an open count task on the RECOUNT arm (count-task-open — approve_adjust under an open sibling task is legal), or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'varianceId', format: 'uuid' })
@@ -916,7 +1256,7 @@ export class MovementsController {
 }
 
 /** Movements uuid path params fail 400 (not a 500 from the `::uuid` cast). */
-function assertUuidParam(value: string, name: 'transferId' | 'taskId' | 'warehouseId' | 'varianceId'): void {
+function assertUuidParam(value: string, name: 'transferId' | 'taskId' | 'warehouseId' | 'varianceId' | 'stockTakeId'): void {
   if (!UUID_RE.test(value)) {
     throw new ProblemException(
       'validation-failed',
@@ -945,4 +1285,9 @@ function assertOwnTenantToken(tokenTenantId: string, tenantId: string): void {
       'The session token tenant does not own this path.',
     );
   }
+}
+
+/** Story 3-5b — a take summary copied key by key (a mutable DTO). */
+function stockTakeDto(summary: StockTakeSummary): StockTakeSummaryDto {
+  return { ...summary, zoneIds: summary.zoneIds === null ? null : [...summary.zoneIds] };
 }

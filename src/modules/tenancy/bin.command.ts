@@ -53,7 +53,7 @@ import { assertWarehouseInTenant, getMemberRoleIn } from './tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
-import { InventoryFacade } from '../inventory/inventory.facade';
+import { InventoryFacade, binFrozen } from '../inventory/inventory.facade';
 import type { SerialLocationEntry } from '../inventory/inventory.facade';
 import { openQcHoldsForBinsInTx } from '../inbound/qc.command';
 import {
@@ -1282,6 +1282,16 @@ export class BinCommand {
         }
         if (row.retiredAt !== null) {
           throw binRetired409(row.code);
+        }
+
+        // Story 3-5b (A9) — a frozen bin cannot retire: its stock take must
+        // still count it. Under the warehouse advisory (bin row → advisory,
+        // the canonical order) so a take starting now either froze the bin
+        // first or sees it retired.
+        await this.inventory.lockWarehouseInTx(tx, command.tenantId, command.warehouseId);
+        const frozen = (await this.inventory.frozenBinsInTx(tx, command.tenantId, command.warehouseId, [row.id])).get(row.id);
+        if (frozen !== undefined) {
+          throw binFrozen(frozen.binCode, frozen.stockTakeId, frozen.frozenAt);
         }
 
         // The open-QC-hold gate (the mergeBin rejection, the retiring arm):

@@ -274,6 +274,9 @@ export class ReceivingController {
     // read). Story 3-5a — BLIND: each line names its SKU only; the frozen
     // expectations never reach a device. Same sequential composition.
     const countTasks = await this.movements.getCountTasks(tenantId, query.warehouseId);
+    // Story 3-5b: the stock-take arm — the warehouse's counting takes and its
+    // frozen bins (bins[].frozen). Same sequential composition.
+    const stockTakeArm = await this.movements.getStockTakeSnapshot(tenantId, query.warehouseId);
     // Story 13-2: the return-receipt arm — the warehouse's open and
     // partially received RMAs. A plain facade call in its own transaction,
     // composed beside the task lists (never nested).
@@ -296,6 +299,9 @@ export class ReceivingController {
     ]);
     return {
       ...snapshot,
+      // Story 3-5b — every bin says whether a stock take froze it.
+      bins: snapshot.bins.map((bin) => ({ ...bin, frozen: stockTakeArm.frozenBinIds.has(bin.id) })),
+      stockTakes: stockTakeArm.stockTakes.map((take) => ({ ...take, zoneIds: take.zoneIds === null ? null : [...take.zoneIds] })),
       // Story 1-4 — the pack barcodes, copied key by key (a mutable DTO array).
       // Story 1-6a — and the DG arm, its subsidiary list copied too.
       skus: snapshot.skus.map((sku) => ({

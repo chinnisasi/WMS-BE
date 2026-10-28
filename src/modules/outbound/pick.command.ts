@@ -1183,6 +1183,8 @@ export class PickCommandService {
             tenantId: command.tenantId,
             warehouseId: command.warehouseId,
             type: 'pick.picked',
+            // Story 3-5b (A1) — a handheld op: the freeze admits it.
+            surface: 'device',
             skuId: command.skuId,
             // One serial is one whole unit — `QUANTITY_SCALE` milli-units.
             quantityDelta: signedQuantity(-QUANTITY_SCALE),
@@ -1202,6 +1204,8 @@ export class PickCommandService {
             tenantId: command.tenantId,
             warehouseId: command.warehouseId,
             type: 'pick.picked',
+            // Story 3-5b (A1) — a handheld op: the freeze admits it.
+            surface: 'device',
             skuId: command.skuId,
             quantityDelta: signedQuantity(-arm.qty),
             fromBinId: drawBin.id,

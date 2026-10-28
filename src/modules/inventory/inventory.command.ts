@@ -1413,6 +1413,9 @@ export class StockAdjustmentCommand {
       tenantId: command.tenantId,
       warehouseId: command.warehouseId,
       type: 'stock.adjusted',
+      // Story 3-5b (A1) — the freeze admits a handheld adjustment (3-2b
+      // `deviceId`), never a web one, an approval or a variance post.
+      ...((command.deviceId ?? null) === null ? {} : { surface: 'device' as const }),
       skuId: command.skuId,
       quantityDelta: perEventDelta,
       fromBinId: delta < 0 ? command.binId : null,
@@ -1430,6 +1433,7 @@ export class StockAdjustmentCommand {
         tenantId: command.tenantId,
         warehouseId: command.warehouseId,
         type: 'stock.adjusted',
+        ...((command.deviceId ?? null) === null ? {} : { surface: 'device' as const }),
         skuId: command.skuId,
         quantityDelta: perEventDelta,
         fromBinId: delta < 0 ? command.binId : null,

@@ -407,6 +407,9 @@ export class CountTaskListEntryDto {
 
   @ApiProperty({ minimum: 0 })
   openVarianceCount!: number;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'Story 3-5b — the stock take this task counts for; null = a cycle count (only a cycle count can be cancelled)' })
+  stockTakeId!: string | null;
 }
 
 export class CountTaskListResponse {
@@ -453,6 +456,41 @@ export class CountTaskDetailTaskDto {
 
   @ApiProperty({ description: 'A movement moved the bin between task start and submit (OQ-2) — the submit minted a recount; false while pending' })
   epochConflict!: boolean;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'Story 3-5b — the stock take this task counts for; null = a cycle count' })
+  stockTakeId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'Story 3-5b — who cancelled it (null unless cancelled)' })
+  cancelledBy!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Story 3-5b — when it was cancelled (null unless cancelled)' })
+  cancelledAt!: string | null;
+}
+
+/** Story 3-5b — POST …/movements/counts/{taskId}/cancel answer. */
+export class CancelledCountTaskDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ enum: ['cancelled'] })
+  status!: 'cancelled';
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  binId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  cancelledBy!: string;
+
+  @ApiProperty()
+  cancelledAt!: string;
+}
+
+export class CancelCountTaskResponse {
+  @ApiProperty({ type: CancelledCountTaskDto })
+  countTask!: CancelledCountTaskDto;
 }
 
 export class CountTaskDetailLineDto {

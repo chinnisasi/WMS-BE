@@ -152,6 +152,14 @@ export interface ConfirmInboundCommand {
    */
   readonly binStateEpoch?: number | null | undefined;
   readonly occurredAt?: string | undefined;
+  /**
+   * Story 3-5b (design review A1/K3) — `'device'` when a handheld confirms the
+   * leg (the controller sets it from the session family; the sync replay of
+   * a queued op sets it too). The stock-take freeze admits a device receive
+   * into a frozen bin. NOT hashed: it comes from the session, never the
+   * body, and the key is the device op's ULID — stated, not an oversight.
+   */
+  readonly surface?: 'web' | 'device' | undefined;
 }
 
 export interface CancelTransferCommand {
@@ -1413,6 +1421,7 @@ export class TransferService {
                 tenantId: command.tenantId,
                 warehouseId: order.sourceWarehouseId,
                 type: 'transfer.inbound',
+                ...(command.surface === 'device' ? { surface: 'device' as const } : {}),
                 skuId: line.skuId,
                 quantityDelta: arm.quantityDelta,
                 fromBinId: inTransit.binId,
@@ -1455,6 +1464,7 @@ export class TransferService {
                 tenantId: command.tenantId,
                 warehouseId: order.sourceWarehouseId,
                 type: 'transfer.inbound',
+                ...(command.surface === 'device' ? { surface: 'device' as const } : {}),
                 skuId: line.skuId,
                 quantityDelta: arm.quantityDelta,
                 fromBinId: inTransit.binId,
@@ -1491,6 +1501,7 @@ export class TransferService {
                 tenantId: command.tenantId,
                 warehouseId: order.destWarehouseId,
                 type: 'transfer.inbound',
+                ...(command.surface === 'device' ? { surface: 'device' as const } : {}),
                 skuId: line.skuId,
                 quantityDelta: arm.quantityDelta,
                 fromBinId: null,

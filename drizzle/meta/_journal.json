@@ -750,6 +750,13 @@
       "when": 1793174486750,
       "tag": "0106_blocked_locations",
       "breakpoints": true
+    },
+    {
+      "idx": 107,
+      "version": "7",
+      "when": 1793189104118,
+      "tag": "0107_stock_take_freeze",
+      "breakpoints": true
     }
   ]
 }

@@ -11,6 +11,7 @@ import {
   ledgerEvents,
   ledgerIntegrityState,
   skus,
+  stockFreezeBins,
   stockOnHand,
 } from '../../shared/db/schema';
 import type { LedgerAnchorKind, LedgerChainBreakDetector, LedgerChainBreakKind } from '../../shared/db/schema';
@@ -23,7 +24,7 @@ import { uuidv7 } from '../../shared/primitives/ids';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
-import { canonicalInstant } from '../../shared/primitives/time';
+import { canonicalInstant, istWallClock } from '../../shared/primitives/time';
 import { LEDGER_GRAMMAR_VERSION, getLedgerEventType } from './ledger-registry';
 import type { LedgerReferenceDoc } from './ledger-registry';
 import { LEDGER_ANCHOR_STORE } from './anchor-store';
@@ -56,6 +57,30 @@ export interface LedgerMovement {
   readonly occurredAt: string;
   readonly recordedAt: string;
   readonly referenceDoc: LedgerReferenceDoc;
+  /**
+   * Story 3-5b (design review A1) — `'device'` when the movement records a
+   * handheld op (pick, putaway, a device move or adjustment, a device
+   * transfer receive). The stock-take freeze ADMITS a device movement on a
+   * frozen bin (the op already happened on the floor; the epoch it moves
+   * forces a recount) and refuses every other one. Set from the session
+   * family by the command, never from a request body; NOT an `eventHashOf`
+   * input and never stored.
+   */
+  readonly surface?: 'device' | undefined;
+}
+
+/**
+ * Story 3-5b — the freeze refusal: the movement touches a bin of an active
+ * stock take. Names the bin, the take and its start (IST).
+ */
+export function binFrozen(binCode: string, stockTakeId: string, frozenAt: string): ProblemException {
+  return new ProblemException(
+    'bin-frozen',
+    409,
+    'The bin is frozen for a stock take',
+    `Bin "${binCode}" is frozen for stock take ${stockTakeId} (started ${istWallClock(frozenAt)} IST) — every movement into or out of it is refused until the take is closed or abandoned.`,
+    { binCode, stockTakeId, frozenAt },
+  );
 }
 
 /** The appended event plus the projection state it produced. */
@@ -568,6 +593,39 @@ export class LedgerService {
   ) {}
 
   /**
+   * Story 3-5b — the freeze probe (one index probe on
+   * `stock_freeze_bins_tenant_bin_unique`; none when both arms are null or
+   * the type is `qc.held`). A web or system movement on a frozen bin throws
+   * 409 `bin-frozen`; a device movement is admitted and bumps the matched
+   * rows' `device_writes` in the same statement.
+   */
+  private async assertNotFrozen(tx: TenantTx, movement: LedgerMovement): Promise<void> {
+    if (movement.type === 'qc.held') return;
+    const arms = [movement.fromBinId, movement.toBinId].filter((id): id is string => id !== null);
+    if (arms.length === 0) return;
+    if (movement.surface === 'device') {
+      await tx
+        .update(stockFreezeBins)
+        .set({ deviceWrites: sql`${stockFreezeBins.deviceWrites} + 1` })
+        .where(and(eq(stockFreezeBins.tenantId, movement.tenantId), inArray(stockFreezeBins.binId, arms)));
+      return;
+    }
+    const rows = await tx
+      .select({
+        binCode: stockFreezeBins.binCode,
+        stockTakeId: stockFreezeBins.stockTakeId,
+        frozenAt: stockFreezeBins.frozenAt,
+      })
+      .from(stockFreezeBins)
+      .where(and(eq(stockFreezeBins.tenantId, movement.tenantId), inArray(stockFreezeBins.binId, arms)))
+      .limit(1);
+    const frozen = rows[0];
+    if (frozen !== undefined) {
+      throw binFrozen(frozen.binCode, frozen.stockTakeId, canonicalInstant(frozen.frozenAt));
+    }
+  }
+
+  /**
    * Appends one registry-validated movement and updates the on-hand
    * projection in the SAME transaction. An unregistered event type, a
    * reference kind the type does not declare, a batch/serial arm on a type
@@ -601,6 +659,15 @@ export class LedgerService {
     if (movement.serialRef !== null) {
       await tx.execute(serialAdvisoryLock(movement.tenantId, movement.serialRef));
     }
+
+    // Story 3-5b — the stock-take freeze, probed UNDER the warehouse
+    // advisory (a take starts under the same lock, so an append either
+    // committed before the freeze or sees it). The append is the only writer
+    // of stock movements, so this one probe covers every stock-moving
+    // command, including any added later. `qc.held` is exempt (a quarantine
+    // is a safety action); a handheld op is admitted and counted on the
+    // freeze row (design review A1 — its epoch bump forces a recount).
+    await this.assertNotFrozen(tx, movement);
 
     // Story 2.4 serial guards: under the lock (so a concurrent scan of the
     // same serial serializes behind it), before any write — a duplicate scan

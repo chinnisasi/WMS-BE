@@ -137,6 +137,9 @@ export const AUDIT_TARGET_TYPES = [
   'stock_adjustment_policy',
   'suggested_po',
   'temperature_excursion',
+  // Story 3-5b — a stock take (`stock_take.started | recount_requested |
+  // closed | abandoned`).
+  'stock_take',
   'tenant',
   'transfer_order',
   'user',
@@ -382,4 +385,12 @@ export const AUDIT_NEW_ACTIONS = [
   // (`CancelRestockCommandService`). Targets the ORDER — the label precedent
   // (`shipment.label-created`); the shipment id rides the snapshot.
   { action: 'shipment.voided', targetType: 'order' },
+  // Story 3-5b — the stock take (`StockTakeCommand`) and the count-task
+  // cancel. The take's verbs also write one `count.variance.resolved` per
+  // posted or recounted variance under the same key.
+  { action: 'stock_take.started', targetType: 'stock_take' },
+  { action: 'stock_take.recount_requested', targetType: 'stock_take' },
+  { action: 'stock_take.closed', targetType: 'stock_take' },
+  { action: 'stock_take.abandoned', targetType: 'stock_take' },
+  { action: 'count.cancelled', targetType: 'count_task' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

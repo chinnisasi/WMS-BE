@@ -57,6 +57,35 @@ import {
 import { VariancePolicyCommand } from './variance-policy.command';
 import { MoveCommand, type MoveStockCommand, type MoveStockSnapshot } from './move.command';
 import { moveReasonEntries, type MoveReasonEntry } from './move-reason';
+import {
+  StockTakeCommand,
+  type AbandonStockTakeCommand,
+  type AbandonStockTakeSnapshot,
+  type CloseStockTakeCommand,
+  type CloseStockTakeSnapshot,
+  type RecountStockTakeBinsCommand,
+  type RecountStockTakeSnapshot,
+  type StartStockTakeCommand,
+  type StartStockTakeSnapshot,
+} from './stock-take.command';
+import {
+  assertCanReadCountDetailInTx,
+  getStockTakeInTx,
+  listStockTakesInTx,
+  listStockTakeVariancesInTx,
+  loadStockTakeInTx,
+  stockTakeReportRowsInTx,
+  type ListStockTakesQuery,
+  type StockTakeDetail,
+  type StockTakeListEntry,
+  type StockTakeVarianceEntry,
+  type StockTakeVariancesQuery,
+} from './stock-take.reads';
+import type { CancelCountTaskCommand, CancelCountTaskSnapshot } from './count.command';
+import { getClientLabelsInTx } from '../clients/clients.facade';
+import { buildCsv } from '../../shared/export/csv';
+import { buildXlsx } from '../../shared/export/xlsx';
+import type { ExportCell, ExportColumn } from '../../shared/export/cells';
 
 /**
  * The movements module's public seam (Story 5-1): every other module (and the
@@ -76,6 +105,37 @@ export const DEFAULT_TRANSFER_PAGE_SIZE = 50;
 export const MAX_SNAPSHOT_TRANSFER_TASKS = 500;
 /** The cap on the snapshot's Count inbox tasks (the same precedent). */
 export const MAX_SNAPSHOT_COUNT_TASKS = 500;
+/**
+ * Story 3-5b (A8) — the cap on the snapshot's STOCK-TAKE tasks: the
+ * per-warehouse freeze cap, so a take's feed never truncates.
+ */
+export const MAX_SNAPSHOT_STOCK_TAKE_TASKS = 3000;
+
+/** Story 3-5b — the report file's content types. */
+const STOCK_TAKE_CSV_CONTENT_TYPE = 'text/csv; charset=utf-8';
+const STOCK_TAKE_XLSX_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+/** The report's columns (A10): the first says whether the file is provisional. */
+export const STOCK_TAKE_REPORT_COLUMNS: readonly ExportColumn[] = [
+  { header: 'status', kind: 'text' },
+  { header: 'zone_code', kind: 'text' },
+  { header: 'bin_code (counted bins only)', kind: 'text' },
+  { header: 'sku_code', kind: 'text' },
+  { header: 'sku_name', kind: 'text' },
+  { header: 'client', kind: 'text' },
+  { header: 'book_qty', kind: 'number' },
+  { header: 'counted_qty', kind: 'number' },
+  { header: 'variance_qty', kind: 'number' },
+  { header: 'outcome', kind: 'text' },
+  { header: 'counted_at_ist', kind: 'instant' },
+];
+
+/** Story 3-5b — the device snapshot's stock-take arm. */
+export interface StockTakeSnapshotEntry {
+  readonly stockTakeId: string;
+  readonly zoneIds: readonly string[] | null;
+  readonly frozenAt: string;
+  readonly pendingTasks: number;
+}
 /** The scheduler's per-warehouse-per-tick task bound (PENDING: tunable). */
 export const MAX_SCHEDULED_TASKS_PER_TICK = 200;
 
@@ -119,6 +179,8 @@ export interface CountTaskListEntry {
   readonly lineCount: number;
   readonly varianceCount: number;
   readonly openVarianceCount: number;
+  /** Story 3-5b — the stock take this task counts for; null = a cycle count. */
+  readonly stockTakeId: string | null;
 }
 
 /**
@@ -141,6 +203,10 @@ export interface CountTaskDetail {
     readonly completedAt: string | null;
     /** A movement moved the bin between task start and submit (OQ-2); false while pending. */
     readonly epochConflict: boolean;
+    /** Story 3-5b. */
+    readonly stockTakeId: string | null;
+    readonly cancelledBy: string | null;
+    readonly cancelledAt: string | null;
   };
   readonly lines: readonly {
     readonly skuId: string;
@@ -243,6 +309,8 @@ export interface CountTaskCard {
    */
   readonly binStateEpoch: number | null;
   readonly createdAt: string;
+  /** Story 3-5b — the stock take this task counts for; null = a cycle count. */
+  readonly stockTakeId: string | null;
   readonly lines: readonly CountTaskLine[];
 }
 
@@ -314,6 +382,8 @@ export class MovementsFacade {
     @Inject(VariancePolicyCommand) private readonly variancePolicies: VariancePolicyCommand,
     // Story 3-1 — the bin-to-bin move.
     @Inject(MoveCommand) private readonly moves: MoveCommand,
+    // Story 3-5b — the stock take.
+    @Inject(StockTakeCommand) private readonly stockTakes: StockTakeCommand,
     // The epoch read for the task cards (the same-tx capture the pick
     // command's task read established) and — nothing else; every stock write
     // already went through the command's facade passthroughs.
@@ -409,6 +479,130 @@ export class MovementsFacade {
     return this.countCommands
       .submitCount(command, idempotencyKey)
       .then((result) => blindSubmitResponse(result.snapshot));
+  }
+
+  /** Story 3-5b — `POST …/movements/counts/{taskId}/cancel`. */
+  cancelCountTask(command: CancelCountTaskCommand, idempotencyKey: string): Promise<CancelCountTaskSnapshot> {
+    return this.countCommands.cancelCountTask(command, idempotencyKey).then((result) => result.snapshot);
+  }
+
+  // ── story 3-5b: the stock take ─────────────────────────────────────────
+
+  startStockTake(command: StartStockTakeCommand, idempotencyKey: string): Promise<StartStockTakeSnapshot> {
+    return this.stockTakes.startStockTake(command, idempotencyKey).then((result) => result.snapshot);
+  }
+
+  recountStockTakeBins(command: RecountStockTakeBinsCommand, idempotencyKey: string): Promise<RecountStockTakeSnapshot> {
+    return this.stockTakes.recountStockTakeBins(command, idempotencyKey).then((result) => result.snapshot);
+  }
+
+  closeStockTake(command: CloseStockTakeCommand, idempotencyKey: string): Promise<CloseStockTakeSnapshot> {
+    return this.stockTakes.closeStockTake(command, idempotencyKey).then((result) => result.snapshot);
+  }
+
+  abandonStockTake(command: AbandonStockTakeCommand, idempotencyKey: string): Promise<AbandonStockTakeSnapshot> {
+    return this.stockTakes.abandonStockTake(command, idempotencyKey).then((result) => result.snapshot);
+  }
+
+  /** `GET …/movements/stock-takes` — any staff role (no quantities). */
+  listStockTakes(tenantId: string, query: ListStockTakesQuery = {}): Promise<Page<StockTakeListEntry>> {
+    return withTenantTransaction(this.db, tenantId, (tx) => listStockTakesInTx(tx, tenantId, query));
+  }
+
+  /** `GET …/movements/stock-takes/{id}` — the dashboard (totals, zones, the digest); no quantities. */
+  getStockTake(tenantId: string, stockTakeId: string): Promise<StockTakeDetail> {
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      getStockTakeInTx(tx, tenantId, stockTakeId, this.inventory, this.stockTakes),
+    );
+  }
+
+  /** `GET …/stock-takes/{id}/variances` — GATED (counts.manage or variances.resolve). */
+  listStockTakeVariances(
+    tenantId: string,
+    actorUserId: string,
+    stockTakeId: string,
+    query: StockTakeVariancesQuery = {},
+  ): Promise<Page<StockTakeVarianceEntry>> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      await assertCanReadCountDetailInTx(tx, tenantId, actorUserId);
+      return listStockTakeVariancesInTx(tx, tenantId, stockTakeId, query);
+    });
+  }
+
+  /**
+   * `GET …/stock-takes/{id}/report` (A10) — the per-client report file, the
+   * WHOLE buffer built before the controller writes a header. Gated like the
+   * variances; allowed while counting and marked provisional.
+   */
+  stockTakeReport(
+    tenantId: string,
+    actorUserId: string,
+    stockTakeId: string,
+    options: { readonly format: 'csv' | 'xlsx'; readonly clientId: string | null },
+  ): Promise<{ body: Buffer; contentType: string; filename: string; provisional: boolean }> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      await assertCanReadCountDetailInTx(tx, tenantId, actorUserId);
+      const take = await loadStockTakeInTx(tx, tenantId, stockTakeId);
+      const rows = await stockTakeReportRowsInTx(tx, tenantId, take, options.clientId);
+      const labels = await getClientLabelsInTx(tx, tenantId, rows.map((row) => row.clientId));
+      // closed = final; counting/posting = provisional; an abandoned take's
+      // file says so (it will never be final).
+      const status = take.status === 'closed' ? 'final' : take.status === 'abandoned' ? 'abandoned' : 'provisional';
+      const provisional = status === 'provisional';
+      const cells: ExportCell[][] = rows.map((row) => [
+        status,
+        row.zoneCode,
+        row.binCode,
+        row.skuCode,
+        row.skuName,
+        labels.get(row.clientId) ?? null,
+        fromMilli(row.expectedMilli),
+        row.countedMilli === null ? null : fromMilli(row.countedMilli),
+        row.countedMilli === null ? null : fromMilli(row.countedMilli - row.expectedMilli),
+        row.outcome,
+        row.countedAt === null ? null : new Date(row.countedAt),
+      ]);
+      const body =
+        options.format === 'csv'
+          ? buildCsv(STOCK_TAKE_REPORT_COLUMNS, cells)
+          : await buildXlsx('Stock take', STOCK_TAKE_REPORT_COLUMNS, cells);
+      return {
+        body,
+        contentType: options.format === 'csv' ? STOCK_TAKE_CSV_CONTENT_TYPE : STOCK_TAKE_XLSX_CONTENT_TYPE,
+        filename: `stock-take-${take.id}${status === 'final' ? '' : `-${status}`}.${options.format}`,
+        provisional,
+      };
+    });
+  }
+
+  /**
+   * The device snapshot's stock-take arm (story 3-5b): the warehouse's
+   * active takes and its frozen bins (`bins[].frozen` — the handheld refuses
+   * them offline). Its own transaction; the api shell composes it.
+   */
+  getStockTakeSnapshot(
+    tenantId: string,
+    warehouseId: string,
+  ): Promise<{ stockTakes: StockTakeSnapshotEntry[]; frozenBinIds: Set<string> }> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const frozen = await this.inventory.frozenBinsInTx(tx, tenantId, warehouseId);
+      const rows = (await tx.execute(sql`
+        select s.id as "id", s.zone_ids as "zoneIds", s.started_at as "startedAt",
+               (select count(*)::int from count_tasks t where t.tenant_id = s.tenant_id and t.stock_take_id = s.id and t.status = 'pending') as "pending"
+          from stock_takes s
+         where s.tenant_id = ${tenantId}::uuid and s.warehouse_id = ${warehouseId}::uuid and s.status in ('counting', 'posting')
+         order by s.started_at, s.id
+      `)) as unknown as { id: string; zoneIds: string[] | null; startedAt: string | Date; pending: number }[];
+      return {
+        stockTakes: rows.map((row) => ({
+          stockTakeId: row.id,
+          zoneIds: row.zoneIds === null ? null : [...row.zoneIds],
+          frozenAt: canonicalInstant(typeof row.startedAt === 'string' ? row.startedAt : row.startedAt.toISOString()),
+          pendingTasks: Number(row.pending),
+        })),
+        frozenBinIds: new Set(frozen.keys()),
+      };
+    });
   }
 
   /** Story 3-5a — `DELETE …/count-policies/{abcClass}`: unschedule one class. */
@@ -508,6 +702,7 @@ export class MovementsFacade {
             lineCount: lineCounts.get(task.id) ?? 0,
             varianceCount: varianceCounts.get(task.id)?.all ?? 0,
             openVarianceCount: varianceCounts.get(task.id)?.open ?? 0,
+            stockTakeId: task.stockTakeId,
           };
         }),
         nextCursor: page.nextCursor,
@@ -619,6 +814,9 @@ export class MovementsFacade {
           completedBy: task.completedBy,
           completedAt: task.completedAt === null ? null : canonicalInstant(task.completedAt),
           epochConflict,
+          stockTakeId: task.stockTakeId,
+          cancelledBy: task.cancelledBy,
+          cancelledAt: task.cancelledAt === null ? null : canonicalInstant(task.cancelledAt),
         },
         lines: lineRows.map((line) => ({
           skuId: line.skuId,
@@ -1128,32 +1326,61 @@ export class MovementsFacade {
 
     // Pending tasks for this warehouse, oldest first. One row over the
     // ceiling: reading it is how we learn the result was truncated.
+    const taskColumns = {
+      id: countTasks.id,
+      binId: countTasks.binId,
+      origin: countTasks.origin,
+      binStateEpoch: countTasks.binStateEpoch,
+      createdAt: countTasks.createdAt,
+      stockTakeId: countTasks.stockTakeId,
+    };
     const taskRows = await tx
-      .select({
-        id: countTasks.id,
-        binId: countTasks.binId,
-        origin: countTasks.origin,
-        binStateEpoch: countTasks.binStateEpoch,
-        createdAt: countTasks.createdAt,
-      })
+      .select(taskColumns)
       .from(countTasks)
       .where(
         and(
           eq(countTasks.tenantId, tenantId),
           eq(countTasks.warehouseId, warehouseId),
           eq(countTasks.status, 'pending'),
+          // Story 3-5b — the cycle feed: tasks no stock take owns.
+          sql`${countTasks.stockTakeId} is null`,
         ),
       )
       .orderBy(asc(countTasks.createdAt), asc(countTasks.id))
       .limit(MAX_SNAPSHOT_COUNT_TASKS + 1);
-    const tasks = taskRows.slice(0, MAX_SNAPSHOT_COUNT_TASKS);
+    // Story 3-5b — the take feed: its own cap (the per-warehouse freeze cap,
+    // A8 — it never truncates in practice), in bin-code order.
+    const takeTaskRows = await tx
+      .select(taskColumns)
+      .from(countTasks)
+      .innerJoin(bins, and(eq(bins.tenantId, countTasks.tenantId), eq(bins.id, countTasks.binId)))
+      .where(
+        and(
+          eq(countTasks.tenantId, tenantId),
+          eq(countTasks.warehouseId, warehouseId),
+          eq(countTasks.status, 'pending'),
+          sql`${countTasks.stockTakeId} is not null`,
+        ),
+      )
+      .orderBy(sql`${bins.code} COLLATE "C"`, asc(countTasks.id))
+      .limit(MAX_SNAPSHOT_STOCK_TAKE_TASKS + 1);
+    if (takeTaskRows.length > MAX_SNAPSHOT_STOCK_TAKE_TASKS) {
+      this.logger.warn(
+        `Catalog snapshot stock-take tasks truncated — tenant=${tenantId} warehouse=${warehouseId} ` +
+          `holds more than ${MAX_SNAPSHOT_STOCK_TAKE_TASKS} pending stock-take task(s); the rest are not shown`,
+      );
+    }
+    const tasks = [
+      ...takeTaskRows.slice(0, MAX_SNAPSHOT_STOCK_TAKE_TASKS),
+      ...taskRows.slice(0, MAX_SNAPSHOT_COUNT_TASKS),
+    ];
     // Story 5-3 (review): the over-read row IS the truncation signal —
     // computed-then-dropped is exactly the shape the spec's Code Map says
     // not to repeat (5-1's PENDING note). The returned rows stay MAX-capped
     // (the device contract); the warning surfaces that this warehouse's
     // older pending counts are silently invisible so the breach is
     // actionable (refresh the seal after counting some) instead of silent.
-    if (taskRows.length > tasks.length) {
+    if (taskRows.length > MAX_SNAPSHOT_COUNT_TASKS) {
       this.logger.warn(
         `Catalog snapshot count tasks truncated — tenant=${tenantId} warehouse=${warehouseId} ` +
           `holds more than ${MAX_SNAPSHOT_COUNT_TASKS} pending count task(s); older tasks are not shown`,
@@ -1212,6 +1439,9 @@ export class MovementsFacade {
       // task row itself (story 3-5a fixed the stale "quoted back" wording).
       binStateEpoch: task.binStateEpoch,
       createdAt: canonicalInstant(task.createdAt),
+      // Story 3-5b — the take this task counts for (null = a cycle count).
+      // Additive; the count stays blind (nothing else about the take rides).
+      stockTakeId: task.stockTakeId,
       lines: linesByTask.get(task.id) ?? [],
     }));
   }

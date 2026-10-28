@@ -20,6 +20,7 @@ import {
   qcInspections,
   serials,
   skus,
+  stockFreezeBins,
   stockOnHand,
 } from '../../shared/db/schema';
 import { getClientLabelsInTx, skuCodeLabelsInTx } from '../clients/clients.facade';
@@ -875,6 +876,8 @@ export class PutawayCommand {
             tenantId: command.tenantId,
             warehouseId: command.warehouseId,
             type: 'putaway.placed',
+            // Story 3-5b (A1) — a handheld op: the freeze admits it.
+            surface: 'device',
             skuId: command.skuId,
             // One serial is one whole unit — `QUANTITY_SCALE` milli-units.
             quantityDelta: signedQuantity(QUANTITY_SCALE),
@@ -901,6 +904,8 @@ export class PutawayCommand {
           tenantId: command.tenantId,
           warehouseId: command.warehouseId,
           type: 'putaway.placed',
+          // Story 3-5b (A1) — a handheld op: the freeze admits it.
+          surface: 'device',
           skuId: command.skuId,
           quantityDelta: signedQuantity(scaled.qty),
           fromBinId: receivingBin.binId,
@@ -1408,6 +1413,11 @@ export async function binCandidatesInTx(
         // WHERE arm is legal here; `candidateFitsSku`'s bulk-asset arm is the
         // second layer.
         notInArray(bins.type, [...BULK_ASSET_TYPES]),
+        // Story 3-5b (A9) — a bin frozen for a stock take is never suggested:
+        // the take is counting it (the handheld refuses it offline; a
+        // placement into it from a stale snapshot is admitted by the freeze
+        // and forces a recount).
+        sql`not exists (select 1 from ${stockFreezeBins} where ${stockFreezeBins.tenantId} = ${bins.tenantId} and ${stockFreezeBins.binId} = ${bins.id})`,
       ),
     )
     .groupBy(

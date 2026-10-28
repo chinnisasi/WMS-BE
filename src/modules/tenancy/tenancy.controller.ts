@@ -1042,7 +1042,7 @@ export class TenancyController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks bin.retire (role-denied — Owner and Ops Manager)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Bin does not exist in this warehouse (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The bin is already retired (bin-retired — retirement is terminal)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The bin is already retired (bin-retired — retirement is terminal), or a stock take froze it (bin-frozen — story 3-5b: close or abandon the take first)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'warehouseId', format: 'uuid' })
