@@ -239,6 +239,14 @@ export const AUDIT_NEW_ACTIONS = [
   // actor is the importing user, a client user on the portal), beside each
   // created order's own `order.created` under its derived key.
   { action: 'order_import.executed', targetType: 'order_import' },
+  // Story 4-2c — the backorder follow-on: a short dispatch writes one
+  // `order.follow-on-created` row (actor the dispatcher, target the
+  // follow-on, reference the dispatch's key) beside its `order.dispatched`;
+  // an allocation that reserved something writes `order.allocated` (the verb:
+  // the staff actor and its key; the sweep and the after-dispatch attempt:
+  // `SYSTEM_ACTOR_ID`, no key).
+  { action: 'order.follow-on-created', targetType: 'order' },
+  { action: 'order.allocated', targetType: 'order' },
   // Story 3-1 — the bin-to-bin move (`MoveCommand.moveStock`); the actor is
   // the operator, also on a review Apply.
   { action: 'stock.moved', targetType: 'bin_move' },

@@ -1396,6 +1396,28 @@ export class CatalogPackTaskDto {
     description: "Story 4-2a — the cash to collect on delivery for this order, integer paise; null means prepaid.",
   })
   codAmountPaise!: number | null;
+
+  @ApiProperty({
+    required: false,
+    description:
+      "Story 4-2c — what the order ORDERED of this SKU (its lines' quantities, base units). Below it, `pickedQty` ships short and the rest follows as a separate (backorder) order. Absent on a device snapshot from before 4-2c.",
+  })
+  orderedQty?: number;
+
+  @ApiProperty({
+    required: false,
+    description:
+      'Story 4-2c — true when ANY line of the order was picked below its quantity (order-level, repeated on each of its SKU rows — a SKU that picked nothing has no row of its own): the bench warns "Short — the rest ships later as a follow-on order", and on a COD order that the courier collects the full amount on this parcel.',
+  })
+  orderShortfall?: boolean;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    required: false,
+    description: "Story 4-2c — the order's place in a backorder chain (the label suffix `-BO{seq}`; the pack card's \"Backorder\" chip); null on an original order.",
+  })
+  followOnSeq?: number | null;
 }
 
 /** One active handling unit of the device snapshot (story 10.7, additive). */

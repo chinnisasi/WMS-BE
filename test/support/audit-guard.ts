@@ -128,6 +128,17 @@ export const AUDIT_NO_OP_ARMS = {
     snapshot.restock === null &&
     isRecord(snapshot.order) &&
     snapshot.order.status === 'cancelled',
+  /**
+   * Story 4-2c — `AllocationCommandService.allocateOrder` ("Allocate now")
+   * that reserved nothing (nothing eligible, or no stock): the key stored
+   * with `{allocation}` and an empty `allocated`.
+   */
+  'orders.allocate:nothing-granted': (snapshot: unknown) =>
+    isRecord(snapshot) &&
+    sameKeys(snapshot, ['allocation']) &&
+    isRecord(snapshot.allocation) &&
+    Array.isArray(snapshot.allocation.allocated) &&
+    snapshot.allocation.allocated.length === 0,
   /** Story 6-1b — `SecondFactorCommand.reset` of a user with no two-factor sign-in and no enrolment code. */
   'users.resetSecondFactor:not-enrolled': (snapshot: unknown) =>
     isRecord(snapshot) &&

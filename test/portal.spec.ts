@@ -896,6 +896,12 @@ describe('client portal (e2e, story 21-7)', () => {
         destinationCity: 'Bengaluru',
         destinationPincode: '560066',
         lineCount,
+        // Story 4-2c (A14) — the backorder chain joins the exact key allowlist,
+        // extended deliberately (null on an original order with no follow-on).
+        followOnOfOrderId: null,
+        followOnRootOrderId: null,
+        followOnSeq: null,
+        followOnOrderId: null,
         createdAt: expect.any(String),
       });
       expect(res.body).toEqual({ items: [row(ids.orderKit, 1), row(ids.orderA1, 1)], nextCursor: null });
@@ -926,21 +932,29 @@ describe('client portal (e2e, story 21-7)', () => {
         destinationCity: 'Bengaluru',
         destinationPincode: '560066',
         lineCount: 1,
+        // Story 4-2c (A14) — the backorder chain joins the exact key allowlist,
+        // extended deliberately (null on an original order with no follow-on).
+        followOnOfOrderId: null,
+        followOnRootOrderId: null,
+        followOnSeq: null,
+        followOnOrderId: null,
         createdAt: expect.any(String),
+        // Story 4-2c (A14) — `shippedQty` on every line: null until dispatched.
         lines: [
           {
             skuCode: 'A-KIT',
             skuName: 'Alpha bundle',
             qty: 1,
+            shippedQty: null,
             components: [
-              { skuCode: 'A-C1', skuName: 'Alpha sock', qty: 1 },
-              { skuCode: 'A-C2', skuName: 'Alpha band', qty: 2 },
+              { skuCode: 'A-C1', skuName: 'Alpha sock', qty: 1, shippedQty: null },
+              { skuCode: 'A-C2', skuName: 'Alpha band', qty: 2, shippedQty: null },
             ],
           },
         ],
       });
       const plain = await portalGet(`orders/${ids.orderA1}`).expect(200);
-      expect(plain.body.lines).toEqual([{ skuCode: 'A-1', skuName: 'Alpha tee', qty: 2, components: [] }]);
+      expect(plain.body.lines).toEqual([{ skuCode: 'A-1', skuName: 'Alpha tee', qty: 2, shippedQty: null, components: [] }]);
       expect((await portalGet(`orders/${ids.orderB}`).expect(404)).body.code).toBe('not-found');
       expect((await portalGet(`orders/${uuidv7()}`).expect(404)).body.code).toBe('not-found');
       expect((await portalGet('orders/not-a-uuid').expect(400)).body.code).toBe('validation-failed');

@@ -652,7 +652,8 @@ function oversellShape(
     backorderedOrders: windowed(
       ctx,
       DRILL.orders(ctx.scope),
-      { source: 'ingested', backordered: 'true' },
+      // Story 4-2c (A15) — the drill lists ROOT orders, like the count.
+      { source: 'ingested', backordered: 'true', followOn: 'false' },
       true,
       values?.backordered ?? null,
     ),
@@ -677,6 +678,10 @@ const oversell: TileDefinition<'oversell'> = {
           where o.tenant_id = ${scope.tenantId}::uuid
             and o.warehouse_id = ${scope.warehouseId}::uuid
             and o.source = 'ingested'
+            -- Story 4-2c (A15) — ROOT orders only: a backorder follow-on is
+            -- the remainder of an order already counted, not a new channel
+            -- acceptance (every one of its lines is created backordered).
+            and o.follow_on_of_order_id is null
             and o.created_at >= ${ts(window.d7From)}
             and o.created_at < ${ts(window.asOf)}
             and exists (

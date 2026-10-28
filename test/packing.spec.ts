@@ -952,7 +952,7 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
     expect((await packEvents(orderId))[0]!.reference_doc.packedQty).toBe(3);
   });
 
-  it('packs a ZERO-unit short pick, which writes NO picks row at all (the picks-based predicate would refuse it)', async () => {
+  it('a ZERO-unit short pick writes NO picks row, passes the line-status completeness (a picks-based predicate would read it outstanding forever) — and story 4-2c then refuses the empty parcel (pack-nothing-picked)', async () => {
     const skuId = sku('PAK-ZERO');
     await seedStock(skuId, binA, 20);
     const { orderId, picklist } = await releasedWave([{ skuId, quantity: 4 }], 'zero');
@@ -971,13 +971,17 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
     `;
     expect(lineRows.map((row) => (row as unknown as { status: string }).status)).toEqual(['short']);
 
-    // Nothing was picked, so the parcel is empty and an empty scan matches.
-    await packOrder(orderId, { scanned: [{ skuId, qty: 1 }] }).expect(422);
-    const res = await packOrder(orderId, { scanned: [] }).expect(201);
-    expect(res.body.pack.totalUnits).toBe(0);
-    expect(res.body.pack.lines[0].packedQty).toBe(0);
-    expect(res.body.pack.lines[0].shortfallQty).toBe(4);
-    expect(await orderStatus(orderId)).toBe('ready_to_dispatch');
+    // Completeness PASSES (the line is settled) — the refusal is 4-2c's
+    // decision 10, never "not picked": before 4-2c the empty scan matched and
+    // the order packed to an empty parcel (and dispatched nothing); with the
+    // follow-on it would also bill a per-order charge and open a follow-on
+    // for everything. Whatever is scanned, the order stays accepted.
+    for (const scanned of [[{ skuId, qty: 1 }], []]) {
+      const refused = await packOrder(orderId, { scanned }).expect(409);
+      expect(refused.body.code).toBe('pack-nothing-picked');
+      expect(refused.body.detail).not.toContain('has not been picked');
+    }
+    expect(await orderStatus(orderId)).toBe('accepted');
   });
 
   it('sums a multi-slice order line: two picks rows, one line, one pack event', async () => {
@@ -1081,16 +1085,17 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
   });
 
   it('a packed order is NOT silently cancelled — cancel refuses it and releases nothing', async () => {
-    // A ZERO-unit short pick packs an order with NO drawn pick lines, so the
-    // 4.4 "drawn lines" guard cannot fire: what refuses this cancel is the
-    // order-status gate itself. Without it the conditional flip would simply
-    // match nothing and the caller would get a 200 carrying an UNCANCELLED
-    // order — success-shaped silence.
+    // What refuses this cancel is the order-status gate itself, which runs
+    // before the 4.4 "drawn lines" guard. Without it the conditional flip
+    // would simply match nothing and the caller would get a 200 carrying an
+    // UNCANCELLED order — success-shaped silence. (Story 4-2c: the order used
+    // to be packed from a zero-unit short pick, which decision 10 now refuses;
+    // a one-unit short pick packs it instead — the gate is the same.)
     const skuId = sku('PAK-CANCEL');
     await seedStock(skuId, binA, 20);
     const { orderId, picklist } = await releasedWave([{ skuId, quantity: 4 }], 'cancel');
-    await pick(picklist.lines[0]!, { qty: 0, reasonCode: 'bin-empty' }).expect(201);
-    await packOrder(orderId, { scanned: [] }).expect(201);
+    await pick(picklist.lines[0]!, { qty: 1, reasonCode: 'fewer-units-than-planned' }).expect(201);
+    await packOrder(orderId, { scanned: [{ skuId, qty: 1 }] }).expect(201);
 
     const res = await request(app.getHttpServer())
       .post(`${API}/${tenantId}/outbound/orders/${orderId}/cancel`)

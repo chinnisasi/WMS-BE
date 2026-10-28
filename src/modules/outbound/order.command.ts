@@ -1,5 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { and, eq, inArray, ne } from 'drizzle-orm';
+import { and, eq, inArray, isNull, ne } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
@@ -54,6 +54,13 @@ import { CatalogFacade } from '../catalog/catalog.facade';
 import type { KitCompositionLine } from '../catalog/catalog.facade';
 import { lockSkuStatusesInTx, skuInactive } from '../catalog/catalog.facade';
 import { picklistLineDrewUnits } from './wave.command';
+import {
+  ORDER_LINE_OWNER_TYPE,
+  ORDER_LINE_RESERVATION_TTL_SECONDS,
+  grantKitBlock,
+  grantLineHold,
+} from './reserve-line';
+import { completeKits } from './follow-on';
 import type { ReservationSnapshot } from '../inventory/inventory.facade';
 import {
   MAX_QUANTITY_MILLI,
@@ -103,6 +110,13 @@ import {
  * quarantine a queued pick instead of retrying it forever.
  */
 export const ORDER_STATUSES = ['accepted', 'ready_to_dispatch', 'dispatched', 'cancelled'] as const;
+
+/**
+ * Story 4-2c (A3) — test seams on `cancelOrder` (never set in production):
+ * `afterPrecheck` runs between the hold pre-check and the flip, so a suite
+ * can commit a backorder allocation in exactly that window.
+ */
+export const cancelOrderTestHooks: { afterPrecheck?: ((orderId: string) => Promise<void>) | undefined } = {};
 export type OrderStatus = (typeof ORDER_STATUSES)[number];
 
 /** The line fulfillment arms shipped in story 4.1. */
@@ -117,7 +131,7 @@ export type OrderSource = (typeof ORDER_SOURCES)[number];
  * The reservation owner type every accepted order line holds through (the
  * `reservations.owner_type` arm Epic 2 reserved for this story's writers).
  */
-export const ORDER_OWNER_TYPE = 'order';
+export const ORDER_OWNER_TYPE = ORDER_LINE_OWNER_TYPE;
 
 /**
  * Accepted-order reservation TTL (the human decision 2026-09-10): seven
@@ -125,16 +139,21 @@ export const ORDER_OWNER_TYPE = 'order';
  * "Reservation is not held") — no order-state machinery for expired holds
  * in this story; the reservation reaper restores the ATP either way.
  */
-export const ORDER_RESERVATION_TTL_SECONDS = 7 * 24 * 3600;
-
-/** Bounded ATP re-probe attempts when a line's grant loses a stock race. */
-const MAX_GRANT_ATTEMPTS = 4;
+export const ORDER_RESERVATION_TTL_SECONDS = ORDER_LINE_RESERVATION_TTL_SECONDS;
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
-/** The channel-dedup partial unique index (the race backstop's name). */
-const ORDERS_SOURCE_EVENT_UNIQUE = 'orders_source_event_unique';
-/** Story 4-1b — the per-client live client-order-number index (0088; the race backstop). */
-const ORDERS_CLIENT_ORDER_REF_LIVE_UNIQUE = 'orders_client_order_ref_live_unique';
+/**
+ * The channel-dedup partial unique index (the race backstop's name). Story
+ * 4-2c (0104) — ROOT orders only, renamed from `orders_source_event_unique`
+ * (a follow-on copies its root's channel event).
+ */
+const ORDERS_SOURCE_EVENT_UNIQUE = 'orders_source_event_root_unique';
+/**
+ * Story 4-1b — the per-client live client-order-number index (0088; the race
+ * backstop). Story 4-2c (0104) — ROOT orders only, renamed from
+ * `orders_client_order_ref_live_unique`.
+ */
+const ORDERS_CLIENT_ORDER_REF_LIVE_UNIQUE = 'orders_client_order_ref_live_root_unique';
 
 /**
  * The line-quantity ceiling, in milli-units (story 10.1). The column is
@@ -413,6 +432,18 @@ export interface OrderSnapshot {
      * carry it; every snapshot built now sets it.
      */
     readonly clientId?: string | null;
+    /**
+     * Story 4-2c — the backorder follow-on link. On a follow-on: its parent
+     * (`followOnOfOrderId`), the chain's root (`followOnRootOrderId`) and its
+     * place in the chain (`followOnSeq`, the label's `-BO{seq}`); all null on
+     * a root. On ANY order: the follow-on its short dispatch opened
+     * (`followOnOrderId`), null when none. Optional: a snapshot stored before
+     * 4-2c lacks them (read absent as null).
+     */
+    readonly followOnOfOrderId?: string | null;
+    readonly followOnRootOrderId?: string | null;
+    readonly followOnSeq?: number | null;
+    readonly followOnOrderId?: string | null;
     readonly createdAt: string;
     readonly updatedAt: string;
     readonly lines: readonly OrderLineSnapshot[];
@@ -1212,6 +1243,10 @@ export class OrderCommandService {
               eq(orders.tenantId, command.tenantId),
               eq(orders.integrationId, integrationId),
               eq(orders.externalEventId, externalEventId),
+              // Story 4-2c — ROOT orders only (the narrowed index's
+              // population): a follow-on shares its root's channel event, and
+              // a redelivery resolves to the root.
+              isNull(orders.followOnOfOrderId),
             ),
           )
           .limit(1);
@@ -1347,29 +1382,19 @@ export class OrderCommandService {
         // exploded quantity is a shortfall too: the granted siblings release
         // and the whole kit backorders. A kit never ships half its contents
         // and never half-holds.
-        const holds: ReservationSnapshot[] = [];
-        let fullyGranted = true;
-        for (let childIndex = 0; childIndex < bom.length; childIndex += 1) {
-          const component = bom[childIndex]!;
-          const reservation = await this.reserveLine(
-            command,
-            { skuId: component.componentSkuId, quantity: component.qty },
-            childIds.get(index)![childIndex]!,
-          );
-          if (reservation === null) {
-            fullyGranted = false;
-            break;
-          }
-          // Push BEFORE the shortfall check: the partial hold is a real
-          // journal row — it must release with its siblings, never orphan.
-          holds.push(reservation);
-          if (reservation.quantity < component.qty) {
-            fullyGranted = false;
-            break;
-          }
-        }
-        if (!fullyGranted) {
-          await this.releaseAll(command.tenantId, holds, 'kit-backorder');
+        // Story 4-2c — the kit block is `grantKitBlock` (`reserve-line.ts`),
+        // shared with the backorder allocation; the rule is unchanged.
+        const holds = await grantKitBlock(
+          this.inventory,
+          { tenantId: command.tenantId, warehouseId: command.warehouseId },
+          bom.map((component, childIndex) => ({
+            skuId: component.componentSkuId,
+            quantity: component.qty,
+            ownerId: childIds.get(index)![childIndex]!,
+          })),
+          (partial) => this.releaseAll(command.tenantId, partial, 'kit-backorder'),
+        );
+        if (holds === null) {
           continue;
         }
         holds.forEach((hold, childIndex) => childHolds.set(`${index}:${childIndex}`, hold));
@@ -1756,7 +1781,7 @@ export class OrderCommandService {
     // anything is written.
     const lines = await withTenantTransaction(this.db, command.tenantId, (tx) =>
       tx
-        .select({ reservationId: orderLines.reservationId })
+        .select({ id: orderLines.id, reservationId: orderLines.reservationId })
         .from(orderLines)
         .where(and(eq(orderLines.tenantId, command.tenantId), eq(orderLines.orderId, order.id))),
     );
@@ -1812,6 +1837,12 @@ export class OrderCommandService {
       );
     }
 
+    // Story 4-2c (A3) — the test seam for the cancel-vs-allocation
+    // interleaving: a backorder allocation committing HERE (between the
+    // pre-check above and the flip below) is what the flip's own re-read of
+    // the holds covers. A no-op in production.
+    await cancelOrderTestHooks.afterPrecheck?.(order.id);
+
     // ── phase 3 (write tx): the flip + the lines + outbox + audit + key ───
     // The flip commits BEFORE the releases run. A crash between the two then
     // leaves the order `cancelled` with its holds still live — ATP
@@ -1831,6 +1862,23 @@ export class OrderCommandService {
         )
         .returning();
       const winner = updates[0];
+      // Story 4-2c (A3) — the holds to release, re-read BY OWNER under the
+      // flip's own row lock: a backorder allocation that committed after the
+      // pre-check above (its phase 3 locks this row, so it either committed
+      // before the flip or will read `cancelled` and release its own grants)
+      // granted holds the pre-check never saw. Owner-keyed, because a short
+      // pick's re-grant (and an allocation's adopted hold) is named by no
+      // line column. Released after the commit with the pre-check's set.
+      const ownerHeld =
+        winner === undefined
+          ? []
+          : await this.inventory.heldReservationsByOwnerInTx(
+              tx,
+              command.tenantId,
+              order.warehouseId,
+              ORDER_OWNER_TYPE,
+              lines.map((line) => line.id),
+            );
       // A lost flip is the concurrent cancel's win — the idempotent no-op.
       // The WINNER's tx owns the outbox event, the audit row and the line
       // reset (one flip → one event, one audit line); the loser records only
@@ -1891,8 +1939,10 @@ export class OrderCommandService {
       }
 
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
-      return { snapshot, won: winner !== undefined };
+      return { snapshot, won: winner !== undefined, ownerHeld };
     });
+    const releaseSet = new Map(holds.map((hold) => [hold.id, hold]));
+    for (const hold of settled.ownerHeld) releaseSet.set(hold.id, hold);
 
     // ── phase 4: release the holds, now that the flip is durable ──────────
     // Only the flip's winner releases (the loser's holds are the winner's to
@@ -1901,7 +1951,7 @@ export class OrderCommandService {
     // settle is logged as the operational anomaly it is and left to the
     // hold's 7-day TTL — the ATP-understating direction.
     if (settled.won) {
-      for (const hold of holds) {
+      for (const hold of releaseSet.values()) {
         try {
           await this.inventory.releaseReservation(command.tenantId, hold.id);
         } catch (err) {
@@ -1950,41 +2000,16 @@ export class OrderCommandService {
     line: OrderLineInput,
     lineId: string,
   ): Promise<ReservationSnapshot | null> {
-    for (let attempt = 0; attempt < MAX_GRANT_ATTEMPTS; attempt += 1) {
-      const atp = await this.inventory.atp(command.tenantId, command.warehouseId, line.skuId);
-      const target = Math.min(line.quantity, atp.atp);
-      if (target <= 0) {
-        return null; // the fixed backorder policy: the shortfall is the line's status
-      }
-      try {
-        return await this.inventory.grantReservation({
-          tenantId: command.tenantId,
-          warehouseId: command.warehouseId,
-          skuId: line.skuId,
-          ownerType: ORDER_OWNER_TYPE,
-          ownerId: lineId,
-          quantity: target,
-          ttlSeconds: ORDER_RESERVATION_TTL_SECONDS,
-        });
-      } catch (err) {
-        const raceLoser =
-          err instanceof ProblemException && err.getStatus() === 409 && codeOf(err) === 'unavailable';
-        if (!raceLoser) {
-          // 503 store-down (and any other fault) propagates — the whole
-          // creation fails closed, nothing accepted half-reserved.
-          throw err;
-        }
-        if (attempt < MAX_GRANT_ATTEMPTS - 1) {
-          continue; // re-probe: a concurrent accept consumed units mid-grant
-        }
-        // The bounded retries are exhausted against a contended scope: the
-        // fixed backorder policy's loser outcome, never a whole-creation 409.
-        return null;
-      }
-    }
-    // Unreachable (MAX_GRANT_ATTEMPTS ≥ 1 and every arm returns/continues/
-    // throws) — kept so the compiler sees the loop can end.
-    return null;
+    // Story 4-2c — the one grant path, shared with the backorder allocation
+    // (`reserve-line.ts`): min(qty, ATP), bounded race re-probes, the
+    // loser's backorder outcome, a 503 propagating.
+    return grantLineHold(this.inventory, {
+      tenantId: command.tenantId,
+      warehouseId: command.warehouseId,
+      skuId: line.skuId,
+      quantity: line.quantity,
+      ownerId: lineId,
+    });
   }
 
   /** Releases every reservation this command granted (the nothing-written invariant). */
@@ -2110,6 +2135,8 @@ export class OrderCommandService {
             eq(orders.tenantId, tenantId),
             eq(orders.integrationId, err.integrationId),
             eq(orders.externalEventId, err.externalEventId),
+            // Story 4-2c — the root (the narrowed index's population).
+            isNull(orders.followOnOfOrderId),
           ),
         )
         .limit(1),
@@ -2199,62 +2226,7 @@ export class OrderCommandService {
 
   /** The order + lines as one snapshot (the live reservation states ride in). */
   async snapshotOf(tx: TenantTx, order: Order): Promise<OrderSnapshot> {
-    const lines = await tx
-      .select()
-      .from(orderLines)
-      .where(eq(orderLines.orderId, order.id))
-      .orderBy(orderLines.createdAt, orderLines.id);
-    // Story 11.4: the kit parents are the ids the children name — inversion,
-    // no flag, the same relational identity as kit-ness itself.
-    const kitParentIds = new Set(
-      lines.map((line) => line.parentLineId).filter((id): id is string => id !== null),
-    );
-    const reservationIds = lines
-      .map((line) => line.reservationId)
-      .filter((id): id is string => id !== null);
-    const reservations = new Map<string, ReservationSnapshot>();
-    if (reservationIds.length > 0) {
-      // The live reservation STATE through the facade (AD-6) — the line row
-      // carries only the id; the journal carries the truth. The in-tx
-      // passthrough (`appendLedgerEventInTx` precedent) keeps the snapshot's
-      // reads in the caller's own transaction.
-      for (const row of await this.inventory.reservationsByIdsInTx(tx, order.tenantId, reservationIds)) {
-        reservations.set(row.id, row);
-      }
-    }
-    return {
-      order: {
-        id: order.id,
-        tenantId: order.tenantId,
-        warehouseId: order.warehouseId,
-        status: order.status as OrderStatus,
-        source: order.source as OrderSource,
-        integrationId: order.integrationId,
-        externalEventId: order.externalEventId,
-        // Story 4-1b: the client's own order number (null when none).
-        clientOrderRef: order.clientOrderRef,
-        // Story 4-2a: the order header fields (orderType null on a pre-4-2a row).
-        orderType: order.orderType as OrderType | null,
-        priority: order.priority as OrderPriority,
-        shipByDate: order.shipByDate,
-        codAmountPaise: order.codAmountPaise,
-        // Story 11-1: the destination echoes from the flat columns; a
-        // pre-11.1 row (all null) reads back `destination: null`.
-        destination: addressFromColumns({
-          contactName: order.destinationContactName,
-          phone: order.destinationPhone,
-          line1: order.destinationLine1,
-          line2: order.destinationLine2,
-          city: order.destinationCity,
-          state: order.destinationState,
-          pincode: order.destinationPincode,
-        }),
-        clientId: order.clientId,
-        createdAt: canonicalInstant(order.createdAt),
-        updatedAt: canonicalInstant(order.updatedAt),
-        lines: lines.map((line) => lineSnapshot(line, reservations, kitParentIds)),
-      },
-    };
+    return orderSnapshotInTx(tx, this.inventory, order);
   }
 
   /**
@@ -2401,21 +2373,109 @@ function uomsOf(facts: ReadonlyMap<string, SkuFacts>): Map<string, string> {
   return new Map([...facts].map(([id, sku]) => [id, sku.uom]));
 }
 
+/**
+ * The order + lines as one snapshot (the live reservation states ride in) —
+ * story 4-2c (A12) extracted it from `OrderCommandService.snapshotOf` so the
+ * dispatch command builds its follow-on's snapshot through the same
+ * serializer, with no new injection (it already holds the inventory facade).
+ */
+export async function orderSnapshotInTx(tx: TenantTx, inventory: InventoryFacade, order: Order): Promise<OrderSnapshot> {
+  const lines = await tx
+    .select()
+    .from(orderLines)
+    .where(eq(orderLines.orderId, order.id))
+    .orderBy(orderLines.createdAt, orderLines.id);
+  // Story 11.4: the kit parents are the ids the children name — inversion,
+  // no flag, the same relational identity as kit-ness itself.
+  const kitParentIds = new Set(
+    lines.map((line) => line.parentLineId).filter((id): id is string => id !== null),
+  );
+  const reservationIds = lines
+    .map((line) => line.reservationId)
+    .filter((id): id is string => id !== null);
+  const reservations = new Map<string, ReservationSnapshot>();
+  if (reservationIds.length > 0) {
+    // The live reservation STATE through the facade (AD-6) — the line row
+    // carries only the id; the journal carries the truth.
+    for (const row of await inventory.reservationsByIdsInTx(tx, order.tenantId, reservationIds)) {
+      reservations.set(row.id, row);
+    }
+  }
+  // Story 4-2c — the follow-on this order's short dispatch opened (one per
+  // parent — `orders_follow_on_of_unique`).
+  const child = await tx
+    .select({ id: orders.id })
+    .from(orders)
+    .where(and(eq(orders.tenantId, order.tenantId), eq(orders.followOnOfOrderId, order.id)))
+    .limit(1);
+  // Story 4-2c (A8) — a kit parent's LIVE shortfall, from its children's
+  // reserved quantities (allocation never changes the acceptance status).
+  const childrenOf = new Map<string, OrderLine[]>();
+  for (const line of lines) {
+    if (line.parentLineId === null) continue;
+    const list = childrenOf.get(line.parentLineId) ?? [];
+    list.push(line);
+    childrenOf.set(line.parentLineId, list);
+  }
+  return {
+    order: {
+      id: order.id,
+      tenantId: order.tenantId,
+      warehouseId: order.warehouseId,
+      status: order.status as OrderStatus,
+      source: order.source as OrderSource,
+      integrationId: order.integrationId,
+      externalEventId: order.externalEventId,
+      // Story 4-1b: the client's own order number (null when none).
+      clientOrderRef: order.clientOrderRef,
+      // Story 4-2a: the order header fields (orderType null on a pre-4-2a row).
+      orderType: order.orderType as OrderType | null,
+      priority: order.priority as OrderPriority,
+      shipByDate: order.shipByDate,
+      codAmountPaise: order.codAmountPaise,
+      // Story 11-1: the destination echoes from the flat columns; a
+      // pre-11.1 row (all null) reads back `destination: null`.
+      destination: addressFromColumns({
+        contactName: order.destinationContactName,
+        phone: order.destinationPhone,
+        line1: order.destinationLine1,
+        line2: order.destinationLine2,
+        city: order.destinationCity,
+        state: order.destinationState,
+        pincode: order.destinationPincode,
+      }),
+      clientId: order.clientId,
+      followOnOfOrderId: order.followOnOfOrderId,
+      followOnRootOrderId: order.followOnRootOrderId,
+      followOnSeq: order.followOnSeq,
+      followOnOrderId: child[0]?.id ?? null,
+      createdAt: canonicalInstant(order.createdAt),
+      updatedAt: canonicalInstant(order.updatedAt),
+      lines: lines.map((line) => lineSnapshot(line, reservations, kitParentIds, childrenOf.get(line.id))),
+    },
+  };
+}
+
 /** One stored line as every read of this module returns it. */
 export function lineSnapshot(
   row: OrderLine,
   reservations: ReadonlyMap<string, ReservationSnapshot>,
   kitParentIds: ReadonlySet<string> = new Set(),
+  children?: readonly OrderLine[],
 ): OrderLineSnapshot {
   const reservation = row.reservationId === null ? undefined : reservations.get(row.reservationId);
   // A kit parent line holds nothing itself — its children hold the stock —
-  // so its shortfall is the all-or-nothing outcome (0 when the kit's
-  // components reserved, the whole qty when the kit backordered), never the
-  // meaningless qty − 0.
+  // so its shortfall is never the meaningless qty − 0. Story 4-2c (A8): it is
+  // the kits the children's LIVE reserved quantities do not cover
+  // (`Q − complete`), so an allocated kit stops reading short; without the
+  // children (a caller that has none to hand) it is the acceptance outcome
+  // (0 when the kit's components reserved, the whole qty when it backordered).
   const shortfallMilli = kitParentIds.has(row.id)
-    ? row.status === 'backordered'
-      ? row.qty
-      : 0
+    ? children !== undefined && children.length > 0
+      ? row.qty - completeKits(row.qty, children.map((child) => ({ qty: child.qty, covered: child.reservedQty })))
+      : row.status === 'backordered'
+        ? row.qty
+        : 0
     : row.qty - row.reservedQty;
   return {
     id: row.id,
@@ -2837,7 +2897,8 @@ async function liveOrderWithRefInTx(tx: TenantTx, tenantId: string, clientId: st
   const rows = await tx
     .select({ orderId: orders.id, warehouseId: orders.warehouseId })
     .from(orders)
-    .where(and(eq(orders.tenantId, tenantId), eq(orders.clientOrderRef, ref), eq(orders.clientId, clientId), ne(orders.status, 'cancelled')))
+    // Story 4-2c — the ROOT holding the number (a follow-on shares it).
+    .where(and(eq(orders.tenantId, tenantId), eq(orders.clientOrderRef, ref), eq(orders.clientId, clientId), ne(orders.status, 'cancelled'), isNull(orders.followOnOfOrderId)))
     .limit(1);
   return rows[0] ?? null;
 }
@@ -2866,10 +2927,6 @@ function orderSourceConflict(existingOrderId: string): ProblemException {
     'Channel order ref already used by another payload',
     `The (integration, external event) ref already created order "${existingOrderId}" with a DIFFERENT payload — this is a data conflict, not a retry.`,
   );
-}
-
-function codeOf(error: ProblemException): string {
-  return (error.getResponse() as { code: string }).code;
 }
 
 /**

@@ -283,7 +283,7 @@ describe('the worker heartbeat (story 6-2c, A3)', () => {
 
     const source = readFileSync(join(__dirname, '..', 'src', 'jobs', 'jobs.module.ts'), 'utf8');
 
-    it('each of the 13 jobs is tracked under its own name, after its env gate', () => {
+    it('each job (seventeen since 4-2c) is tracked under its own name, after its env gate', () => {
       const tracked = [...source.matchAll(/this\.ticks\.track\('([a-z-]+)', this\.pollMs\)/g)].map((m) => m[1]);
       expect(tracked.sort()).toEqual([...WORKER_JOBS].sort());
     });
@@ -309,6 +309,8 @@ describe('the worker heartbeat (story 6-2c, A3)', () => {
           'WaveCutoffSweepWorker',
           // Story 5-2a — per tenant and per completed send.
           'WebhookSenderWorker',
+          // Story 4-2c — per tenant.
+          'BackorderAllocationWorker',
         ].sort(),
       );
     });

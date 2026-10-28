@@ -8,6 +8,7 @@ import { WaveCommandService } from './wave.command';
 import { PickCommandService } from './pick.command';
 import { PackCommandService } from './pack.command';
 import { DispatchCommandService } from './dispatch.command';
+import { AllocationCommandService } from './allocation.command';
 import { ShipmentCommandService } from './shipment.command';
 import { ManifestCommandService } from './manifest.command';
 import { RateService } from './rate.service';
@@ -104,6 +105,9 @@ import { ValkeyModule } from '../../shared/valkey/valkey.module';
     RateService,
     OrderImportCommand,
     CancelRestockCommandService,
+    // Story 4-2c — the backorder allocation (the verb, the sweep, the
+    // after-dispatch attempt).
+    AllocationCommandService,
     { provide: WAVE_CLOCK, useClass: SystemWaveClock },
     OutboundFacade,
   ],

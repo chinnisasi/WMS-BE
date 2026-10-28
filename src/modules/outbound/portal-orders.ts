@@ -6,6 +6,7 @@ import { fromMilli } from '../../shared/primitives/quantity';
 import { canonicalInstant } from '../../shared/primitives/time';
 import type { OrderSource, OrderStatus } from './order.command';
 import { orderReferenceMatch } from './order-reference';
+import { completeKits } from './follow-on';
 import type { OrderPriority, OrderType } from './order-urgency';
 
 /**
@@ -42,6 +43,16 @@ export interface PortalOrderRow {
   readonly destinationPincode: string | null;
   /** Top-level lines only — a kit counts once, its components never. */
   readonly lineCount: number;
+  /**
+   * Story 4-2c — the backorder chain, raw (the web composes "Backorder of
+   * 1042" and the label `1042-BO1`): this order's parent, the chain's root and
+   * its `-BO{seq}` (all null on a root); the follow-on its short dispatch
+   * opened (null when none). The ids are this client's own orders.
+   */
+  readonly followOnOfOrderId: string | null;
+  readonly followOnRootOrderId: string | null;
+  readonly followOnSeq: number | null;
+  readonly followOnOrderId: string | null;
   readonly createdAt: string;
 }
 
@@ -49,6 +60,12 @@ export interface PortalOrderComponent {
   readonly skuCode: string | null;
   readonly skuName: string | null;
   readonly qty: number;
+  /**
+   * Story 4-2c (A14) — what SHIPPED of this line once the order is
+   * `dispatched` (Σ its picks; on a kit parent the number of COMPLETE kits),
+   * base units; null before dispatch.
+   */
+  readonly shippedQty: number | null;
 }
 
 export interface PortalOrderLine extends PortalOrderComponent {
@@ -74,6 +91,10 @@ interface OrderHeaderRow {
   destinationCity: string | null;
   destinationPincode: string | null;
   lineCount: number;
+  followOnOfOrderId: string | null;
+  followOnRootOrderId: string | null;
+  followOnSeq: number | string | null;
+  followOnOrderId: string | null;
   createdAt: string;
   createdAtText: string;
 }
@@ -92,6 +113,12 @@ function headerSelect(tenantId: string): ReturnType<typeof sql> {
            o.destination_pincode as "destinationPincode",
            (select count(*)::int from order_lines ol
               where ol.tenant_id = o.tenant_id and ol.order_id = o.id and ol.parent_line_id is null) as "lineCount",
+           o.follow_on_of_order_id as "followOnOfOrderId",
+           o.follow_on_root_order_id as "followOnRootOrderId",
+           o.follow_on_seq as "followOnSeq",
+           (select fo.id from orders fo
+              where fo.tenant_id = o.tenant_id and fo.follow_on_of_order_id = o.id and fo.client_id = o.client_id
+              limit 1) as "followOnOrderId",
            o.created_at as "createdAt",
            o.created_at::text as "createdAtText"
     from orders o
@@ -116,6 +143,10 @@ function toRow(row: OrderHeaderRow): PortalOrderRow {
     destinationCity: row.destinationCity,
     destinationPincode: row.destinationPincode,
     lineCount: Number(row.lineCount),
+    followOnOfOrderId: row.followOnOfOrderId,
+    followOnRootOrderId: row.followOnRootOrderId,
+    followOnSeq: row.followOnSeq === null ? null : Number(row.followOnSeq),
+    followOnOrderId: row.followOnOrderId,
     createdAt: canonicalInstant(String(row.createdAt)),
   };
 }
@@ -164,7 +195,8 @@ export async function portalOrderInTx(
   // still shows, with a null code, rather than vanishing.
   const lines = (await tx.execute(sql`
     select ol.id, ol.parent_line_id as "parentLineId", ol.qty::bigint as "qtyMilli",
-           s.code as "skuCode", s.name as "skuName"
+           s.code as "skuCode", s.name as "skuName",
+           coalesce((select sum(p.qty) from picks p where p.tenant_id = ol.tenant_id and p.order_line_id = ol.id), 0)::bigint::text as "pickedMilli"
     from order_lines ol
     join orders o on o.tenant_id = ol.tenant_id and o.id = ol.order_id
     left join skus s on s.tenant_id = ol.tenant_id and s.id = ol.sku_id
@@ -178,23 +210,41 @@ export async function portalOrderInTx(
     qtyMilli: string | number;
     skuCode: string | null;
     skuName: string | null;
+    pickedMilli: string;
   }[];
+  // A14 — `shippedQty` only once the order is dispatched (null before).
+  const dispatched = header.status === 'dispatched';
   const components = new Map<string, PortalOrderComponent[]>();
+  const coverage = new Map<string, { qty: number; covered: number }[]>();
   for (const line of lines) {
     if (line.parentLineId === null) continue;
     const list = components.get(line.parentLineId) ?? [];
-    list.push({ skuCode: line.skuCode, skuName: line.skuName, qty: fromMilli(Number(line.qtyMilli)) });
+    list.push({
+      skuCode: line.skuCode,
+      skuName: line.skuName,
+      qty: fromMilli(Number(line.qtyMilli)),
+      shippedQty: dispatched ? fromMilli(Number(line.pickedMilli)) : null,
+    });
     components.set(line.parentLineId, list);
+    const covered = coverage.get(line.parentLineId) ?? [];
+    covered.push({ qty: Number(line.qtyMilli), covered: Number(line.pickedMilli) });
+    coverage.set(line.parentLineId, covered);
   }
   return {
     ...toRow(header),
     lines: lines
       .filter((line) => line.parentLineId === null)
-      .map((line) => ({
-        skuCode: line.skuCode,
-        skuName: line.skuName,
-        qty: fromMilli(Number(line.qtyMilli)),
-        components: components.get(line.id) ?? [],
-      })),
+      .map((line) => {
+        const kit = coverage.get(line.id);
+        // A kit parent ships COMPLETE kits only (decision 2's `complete`).
+        const shippedMilli = kit === undefined ? Number(line.pickedMilli) : completeKits(Number(line.qtyMilli), kit);
+        return {
+          skuCode: line.skuCode,
+          skuName: line.skuName,
+          qty: fromMilli(Number(line.qtyMilli)),
+          shippedQty: dispatched ? fromMilli(shippedMilli) : null,
+          components: components.get(line.id) ?? [],
+        };
+      }),
   };
 }

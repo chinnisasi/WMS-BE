@@ -1215,27 +1215,34 @@ describe('dispatch: the terminal order transition (e2e, story 4.6)', () => {
     expect(after.filter((hold) => hold.state === 'committed')).toHaveLength(0);
     expect(after).toHaveLength(before.length); // no hold was created or lost
 
-    // Both SKUs recover: nothing of this order is reserved any more.
-    expect((await atp(shortSku)).reserved).toBe(0);
+    // Both SKUs recover: nothing of THIS order is reserved any more. Story
+    // 4-2c — the short line's remainder (2) opened a follow-on, and the
+    // after-dispatch allocation reserved those 2 from the stock still on the
+    // shelf: the only reservation left on the SKU is the follow-on's own hold
+    // (before 4-2c: none, and the remainder was simply lost).
+    const followOnId = dispatch.followOnOrderId as string;
+    expect(followOnId).toEqual(expect.any(String));
+    const followOnHolds = await holdsOfOrder(followOnId);
+    expect(followOnHolds.map((hold) => [hold.state, hold.quantity])).toEqual([['held', 2]]);
+    expect((await atp(shortSku)).reserved).toBe(2);
     expect((await atp(wholeSku)).reserved).toBe(0);
   });
 
-  it('dispatches an order whose every line short-picked to ZERO — nothing to retire, and the order still closes', async () => {
+  it('an order whose every line short-picked to ZERO never reaches dispatch — story 4-2c refuses the empty pack (pack-nothing-picked), so no empty parcel ships', async () => {
+    // Before 4-2c this order packed to an empty parcel and dispatched with
+    // nothing retired (outbound.md "stated plainly"). With the follow-on it
+    // would dispatch an empty parcel, bill a per-order charge and open a
+    // follow-on for everything, so decision 10 refuses the pack instead — the
+    // pinned outcome is now the refusal, and the order stays accepted.
     const skuId = sku('DSP-ZERO');
     await seedStock(skuId, binA, 20);
     const { orderId, picklist } = await releasedWave([{ skuId, quantity: 4 }], 'zero');
     await pick(picklist.lines[0]!, { qty: 0, reasonCode: 'bin-empty' }).expect(201);
-    await packOrder(orderId, []).expect(201);
-
-    const res = await dispatchOrder(orderId).expect(201);
-    expect(res.body.dispatch.totalUnits).toBe(0);
-    expect(res.body.dispatch.retiredReservationIds).toEqual([]);
-    // The event is still written: one per ORDER LINE, shipment or not — the
-    // order's terminal fact is journalled either way.
-    const events = await dispatchEvents(orderId);
-    expect(events).toHaveLength(1);
-    expect(events[0]!.reference_doc.dispatchedQty).toBe(0);
-    expect(await orderStatus(orderId)).toBe('dispatched');
+    const refused = await packOrder(orderId, []).expect(409);
+    expect(refused.body.code).toBe('pack-nothing-picked');
+    expect(await orderStatus(orderId)).toBe('accepted');
+    await dispatchOrder(orderId).expect(409);
+    expect(await dispatchEvents(orderId)).toHaveLength(0);
   });
 
   // ── `dispatched` is terminal everywhere ───────────────────────────────────

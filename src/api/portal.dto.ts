@@ -220,6 +220,18 @@ export class PortalOrderRowDto {
   @ApiProperty({ description: 'Top-level lines — a kit counts once' })
   lineCount!: number;
 
+  @ApiProperty({ type: String, format: 'uuid', nullable: true, required: false, description: 'Story 4-2c — on a backorder follow-on (the order a short shipment opened for what did not ship): the order it follows; null on your original order' })
+  followOnOfOrderId?: string | null;
+
+  @ApiProperty({ type: String, format: 'uuid', nullable: true, required: false, description: 'Story 4-2c — on a follow-on: your original order (the chain\'s root); null on the original' })
+  followOnRootOrderId?: string | null;
+
+  @ApiProperty({ type: Number, nullable: true, required: false, description: 'Story 4-2c — on a follow-on: its place in the chain — the label suffix `-BO{seq}` (1042-BO1); null on the original' })
+  followOnSeq?: number | null;
+
+  @ApiProperty({ type: String, format: 'uuid', nullable: true, required: false, description: 'Story 4-2c — the follow-on this order\'s short shipment opened for the units that did not ship; null when everything shipped' })
+  followOnOrderId?: string | null;
+
   @ApiProperty()
   createdAt!: string;
 }
@@ -241,6 +253,9 @@ export class PortalOrderComponentDto {
 
   @ApiProperty({ description: 'Base units' })
   qty!: number;
+
+  @ApiProperty({ type: Number, nullable: true, required: false, description: 'Story 4-2c — what shipped of this line once the order is dispatched, base units (a kit: the number of complete kits); null before dispatch' })
+  shippedQty?: number | null;
 }
 
 export class PortalOrderLineDto extends PortalOrderComponentDto {

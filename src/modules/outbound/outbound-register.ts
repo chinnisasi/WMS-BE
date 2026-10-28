@@ -74,6 +74,13 @@ export interface OutboundRegisterRow {
   readonly quantity: number;
   readonly shipmentCarrier: string | null;
   readonly shipmentTracking: string | null;
+  /**
+   * Story 4-2c — the backorder link, ORDER-level (repeated on every line):
+   * the parent a follow-on ships the remainder of, and its `-BO{seq}`; null
+   * on a root order.
+   */
+  readonly followOnOfOrderId: string | null;
+  readonly followOnSeq: number | null;
 }
 
 /** Orders per walk statement. */
@@ -117,7 +124,8 @@ export async function outboundRegisterInTx(
              o.destination_city as "destinationCity", o.destination_state as "destinationState", o.destination_pincode as "destinationPincode",
              ol.id::text as "lineId", k.id::text as "skuId", k.code as "skuCode", k.name as "skuName", k.uom as "uom",
              pk.code as "kitOf", ol.qty::text as "quantity",
-             sh.carrier_name as "shipmentCarrier", sh.tracking_number as "shipmentTracking"
+             sh.carrier_name as "shipmentCarrier", sh.tracking_number as "shipmentTracking",
+             o.follow_on_of_order_id::text as "followOnOfOrderId", o.follow_on_seq as "followOnSeq"
       from order_lines ol
       join orders o on o.tenant_id = ol.tenant_id and o.id = ol.order_id
       join skus k on k.tenant_id = ol.tenant_id and k.id = ol.sku_id
@@ -146,6 +154,7 @@ export async function outboundRegisterInTx(
         quantity: fromMilli(Number(row.quantity)),
         // bigint over raw SQL is text (IMPLEMENTATION-GUIDE §2), coerced here.
         codAmountPaise: row.codAmountPaise === null ? null : Number(row.codAmountPaise),
+        followOnSeq: row.followOnSeq === null ? null : Number(row.followOnSeq),
       });
     }
     if (orders.length < pageSize) break;

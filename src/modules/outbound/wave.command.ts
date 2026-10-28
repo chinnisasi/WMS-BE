@@ -1241,6 +1241,14 @@ export class WaveCommandService {
       // is simply not swept, with no new clause needed.
       eq(orders.status, 'accepted'),
       sql`not exists (select 1 from ${picklistLines} pl where pl.tenant_id = ${orders.tenantId} and pl.order_id = ${orders.id} and pl.status <> 'cancelled')`,
+      // Story 4-2c (A4) — only an order with a line that HOLDS something: a
+      // hold-less (wholly backordered) order — a follow-on awaiting stock, or
+      // an order accepted with nothing reserved — has nothing to plan, and a
+      // follow-on inherits its ship-by, so without this the overdue hold-less
+      // orders sort first and crowd every reserved order out of the
+      // `cap * 2` candidate read. Table-qualified by hand (Gotcha 9). The
+      // backorder allocation reserves such an order; then it waves.
+      sql`exists (select 1 from order_lines ol where ol.tenant_id = ${orders.tenantId} and ol.order_id = ${orders.id} and ol.reserved_qty > 0 and ol.reservation_id is not null)`,
     );
     const urgency = orderUrgencyOrderBy(todayIst, {
       priority: sql`${orders.priority}`,
@@ -1256,7 +1264,7 @@ export class WaveCommandService {
       if (candidates.length === 0) {
         if (attempt === 0) {
           throw noEligibleOrders(
-            'No accepted order in this warehouse is free to wave — every one is already on an open wave, or none exists.',
+            'No accepted order in this warehouse is free to wave — every one is already on an open wave, holds no stock yet (it is awaiting stock — the backorder allocation reserves it when stock arrives), or none exists.',
           );
         }
         // Every candidate was claimed while this sweep waited — a lost race.

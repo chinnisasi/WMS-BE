@@ -569,6 +569,8 @@ describe('operational registers (e2e, story 5-3a)', () => {
         'sku_code:text', 'sku_name:text', 'kit_of:text', 'uom:text', 'ordered_qty:number', 'first_dispatched_ist:instant', 'carrier:text', 'awb:text', 'client_order_ref:text',
         // Story 4-2a (A20) — the order header fields, appended at the END.
         'order_type:text', 'priority:text', 'ship_by_date:date', 'cod_amount_paise:number',
+        // Story 4-2c — the backorder link, appended at the END.
+        'follow_on_of_order_id:text', 'follow_on_seq:number',
       ],
       ledger: [
         'created_ist:instant', 'recorded_ist:instant', 'occurred_ist:instant', 'type:text', 'sku_code:text', 'client_code:text', 'uom:text',
@@ -714,15 +716,17 @@ describe('operational registers (e2e, story 5-3a)', () => {
     const first = istWallClock(at(3, 9));
     const accepted = (id: string, when: string, client: string, skuCode: string, name: string, kitOf: string, qty: string) =>
       // (Story 4-2a: a legacy-shaped row — no type, priority normal, no ship-by, prepaid.)
-      [id, istWallClock(when), 'accepted', 'manual', '', client, '', '', 'Bengaluru', 'Karnataka', '560001', skuCode, name, kitOf, 'each', qty, '', '', '', '', '', 'normal', '', ''];
+      [id, istWallClock(when), 'accepted', 'manual', '', client, '', '', 'Bengaluru', 'Karnataka', '560001', skuCode, name, kitOf, 'each', qty, '', '', '', '', '', 'normal', '', '', '', ''];
     expect(rows).toEqual([
       // Story 4-1b — the client order number is the LAST column.
       // Story 4-2a (A20) — the four order fields last; the ORDER-level COD
-      // (paise) repeated on BOTH lines of the two-line order.
-      [o1, istWallClock(at(2, 10)), 'dispatched', 'manual', '', 'ACME', 'Acme Retail LLP', '29ABCDE1234F1Z5', 'Bengaluru', 'Karnataka', '560001', 'AC-PL', 'Acme Plain', '', 'each', '2', first, 'BlueDart', 'BD-111', 'SO-1042', 'b2b', 'high', addIsoDays(D0, 3), '149900'],
-      [o1, istWallClock(at(2, 10)), 'dispatched', 'manual', '', 'ACME', 'Acme Retail LLP', '29ABCDE1234F1Z5', 'Bengaluru', 'Karnataka', '560001', 'AC-BT', 'Acme Pills', '', 'each', '3', first, 'BlueDart', 'BD-111', 'SO-1042', 'b2b', 'high', addIsoDays(D0, 3), '149900'],
+      // (paise) repeated on BOTH lines of the two-line order. Story 4-2c —
+      // the two backorder-link columns after them (blank: no follow-on here;
+      // a follow-on's are pinned in test/order-follow-on.spec.ts).
+      [o1, istWallClock(at(2, 10)), 'dispatched', 'manual', '', 'ACME', 'Acme Retail LLP', '29ABCDE1234F1Z5', 'Bengaluru', 'Karnataka', '560001', 'AC-PL', 'Acme Plain', '', 'each', '2', first, 'BlueDart', 'BD-111', 'SO-1042', 'b2b', 'high', addIsoDays(D0, 3), '149900', '', ''],
+      [o1, istWallClock(at(2, 10)), 'dispatched', 'manual', '', 'ACME', 'Acme Retail LLP', '29ABCDE1234F1Z5', 'Bengaluru', 'Karnataka', '560001', 'AC-BT', 'Acme Pills', '', 'each', '3', first, 'BlueDart', 'BD-111', 'SO-1042', 'b2b', 'high', addIsoDays(D0, 3), '149900', '', ''],
       // The dispatch event named no carrier: the LATEST shipment's pair (never the older one's).
-      [o2, istWallClock(at(5, 10)), 'dispatched', 'ingested', 'SHOP-1001', 'ACME', '', '', 'Bengaluru', 'Karnataka', '560001', 'AC-PL', 'Acme Plain', '', 'each', '1', istWallClock(at(5, 15)), 'Ekart', 'AWB-22', '', '', 'normal', '', ''],
+      [o2, istWallClock(at(5, 10)), 'dispatched', 'ingested', 'SHOP-1001', 'ACME', '', '', 'Bengaluru', 'Karnataka', '560001', 'AC-PL', 'Acme Plain', '', 'each', '1', istWallClock(at(5, 15)), 'Ekart', 'AWB-22', '', '', 'normal', '', '', '', ''],
       accepted(o3, at(6, 10), 'BETA', 'BE-PL', 'Beta Plain', '', '4'),
       accepted(o5, at(7, 10), 'ACME', 'AC-KIT', 'Acme Kit', '', '1'),
       accepted(o5, at(7, 10), 'ACME', 'AC-PL', 'Acme Plain', 'AC-KIT', '2'),

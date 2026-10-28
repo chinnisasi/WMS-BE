@@ -89,6 +89,9 @@ export interface OrderRefView {
   readonly externalEventId: string | null;
   /** Story 4-1b — the client's own order number; null when none (or the order row is missing). */
   readonly clientOrderRef: string | null;
+  /** Story 4-2c — a follow-on's `-BO{seq}` and its chain root (the label's short id); null on a root. */
+  readonly followOnSeq: number | null;
+  readonly followOnRootOrderId: string | null;
   readonly orderId: string;
 }
 
@@ -462,6 +465,8 @@ export class InvoiceRecordsService {
               source: row.orderSource,
               externalEventId: row.orderExternalEventId,
               clientOrderRef: row.orderClientOrderRef,
+              followOnSeq: row.orderFollowOnSeq === null ? null : Number(row.orderFollowOnSeq),
+              followOnRootOrderId: row.orderFollowOnRootOrderId,
               orderId: row.orderId,
             },
             skuId: row.skuId,
@@ -492,6 +497,8 @@ export class InvoiceRecordsService {
                 source: ref?.source ?? null,
                 externalEventId: ref?.externalEventId ?? null,
                 clientOrderRef: ref?.clientOrderRef ?? null,
+                followOnSeq: ref?.followOnSeq ?? null,
+                followOnRootOrderId: ref?.followOnRootOrderId ?? null,
                 orderId: row.orderId,
               },
               lines: row.lines,

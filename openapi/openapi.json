@@ -10563,6 +10563,135 @@
         ]
       }
     },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/allocate": {
+      "post": {
+        "operationId": "OutboundController_allocateOrder",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "What this run reserved, what still awaits stock and what it skipped (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AllocateOrderResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key or path parameter (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks orders.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Order does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The order is not accepted (order-not-accepted), it is on an open wave (order-on-open-wave — extensions.waveId), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The reservation store is unreachable (reservation-store-unavailable) — nothing reserved",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-2c — \"Allocate now\" (orders.manage): re-reserves an accepted order's backordered lines that hold nothing, from stock available now (min(qty, ATP) per line, a kit all-or-nothing). Nothing to reserve is 200 with an empty `allocated`. The backorder sweep does the same in the background.",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
     "/tenants/{tenantId}/outbound/orders/{orderId}/cancel-with-restock": {
       "post": {
         "operationId": "OutboundController_cancelOrderWithRestock",
@@ -11596,6 +11725,15 @@
             "schema": {
               "maxLength": 200,
               "type": "string"
+            }
+          },
+          {
+            "name": "followOn",
+            "required": false,
+            "in": "query",
+            "description": "Story 4-2c — `true`: only backorder follow-ons (orders a short dispatch opened for the unshipped remainder); `false`: only root orders (the SM-4 drill — a follow-on is not a new client order). Exactly 'true' or 'false'",
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
@@ -45789,6 +45927,29 @@
             "nullable": true,
             "description": "Story 21-2b — the client the order is for, derived from its lines' and kit components' SKUs. Absent or null only on a replayed response stored before 21-2b"
           },
+          "followOnOfOrderId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 4-2c — on a backorder follow-on (the order a short dispatch opened for the unshipped remainder): its parent order; null on a root order. Absent only on a replayed response stored before 4-2c — read absent as null."
+          },
+          "followOnRootOrderId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 4-2c — on a follow-on: the chain's root (the client's original order; the label's short id when it has no number); null on a root. Absent only on a replayed response stored before 4-2c — read absent as null."
+          },
+          "followOnSeq": {
+            "type": "number",
+            "nullable": true,
+            "description": "Story 4-2c — on a follow-on: its place in the chain, the label suffix `-BO{seq}` (`1042-BO1`, then `1042-BO2`); null on a root. Absent only on a replayed response stored before 4-2c — read absent as null."
+          },
+          "followOnOrderId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 4-2c — the follow-on this order's short dispatch opened; null when everything shipped (or before dispatch). Absent only on a replayed response stored before 4-2c — read absent as null."
+          },
           "createdAt": {
             "type": "string",
             "description": "ISO-8601 UTC creation time"
@@ -46034,6 +46195,146 @@
       "CancelOrderDto": {
         "type": "object",
         "properties": {}
+      },
+      "AllocatedLineDto": {
+        "type": "object",
+        "properties": {
+          "orderLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Ordered, base units"
+          },
+          "reservedQty": {
+            "type": "number",
+            "description": "What the line now holds, base units (may be below qty — a partial grant, as at acceptance)"
+          }
+        },
+        "required": [
+          "orderLineId",
+          "skuId",
+          "skuCode",
+          "qty",
+          "reservedQty"
+        ]
+      },
+      "StillShortLineDto": {
+        "type": "object",
+        "properties": {
+          "orderLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "shortQty": {
+            "type": "number",
+            "description": "Still awaiting stock, base units"
+          }
+        },
+        "required": [
+          "orderLineId",
+          "skuId",
+          "skuCode",
+          "shortQty"
+        ]
+      },
+      "SkippedAllocationLineDto": {
+        "type": "object",
+        "properties": {
+          "orderLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "sku-inactive",
+              "licence-not-covered",
+              "contended"
+            ],
+            "description": "Why the line was not reserved this run: `sku-inactive` — the SKU is inactive and its stock does not cover the line in full (an inactive SKU sells existing stock only); `licence-not-covered` — licence enforcement is on and the order's goods are not covered at this warehouse today; `contended` — another allocation reserved it at the same moment"
+          }
+        },
+        "required": [
+          "orderLineId",
+          "skuId",
+          "skuCode",
+          "reason"
+        ]
+      },
+      "AllocationDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "allocated": {
+            "description": "Lines reserved by this run (empty when nothing could be — still 200)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AllocatedLineDto"
+            }
+          },
+          "stillShort": {
+            "description": "Eligible lines still awaiting stock after this run",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StillShortLineDto"
+            }
+          },
+          "skipped": {
+            "description": "Eligible lines this run did not reserve, with the reason",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SkippedAllocationLineDto"
+            }
+          }
+        },
+        "required": [
+          "orderId",
+          "warehouseId",
+          "allocated",
+          "stillShort",
+          "skipped"
+        ]
+      },
+      "AllocateOrderResponse": {
+        "type": "object",
+        "properties": {
+          "allocation": {
+            "$ref": "#/components/schemas/AllocationDto"
+          }
+        },
+        "required": [
+          "allocation"
+        ]
       },
       "CancelOrderWithRestockDto": {
         "type": "object",
@@ -46889,6 +47190,29 @@
             "type": "number",
             "description": "Total units shipped — the sum of every line’s dispatchedQty"
           },
+          "followOnOrderId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 4-2c — the follow-on order this dispatch opened for what did not ship (accepted, every line backordered; it ships when stock arrives — `followOnSeq + 1`, or 1, names it `-BO{n}`); null when everything shipped. Absent only on a replayed response stored before 4-2c — read absent as null."
+          },
+          "followOnOfOrderId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 4-2c — THIS order's parent when it is itself a follow-on; null on a root. Absent before 4-2c."
+          },
+          "followOnRootOrderId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 4-2c — THIS order's chain root when it is a follow-on; null on a root. Absent before 4-2c."
+          },
+          "followOnSeq": {
+            "type": "number",
+            "nullable": true,
+            "description": "Story 4-2c — THIS order's `-BO{seq}` when it is a follow-on; null on a root. Absent before 4-2c."
+          },
           "retiredReservationIds": {
             "description": "The reservation holds this dispatch retired committed → released — the ATP correction. Empty when the order had none left to retire.",
             "type": "array",
@@ -47292,6 +47616,29 @@
             "format": "uuid",
             "nullable": true,
             "description": "Story 21-2b — the client the order is for, derived from its SKUs"
+          },
+          "followOnOfOrderId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 4-2c — on a backorder follow-on (the order a short dispatch opened for the unshipped remainder): its parent order; null on a root order."
+          },
+          "followOnRootOrderId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 4-2c — on a follow-on: the chain's root (the client's original order; the label's short id when it has no number); null on a root."
+          },
+          "followOnSeq": {
+            "type": "number",
+            "nullable": true,
+            "description": "Story 4-2c — on a follow-on: its place in the chain, the label suffix `-BO{seq}` (`1042-BO1`, then `1042-BO2`); null on a root."
+          },
+          "followOnOrderId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 4-2c — the follow-on this order's short dispatch opened; null when everything shipped (or before dispatch)."
           },
           "createdAt": {
             "type": "string",
@@ -50284,6 +50631,19 @@
             "type": "number",
             "nullable": true,
             "description": "Story 4-2a — the cash to collect on delivery for this order, integer paise; null means prepaid."
+          },
+          "orderedQty": {
+            "type": "number",
+            "description": "Story 4-2c — what the order ORDERED of this SKU (its lines' quantities, base units). Below it, `pickedQty` ships short and the rest follows as a separate (backorder) order. Absent on a device snapshot from before 4-2c."
+          },
+          "orderShortfall": {
+            "type": "boolean",
+            "description": "Story 4-2c — true when ANY line of the order was picked below its quantity (order-level, repeated on each of its SKU rows — a SKU that picked nothing has no row of its own): the bench warns \"Short — the rest ships later as a follow-on order\", and on a COD order that the courier collects the full amount on this parcel."
+          },
+          "followOnSeq": {
+            "type": "number",
+            "nullable": true,
+            "description": "Story 4-2c — the order's place in a backorder chain (the label suffix `-BO{seq}`; the pack card's \"Backorder\" chip); null on an original order."
           }
         },
         "required": [
@@ -61929,6 +62289,17 @@
             "pattern": "^[!-~]([ -~]{0,62}[!-~])?$",
             "description": "Story 4-1b — the client's own order number; null when none (or when the order row is missing)"
           },
+          "followOnSeq": {
+            "type": "number",
+            "nullable": true,
+            "description": "Story 4-2c — a backorder follow-on's place in its chain (the label's `-BO{seq}`); null on a root order. Absent on a response built before 4-2c — read absent as null"
+          },
+          "followOnRootOrderId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 4-2c — a follow-on's chain root (the label's short id when the order has no number); null on a root order"
+          },
           "orderId": {
             "type": "string",
             "format": "uuid"
@@ -64437,6 +64808,29 @@
             "type": "number",
             "description": "Top-level lines — a kit counts once"
           },
+          "followOnOfOrderId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 4-2c — on a backorder follow-on (the order a short shipment opened for what did not ship): the order it follows; null on your original order"
+          },
+          "followOnRootOrderId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 4-2c — on a follow-on: your original order (the chain's root); null on the original"
+          },
+          "followOnSeq": {
+            "type": "number",
+            "nullable": true,
+            "description": "Story 4-2c — on a follow-on: its place in the chain — the label suffix `-BO{seq}` (1042-BO1); null on the original"
+          },
+          "followOnOrderId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 4-2c — the follow-on this order's short shipment opened for the units that did not ship; null when everything shipped"
+          },
           "createdAt": {
             "type": "string"
           }
@@ -64766,6 +65160,11 @@
           "qty": {
             "type": "number",
             "description": "Base units"
+          },
+          "shippedQty": {
+            "type": "number",
+            "nullable": true,
+            "description": "Story 4-2c — what shipped of this line once the order is dispatched, base units (a kit: the number of complete kits); null before dispatch"
           }
         },
         "required": [
@@ -64788,6 +65187,11 @@
           "qty": {
             "type": "number",
             "description": "Base units"
+          },
+          "shippedQty": {
+            "type": "number",
+            "nullable": true,
+            "description": "Story 4-2c — what shipped of this line once the order is dispatched, base units (a kit: the number of complete kits); null before dispatch"
           },
           "components": {
             "description": "A kit line's components; empty for a plain line",
@@ -64887,6 +65291,29 @@
           "lineCount": {
             "type": "number",
             "description": "Top-level lines — a kit counts once"
+          },
+          "followOnOfOrderId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 4-2c — on a backorder follow-on (the order a short shipment opened for what did not ship): the order it follows; null on your original order"
+          },
+          "followOnRootOrderId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 4-2c — on a follow-on: your original order (the chain's root); null on the original"
+          },
+          "followOnSeq": {
+            "type": "number",
+            "nullable": true,
+            "description": "Story 4-2c — on a follow-on: its place in the chain — the label suffix `-BO{seq}` (1042-BO1); null on the original"
+          },
+          "followOnOrderId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 4-2c — the follow-on this order's short shipment opened for the units that did not ship; null when everything shipped"
           },
           "createdAt": {
             "type": "string"

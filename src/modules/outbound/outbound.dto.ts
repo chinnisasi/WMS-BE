@@ -44,6 +44,7 @@ import { MAX_DIMENSION_MM, MAX_SCAN_LINES, MAX_WEIGHT_GRAMS } from './pack.comma
 import { GSTIN_RE, gstinDtoTransform } from '../../shared/primitives/gstin';
 import { MAX_HANDLING_UNITS_PER_REQUEST } from '../catalog/handling-unit';
 import { MAX_CARRIER_NAME_LENGTH, MAX_TRACKING_NUMBER_LENGTH } from './dispatch.command';
+import { ALLOCATION_SKIP_REASONS } from './allocation.command';
 import { SHIPMENT_STATUSES } from './shipment.command';
 import { MAX_MANIFEST_SHIPMENTS } from './manifest.command';
 import {
@@ -388,6 +389,42 @@ export class OrderDto {
   })
   clientId?: string | null;
 
+  @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    required: false,
+    description:
+      'Story 4-2c — on a backorder follow-on (the order a short dispatch opened for the unshipped remainder): its parent order; null on a root order. Absent only on a replayed response stored before 4-2c — read absent as null.',
+  })
+  followOnOfOrderId?: string | null;
+
+  @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    required: false,
+    description: "Story 4-2c — on a follow-on: the chain's root (the client's original order; the label's short id when it has no number); null on a root. Absent only on a replayed response stored before 4-2c — read absent as null.",
+  })
+  followOnRootOrderId?: string | null;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    required: false,
+    description: "Story 4-2c — on a follow-on: its place in the chain, the label suffix `-BO{seq}` (`1042-BO1`, then `1042-BO2`); null on a root. Absent only on a replayed response stored before 4-2c — read absent as null.",
+  })
+  followOnSeq?: number | null;
+
+  @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    required: false,
+    description: "Story 4-2c — the follow-on this order's short dispatch opened; null when everything shipped (or before dispatch). Absent only on a replayed response stored before 4-2c — read absent as null.",
+  })
+  followOnOrderId?: string | null;
+
   @ApiProperty({ description: 'ISO-8601 UTC creation time' })
   createdAt!: string;
 
@@ -499,6 +536,17 @@ export class OrdersListQuery extends OrderListQuery {
   @IsString()
   @Length(1, MAX_EXTERNAL_ID_LENGTH)
   reference?: string;
+
+  @ApiProperty({
+    required: false,
+    type: Boolean,
+    description:
+      "Story 4-2c — `true`: only backorder follow-ons (orders a short dispatch opened for the unshipped remainder); `false`: only root orders (the SM-4 drill — a follow-on is not a new client order). Exactly 'true' or 'false'",
+  })
+  @IsOptional()
+  @BooleanFlag()
+  @IsBoolean()
+  followOn?: boolean;
 }
 
 /** One header row of the order list (no lines — the detail read carries them). */
@@ -577,6 +625,42 @@ export class OrderEntryDto {
     description: "Story 21-2b — the client the order is for, derived from its SKUs",
   })
   clientId?: string | null;
+
+  @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    required: false,
+    description:
+      'Story 4-2c — on a backorder follow-on (the order a short dispatch opened for the unshipped remainder): its parent order; null on a root order.',
+  })
+  followOnOfOrderId?: string | null;
+
+  @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    required: false,
+    description: "Story 4-2c — on a follow-on: the chain's root (the client's original order; the label's short id when it has no number); null on a root.",
+  })
+  followOnRootOrderId?: string | null;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    required: false,
+    description: "Story 4-2c — on a follow-on: its place in the chain, the label suffix `-BO{seq}` (`1042-BO1`, then `1042-BO2`); null on a root.",
+  })
+  followOnSeq?: number | null;
+
+  @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    required: false,
+    description: "Story 4-2c — the follow-on this order's short dispatch opened; null when everything shipped (or before dispatch).",
+  })
+  followOnOrderId?: string | null;
 
   @ApiProperty({ description: 'ISO-8601 UTC creation time' })
   createdAt!: string;
@@ -1729,6 +1813,25 @@ export class DispatchDto {
   totalUnits!: number;
 
   @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    required: false,
+    description:
+      'Story 4-2c — the follow-on order this dispatch opened for what did not ship (accepted, every line backordered; it ships when stock arrives — `followOnSeq + 1`, or 1, names it `-BO{n}`); null when everything shipped. Absent only on a replayed response stored before 4-2c — read absent as null.',
+  })
+  followOnOrderId?: string | null;
+
+  @ApiProperty({ type: String, format: 'uuid', nullable: true, required: false, description: 'Story 4-2c — THIS order\'s parent when it is itself a follow-on; null on a root. Absent before 4-2c.' })
+  followOnOfOrderId?: string | null;
+
+  @ApiProperty({ type: String, format: 'uuid', nullable: true, required: false, description: "Story 4-2c — THIS order's chain root when it is a follow-on; null on a root. Absent before 4-2c." })
+  followOnRootOrderId?: string | null;
+
+  @ApiProperty({ type: Number, nullable: true, required: false, description: "Story 4-2c — THIS order's `-BO{seq}` when it is a follow-on; null on a root. Absent before 4-2c." })
+  followOnSeq?: number | null;
+
+  @ApiProperty({
     type: [String],
     format: 'uuid',
     description:
@@ -2545,4 +2648,77 @@ export class OrderImportResponseDto {
 
   @ApiProperty({ type: [OrderImportRowErrorDto], description: 'Every refused row, in sheet order' })
   errors!: OrderImportRowErrorDto[];
+}
+
+// ── Story 4-2c — "Allocate now" ─────────────────────────────────────────────
+
+export class AllocatedLineDto {
+  @ApiProperty({ format: 'uuid' })
+  orderLineId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty({ description: 'Ordered, base units' })
+  qty!: number;
+
+  @ApiProperty({ description: 'What the line now holds, base units (may be below qty — a partial grant, as at acceptance)' })
+  reservedQty!: number;
+}
+
+export class StillShortLineDto {
+  @ApiProperty({ format: 'uuid' })
+  orderLineId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty({ description: 'Still awaiting stock, base units' })
+  shortQty!: number;
+}
+
+export class SkippedAllocationLineDto {
+  @ApiProperty({ format: 'uuid' })
+  orderLineId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty({
+    enum: [...ALLOCATION_SKIP_REASONS],
+    description:
+      "Why the line was not reserved this run: `sku-inactive` — the SKU is inactive and its stock does not cover the line in full (an inactive SKU sells existing stock only); `licence-not-covered` — licence enforcement is on and the order's goods are not covered at this warehouse today; `contended` — another allocation reserved it at the same moment",
+  })
+  reason!: string;
+}
+
+export class AllocationDto {
+  @ApiProperty({ format: 'uuid' })
+  orderId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ type: [AllocatedLineDto], description: 'Lines reserved by this run (empty when nothing could be — still 200)' })
+  allocated!: AllocatedLineDto[];
+
+  @ApiProperty({ type: [StillShortLineDto], description: 'Eligible lines still awaiting stock after this run' })
+  stillShort!: StillShortLineDto[];
+
+  @ApiProperty({ type: [SkippedAllocationLineDto], description: 'Eligible lines this run did not reserve, with the reason' })
+  skipped!: SkippedAllocationLineDto[];
+}
+
+export class AllocateOrderResponse {
+  @ApiProperty({ type: AllocationDto })
+  allocation!: AllocationDto;
 }

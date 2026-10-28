@@ -1,6 +1,7 @@
 import { sql } from 'drizzle-orm';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { windDownBlockerInTx, type WindDownBlocker } from '../../shared/primitives/wind-down';
+import { orderLabelSql } from '../../shared/primitives/order-label';
 
 /**
  * Story 1-2a — the outbound-owned wind-down blocker of one client: orders
@@ -24,7 +25,7 @@ export async function clientWindDownBlockersInTx(
     'open-orders',
     sql`select count(*)::bigint as n, (array_agg(label order by label))[1:5] as codes
         from (
-          select coalesce(client_order_ref, external_event_id, right(id::text, 8)) as label
+          select ${orderLabelSql('')} as label
           from orders
           where tenant_id = ${tenantId} and client_id = ${clientId} and status in ${[...ORDER_OPEN_STATUSES]}
         ) open_orders`,

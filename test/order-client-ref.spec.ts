@@ -301,10 +301,13 @@ describe('client order number (e2e, story 4-1b)', () => {
     });
 
     it('the three partial indexes exist with their predicates (the live unique index excludes cancelled orders; the search index does not)', async () => {
-      const rows = await sql`select indexname, indexdef from pg_indexes where tablename = 'orders' and indexname in ('orders_client_order_ref_live_unique', 'orders_client_order_ref_idx', 'orders_external_event_client_idx') order by indexname`;
-      expect(rows.map((row) => row.indexname)).toEqual(['orders_client_order_ref_idx', 'orders_client_order_ref_live_unique', 'orders_external_event_client_idx']);
+      // Story 4-2c (0104) — the live unique index counts ROOT orders only and
+      // was rebuilt under a NEW name (`…_live_root_unique`; migrate-deploy
+      // refuses a same-name rebuild); its predicate gains the root clause.
+      const rows = await sql`select indexname, indexdef from pg_indexes where tablename = 'orders' and indexname in ('orders_client_order_ref_live_root_unique', 'orders_client_order_ref_idx', 'orders_external_event_client_idx') order by indexname`;
+      expect(rows.map((row) => row.indexname)).toEqual(['orders_client_order_ref_idx', 'orders_client_order_ref_live_root_unique', 'orders_external_event_client_idx']);
       expect(rows[0]!.indexdef).toMatch(/CREATE INDEX .* \(tenant_id, client_order_ref, client_id\) WHERE \(client_order_ref IS NOT NULL\)$/);
-      expect(rows[1]!.indexdef).toMatch(/CREATE UNIQUE INDEX .* \(tenant_id, client_order_ref, client_id\) WHERE \(\(client_order_ref IS NOT NULL\) AND \(status <> 'cancelled'::text\)\)/);
+      expect(rows[1]!.indexdef).toMatch(/CREATE UNIQUE INDEX .* \(tenant_id, client_order_ref, client_id\) WHERE \(\(client_order_ref IS NOT NULL\) AND \(status <> 'cancelled'::text\) AND \(follow_on_of_order_id IS NULL\)\)/);
       expect(rows[2]!.indexdef).toMatch(/CREATE INDEX .* \(tenant_id, external_event_id, client_id\) WHERE \(external_event_id IS NOT NULL\)/);
     });
 

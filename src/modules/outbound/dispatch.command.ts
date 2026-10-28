@@ -21,7 +21,8 @@ import { CatalogFacade } from '../catalog/catalog.facade';
 // Story 3-7a — the open-live-recall seam (a free-function file, guide §7h):
 // outbound imports it, never the recalls module (which depends on outbound).
 import { openLiveRecallLinesForBatchesInTx } from '../recalls/open-recall-lines';
-import { ORDER_OWNER_TYPE } from './order.command';
+import { ORDER_OWNER_TYPE, orderSnapshotInTx } from './order.command';
+import { followOnRemainder, orderLabelOf } from './follow-on';
 import type { OrderSource, OrderStatus } from './order.command';
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
@@ -115,6 +116,21 @@ export interface DispatchSnapshot {
     readonly trackingNumber: string | null;
     /** Total units shipped — the sum of every line's `dispatchedQty`. */
     readonly totalUnits: number;
+    /**
+     * Story 4-2c — the follow-on order this dispatch opened for the unshipped
+     * remainder (`accepted`, every line backordered), or null when everything
+     * shipped. Optional: a snapshot stored before 4-2c lacks it (read absent
+     * as null).
+     */
+    readonly followOnOrderId?: string | null;
+    /**
+     * Story 4-2c — THIS order's own place in a backorder chain (null on a
+     * root): its parent, the chain's root and its `-BO{seq}`. Optional, as
+     * above. The follow-on this dispatch opened is `followOnSeq + 1` (or 1).
+     */
+    readonly followOnOfOrderId?: string | null;
+    readonly followOnRootOrderId?: string | null;
+    readonly followOnSeq?: number | null;
     /**
      * The holds this dispatch retired `committed → released` — the ATP
      * correction, made visible. Empty when the order had none left (every
@@ -303,7 +319,7 @@ export class DispatchCommandService {
           'order-holds-recalled-batch',
           409,
           'Order holds a recalled lot',
-          `Order "${order.clientOrderRef ?? order.externalEventId ?? order.id.slice(-8)}" holds units of lot ${codes.join(', ')} under recall ${recallCodes.join(', ')} — it cannot ship. ` +
+          `Order "${orderLabelOf(order)}" holds units of lot ${codes.join(', ')} under recall ${recallCodes.join(', ')} — it cannot ship. ` +
             `Release the lot from the recall (close ${recallCodes.join(', ')} with it in releaseBatchIds), or cancel the order with restock (its units go back to stock; the lot stays blocked).`,
           { batchCodes: codes, recallCodes },
         );
@@ -387,6 +403,17 @@ export class DispatchCommandService {
               .from(skus)
               .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.id, skuIds)));
       const skuById = new Map(skuRows.map((row) => [row.id, row]));
+
+      // ── story 4-2c: the follow-on for what did not ship ─────────────────
+      // Per line `qty − Σ picks` (decision 2 / A9: plain lines from one base
+      // unit, kits by whole kits). Created in THIS transaction, so the
+      // dispatch and its follow-on commit or roll back together. No
+      // create-time check runs (A6 — it is the remainder of an order already
+      // accepted); the allocation re-checks SKU status and licences.
+      const remainder = followOnRemainder(
+        lines.map((line) => ({ id: line.id, skuId: line.skuId, qty: line.qty, parentLineId: line.parentLineId, ratePaise: line.ratePaise })),
+        pickedByLine,
+      );
 
       // ── the ledger: one ZERO-quantity event per order line ──────────────
       // Picking already drew these units out of stock entirely (`pick.picked`
@@ -492,6 +519,88 @@ export class DispatchCommandService {
       // so a retired hold already reads `released` everywhere, and the line
       // keeps naming the hold that actually served it.
 
+      const followOnOrderId = remainder.length === 0 ? null : uuidv7();
+      if (followOnOrderId !== null) {
+        // Decision 3 — the identity, address and urgency copied; never the
+        // COD (decision 4: the first parcel's COD rides its label, manifest
+        // and dispatch record — the follow-on is prepaid), never the source
+        // payload hash (a follow-on is no delivery), never a reservation.
+        // `orders_follow_on_of_unique` is the backstop; the order row lock
+        // above already makes a second follow-on of this parent unreachable.
+        await tx.insert(orders).values({
+          id: followOnOrderId,
+          tenantId: order.tenantId,
+          clientId: order.clientId,
+          warehouseId: order.warehouseId,
+          status: 'accepted',
+          source: order.source,
+          integrationId: order.integrationId,
+          externalEventId: order.externalEventId,
+          sourcePayloadHash: null,
+          destinationContactName: order.destinationContactName,
+          destinationPhone: order.destinationPhone,
+          destinationLine1: order.destinationLine1,
+          destinationLine2: order.destinationLine2,
+          destinationCity: order.destinationCity,
+          destinationState: order.destinationState,
+          destinationPincode: order.destinationPincode,
+          consigneeGstin: order.consigneeGstin,
+          consigneeLegalName: order.consigneeLegalName,
+          clientOrderRef: order.clientOrderRef,
+          orderType: order.orderType,
+          priority: order.priority,
+          shipByDate: order.shipByDate,
+          codAmountPaise: null,
+          followOnOfOrderId: order.id,
+          followOnRootOrderId: order.followOnRootOrderId ?? order.id,
+          followOnSeq: (order.followOnSeq ?? 0) + 1,
+          createdAt: dispatchedAt,
+          updatedAt: dispatchedAt,
+        });
+        const newLineIds = new Map(remainder.map((plan) => [plan.sourceLineId, uuidv7()]));
+        await tx.insert(orderLines).values(
+          remainder.map((plan) => ({
+            id: newLineIds.get(plan.sourceLineId)!,
+            tenantId: order.tenantId,
+            orderId: followOnOrderId,
+            skuId: plan.skuId,
+            qty: plan.qty,
+            reservedQty: 0,
+            reservationId: null,
+            // Every line is backordered at "acceptance" (SM-4's history and
+            // the list's `backordered` filter read this); the allocation
+            // never changes it (decision 5).
+            status: 'backordered',
+            parentLineId: plan.parentSourceLineId === null ? null : newLineIds.get(plan.parentSourceLineId)!,
+            ratePaise: plan.ratePaise,
+          })),
+        );
+        const followOnRow = (await tx.select().from(orders).where(eq(orders.id, followOnOrderId)).limit(1))[0]!;
+        const followOnSnapshot = await orderSnapshotInTx(tx, this.inventory, followOnRow);
+        // A12 — its OWN event, never `order.created`: no consumer of a new
+        // client order may count a remainder as one.
+        await this.outbox.append(tx, {
+          messageId: uuidv7(),
+          tenantId: command.tenantId,
+          type: 'order.follow-on-created',
+          occurredAt: dispatchedAt,
+          payload: { order: followOnSnapshot.order, parentOrderId: order.id },
+        });
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'order.follow-on-created',
+          targetType: 'order',
+          targetId: followOnOrderId,
+          reference: idempotencyKey,
+          occurredAt: dispatchedAt,
+        });
+        this.logger.log(
+          `Order ${orderLabelOf(order)} shipped short — follow-on ${orderLabelOf({ ...order, id: followOnOrderId, followOnRootOrderId: order.followOnRootOrderId ?? order.id, followOnSeq: (order.followOnSeq ?? 0) + 1 })} (${followOnOrderId}) opened with ${remainder.length} line(s).`,
+        );
+      }
+
       const snapshot: DispatchSnapshot = {
         dispatch: {
           orderId: order.id,
@@ -512,6 +621,10 @@ export class DispatchCommandService {
           carrierName: stampedCarrierName,
           trackingNumber: stampedTracking,
           totalUnits: fromMilli(totalUnits),
+          followOnOrderId,
+          followOnOfOrderId: order.followOnOfOrderId,
+          followOnRootOrderId: order.followOnRootOrderId,
+          followOnSeq: order.followOnSeq,
           retiredReservationIds,
           lines: dispatchedLines,
         },

@@ -23,6 +23,7 @@ import { toAddressDto } from '../modules/tenancy/tenancy.dto';
 // decorator metadata needs the runtime class tokens (eslint rule bends).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import {
+  AllocateOrderResponse,
   CancelOrderDto,
   CancelOrderWithRestockDto,
   CancelWithRestockResponse,
@@ -292,6 +293,45 @@ export class OutboundController {
       key,
     );
     return { order: { ...snapshot.order, destination: toAddressDto(snapshot.order.destination), lines: snapshot.order.lines.map(toLineDto) } };
+  }
+
+  @Post(':tenantId/outbound/orders/:orderId/allocate')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Story 4-2c — "Allocate now" (orders.manage): re-reserves an accepted order\'s backordered lines that hold nothing, from stock available now (min(qty, ATP) per line, a kit all-or-nothing). Nothing to reserve is 200 with an empty `allocated`. The backorder sweep does the same in the background.',
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: AllocateOrderResponse, description: 'What this run reserved, what still awaits stock and what it skipped (the idempotency snapshot)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key or path parameter (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks orders.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Order does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The order is not accepted (order-not-accepted), it is on an open wave (order-on-open-wave — extensions.waveId), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('The reservation store is unreachable (reservation-store-unavailable) — nothing reserved') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async allocateOrder(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<AllocateOrderResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.outbound.allocateOrder({ tenantId, actorUserId: session.userId, orderId }, key);
+    return {
+      allocation: {
+        ...snapshot.allocation,
+        allocated: snapshot.allocation.allocated.map((line) => ({ ...line })),
+        stillShort: snapshot.allocation.stillShort.map((line) => ({ ...line })),
+        skipped: snapshot.allocation.skipped.map((line) => ({ ...line })),
+      },
+    };
   }
 
   @Post(':tenantId/outbound/orders/:orderId/cancel-with-restock')
@@ -670,6 +710,7 @@ export class OutboundController {
       to: query.to,
       // Story 4-1b — the exact-match search (trimmed by the DTO).
       reference: query.reference,
+      followOn: query.followOn,
       cursor: query.cursor,
       limit: query.limit,
     };

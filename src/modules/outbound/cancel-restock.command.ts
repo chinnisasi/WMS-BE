@@ -34,6 +34,7 @@ import { openLiveRecallLinesForBatchesInTx } from '../recalls/open-recall-lines'
 import { ORDER_OWNER_TYPE, OrderCommandService } from './order.command';
 import type { OrderSnapshot, OrderStatus } from './order.command';
 import type { ShipmentStatus } from './shipment.command';
+import { orderLabelOf } from './follow-on';
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
@@ -210,8 +211,8 @@ function byText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function orderLabel(order: Pick<Order, 'id' | 'clientOrderRef' | 'externalEventId'>): string {
-  return order.clientOrderRef ?? order.externalEventId ?? order.id.slice(-8);
+function orderLabel(order: Pick<Order, 'id' | 'clientOrderRef' | 'externalEventId' | 'followOnSeq' | 'followOnRootOrderId'>): string {
+  return orderLabelOf(order);
 }
 
 /**
@@ -1031,7 +1032,7 @@ function orderNotFound(orderId: string): ProblemException {
   return new ProblemException('not-found', 404, 'Order not found', `No order with id "${orderId}" exists in this tenant.`);
 }
 
-function shipmentManifested(order: Pick<Order, 'id' | 'clientOrderRef' | 'externalEventId'>, shipment: Shipment): ProblemException {
+function shipmentManifested(order: Pick<Order, 'id' | 'clientOrderRef' | 'externalEventId' | 'followOnSeq' | 'followOnRootOrderId'>, shipment: Shipment): ProblemException {
   return new ProblemException(
     'shipment-manifested',
     409,

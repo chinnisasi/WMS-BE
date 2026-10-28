@@ -6,7 +6,7 @@ import { MissingChannelEncryptionKeyError, openCredential } from './channel-cred
 import type { ChannelCredential } from './channel-credentials';
 import type { ChannelOrderWritebackRequest } from './channel-writeback-port';
 import { OutboundFacade } from '../outbound/outbound.facade';
-import type { OrderSnapshot } from '../outbound/outbound.facade';
+import type { WritebackOrder } from '../outbound/outbound.facade';
 import { ChannelsPublishService } from './channels.publish';
 
 /**
@@ -85,6 +85,14 @@ export class ChannelWritebackDelivery implements OnModuleInit {
       // business — ack, no meter, no effect.
       return;
     }
+    if ((order.followOnOfOrderId ?? null) !== null) {
+      // Story 4-2c (decision 8, A13) — a backorder FOLLOW-ON writes nothing
+      // back: it carries its root's channel identity, so its pack, dispatch
+      // or cancel would otherwise reach the customer's channel order — and a
+      // staff cancel of the remainder must never cancel the whole Shopify
+      // order. Ack, no meter. A second fulfillment for the follow-on is 4-2d.
+      return;
+    }
     if (type === 'order.packed' && order.status === 'cancelled') {
       // Story 4-2b (decision 13) — a stale `order.packed` relayed after the
       // order was cancelled with restock: creating a fulfillment now would
@@ -131,7 +139,16 @@ export class ChannelWritebackDelivery implements OnModuleInit {
     const mappings = new Map(
       (await this.publish.listChannelMappings(event.tenantId, connectionId)).map((m) => [m.skuId, m.externalRef]),
     );
-    const unresolved = itemLines.filter((line) => !mappings.has(line.skuId));
+    // Story 4-2c (decision 8 fold-in, A13) — the fulfillment posts what
+    // SHIPPED (Σ picks, base units), never the ordered quantity: a short
+    // shipment must not tell the channel the order was fulfilled in full. A
+    // line that shipped nothing is left out (and so is not mapping-checked).
+    // The cancellation keeps every line at its ordered quantity.
+    const postedLines =
+      type === 'order.cancelled'
+        ? itemLines.map((line) => ({ line, quantity: line.qty }))
+        : itemLines.filter((line) => line.shippedQty > 0).map((line) => ({ line, quantity: line.shippedQty }));
+    const unresolved = postedLines.map((entry) => entry.line).filter((line) => !mappings.has(line.skuId));
     if (type !== 'order.cancelled' && unresolved.length > 0) {
       // ANY fulfillment line without a live mapping fails the WHOLE attempt
       // with the typed, metered refusal — the channel never sees a partial
@@ -139,14 +156,14 @@ export class ChannelWritebackDelivery implements OnModuleInit {
       // measure — the silent drop — is gone). `422`-shaped: remediation is
       // the mapping PUT; the relay retries honestly, and past its budget
       // dead-letters. The count is the only content — never a secret.
-      const error = `${unresolved.length} of ${itemLines.length} order line(s) resolve to no channel SKU mapping — the fulfillment is refused whole; map the SKU(s) (mapping PUT) to heal`;
+      const error = `${unresolved.length} of ${postedLines.length} order line(s) resolve to no channel SKU mapping — the fulfillment is refused whole; map the SKU(s) (mapping PUT) to heal`;
       await this.settleFailure(event.tenantId, connectionId, error);
       throw new Error(`the writeback delivery failed: ${error}`);
     }
-    const lines = itemLines
-      .map((line) => {
+    const lines = postedLines
+      .map(({ line, quantity }) => {
         const externalRef = mappings.get(line.skuId);
-        return externalRef === undefined ? null : { externalRef, quantity: line.qty };
+        return externalRef === undefined ? null : { externalRef, quantity };
       })
       .filter((line): line is { externalRef: string; quantity: number } => line !== null);
     if (type !== 'order.cancelled' && lines.length === 0) {
@@ -218,7 +235,7 @@ export class ChannelWritebackDelivery implements OnModuleInit {
   private async orderForWriteback(
     tenantId: string,
     orderId: string,
-  ): Promise<OrderSnapshot['order'] | null> {
+  ): Promise<WritebackOrder | null> {
     return this.outbound.orderForWriteback(tenantId, orderId);
   }
 }
