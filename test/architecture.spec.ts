@@ -3678,6 +3678,63 @@ describe('architecture: the gate-in is inbound-owned (story 2-3a)', () => {
   });
 });
 
+describe('architecture: dock appointments are inbound-owned (story 2-3b)', () => {
+  const inboundRoot = join(SRC_ROOT, 'modules', 'inbound');
+  /** A25 — each table's writers, by file (dock_appointments has two: the link and release ride the gate-in). */
+  const WRITERS: Record<string, readonly string[]> = {
+    dockDoors: ['dock-door.command.ts'],
+    dockSchedules: ['dock-schedule.command.ts'],
+    dockAppointments: ['dock-appointment.command.ts', 'gate-in.command.ts'],
+    dockAppointmentDocuments: ['dock-appointment.command.ts'],
+  };
+  const RAW_DOCK_WRITE = /\b(insert into|update|delete from)\s+"?dock_(doors|schedules|appointments|appointment_documents)\b/i;
+
+  it('the detectors bite', () => {
+    for (const [table, writers] of Object.entries(WRITERS)) {
+      for (const writer of writers) {
+        expect(drizzleWriteOn(table).test(readFileSync(join(inboundRoot, writer), 'utf8'))).toBe(true);
+      }
+    }
+    expect(RAW_DOCK_WRITE.test('sql`update dock_appointments set status = 1`')).toBe(true);
+  });
+
+  it('each dock table is written only by its named commands (no raw SQL write anywhere)', () => {
+    const offenders: string[] = [];
+    for (const file of files) {
+      for (const [table, writers] of Object.entries(WRITERS)) {
+        if (writers.some((writer) => file.path === join(inboundRoot, writer))) continue;
+        if (drizzleWriteOn(table).test(file.source)) offenders.push(`${file.path}: writes ${table}`);
+      }
+      // The migration's probes live in drizzle/, outside the scan; no source file writes them raw.
+      if (RAW_DOCK_WRITE.test(file.source)) offenders.push(`${file.path}: raw dock write`);
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('no file outside the inbound module reads the dock tables; the api shell reaches them only through DockFacade', () => {
+    const offenders = files
+      .filter((file) => !file.path.startsWith(inboundRoot))
+      .filter((file) => !file.path.endsWith(join('shared', 'db', 'schema.ts')))
+      .filter((file) => /\bdock(Doors|Schedules|Appointments|AppointmentDocuments)\b/.test(file.source) && /from '.*shared\/db\/schema'/.test(file.source))
+      .map((file) => file.path);
+    expect(offenders).toEqual([]);
+    const controller = readFileSync(join(SRC_ROOT, 'api', 'dock.controller.ts'), 'utf8');
+    expect(controller).toMatch(/\bDockFacade\b/);
+    expect(controller).not.toMatch(/\bDock(Door|Schedule|Appointment)Command\b/);
+  });
+
+  it('A15: every appointment outbox payload goes through outboxAppointment (the note never rides an event)', () => {
+    const command = readFileSync(join(inboundRoot, 'dock-appointment.command.ts'), 'utf8');
+    expect([...command.matchAll(/this\.outbox\.append\(/g)]).toHaveLength(1);
+    expect(command).toMatch(/payload:\s*\{\s*appointment:\s*outboxAppointment\(snapshot\.appointment\)\s*\}/);
+    const gateIn = readFileSync(join(inboundRoot, 'gate-in.command.ts'), 'utf8');
+    expect(gateIn).toMatch(/payload:\s*\{\s*appointment:\s*outboxAppointment\(linked\.appointment\)\s*\}/);
+    expect(gateIn).not.toMatch(/appointment:\s*linked\.appointment\b/);
+    const read = readFileSync(join(inboundRoot, 'dock.read.ts'), 'utf8');
+    expect(read).toMatch(/const \{ note, \.\.\.rest \} = view;/);
+  });
+});
+
 describe('architecture: the client-webhooks module (story 5-2a)', () => {
   const root = join(SRC_ROOT, 'modules', 'client-webhooks');
   const moduleFiles = files.filter((file) => file.path.startsWith(root) && !file.path.endsWith('.spec.ts'));

@@ -7,6 +7,7 @@ import { InboundController } from './inbound.controller';
 import { OutboundController } from './outbound.controller';
 import { ReceivingController } from './receiving.controller';
 import { GateInController } from './gate-in.controller';
+import { DockController } from './dock.controller';
 import { PutawayController } from './putaway.controller';
 import { CarriersController } from './carriers.controller';
 import { ChannelsController } from './channels.controller';
@@ -108,6 +109,9 @@ import { RecallsModule } from '../modules/recalls/recalls.module';
     // Story 2-3a — the gate-in (record, amend, unload — web and device —,
     // gate-out, list, detail) through `GateInFacade` (inbound).
     GateInController,
+    // Story 2-3b — the dock doors, schedule, appointments and calendar
+    // through `DockFacade` (inbound).
+    DockController,
     PutawayController,
     CarriersController,
     // Story 12-5 — the compliance surface (excursion record/list/resolve)

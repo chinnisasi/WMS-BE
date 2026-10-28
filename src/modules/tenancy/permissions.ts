@@ -375,6 +375,22 @@ export const CAPABILITIES = [
   // operator. Accountant absent (reads only), never a client. Mirrored into
   // wms-fe `src/lib/users.ts` (CAPABILITIES — ops_manager is derived there).
   'rtv.manage',
+  // Story 2-3b — the dock-door master and the per-warehouse dock schedule
+  // (`DockDoorCommand`, `DockScheduleCommand`): add, rename, deactivate and
+  // reactivate a door; set the slot length, the opening hours, the open days
+  // and the on-time grace. Owner + Ops Manager: the dock's shape is a
+  // planner's setting (`warehouse.create`'s rationale). Operator and
+  // Accountant absent (reads only), never a client. Mirrored into wms-fe
+  // `src/lib/users.ts` (CAPABILITIES — ops_manager is derived there).
+  'dock.manage',
+  // Story 2-3b — book, reschedule and cancel a dock appointment
+  // (`DockAppointmentCommand`). Owner, Ops Manager AND Operator: the inbound
+  // planner and the gate desk book slots (decision 13). Linking an
+  // appointment at the gate-in stays `gate.manage`. Accountant absent (reads
+  // only); a client-portal session is refused at the guard (client booking
+  // is 2-3c). Mirrored into wms-fe `src/lib/users.ts` (CAPABILITIES — ops_manager
+  // is derived there — and the operator grant).
+  'dock.schedule',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -471,6 +487,10 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'billing.charge',
     // Story 2-8b — the return to vendor (owner holds everything).
     'rtv.manage',
+    // Story 2-3b — the dock doors and schedule, and the appointments (owner
+    // holds everything).
+    'dock.manage',
+    'dock.schedule',
   ]),
   operator: new Set<Capability>([
     'putaway.execute',
@@ -504,6 +524,10 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'stock.adjust.request',    // Story 2-5a — the dock adds a damage photo from the web. Never
     // `receipt.photo-remove`: evidence is removed by a manager.
     'receipt.attach',
+    // Story 2-3b — the gate desk books, reschedules and cancels dock
+    // appointments. Never `dock.manage`: the doors and the schedule are a
+    // manager's.
+    'dock.schedule',
   ]),
   // Story 8-2b: the accountant's first write — the e-way paperwork (finance
   // work). Story 21-3: the client rate cards (finance work — decision 2,

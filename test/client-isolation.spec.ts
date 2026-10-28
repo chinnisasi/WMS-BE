@@ -1202,7 +1202,20 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // the warehouse's own count; its portal view is 3-5c). Retargeted 148 → 150.
       // Story 2-10b: + one (0109) — lpns, tenant-only (a licence plate is the
       // dock's label; no portal read). Retargeted 150 → 151.
-      expect(policies).toHaveLength(151);
+      // Story 2-3b: + four (0110) — dock_doors and dock_schedules tenant-only,
+      // dock_appointments client-bound on both arms (the 0064 ASN shape, for
+      // 2-3c's portal booking), dock_appointment_documents riding its parent
+      // (the asn_lines shape). Retargeted 151 → 155.
+      expect(policies).toHaveLength(155);
+      {
+        const appointments = policies.find((row) => row.policyname === 'dock_appointments_tenant_isolation')!;
+        expect(appointments.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+        expect(appointments.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+        expect(policies.find((row) => row.policyname === 'dock_appointment_documents_tenant_isolation')!.qual).toContain('dock_appointments');
+        for (const name of ['dock_doors_tenant_isolation', 'dock_schedules_tenant_isolation']) {
+          expect(policies.find((row) => row.policyname === name)!.qual).not.toContain('app.client_id');
+        }
+      }
       {
         const recalls = policies.find((row) => row.policyname === 'batch_recalls_tenant_isolation')!;
         expect(recalls.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");

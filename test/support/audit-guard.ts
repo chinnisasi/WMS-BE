@@ -107,6 +107,13 @@ export const AUDIT_NO_OP_ARMS = {
    */
   'gateIns.unload:already-recorded': (snapshot: unknown) =>
     isRecord(snapshot) && sameKeys(snapshot, ['applied', 'gateIn']) && snapshot.applied === false && isRecord(snapshot.gateIn),
+  /** Story 2-3b — `DockDoorCommand.update` with the code, name and active already in place (stores the key with `{ dockDoor }`). */
+  'dockDoors.update:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'dockDoor'),
+  /** Story 2-3b — `DockScheduleCommand.put` on a CONFIGURED warehouse with the stored schedule resent (stores the key with `{ schedule }`). */
+  'dockSchedule.put:unchanged': (snapshot: unknown) =>
+    entitySnapshot(snapshot, 'schedule') && (snapshot as { schedule: { configured?: unknown } }).schedule.configured === true,
+  /** Story 2-3b — `DockAppointmentCommand.reschedule` with every field already in place (stores the key with `{ appointment }`). */
+  'dockAppointments.reschedule:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'appointment', 'booked'),
   /**
    * Story 3-5a — `CountService.createCountsBulk` that created nothing: every
    * bin had an open task (or was a listed system/retired bin), or the zone

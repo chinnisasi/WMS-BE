@@ -944,7 +944,12 @@ describe('users, roles, and permission gating (e2e)', () => {
     // Story 2-8b grows it to 54: `rtv.manage` — owner and ops_manager create
     // and cancel a return to vendor (a planner act); the floor's pick and
     // dispatch ride `picks.execute` / `dispatch.execute`.
-    expect([...CAPABILITIES]).toHaveLength(54);
+    // Story 2-3b grows it to 56: `dock.manage` (owner, ops_manager — the
+    // doors and the schedule) and `dock.schedule` (owner, ops_manager,
+    // operator — book, reschedule and cancel an appointment).
+    expect([...CAPABILITIES]).toHaveLength(56);
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('dock.manage'))).toEqual(['owner', 'ops_manager']);
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('dock.schedule'))).toEqual(['owner', 'ops_manager', 'operator']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('rtv.manage'))).toEqual(['owner', 'ops_manager']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('billing.charge'))).toEqual(['owner', 'ops_manager', 'accountant']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('billing.configure'))).toEqual(['owner']);

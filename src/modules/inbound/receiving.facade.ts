@@ -42,6 +42,7 @@ import { fromMilli } from '../../shared/primitives/quantity';
 import { OPEN_ASN_STATUSES, asnLineSnapshot, type AsnLineSnapshot } from './asn.command';
 import { partnerNamesInTx, type VendorSnapshotV1 } from '../partners/partners.facade';
 import { gateInLabelsInTx, openGateInsInTx, type OpenGateInView } from './gate-in.read';
+import { dockClock, todaysDockAppointmentsInTx, type DeviceDockAppointmentView } from './dock.read';
 import { gateInClock } from './gate-in.command';
 import { AttachmentsFacade, MAX_IMAGE_BYTES } from '../attachments/attachments.facade';
 import {
@@ -303,6 +304,8 @@ export interface CatalogSnapshot {
   }[];
   /** Story 2-3a (additive): the open gate-ins the dock unloads and receives against (decision 15). */
   readonly openGateIns: readonly OpenGateInView[];
+  /** Story 2-3b (additive, decision 12): the warehouse's booked dock appointments starting today (IST). */
+  readonly dockAppointments: readonly DeviceDockAppointmentView[];
   /** Story 2-4a (additive): the damage and short reason vocabularies — the device's gate on its controls. */
   readonly receiptDamageReasons: readonly string[];
   readonly receiptShortReasons: readonly string[];
@@ -954,6 +957,8 @@ export class ReceivingFacade {
       const putawayTasks = await this.putaway.getPutawayTasksInTx(tx, tenantId, warehouseId);
       // Story 2-3a: the open gate-ins — an …InTx read on THIS transaction (Gotcha 2).
       const openGateIns = await openGateInsInTx(tx, tenantId, warehouseId, gateInClock.now());
+      // Story 2-3b: today's expected trucks — an …InTx read on THIS transaction (Gotcha 2).
+      const dockAppointments = await todaysDockAppointmentsInTx(tx, tenantId, warehouseId, dockClock.now());
       return {
         generatedAt: new Date().toISOString(),
         warehouseId,
@@ -978,6 +983,7 @@ export class ReceivingFacade {
         bins: binSummaries,
         putawayTasks: putawayTasks.map((task) => ({ ...task })),
         openGateIns,
+        dockAppointments,
         // Story 2-4a — the vocabularies; their presence is the device's gate.
         receiptDamageReasons: [...DAMAGE_REASON_CODES],
         receiptShortReasons: [...SHORT_REASON_CODES],

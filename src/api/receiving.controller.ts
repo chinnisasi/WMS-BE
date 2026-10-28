@@ -337,7 +337,17 @@ export class ReceivingController {
       openVendorReturns: openVendorReturns.map((rtv) => ({ ...rtv, lines: rtv.lines.map((line) => ({ ...line })) })),
       clients,
       // Story 2-3a — the open gate-ins, copied key by key (a mutable DTO array).
-      openGateIns: snapshot.openGateIns.map((gateIn) => ({ ...gateIn, documents: gateIn.documents.map((doc) => ({ ...doc })) })),
+      openGateIns: snapshot.openGateIns.map((gateIn) => ({
+        ...gateIn,
+        documents: gateIn.documents.map((doc) => ({ ...doc })),
+        // Story 2-3b — the linked appointment, copied key by key.
+        appointment: gateIn.appointment === null ? null : { ...gateIn.appointment },
+      })),
+      // Story 2-3b — today's expected trucks, copied key by key.
+      dockAppointments: snapshot.dockAppointments.map((appointment) => ({
+        ...appointment,
+        documents: appointment.documents.map((doc) => ({ ...doc })),
+      })),
       // Story 3-1 — the move reason vocabulary, read through the movements
       // facade (inbound never imports the movements module).
       moveReasons: this.movements.moveReasons().map((reason) => ({ ...reason })),

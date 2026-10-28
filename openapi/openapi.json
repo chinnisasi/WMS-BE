@@ -16723,7 +16723,7 @@
             }
           },
           "404": {
-            "description": "The warehouse, the transporter partner, or a document's purchase order or ASN does not exist in this tenant (not-found)",
+            "description": "The warehouse, the transporter partner, a document's purchase order or ASN, or the dock appointment does not exist in this tenant (not-found)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -16733,7 +16733,7 @@
             }
           },
           "409": {
-            "description": "The partner lacks the transporter role (partner-not-transporter) or is inactive (transporter-inactive); a document's PO or ASN is another warehouse's (document-warehouse-mismatch); or a concurrent idempotent request (conflict)",
+            "description": "The partner lacks the transporter role (partner-not-transporter) or is inactive (transporter-inactive); a document's PO or ASN is another warehouse's (document-warehouse-mismatch); the dock appointment is another warehouse's (appointment-warehouse-mismatch), cancelled or another gate-in's (appointment-closed), or does not start yesterday, today or tomorrow IST (appointment-not-due); or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -17061,7 +17061,7 @@
             }
           },
           "404": {
-            "description": "The gate-in, the (new) transporter partner, or a document's PO or ASN does not exist in this tenant (not-found)",
+            "description": "The gate-in, the (new) transporter partner, a document's PO or ASN, or the new dock appointment does not exist in this tenant (not-found)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -17071,7 +17071,7 @@
             }
           },
           "409": {
-            "description": "The gate-in is gated out (gate-in-closed); a different gated-in time once the unload started (gate-in-time-locked); a changed seal status, seal number or packages declared once the unload ended (gate-in-field-locked); a new transporter partner without the role (partner-not-transporter) or inactive (transporter-inactive); a document of another warehouse (document-warehouse-mismatch); or a concurrent idempotent request (conflict)",
+            "description": "The gate-in is gated out (gate-in-closed); a different gated-in time once the unload started (gate-in-time-locked); a changed seal status, seal number or packages declared once the unload ended (gate-in-field-locked); a new transporter partner without the role (partner-not-transporter) or inactive (transporter-inactive); a document of another warehouse (document-warehouse-mismatch); a new dock appointment of another warehouse (appointment-warehouse-mismatch), cancelled or another gate-in's (appointment-closed), or not due (appointment-not-due); or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -17486,6 +17486,1141 @@
         "summary": "Gates the vehicle out (gate.manage) — from any state but gated_out; closes the visit (no further edits; a late unload still records)",
         "tags": [
           "gate-ins"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/dock-doors": {
+      "get": {
+        "operationId": "DockController_listDoors",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DockDoorListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed warehouseId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied — an operator surface)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "A warehouse's dock doors, active first then by code (any staff member)",
+        "tags": [
+          "dock"
+        ]
+      },
+      "post": {
+        "operationId": "DockController_createDoor",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDockDoorDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DockDoorResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, the code (1–20 letters, digits or hyphens) or the name (≤ 60) (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied — an operator surface), or the caller lacks dock.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The code exists in this warehouse (dock-door-code-taken); 100 doors already (dock-door-limit); a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Adds a dock door (dock.manage) — a code unique in the warehouse, an optional name; at most 100 doors",
+        "tags": [
+          "dock"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/dock-doors/{doorId}": {
+      "patch": {
+        "operationId": "DockController_updateDoor",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "doorId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateDockDoorDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DockDoorResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed id, the code, the name or active (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied — an operator surface), or the caller lacks dock.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such door in this warehouse (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The code exists in this warehouse (dock-door-code-taken); booked appointments still to come — appointmentCount and firstAppointmentCode name them (dock-door-has-appointments); a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Replaces a dock door (dock.manage) — code, name and active in full; a deactivation is refused while a booked appointment is still to come",
+        "tags": [
+          "dock"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/dock-schedule": {
+      "get": {
+        "operationId": "DockController_getSchedule",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DockScheduleResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed warehouseId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied — an operator surface)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "A warehouse's dock schedule (any staff member) — the defaults with configured: false until one is saved",
+        "tags": [
+          "dock"
+        ]
+      },
+      "put": {
+        "operationId": "DockController_putSchedule",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutDockScheduleDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DockScheduleResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key; a slot length not 15/30/60, a time not HH:MM or off the slot grid, closesAt not after opensAt, no open day or a repeated one, a grace outside 0–120 — the field named (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied — an operator surface), or the caller lacks dock.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Sets a warehouse's dock schedule (dock.manage) — a full replacement; never moves or refuses an existing appointment",
+        "tags": [
+          "dock"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/dock-schedule": {
+      "get": {
+        "operationId": "DockController_window",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "query",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "required": true,
+            "in": "query",
+            "description": "First IST date (inclusive)",
+            "schema": {
+              "example": "2026-10-29",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": true,
+            "in": "query",
+            "description": "Last IST date (inclusive); at most 7 days from `from`",
+            "schema": {
+              "example": "2026-10-29",
+              "type": "string"
+            }
+          },
+          {
+            "name": "includeCancelled",
+            "required": false,
+            "in": "query",
+            "description": "List cancelled appointments too (the summary counts them either way)",
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DockWindowResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed warehouseId, from or to, to before from, or more than 7 days (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied — an operator surface)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The dock calendar's window (any staff member): one warehouse's appointments starting on the IST dates from–to (≤ 7 days, ≤ 1000 listed), its schedule, the doors and the summary — every client's",
+        "tags": [
+          "dock"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/dock-appointments": {
+      "post": {
+        "operationId": "DockController_book",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BookDockAppointmentDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DockAppointmentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key; a malformed field — the instants, more than 8 slots, more than 10 documents or a repeated one, a document naming both or neither of poId / asnId, the vehicle, a length (validation-failed); a start off the slot grid or a duration that is not whole slots (slot-misaligned); before the current slot (slot-in-past); more than 90 IST days ahead (slot-too-far)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied — an operator surface), or the caller lacks dock.schedule (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse, the door, or a document does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A closed day or outside the opening hours (dock-closed); the door is another warehouse's (dock-door-warehouse-mismatch) or inactive (dock-door-inactive); the door is taken — `clash` names the appointment and its window (dock-slot-taken); a document of another warehouse (document-warehouse-mismatch), a PO not open (po-not-open), an ASN not announced or partially received (asn-not-open); or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Books a dock appointment (dock.schedule) — one door for 1–8 whole slots of an open day, optionally against open POs and ASNs of the warehouse (any client); DA-<n>, status booked; no overbooking",
+        "tags": [
+          "dock"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/dock-appointments/{appointmentId}": {
+      "get": {
+        "operationId": "DockController_get",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "appointmentId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DockAppointmentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed appointmentId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied — an operator surface)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such appointment in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One dock appointment (any staff member) — the calendar drawer",
+        "tags": [
+          "dock"
+        ]
+      },
+      "patch": {
+        "operationId": "DockController_reschedule",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "appointmentId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RescheduleDockAppointmentDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DockAppointmentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key; a malformed field — the instants, more than 8 slots, more than 10 documents or a repeated one, a document naming both or neither of poId / asnId, the vehicle, a length (validation-failed); a start off the slot grid or a duration that is not whole slots (slot-misaligned); before the current slot (slot-in-past); more than 90 IST days ahead (slot-too-far); a malformed appointmentId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied — an operator surface), or the caller lacks dock.schedule (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The appointment, the new door or a document does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Arrived or cancelled (appointment-closed); past its window and grace (appointment-no-show); moved concurrently — reload (conflict); A closed day or outside the opening hours (dock-closed); the door is another warehouse's (dock-door-warehouse-mismatch) or inactive (dock-door-inactive); the door is taken — `clash` names the appointment and its window (dock-slot-taken); a document of another warehouse (document-warehouse-mismatch), a PO not open (po-not-open), an ASN not announced or partially received (asn-not-open); or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Reschedules a booked dock appointment (dock.schedule) — a full replacement of the door, window, documents, vehicle, transporter and note; only what changed is re-checked (a vehicle, transporter or note edit is always accepted while booked)",
+        "tags": [
+          "dock"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/dock-appointments/{appointmentId}/cancel": {
+      "post": {
+        "operationId": "DockController_cancel",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "appointmentId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelDockAppointmentDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DockAppointmentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed appointmentId, a blank or over-200 reason (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied — an operator surface), or the caller lacks dock.schedule (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such appointment in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Arrived or cancelled (appointment-closed); past its window and grace (appointment-no-show); a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Cancels a booked dock appointment with a reason (dock.schedule) — the slot frees",
+        "tags": [
+          "dock"
         ]
       }
     },
@@ -27202,6 +28337,8 @@
                 "count_variance",
                 "count_variance_policy",
                 "device",
+                "dock_appointment",
+                "dock_door",
                 "eway_bill",
                 "eway_gstin_setting",
                 "eway_state_threshold",
@@ -54223,6 +55360,46 @@
           "number"
         ]
       },
+      "CatalogGateInAppointmentDto": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "example": "DA-0012"
+          },
+          "startsAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "endsAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "doorCode": {
+            "type": "string",
+            "example": "D3"
+          },
+          "punctuality": {
+            "type": "string",
+            "enum": [
+              "early",
+              "on_time",
+              "late"
+            ]
+          },
+          "punctualityMinutes": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "code",
+          "startsAt",
+          "endsAt",
+          "doorCode",
+          "punctuality",
+          "punctualityMinutes"
+        ]
+      },
       "CatalogOpenGateInDto": {
         "type": "object",
         "properties": {
@@ -54274,6 +55451,16 @@
             "items": {
               "$ref": "#/components/schemas/CatalogOpenGateInDocumentDto"
             }
+          },
+          "appointment": {
+            "nullable": true,
+            "description": "Story 2-3b (additive) — the linked dock appointment, read-only; null = unscheduled. An older server omits it",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CatalogGateInAppointmentDto"
+              }
+            ]
           }
         },
         "required": [
@@ -54286,6 +55473,82 @@
           "status",
           "sealStatus",
           "unloadStartedAt",
+          "documents",
+          "appointment"
+        ]
+      },
+      "CatalogDockAppointmentDocumentDto": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "po",
+              "asn"
+            ]
+          },
+          "code": {
+            "type": "string",
+            "nullable": true,
+            "example": "PO-1002"
+          }
+        },
+        "required": [
+          "kind",
+          "code"
+        ]
+      },
+      "CatalogDockAppointmentDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "example": "DA-0002"
+          },
+          "startsAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "endsAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "graceMinutes": {
+            "type": "number",
+            "description": "The frozen grace — the device reads \"Not arrived\" once its clock passes endsAt + grace"
+          },
+          "doorCode": {
+            "type": "string",
+            "example": "D2"
+          },
+          "vehicleNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "transporterName": {
+            "type": "string",
+            "nullable": true
+          },
+          "documents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogDockAppointmentDocumentDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "startsAt",
+          "endsAt",
+          "graceMinutes",
+          "doorCode",
+          "vehicleNo",
+          "transporterName",
           "documents"
         ]
       },
@@ -54484,6 +55747,13 @@
               "$ref": "#/components/schemas/CatalogOpenGateInDto"
             }
           },
+          "dockAppointments": {
+            "description": "Story 2-3b (additive): the warehouse's BOOKED dock appointments starting today (IST, server clock), at most 100, by start — the Receive tab's read-only \"Expected today\". The device derives \"Not arrived\" from endsAt + graceMinutes against its own clock. An older server omits it",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogDockAppointmentDto"
+            }
+          },
           "receiptDamageReasons": {
             "type": "array",
             "description": "Story 2-4a (additive): the damage reason vocabulary — the handheld shows its Damaged control only when the snapshot carries it (an older server omits it), and refuses to confirm a draft holding damage against a snapshot without it",
@@ -54554,6 +55824,7 @@
           "openVendorReturns",
           "clients",
           "openGateIns",
+          "dockAppointments",
           "receiptDamageReasons",
           "receiptShortReasons",
           "receiptPhotos",
@@ -56325,6 +57596,12 @@
               "$ref": "#/components/schemas/GateInDocumentInputDto"
             }
           },
+          "appointmentId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Story 2-3b — the dock appointment this visit keeps: a booked appointment of this warehouse starting yesterday, today or tomorrow (IST). Create: absent or null = unscheduled. Amend: ABSENT = the link unchanged (the one field where absent ≠ null), null = clear (the appointment returns to booked), an id = move. 404 unknown; 409 appointment-warehouse-mismatch, appointment-closed (cancelled, or another gate-in's), appointment-not-due"
+          },
           "warehouseId": {
             "type": "string",
             "format": "uuid",
@@ -56540,6 +57817,18 @@
             "items": {
               "$ref": "#/components/schemas/GateInDocumentDto"
             }
+          },
+          "appointmentId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Story 2-3b — the linked dock appointment (null: unscheduled). Absent on an answer stored before 2-3b and replayed"
+          },
+          "appointmentCode": {
+            "type": "string",
+            "nullable": true,
+            "example": "DA-0012",
+            "description": "Story 2-3b — its code"
           }
         },
         "required": [
@@ -56585,6 +57874,52 @@
         },
         "required": [
           "gateIn"
+        ]
+      },
+      "GateInAppointmentDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "example": "DA-0012"
+          },
+          "startsAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "endsAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "doorCode": {
+            "type": "string",
+            "example": "D3"
+          },
+          "punctuality": {
+            "type": "string",
+            "enum": [
+              "early",
+              "on_time",
+              "late"
+            ]
+          },
+          "punctualityMinutes": {
+            "type": "number",
+            "description": "The gate-in time − the slot start in whole minutes (negative = early)"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "startsAt",
+          "endsAt",
+          "doorCode",
+          "punctuality",
+          "punctualityMinutes"
         ]
       },
       "GateInEntryDto": {
@@ -56761,6 +58096,16 @@
           "staleOpen": {
             "type": "boolean",
             "description": "Not gated out and gated in more than 7 days ago (the device no longer offers it)"
+          },
+          "appointment": {
+            "nullable": true,
+            "description": "Story 2-3b — the linked dock appointment and the visit's punctuality against it (derived from the gated-in time); null = unscheduled",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GateInAppointmentDto"
+              }
+            ]
           }
         },
         "required": [
@@ -56798,7 +58143,8 @@
           "receiptCount",
           "packagesFlag",
           "packagesDifference",
-          "staleOpen"
+          "staleOpen",
+          "appointment"
         ]
       },
       "GateInListResponse": {
@@ -57110,6 +58456,16 @@
             "type": "boolean",
             "description": "Not gated out and gated in more than 7 days ago (the device no longer offers it)"
           },
+          "appointment": {
+            "nullable": true,
+            "description": "Story 2-3b — the linked dock appointment and the visit's punctuality against it (derived from the gated-in time); null = unscheduled",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GateInAppointmentDto"
+              }
+            ]
+          },
           "documents": {
             "type": "array",
             "items": {
@@ -57160,6 +58516,7 @@
           "packagesFlag",
           "packagesDifference",
           "staleOpen",
+          "appointment",
           "documents",
           "receipts"
         ]
@@ -57265,6 +58622,12 @@
             "items": {
               "$ref": "#/components/schemas/GateInDocumentInputDto"
             }
+          },
+          "appointmentId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Story 2-3b — the dock appointment this visit keeps: a booked appointment of this warehouse starting yesterday, today or tomorrow (IST). Create: absent or null = unscheduled. Amend: ABSENT = the link unchanged (the one field where absent ≠ null), null = clear (the appointment returns to booked), an id = move. 404 unknown; 409 appointment-warehouse-mismatch, appointment-closed (cancelled, or another gate-in's), appointment-not-due"
           }
         },
         "required": [
@@ -57323,6 +58686,747 @@
             "description": "When the vehicle left (ISO-8601 with a zone); absent = now. Not before the gated-in time, not more than 5 minutes ahead"
           }
         }
+      },
+      "DockDoorDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "example": "D3"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "active": {
+            "type": "boolean"
+          },
+          "createdBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "warehouseId",
+          "code",
+          "name",
+          "active",
+          "createdBy",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "DockDoorListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "description": "Every door of the warehouse — active first, then by code",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DockDoorDto"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "CreateDockDoorDto": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "example": "D3",
+            "maxLength": 20,
+            "description": "Uppercased and trimmed; 1–20 letters, digits or hyphens; unique per warehouse (active or inactive)"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 60,
+            "description": "Trimmed; blank = none"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "DockDoorResponse": {
+        "type": "object",
+        "properties": {
+          "dockDoor": {
+            "$ref": "#/components/schemas/DockDoorDto"
+          }
+        },
+        "required": [
+          "dockDoor"
+        ]
+      },
+      "UpdateDockDoorDto": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "example": "D3",
+            "maxLength": 20,
+            "description": "Uppercased and trimmed; 1–20 letters, digits or hyphens; unique per warehouse (active or inactive)"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 60,
+            "description": "Trimmed; blank = none"
+          },
+          "active": {
+            "type": "boolean",
+            "description": "false deactivates (refused while the door has a booked appointment still to come — 409 dock-door-has-appointments); a door is never deleted"
+          }
+        },
+        "required": [
+          "code",
+          "active"
+        ]
+      },
+      "DockScheduleDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "slotMinutes": {
+            "type": "number",
+            "enum": [
+              15,
+              30,
+              60
+            ]
+          },
+          "opensAt": {
+            "type": "string",
+            "example": "09:00"
+          },
+          "closesAt": {
+            "type": "string",
+            "example": "18:00",
+            "description": "24:00 = midnight"
+          },
+          "openDays": {
+            "example": [
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "graceMinutes": {
+            "type": "number"
+          },
+          "configured": {
+            "type": "boolean",
+            "description": "false while the warehouse has no stored schedule — the defaults (30 min, 09:00–18:00, Mon–Sat, grace 15) are shown"
+          },
+          "updatedAt": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "warehouseId",
+          "slotMinutes",
+          "opensAt",
+          "closesAt",
+          "openDays",
+          "graceMinutes",
+          "configured",
+          "updatedAt"
+        ]
+      },
+      "DockScheduleResponse": {
+        "type": "object",
+        "properties": {
+          "schedule": {
+            "$ref": "#/components/schemas/DockScheduleDto"
+          }
+        },
+        "required": [
+          "schedule"
+        ]
+      },
+      "PutDockScheduleDto": {
+        "type": "object",
+        "properties": {
+          "slotMinutes": {
+            "type": "number",
+            "enum": [
+              15,
+              30,
+              60
+            ],
+            "description": "The slot length in minutes"
+          },
+          "opensAt": {
+            "type": "string",
+            "example": "09:00",
+            "description": "IST wall clock HH:MM, on the slot grid"
+          },
+          "closesAt": {
+            "type": "string",
+            "example": "18:00",
+            "description": "IST wall clock HH:MM, on the slot grid, after opensAt; 24:00 closes at midnight"
+          },
+          "openDays": {
+            "example": [
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "description": "ISO weekdays the dock is open (1 = Monday … 7 = Sunday), at least one, no repeats",
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "graceMinutes": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 120,
+            "description": "Minutes either side of the slot start an arrival still reads on time (frozen on each appointment at booking)"
+          }
+        },
+        "required": [
+          "slotMinutes",
+          "opensAt",
+          "closesAt",
+          "openDays",
+          "graceMinutes"
+        ]
+      },
+      "DockAppointmentDocumentDto": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "po",
+              "asn"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "nullable": true,
+            "example": "PO-1001"
+          },
+          "clientId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "vendorName": {
+            "type": "string",
+            "nullable": true,
+            "description": "The PO's frozen vendor name; null on an ASN"
+          }
+        },
+        "required": [
+          "kind",
+          "id",
+          "code",
+          "clientId",
+          "vendorName"
+        ]
+      },
+      "DockAppointmentDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "example": "DA-0001"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "booked",
+              "arrived",
+              "cancelled"
+            ],
+            "description": "Stored status; a no-show is derived (noShow), never stored"
+          },
+          "dockDoorId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "doorCode": {
+            "type": "string",
+            "example": "D3"
+          },
+          "startsAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "endsAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "graceMinutes": {
+            "type": "number",
+            "description": "The on-time grace frozen at booking (re-frozen when rescheduled to another door or window)"
+          },
+          "clientId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Set when every document names one client; null when mixed or none"
+          },
+          "vehicleNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "transporterName": {
+            "type": "string",
+            "nullable": true
+          },
+          "note": {
+            "type": "string",
+            "nullable": true
+          },
+          "documents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DockAppointmentDocumentDto"
+            }
+          },
+          "gateInId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "gateInCode": {
+            "type": "string",
+            "nullable": true,
+            "example": "GI-0001"
+          },
+          "gatedInAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "The linked gate-in's gated-in time — the arrival"
+          },
+          "linkedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "linkedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "bookedBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "cancelledAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "cancelledBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "cancelReason": {
+            "type": "string",
+            "nullable": true
+          },
+          "punctuality": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "early",
+              "on_time",
+              "late",
+              null
+            ],
+            "description": "Derived from the arrival: early below −grace, late above +grace, else on_time; null until arrived"
+          },
+          "punctualityMinutes": {
+            "type": "number",
+            "nullable": true,
+            "description": "Arrival − start in whole minutes (the raw delta, truncated toward zero; negative = early)"
+          },
+          "noShow": {
+            "type": "boolean",
+            "description": "Derived: still booked at or after endsAt + grace"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "warehouseId",
+          "code",
+          "status",
+          "dockDoorId",
+          "doorCode",
+          "startsAt",
+          "endsAt",
+          "graceMinutes",
+          "clientId",
+          "vehicleNo",
+          "transporterName",
+          "note",
+          "documents",
+          "gateInId",
+          "gateInCode",
+          "gatedInAt",
+          "linkedAt",
+          "linkedBy",
+          "bookedBy",
+          "cancelledAt",
+          "cancelledBy",
+          "cancelReason",
+          "punctuality",
+          "punctualityMinutes",
+          "noShow",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "DockDoorMinutesDto": {
+        "type": "object",
+        "properties": {
+          "doorId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "bookedMinutes": {
+            "type": "number"
+          },
+          "openMinutes": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "doorId",
+          "bookedMinutes",
+          "openMinutes"
+        ]
+      },
+      "DockSummaryDto": {
+        "type": "object",
+        "properties": {
+          "scheduled": {
+            "type": "number",
+            "description": "Non-cancelled appointments starting in the window"
+          },
+          "pending": {
+            "type": "number",
+            "description": "Booked and not yet a no-show"
+          },
+          "arrived": {
+            "type": "number"
+          },
+          "early": {
+            "type": "number"
+          },
+          "onTime": {
+            "type": "number"
+          },
+          "late": {
+            "type": "number"
+          },
+          "noShow": {
+            "type": "number"
+          },
+          "cancelled": {
+            "type": "number",
+            "description": "Counted even when includeCancelled is false"
+          },
+          "onTimeRate": {
+            "type": "number",
+            "nullable": true,
+            "description": "onTime ÷ (arrived + noShow) as a percentage (0–100, one decimal); null when the denominator is 0"
+          },
+          "bookedMinutes": {
+            "type": "number",
+            "description": "Minutes of scheduled appointments, each clipped to its day's opening hours"
+          },
+          "openMinutes": {
+            "type": "number",
+            "description": "The door set (active now, plus any door with an appointment in the window) × the open minutes of each open day"
+          },
+          "utilisationRate": {
+            "type": "number",
+            "nullable": true,
+            "description": "bookedMinutes ÷ openMinutes as a percentage (0–100, one decimal, clamped); null when openMinutes is 0"
+          },
+          "byDoor": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DockDoorMinutesDto"
+            }
+          }
+        },
+        "required": [
+          "scheduled",
+          "pending",
+          "arrived",
+          "early",
+          "onTime",
+          "late",
+          "noShow",
+          "cancelled",
+          "onTimeRate",
+          "bookedMinutes",
+          "openMinutes",
+          "utilisationRate",
+          "byDoor"
+        ]
+      },
+      "DockWindowResponse": {
+        "type": "object",
+        "properties": {
+          "asOf": {
+            "type": "string",
+            "description": "The server instant the derived fields (noShow, pending) were read at"
+          },
+          "from": {
+            "type": "string",
+            "example": "2026-10-29"
+          },
+          "to": {
+            "type": "string",
+            "example": "2026-10-29"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/DockScheduleDto"
+          },
+          "doors": {
+            "description": "Active doors, plus any inactive door with an appointment in the window",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DockDoorDto"
+            }
+          },
+          "appointments": {
+            "description": "By (startsAt, id), at most 1000",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DockAppointmentDto"
+            }
+          },
+          "summary": {
+            "description": "Over the whole window, independent of the 1000-row cap",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/DockSummaryDto"
+              }
+            ]
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "true when the window holds more than 1000 listed appointments"
+          }
+        },
+        "required": [
+          "asOf",
+          "from",
+          "to",
+          "schedule",
+          "doors",
+          "appointments",
+          "summary",
+          "truncated"
+        ]
+      },
+      "DockAppointmentDocumentInputDto": {
+        "type": "object",
+        "properties": {
+          "poId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "An OPEN purchase order of this warehouse (any client) — exactly one of poId / asnId"
+          },
+          "asnId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "An announced or partially received ASN of this warehouse (any client)"
+          }
+        }
+      },
+      "BookDockAppointmentDto": {
+        "type": "object",
+        "properties": {
+          "dockDoorId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "An active dock door of the warehouse"
+          },
+          "startsAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "On the warehouse's IST slot grid, not before the current slot, at most 90 IST days ahead, inside an open day's hours"
+          },
+          "endsAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "1 to 8 whole slots after startsAt, not past the closing time"
+          },
+          "documents": {
+            "maxItems": 10,
+            "description": "The POs and ASNs the truck carries (0–10, no repeats); the full set (reschedule replaces it)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DockAppointmentDocumentInputDto"
+            }
+          },
+          "vehicleNo": {
+            "type": "string",
+            "nullable": true,
+            "description": "The expected vehicle — normalised like the gate-in (4–15 letters and digits)"
+          },
+          "transporterName": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 80
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 500,
+            "description": "Free text — never copied into an event"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "dockDoorId",
+          "startsAt",
+          "endsAt",
+          "warehouseId"
+        ]
+      },
+      "DockAppointmentResponse": {
+        "type": "object",
+        "properties": {
+          "appointment": {
+            "$ref": "#/components/schemas/DockAppointmentDto"
+          }
+        },
+        "required": [
+          "appointment"
+        ]
+      },
+      "RescheduleDockAppointmentDto": {
+        "type": "object",
+        "properties": {
+          "dockDoorId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "An active dock door of the warehouse"
+          },
+          "startsAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "On the warehouse's IST slot grid, not before the current slot, at most 90 IST days ahead, inside an open day's hours"
+          },
+          "endsAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "1 to 8 whole slots after startsAt, not past the closing time"
+          },
+          "documents": {
+            "maxItems": 10,
+            "description": "The POs and ASNs the truck carries (0–10, no repeats); the full set (reschedule replaces it)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DockAppointmentDocumentInputDto"
+            }
+          },
+          "vehicleNo": {
+            "type": "string",
+            "nullable": true,
+            "description": "The expected vehicle — normalised like the gate-in (4–15 letters and digits)"
+          },
+          "transporterName": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 80
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 500,
+            "description": "Free text — never copied into an event"
+          }
+        },
+        "required": [
+          "dockDoorId",
+          "startsAt",
+          "endsAt"
+        ]
+      },
+      "CancelDockAppointmentDto": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "maxLength": 200,
+            "example": "Vendor postponed",
+            "description": "Why (1–200 characters, trimmed)"
+          }
+        },
+        "required": [
+          "reason"
+        ]
       },
       "PlacePutawayDto": {
         "type": "object",
@@ -63802,6 +65906,8 @@
               "count_variance",
               "count_variance_policy",
               "device",
+              "dock_appointment",
+              "dock_door",
               "eway_bill",
               "eway_gstin_setting",
               "eway_state_threshold",
@@ -63908,6 +66014,8 @@
               "count_variance",
               "count_variance_policy",
               "device",
+              "dock_appointment",
+              "dock_door",
               "eway_bill",
               "eway_gstin_setting",
               "eway_state_threshold",
