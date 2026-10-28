@@ -378,7 +378,12 @@ const LEDGER_COLUMNS: readonly ExportColumn[] = [
  * until it is summarised); a stored kind this build does not know — a
  * legacy row, a newer writer — prints its kind, never throws.
  */
-export function referenceSummary(doc: LedgerReferenceDoc, grnCodes: ReadonlyMap<string, string>): string {
+export function referenceSummary(
+  doc: LedgerReferenceDoc,
+  grnCodes: ReadonlyMap<string, string>,
+  // Story 2-8b (A11) — RTV codes by id, read like the GRN codes; an id the map lacks prints itself.
+  vendorReturnCodes: ReadonlyMap<string, string> = new Map(),
+): string {
   if (typeof doc !== 'object' || doc === null) return 'unknown';
   const grn = (id: string): string => `GRN ${grnCodes.get(id) ?? id}`;
   switch (doc.kind) {
@@ -416,6 +421,9 @@ export function referenceSummary(doc: LedgerReferenceDoc, grnCodes: ReadonlyMap<
     // Story 4-2b — a cancelled order's drawn units put back.
     case 'restock':
       return `restock order ${doc.orderId}`;
+    // Story 2-8b — damaged units sent back to their vendor.
+    case 'vendor-return':
+      return `return to vendor ${vendorReturnCodes.get(doc.vendorReturnId) ?? doc.vendorReturnId}`;
     default: {
       const unknown: never = doc;
       const kind = (unknown as { kind?: unknown }).kind;
@@ -442,6 +450,10 @@ const ledger: RegisterDefinition = {
         : [],
     );
     const grnCodes = await ctx.sources.inbound.grnCodesByIdsInTx(ctx.tx, ctx.tenantId, grnIds);
+    const vendorReturnIds = rows.flatMap((row) =>
+      row.referenceDoc !== null && typeof row.referenceDoc === 'object' && row.referenceDoc.kind === 'vendor-return' ? [row.referenceDoc.vendorReturnId] : [],
+    );
+    const vendorReturnCodes = await ctx.sources.inbound.vendorReturnCodesByIdsInTx(ctx.tx, ctx.tenantId, vendorReturnIds);
     const batches = await ctx.sources.catalog.batchFactsByIdsInTx(
       ctx.tx,
       ctx.tenantId,
@@ -461,7 +473,7 @@ const ledger: RegisterDefinition = {
       row.toBinCode,
       row.batchId === null ? null : (batches.get(row.batchId)?.code ?? row.batchId),
       row.quantity,
-      referenceSummary(row.referenceDoc, grnCodes),
+      referenceSummary(row.referenceDoc, grnCodes, vendorReturnCodes),
       names.get(row.actorUserId) ?? null,
     ]);
   },

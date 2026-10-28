@@ -1074,6 +1074,25 @@ describe('architecture: clients are clients-module-owned (story 21-1)', () => {
     }
   });
 
+  it('story 2-8b: inbound/vendor-return-claims.ts imports only drizzle-orm and shared/ — the inventory write-off guard imports it, never the inbound module', () => {
+    const source = readFileSync(join(SRC_ROOT, 'modules', 'inbound', 'vendor-return-claims.ts'), 'utf8');
+    expect(source).toMatch(/export async function openVendorReturnClaimsInTx\(/);
+    const offenders: string[] = [];
+    for (const match of source.matchAll(/from '([^']+)'/g)) {
+      const target = match[1]!;
+      if (target !== 'drizzle-orm' && !target.startsWith('../../shared/')) offenders.push(`imports ${target}`);
+    }
+    expect(offenders).toEqual([]);
+    const inventory = readFileSync(join(SRC_ROOT, 'modules', 'inventory', 'inventory.command.ts'), 'utf8');
+    expect(inventory).toContain(`from '../inbound/vendor-return-claims'`);
+    // The inventory module imports exactly this one inbound file — no facade, no module.
+    const inventoryRoot = join(SRC_ROOT, 'modules', 'inventory');
+    const reaches = files
+      .filter((file) => file.path.startsWith(inventoryRoot))
+      .flatMap((file) => [...file.source.matchAll(/from '\.\.\/inbound\/([^']+)'/g)].map((m) => m[1]!));
+    expect([...new Set(reaches)]).toEqual(['vendor-return-claims']);
+  });
+
   /**
    * Story 2-5a — the attachments module's boundary. Its records seam
    * (`attachment-records.ts`) imports only drizzle-orm and shared/ (§7h), so

@@ -140,6 +140,9 @@ export const AUDIT_TARGET_TYPES = [
   'tenant',
   'transfer_order',
   'user',
+  // Story 2-8b — a return-to-vendor document (`vendor_return.created |
+  // picked | dispatched | cancelled`).
+  'vendor_return',
   'warehouse',
   'wave',
   'wave_policy',
@@ -218,6 +221,11 @@ export const AUDIT_NEW_ACTIONS = [
   // Story 4-7a — the disposition commands (`ReturnDispositionCommand`, web
   // and handheld): one row per command, the first disposition its target.
   { action: 'return_disposition.recorded', targetType: 'return_disposition' },
+  // Story 2-8b — the return-to-vendor document's four transitions.
+  { action: 'vendor_return.created', targetType: 'vendor_return' },
+  { action: 'vendor_return.picked', targetType: 'vendor_return' },
+  { action: 'vendor_return.dispatched', targetType: 'vendor_return' },
+  { action: 'vendor_return.cancelled', targetType: 'vendor_return' },
   // Story 5-6a — credit and debit notes (`ClientInvoiceNoteService`); a void
   // of the invoice discards its draft notes under the void's key.
   { action: 'client_invoice_note.drafted', targetType: 'client_invoice_note' },

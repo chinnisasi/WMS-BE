@@ -910,7 +910,9 @@ describe('return receipts (e2e, story 13-2)', () => {
     // (a refused damage photo — the device deleted the file). Named here.
     // Story 4-7a adds the device-uploaded Discard-only `return.restock` (A4 —
     // the units were placed in the scanned bin; restock them on the web).
-    const discardOnly = new Set(['return.receive', 'grn.lines-refused', 'grn.inactive-sku-received', 'gate-in.unload', 'receipt-photo.stage', 'return.restock']);
+    // Story 2-8b adds the device-uploaded Discard-only `rtv.pick` (the pick
+    // moved nothing — there is nothing to re-apply).
+    const discardOnly = new Set(['return.receive', 'grn.lines-refused', 'grn.inactive-sku-received', 'gate-in.unload', 'receipt-photo.stage', 'return.restock', 'rtv.pick']);
     for (const type of REJECTED_OP_TYPES) {
       const expected =
         // Story 3-1 adds the device-uploaded `stock.move` — apply + discard (a

@@ -329,6 +329,19 @@ export type LedgerReferenceDoc =
       readonly reasonCode: string;
       /** The operator's note, trimmed; present only when one was given. */
       readonly note?: string;
+    }
+  // Story 2-8b — the vendor-return arm: every `rtv.dispatched` event names the
+  // return-to-vendor document it left under and the exact line dispatched
+  // (`vendorReturnLineId` — named so it cannot be read as a PO or GRN line)
+  // and, only when the line names one, the GRN line the units came from (the
+  // vendor's debit-note source). `grnLineId` is OMITTED when absent, never
+  // `null` (the 9-3a rule). NEW union arm — the earlier kinds are never
+  // reshaped.
+  | {
+      readonly kind: 'vendor-return';
+      readonly vendorReturnId: string;
+      readonly vendorReturnLineId: string;
+      readonly grnLineId?: string;
     };
 // Later stories extend this union with NEW kinds — never by reshaping an
 // existing arm.
@@ -660,8 +673,9 @@ registerLedgerEventType({
  * bin: `grn.received` means "a credited receipt into Receiving", and putaway,
  * the billing notes and over-receipt approval all reason about it, so a
  * distinct type leaves each of them unchanged. The units are on-hand but
- * excluded from ATP by `damagedUnits`; they leave only by a write-off (a
- * negative `stock.adjusted` out of DAMAGED). The reference is the receipt arm
+ * excluded from ATP by `damagedUnits`; they leave by a write-off (a
+ * negative `stock.adjusted` out of DAMAGED) or a return to vendor (2-8b's
+ * `rtv.dispatched`). The reference is the receipt arm
  * (`grn-receipt`): the GRN, the header's PO or ASN (never a line — damaged
  * units credit no document line) and the `grnLineId`. The batch arm is OPEN
  * (a batch-tracked line's damaged units keep their batch); the serial arm is
@@ -754,6 +768,28 @@ registerLedgerEventType({
   referenceKinds: ['return-disposition'],
   allowsBatchArm: true,
   allowsSerialArm: true,
+});
+
+/**
+ * Grammar v1, Story 2-8b — the return to vendor: a pure DRAW out of the
+ * warehouse's system DAMAGED bin (`fromBinId` DAMAGED, `toBinId` null — the
+ * `pick.picked` / write-off convention), one event per dispatched line with
+ * its batch arm, written at the RTV's dispatch — the one moment the units
+ * leave the building (the handheld pick moves nothing). The reference is the
+ * vendor-return arm (the document, the line, and the source GRN line when
+ * the line names one). ATP-neutral: `damagedUnits` and on-hand drop together.
+ * It meters `['from']` (storage stops the day the units leave). The batch arm
+ * is OPEN; the serial arm CLOSED — DAMAGED holds no serial-tracked units
+ * (`grn.damaged` and `qc.failed` keep theirs closed; the RTV refuses a serial
+ * line, 409 `rtv-sku-unsupported`). Reconcile and replay fold it by its bin
+ * arms unchanged. Registers sinceVersion 1 — no new grammar version.
+ */
+registerLedgerEventType({
+  type: 'rtv.dispatched',
+  sinceVersion: 1,
+  referenceKinds: ['vendor-return'],
+  allowsBatchArm: true,
+  allowsSerialArm: false,
 });
 
 /** The registered definition — `undefined` for an unregistered type. */

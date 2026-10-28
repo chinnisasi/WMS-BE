@@ -148,7 +148,15 @@ export type RejectedOpType =
   // so the reviewer restocks them on the web to that bin, or records a move
   // or count to match the floor. Excluded from `ApplicableOpType`, so tenancy
   // never imports returns.
-  | 'return.restock';
+  | 'return.restock'
+  // Story 2-8b — the handheld's pick of a return to vendor, refused on replay
+  // (the RTV was cancelled or picked meanwhile, its lines changed, every line
+  // picked 0, another warehouse's RTV, a role that lost the floor).
+  // DEVICE-UPLOADED; Discard ONLY: the pick moved nothing, so there is nothing
+  // to re-apply — the reviewer returns any staged units to DAMAGED, or picks
+  // the RTV again. Excluded from `ApplicableOpType`, so tenancy never imports
+  // the RTV command.
+  | 'rtv.pick';
 
 export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'grn.submit',
@@ -168,6 +176,7 @@ export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'stock.adjust',
   'receipt-photo.stage',
   'return.restock',
+  'rtv.pick',
 ];
 
 /**
@@ -246,6 +255,8 @@ export const REJECTED_OP_DECISIONS_BY_TYPE: Readonly<Record<RejectedOpType, read
   // Story 4-7a (A4) — a refused restock: Discard only (the remedy is a web
   // restock to the bin the units were placed in, or a move/count).
   'return.restock': ['discard'],
+  // Story 2-8b — a refused RTV pick: Discard only (see the type's comment).
+  'rtv.pick': ['discard'],
 };
 
 /** Story 1-6d — the 403 an Apply on a `grn.licence-refused` row answers without `licences.manage`. */
@@ -257,7 +268,7 @@ export const RESOLVE_NOTE_MAX = 500;
 /** The op types the apply arm can re-execute (every type admitting `apply`). */
 type ApplicableOpType = Exclude<
   RejectedOpType,
-  'return.receive' | 'grn.lines-refused' | 'grn.inactive-sku-received' | 'gate-in.unload' | 'receipt-photo.stage' | 'return.restock'
+  'return.receive' | 'grn.lines-refused' | 'grn.inactive-sku-received' | 'gate-in.unload' | 'receipt-photo.stage' | 'return.restock' | 'rtv.pick'
 >;
 
 function isApplicableOpType(opType: RejectedOpType): opType is ApplicableOpType {
@@ -500,6 +511,15 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
     ['batchCode', 'string-or-null'],
     ['toBinId', 'uuid'],
     ['occurredAt', 'string'],
+  ],
+  // Story 2-8b — the handheld's RTV pick as it enqueued it (the request body
+  // plus the RTV id the path carries). `vendorReturnId` any string: a
+  // malformed id must still reach the queue to be discarded.
+  'rtv.pick': [
+    ['vendorReturnId', 'string'],
+    ['warehouseId', 'uuid-or-null'],
+    ['occurredAt', 'string'],
+    ['lines', 'array'],
   ],
   'stock.move': [
     ['warehouseId', 'uuid'],
@@ -1228,7 +1248,9 @@ export class SyncReportCommand {
                       ? ' Accept the lines without a valid licence anyway (an owner, with a note), or discard them.'
                       : row.opType === 'grn.inactive-sku-received'
                         ? ' The lines were already booked — acknowledge the row.'
-                        : ''),
+                        : row.opType === 'rtv.pick'
+                          ? ' The pick moved nothing — return any staged units to DAMAGED, or pick the return to vendor again on the handheld.'
+                          : ''),
             { decisions: [...admitted] },
           );
         }

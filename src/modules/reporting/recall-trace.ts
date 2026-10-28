@@ -54,6 +54,8 @@ export const RECALL_REPORT_SECTIONS = [
   'received_damaged',
   'returned',
   'return_scrapped',
+  // Story 2-8b — recalled (or any) units of the lot sent back to their vendor.
+  'returned_to_vendor',
   'adjusted_out',
   'end',
 ] as const;
@@ -310,12 +312,14 @@ export function timeToReportSeconds(prepared: PreparedRecall): number | null {
 // ── the event walk (dispatched, received, damaged, returned, scrapped, written off) ─
 
 /** The event sections, each with the ledger types it walks. */
-const EVENT_SECTIONS: Readonly<Record<'dispatched' | 'received' | 'received_damaged' | 'returned' | 'return_scrapped' | 'adjusted_out', readonly string[]>> = {
+const EVENT_SECTIONS: Readonly<Record<'dispatched' | 'received' | 'received_damaged' | 'returned' | 'return_scrapped' | 'returned_to_vendor' | 'adjusted_out', readonly string[]>> = {
   dispatched: PICK_NETTING_TYPES,
   received: ['grn.received'],
   received_damaged: ['grn.damaged'],
   returned: ['return.received'],
   return_scrapped: ['return.scrapped'],
+  // Story 2-8b — the draw out of DAMAGED at a return-to-vendor's dispatch.
+  returned_to_vendor: ['rtv.dispatched'],
   adjusted_out: ['stock.adjusted'],
 };
 type EventSection = keyof typeof EVENT_SECTIONS;
@@ -400,6 +404,13 @@ export async function eventRowsPageInTx(
         })
       : [];
     const damageReasons = damageLineIds.length === 0 ? new Map<string, string>() : await sources.inbound.grnLineDamageReasonsByIdsInTx(tx, prepared.tenantId, damageLineIds);
+    const vendorReturnIds = section === 'returned_to_vendor'
+      ? kept.flatMap((event) => {
+          const doc = refDoc(event);
+          return doc !== null && doc.kind === 'vendor-return' ? [doc.vendorReturnId] : [];
+        })
+      : [];
+    const vendorReturns = vendorReturnIds.length === 0 ? new Map<string, { code: string; vendorName: string }>() : await sources.inbound.vendorReturnTraceFactsInTx(tx, prepared.tenantId, vendorReturnIds);
 
     const keptSet = new Set(kept);
     let stoppedEarly = false;
@@ -453,13 +464,21 @@ export async function eventRowsPageInTx(
           reason:
             section === 'received'
               ? (grn?.document ?? null)
-              : `damaged on receipt${damage === undefined ? '' : ` (${damage})`} — held in DAMAGED; the units leave only by a write-off`,
+              : `damaged on receipt${damage === undefined ? '' : ` (${damage})`} — held in DAMAGED; the units leave by a write-off or a return to vendor`,
         });
       } else if (section === 'returned') {
         rows.push({ ...base, reason: 'returned by the consignee (an authorised return received into RETURNS)' });
       } else if (section === 'return_scrapped') {
         const reason = doc !== null && doc.kind === 'return-disposition' ? (doc.reasonCode ?? 'scrap') : 'scrap';
         rows.push({ ...base, reason: `${reason} — trace stops here: the returned units were scrapped` });
+      } else if (section === 'returned_to_vendor') {
+        const rtv = doc !== null && doc.kind === 'vendor-return' ? vendorReturns.get(doc.vendorReturnId) : undefined;
+        rows.push({
+          ...base,
+          document: rtv?.code ?? null,
+          vendorName: rtv?.vendorName ?? null,
+          reason: `returned to vendor${rtv === undefined ? '' : ` on ${rtv.code}`} — trace stops here: the units left DAMAGED for the vendor`,
+        });
       } else if (section === 'adjusted_out') {
         const reason = doc !== null && doc.kind === 'manual-adjustment' ? doc.reasonCode : 'adjustment';
         rows.push({ ...base, reason: `${reason} — trace stops here: the units left stock by adjustment` });
@@ -658,6 +677,7 @@ export function eventCells(prepared: PreparedRecall, row: RecallEventRow): Expor
     if (row.grnCode !== null) cells[COL.location!] = row.grnCode;
     cells[COL.vendor_name!] = row.vendorName;
     if (row.section === 'returned' || row.section === 'return_scrapped') cells[COL.location!] = 'RETURNS';
+    if (row.section === 'returned_to_vendor') cells[COL.location!] = 'DAMAGED';
   }
   return cells;
 }
@@ -671,7 +691,7 @@ export function endRow(rowCount: number): ExportCell[] {
 }
 
 /** The event sections, in file order. */
-export const RECALL_EVENT_SECTIONS: readonly EventSection[] = ['dispatched', 'received', 'received_damaged', 'returned', 'return_scrapped', 'adjusted_out'];
+export const RECALL_EVENT_SECTIONS: readonly EventSection[] = ['dispatched', 'received', 'received_damaged', 'returned', 'return_scrapped', 'returned_to_vendor', 'adjusted_out'];
 
 /**
  * Every report row after the meta, in section order: the snapshot rows, then

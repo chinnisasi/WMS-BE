@@ -7,6 +7,8 @@ import type { LedgerReferenceDoc } from '../inventory/inventory.facade';
 describe('referenceSummary (story 5-3a)', () => {
   const GRN = '0192f1a2-0000-7000-8000-000000000001';
   const codes = new Map([[GRN, 'GRN-0042']]);
+  const RTV = '0192f1a2-0000-7000-8000-000000000002';
+  const rtvCodes = new Map([[RTV, 'RTV-0007']]);
   const cases: [LedgerReferenceDoc, string][] = [
     [{ kind: 'manual-adjustment', reasonCode: 'damage', note: 'crushed' }, 'adjustment damage — crushed'],
     [{ kind: 'manual-adjustment', reasonCode: 'stock-count', note: '' }, 'adjustment stock-count'],
@@ -27,14 +29,17 @@ describe('referenceSummary (story 5-3a)', () => {
     [{ kind: 'return-disposition', dispositionId: 'd', returnReceiptLineId: 'rl', rmaId: 'rma1', outcome: 'restock' }, 'return restock rma1'],
     [{ kind: 'return-disposition', dispositionId: 'd', returnReceiptLineId: 'rl', rmaId: 'rma1', outcome: 'scrap', reasonCode: 'damaged' }, 'return scrap rma1 (damaged)'],
     [{ kind: 'restock', restockId: 'r', orderId: 'o1', orderLineId: 'ol', picklistLineId: 'pl', drawEventId: 'e' }, 'restock order o1'],
+    // Story 2-8b — the RTV's code from the lookup; an id the lookup lacks prints itself.
+    [{ kind: 'vendor-return', vendorReturnId: RTV, vendorReturnLineId: 'vl', grnLineId: 'g' }, 'return to vendor RTV-0007'],
+    [{ kind: 'vendor-return', vendorReturnId: 'unknown-rtv', vendorReturnLineId: 'vl' }, 'return to vendor unknown-rtv'],
   ];
 
   it.each(cases)('%j → %s', (doc, expected) => {
-    expect(referenceSummary(doc, codes)).toBe(expected);
+    expect(referenceSummary(doc, codes, rtvCodes)).toBe(expected);
   });
 
   it('covers every kind of the union', () => {
-    expect(new Set(cases.map(([doc]) => doc.kind)).size).toBe(14);
+    expect(new Set(cases.map(([doc]) => doc.kind)).size).toBe(15);
   });
 
   it('a kind this build does not know prints its kind; a non-object prints unknown', () => {

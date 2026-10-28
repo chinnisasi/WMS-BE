@@ -37,6 +37,7 @@ import {
   type InboundRegisterRow,
   type InboundRegisterScope,
 } from './inbound-register';
+import { vendorReturnCodesByIdsInTx as vendorReturnCodesByIdsInTxImpl, vendorReturnTraceFactsInTx as vendorReturnTraceFactsInTxImpl } from './vendor-return.read';
 // Story 5-3a — the register row shapes cross the seam here (reporting reads them).
 export type { GrnTraceFacts, InboundRegisterRow, InboundRegisterScope } from './inbound-register';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
@@ -598,6 +599,16 @@ export class InboundFacade {
   /** GRN id → code (the ledger register's reference summary names GRNs by code). */
   async grnCodesByIdsInTx(tx: TenantTx, tenantId: string, grnIds: readonly string[]): Promise<Map<string, string>> {
     return grnCodesByIdsInTxImpl(tx, tenantId, grnIds);
+  }
+
+  /** Story 2-8b (A11) — RTV id → code, in the caller's transaction (the ledger register's reference summary). */
+  async vendorReturnCodesByIdsInTx(tx: TenantTx, tenantId: string, ids: readonly string[]): Promise<Map<string, string>> {
+    return vendorReturnCodesByIdsInTxImpl(tx, tenantId, ids);
+  }
+
+  /** Story 2-8b (3-7a fold-in) — RTV id → its code and frozen vendor name (a recall's `returned_to_vendor` rows). */
+  async vendorReturnTraceFactsInTx(tx: TenantTx, tenantId: string, ids: readonly string[]): Promise<Map<string, { code: string; vendorName: string }>> {
+    return vendorReturnTraceFactsInTxImpl(tx, tenantId, ids);
   }
 
   /** Story 3-7a — the damage reason code of these GRN lines (a recall's `received_damaged` rows). */

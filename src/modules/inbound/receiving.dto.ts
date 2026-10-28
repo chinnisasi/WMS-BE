@@ -1598,6 +1598,57 @@ export class CatalogOpenReturnDto {
   lines!: readonly CatalogOpenReturnLineDto[];
 }
 
+/** Story 2-8b — one line of an open return to vendor as the device snapshot carries it. */
+export class CatalogOpenVendorReturnLineDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ description: '1-based, the document order' })
+  lineNo!: number;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty()
+  skuName!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The batch the pick must scan (null on an untracked SKU)' })
+  batchCode!: string | null;
+
+  @ApiProperty()
+  uom!: string;
+
+  @ApiProperty({ description: 'Units to pick (base units) — the pick takes at most this' })
+  qty!: number;
+}
+
+/** Story 2-8b — one draft return to vendor, the handheld's pick work. */
+export class CatalogOpenVendorReturnDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ enum: ['vendor'], description: "The return shipment's kind (4-7c adds `client`)" })
+  kind!: 'vendor';
+
+  @ApiProperty({ description: 'RTV-0001' })
+  code!: string;
+
+  @ApiProperty({ description: "The vendor's frozen name" })
+  vendorName!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  clientId!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC' })
+  createdAt!: string;
+
+  @ApiProperty({ type: [CatalogOpenVendorReturnLineDto] })
+  lines!: readonly CatalogOpenVendorReturnLineDto[];
+}
+
 /** Story 3-1 — one move reason as the device snapshot carries it. */
 export class CatalogMoveReasonDto {
   @ApiProperty({ enum: ['consolidate', 're-slot', 'make-room', 'found-misplaced', 'client-request', 'other'] })
@@ -1667,6 +1718,13 @@ export class CatalogSnapshotResponse {
       'Story 13-2 (additive): the warehouse\'s return authorizations that can still receive (open or partially received) — the handheld receives returned units against them offline, grading each unit; units not on an authorization are queued for review, never refused on the device',
   })
   openReturns!: readonly CatalogOpenReturnDto[];
+
+  @ApiProperty({
+    type: [CatalogOpenVendorReturnDto],
+    description:
+      "Story 2-8b (additive): the warehouse's DRAFT returns to vendor, oldest first — the handheld's Returns out tab picks them scan-verified (rtv.pick). An older server omits it",
+  })
+  openVendorReturns!: readonly CatalogOpenVendorReturnDto[];
 
   @ApiProperty({
     type: [CatalogSnapshotClientDto],

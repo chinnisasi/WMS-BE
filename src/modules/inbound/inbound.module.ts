@@ -16,6 +16,8 @@ import { QcCommand } from './qc.command';
 import { QcFacade } from './qc.facade';
 import { GateInCommand } from './gate-in.command';
 import { GateInFacade } from './gate-in.facade';
+import { VendorReturnCommand } from './vendor-return.command';
+import { VendorReturnFacade } from './vendor-return.facade';
 
 /**
  * Inbound module (Story 3.1): the purchase-order lifecycle — the upstream
@@ -72,7 +74,10 @@ import { GateInFacade } from './gate-in.facade';
     GateInFacade,
     // Story 2-5a — damage photos on a receipt line.
     ReceiptPhotoCommand,
+    // Story 2-8b — the return to vendor (DAMAGED stock back to its vendor).
+    VendorReturnCommand,
+    VendorReturnFacade,
   ],
-  exports: [InboundFacade, ReceivingFacade, QcFacade, GateInFacade],
+  exports: [InboundFacade, ReceivingFacade, QcFacade, GateInFacade, VendorReturnFacade],
 })
 export class InboundModule {}

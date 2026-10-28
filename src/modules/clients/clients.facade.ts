@@ -416,6 +416,43 @@ export async function getClientInTx(tx: TenantTx, tenantId: string, clientId: st
   return toClientSnapshot(row);
 }
 
+/**
+ * Story 2-8b (decision 6) — the brand as a goods-out document FREEZES it (the
+ * return-to-vendor's consignor; 4-7c's return to client reuses it). Every key
+ * present, null where empty: the legal name and GSTIN from the tax details,
+ * the registered address. Frozen at the document's create; a later client
+ * edit never rewrites it.
+ */
+export interface ClientPartySnapshotV1 {
+  readonly v: 1;
+  readonly code: string;
+  readonly name: string;
+  readonly legalName: string | null;
+  readonly gstin: string | null;
+  readonly registeredAddress: ClientRegisteredAddress | null;
+}
+
+/** The v1 party snapshot of a client read (`getClientInTx`). */
+export function clientPartySnapshotOf(client: ClientSnapshot): ClientPartySnapshotV1 {
+  return {
+    v: 1,
+    code: client.code,
+    name: client.name,
+    legalName: client.taxDetails.legalName ?? null,
+    gstin: client.taxDetails.gstin ?? null,
+    registeredAddress:
+      client.registeredAddress === null
+        ? null
+        : {
+            line1: client.registeredAddress.line1,
+            line2: client.registeredAddress.line2 ?? null,
+            city: client.registeredAddress.city,
+            stateCode: client.registeredAddress.stateCode,
+            pincode: client.registeredAddress.pincode,
+          },
+  };
+}
+
 /** A client's facts plus its status — what a priced relationship checks (21-3). */
 export interface LockedClientFacts extends ClientFacts {
   readonly status: ClientStatus;
