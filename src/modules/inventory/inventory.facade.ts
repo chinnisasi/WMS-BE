@@ -77,6 +77,23 @@ import {
 } from './registers';
 // Story 5-3a — the register row shapes cross the seam here (reporting reads them).
 export type { BatchAgeingRegisterRow, FirstDispatch, LedgerRegisterRow, RegisterScope, RegisterWindow, StockRegisterRow } from './registers';
+// Story 3-7a — the batch recall's reads (`recall-trace.ts`).
+import {
+  batchLedgerFiguresInTx as batchLedgerFiguresInTxImpl,
+  batchOnHandForRecallInTx as batchOnHandForRecallInTxImpl,
+  batchPickTotalsByOrderLineInTx as batchPickTotalsByOrderLineInTxImpl,
+  batchTraceEventsPageInTx as batchTraceEventsPageInTxImpl,
+  ledgerPickEventsByOrderRefsInTx as ledgerPickEventsByOrderRefsInTxImpl,
+  pickedBatchRefsOfOrderInTx as pickedBatchRefsOfOrderInTxImpl,
+  type BatchLedgerFigures,
+  type BatchOrderPickTotal,
+  type BatchTraceCursor,
+  type BatchTraceEvent,
+  type OrderPickEvent,
+  type RecallOnHandRow,
+} from './recall-trace';
+export type { BatchLedgerFigures, BatchOrderPickTotal, BatchTraceCursor, BatchTraceEvent, OrderPickEvent, RecallOnHandRow } from './recall-trace';
+export { PICK_NETTING_TYPES } from './recall-trace';
 // Story 21-4 — the metering scope shapes and the shared dispatched-order
 // predicate (21-5's dispute drill-down reuses it) cross the seam here.
 export type { ClientDayDelta, ClientScope, ClientSkuOnHand, ClientWarehouseScope, DispatchedOrderRecordRow } from './client-metering';
@@ -1789,6 +1806,58 @@ export class InventoryFacade {
   /** Every ledger event of the warehouse created in `[from, to)`, oldest first (the keyset walk). */
   async ledgerRegisterInTx(tx: TenantTx, scope: RegisterScope & RegisterWindow, limit: number, pageSize?: number): Promise<LedgerRegisterRow[]> {
     return ledgerRegisterInTxImpl(tx, scope, limit, pageSize);
+  }
+
+  // ── story 3-7a: the batch recall's reads (`recall-trace.ts`) ─────────────
+  // Read-only, in the caller's transaction; each statement re-arms the
+  // caller's whole-read deadline. Base units out.
+
+  /** Every positive `batch_on_hand` row of these batches across the named warehouses, with the bin's code and role. */
+  async batchOnHandForRecallInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseIds: readonly string[],
+    skuIds: readonly string[],
+    batchIds: readonly string[],
+  ): Promise<RecallOnHandRow[]> {
+    return batchOnHandForRecallInTxImpl(tx, tenantId, warehouseIds, skuIds, batchIds);
+  }
+
+  /** The receipt, damage, return, scrap and write-off sums and the whole-history fold of each batch (one statement). */
+  async batchLedgerFiguresInTx(tx: TenantTx, tenantId: string, batchIds: readonly string[]): Promise<Map<string, BatchLedgerFigures>> {
+    return batchLedgerFiguresInTxImpl(tx, tenantId, batchIds);
+  }
+
+  /** One keyset page of ONE batch's events of the given types, `(seq, warehouse_id)` order. */
+  async batchTraceEventsPageInTx(
+    tx: TenantTx,
+    tenantId: string,
+    batchId: string,
+    types: readonly string[],
+    after: BatchTraceCursor | null,
+    limit: number,
+  ): Promise<BatchTraceEvent[]> {
+    return batchTraceEventsPageInTxImpl(tx, tenantId, batchId, types, after, limit);
+  }
+
+  /** The `pick.picked` events of these orders carrying these batches — one statement (the 0039 order-ref qual). */
+  async ledgerPickEventsByOrderRefsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    orderIds: readonly string[],
+    batchIds: readonly string[],
+  ): Promise<OrderPickEvent[]> {
+    return ledgerPickEventsByOrderRefsInTxImpl(tx, tenantId, orderIds, batchIds);
+  }
+
+  /** Each (batch, order line)'s NET pick quantity of these batches — one grouped statement. */
+  async batchPickTotalsByOrderLineInTx(tx: TenantTx, tenantId: string, batchIds: readonly string[]): Promise<BatchOrderPickTotal[]> {
+    return batchPickTotalsByOrderLineInTxImpl(tx, tenantId, batchIds);
+  }
+
+  /** The distinct batches one order's picks drew (the dispatch guard's lock set). */
+  async pickedBatchRefsOfOrderInTx(tx: TenantTx, tenantId: string, orderId: string): Promise<string[]> {
+    return pickedBatchRefsOfOrderInTxImpl(tx, tenantId, orderId);
   }
 
   /** Each order's FIRST `dispatch.dispatched` event (carries `reference_doc ? 'orderId'` — 0039's partial index). */

@@ -54,6 +54,10 @@ export const AUDIT_TARGET_TYPES = [
   // Story 3-3a — a batch (lot) blocked or unblocked (`batch.blocked | batch.unblocked`).
   'batch',
   'batch_alert',
+  // Story 3-7a — a batch recall (`batch_recall.opened | batches_added |
+  // closed | report_downloaded`); its lots' blocks and releases write their
+  // own `batch.blocked` / `batch.unblocked` rows under the same key.
+  'batch_recall',
   'bin',
   // Story 3-1 — a bin-to-bin move (`stock.moved`; `targetId` = the moveId on
   // its events' reference doc — there is no move table, the ledger is its record).
@@ -275,6 +279,13 @@ export const AUDIT_NEW_ACTIONS = [
   // history survives the unblock clearing the row.
   { action: 'batch.blocked', targetType: 'batch' },
   { action: 'batch.unblocked', targetType: 'batch' },
+  // Story 3-7a — the batch recall (`RecallCommand`). Open, add and close are
+  // keyed; the report download is an UNKEYED read audit (`reference` = a
+  // fresh uuidv7 — no key was sent), one row per download.
+  { action: 'batch_recall.opened', targetType: 'batch_recall' },
+  { action: 'batch_recall.batches_added', targetType: 'batch_recall' },
+  { action: 'batch_recall.closed', targetType: 'batch_recall' },
+  { action: 'batch_recall.report_downloaded', targetType: 'batch_recall' },
   // Story 1-3 — the business partner master (`PartnersCommand`). The Story
   // 3.1 `vendor.created` audit action left the registry with it (the outbox
   // event of that name stays).

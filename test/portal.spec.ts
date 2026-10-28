@@ -726,8 +726,9 @@ describe('client portal (e2e, story 21-7)', () => {
       expect([...PORTAL_WRITES].filter((id) => !declared.has(id))).toEqual([]);
       // 21-7's ten reads, plus 21-7b's announce and its two form reads, plus
       // 21-8's service report, plus 4-1a's order, plus 2-5a's two goods-receipt reads,
-      // plus 4-7a's two returns reads, plus 5-6a's two credit/debit note reads.
-      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(21);
+      // plus 4-7a's two returns reads, plus 5-6a's two credit/debit note reads,
+      // plus 3-7a's three recall reads (the list, one recall, its report).
+      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(24);
     });
 
     it('a portal token is refused on EVERY operator route — reads and writes — with the exact fence detail', async () => {
@@ -1196,6 +1197,9 @@ describe('client portal (e2e, story 21-7)', () => {
           '/tenants/{tenantId}/portal/me',
           '/tenants/{tenantId}/portal/orders',
           '/tenants/{tenantId}/portal/orders/{orderId}',
+        '/tenants/{tenantId}/portal/recalls',
+        '/tenants/{tenantId}/portal/recalls/{recallId}',
+        '/tenants/{tenantId}/portal/recalls/{recallId}/report',
           // Story 4-7a — the client's returns and their dispositions.
           '/tenants/{tenantId}/portal/returns',
           '/tenants/{tenantId}/portal/returns/{rmaId}',

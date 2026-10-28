@@ -34,6 +34,15 @@ import {
 } from './outbound-register';
 // Story 5-3a — the register row shapes cross the seam here (reporting reads them).
 export type { OutboundRegisterRow, OutboundRegisterScope } from './outbound-register';
+// Story 3-7a — the batch recall's outbound reads (`recall-trace.ts`).
+import {
+  openOrderIdsOfClientInTx as openOrderIdsOfClientInTxImpl,
+  orderTraceFactsByIdsInTx as orderTraceFactsByIdsInTxImpl,
+  plannedTasksInBinsInTx as plannedTasksInBinsInTxImpl,
+  type OrderTraceFacts,
+  type PlannedRecallBinTask,
+} from './recall-trace';
+export type { OrderTraceFacts, PlannedRecallBinTask } from './recall-trace';
 import {
   listBackorderRefusalsInTx,
   listPackFailuresInTx,
@@ -464,6 +473,28 @@ export class OutboundFacade {
    */
   async outboundRegisterInTx(tx: TenantTx, scope: OutboundRegisterScope, limit: number, pageSize?: number): Promise<OutboundRegisterRow[]> {
     return outboundRegisterInTxImpl(tx, scope, limit, pageSize);
+  }
+
+  // ── story 3-7a: the batch recall's reads (`recall-trace.ts`) ─────────────
+
+  /** One client's OPEN order ids across the named warehouses (the 0101 partial index). */
+  async openOrderIdsOfClientInTx(tx: TenantTx, tenantId: string, clientId: string, warehouseIds: readonly string[]): Promise<string[]> {
+    return openOrderIdsOfClientInTxImpl(tx, tenantId, clientId, warehouseIds);
+  }
+
+  /** These orders' trace facts (status, label, consignee, destination, latest shipment) — one statement. */
+  async orderTraceFactsByIdsInTx(tx: TenantTx, tenantId: string, orderIds: readonly string[]): Promise<Map<string, OrderTraceFacts>> {
+    return orderTraceFactsByIdsInTxImpl(tx, tenantId, orderIds);
+  }
+
+  /** The planned pick lines of these orders at these (bin, SKU) pairs. */
+  async plannedTasksInBinsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    orderIds: readonly string[],
+    binSkuPairs: readonly { readonly binId: string; readonly skuId: string }[],
+  ): Promise<PlannedRecallBinTask[]> {
+    return plannedTasksInBinsInTxImpl(tx, tenantId, orderIds, binSkuPairs);
   }
 
   /** `POST .../outbound/orders/{orderId}/label` — the 4.6c label command. */

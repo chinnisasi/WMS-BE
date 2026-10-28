@@ -614,6 +614,7 @@ export class InventoryController {
         blockedBy: batch.blockedBy,
         blockedByName: batch.blockedByName,
         expired: batch.expired,
+        recallCode: batch.recallCode ?? null,
         quantity: quantityByBatch.get(batch.id) ?? 0,
       }))
       // FEFO order is data, not policy (Design Notes): expiry ASC, nulls
@@ -682,6 +683,7 @@ export class InventoryController {
       blockedBy: identity.blockedBy,
       blockedByName: identity.blockedByName,
       expired: identity.expired,
+      recallCode: identity.recallCode ?? null,
       bins: bins.map((bin) => ({ warehouseId: bin.warehouseId, binId: bin.binId, quantity: bin.quantity })),
       history,
     };
@@ -734,7 +736,7 @@ export class InventoryController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks qc.manage (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('No batch with this id exists in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The batch is not blocked (batch-not-blocked), or a concurrent request on the same Idempotency-Key (conflict)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The batch is not blocked (batch-not-blocked); story 3-7a — the batch is on an open live recall, released only by closing it (batch-under-recall, member recallCode); or a concurrent request on the same Idempotency-Key (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'batchId', format: 'uuid' })

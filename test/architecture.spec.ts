@@ -1,5 +1,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { getLedgerEventType, registeredLedgerEventTypes } from '../src/modules/inventory/ledger-registry';
+import { PICK_NETTING_TYPES } from '../src/modules/inventory/recall-trace';
 
 /**
  * The first architecture test in the repo (Story 2.1). It is a pure source
@@ -498,9 +500,15 @@ describe('architecture: catalog identity is catalog-module-owned (story 10.3)', 
     expect(allowed).toContain('export async function unpromisableBatchUnits(');
     // Story 4-3a (A12) — the allocation panel's undated-batch count rides the same allowance (same columns).
     expect(allowed).toContain('export async function undatedBatchesOnHandOfClientInTx(');
-    // The writer of the lifecycle columns is catalog's block command.
+    // The writer of the lifecycle columns is catalog's block write — story
+    // 3-7a (A1) extracted it from the command into `batch-block.ts`, which the
+    // 3-3a command and the recall (through `CatalogFacade`) both call.
+    const helpers = readFileSync(join(catalogRoot, 'batch-block.ts'), 'utf8');
+    expect(drizzleWriteOn('batches').test(helpers)).toBe(true);
     const command = readFileSync(join(catalogRoot, 'batch-block.command.ts'), 'utf8');
-    expect(drizzleWriteOn('batches').test(command)).toBe(true);
+    expect(command).toContain(`from './batch-block'`);
+    expect(command).toMatch(/applyBatchBlockInTx\(/);
+    expect(command).toMatch(/applyBatchUnblockInTx\(/);
   });
 
   it('handling units have exactly ONE writer, and every transition goes through it (story 10.3)', () => {
@@ -1021,7 +1029,7 @@ describe('architecture: clients are clients-module-owned (story 21-1)', () => {
    * never `modules/clients`, nor a command file that imports the clients
    * facade) — the dependency stays one-way, with no import cycle.
    */
-  const WIND_DOWN_FILES = ['inventory', 'inbound', 'outbound', 'returns', 'tenancy', 'billing', 'channels'].map((module) =>
+  const WIND_DOWN_FILES = ['inventory', 'inbound', 'outbound', 'returns', 'tenancy', 'billing', 'channels', 'recalls'].map((module) =>
     join(SRC_ROOT, 'modules', module, 'client-wind-down.ts'),
   );
 
@@ -1038,7 +1046,7 @@ describe('architecture: clients are clients-module-owned (story 21-1)', () => {
     expect(offenders).toEqual([]);
     // Meaningful: the status command composes all six.
     const command = readFileSync(join(clientsRoot, 'clients.command.ts'), 'utf8');
-    for (const module of ['inventory', 'inbound', 'outbound', 'returns', 'tenancy', 'billing', 'channels']) {
+    for (const module of ['inventory', 'inbound', 'outbound', 'returns', 'tenancy', 'billing', 'channels', 'recalls']) {
       expect(command).toContain(`from '../${module}/client-wind-down'`);
     }
   });
@@ -2434,9 +2442,13 @@ describe('architecture: the client portal (story 21-7)', () => {
     { file: join(SRC_ROOT, 'modules', 'catalog', 'catalog.facade.ts'), methods: ['portalSkus'] },
     { file: join(SRC_ROOT, 'modules', 'tenancy', 'tenancy.service.ts'), methods: ['portalWarehouses'] },
     // Story 21-8 — the client's service report (the operator read's twin, stamped).
-    { file: join(SRC_ROOT, 'modules', 'reporting', 'reporting.facade.ts'), methods: ['portalServiceReport'] },
+    // Story 3-7a — the client's batch recalls, one recall and its report.
+    { file: join(SRC_ROOT, 'modules', 'reporting', 'reporting.facade.ts'), methods: ['portalServiceReport', 'portalRecalls', 'portalRecall', 'portalRecallReport'] },
     // Story 4-7a — the client's returns and their dispositions.
     { file: join(SRC_ROOT, 'modules', 'returns', 'returns.facade.ts'), methods: ['portalReturns', 'portalReturn'] },
+    // Story 3-7a — the portal report download's audit row: an audit
+    // side-effect of the read, stamped exactly like one (never a command).
+    { file: join(SRC_ROOT, 'modules', 'recalls', 'recalls.facade.ts'), methods: ['portalRecordReportDownload'] },
   ];
 
   /** The body of one method or function: from its declaration to the next top-level member. */
@@ -2449,7 +2461,11 @@ describe('architecture: the client portal (story 21-7)', () => {
   }
 
   function stampsClient(body: string): boolean {
-    return /withTenantTransaction\(/.test(body) && /\{\s*clientId\s*,?\s*\}\s*,?\s*\)/.test(body);
+    // Story 3-7a — the stamp may sit beside other transaction options
+    // (`{ ...RECALL_READ_TX, clientId }` — a repeatable-read portal read), but
+    // `clientId` must be the shorthand LAST key: the session's client, never
+    // `clientId: <something else>`.
+    return /withTenantTransaction\(/.test(body) && /\{[^{}]*?(?:^|[{,\s])clientId\s*,?\s*\}\s*,?\s*\)/.test(body);
   }
 
   it('every portal facade read opens withTenantTransaction stamped with { clientId }', () => {
@@ -2490,6 +2506,11 @@ describe('architecture: the client portal (story 21-7)', () => {
         'portalServiceReport',
         'portalReturns',
         'portalReturn',
+        // Story 3-7a — the batch recalls.
+        'portalRecalls',
+        'portalRecall',
+        'portalRecallReport',
+        'portalRecordReportDownload',
       ].sort(),
     );
   });
@@ -2603,6 +2624,25 @@ describe('architecture: the client portal (story 21-7)', () => {
     expect(stampsClient(bodyOf(stamped, 'portalThing')!)).toBe(true);
     expect(stampsClient(bodyOf(unstamped, 'portalThing')!)).toBe(false);
     expect(stampsClient(bodyOf(wrongOption, 'portalThing')!)).toBe(false);
+    // Story 3-7a — the stamp beside other options passes; a non-shorthand client does not.
+    const combined = `
+  async portalThing(tenantId: string, clientId: string) {
+    return withTenantTransaction(this.db, tenantId, (tx) => readInTx(tx, tenantId, clientId), { ...RECALL_READ_TX, clientId });
+  }
+`;
+    const otherClient = `
+  async portalThing(tenantId: string, clientId: string) {
+    return withTenantTransaction(this.db, tenantId, (tx) => readInTx(tx, tenantId, clientId), { ...RECALL_READ_TX, clientId: body.clientId });
+  }
+`;
+    const suffixed = `
+  async portalThing(tenantId: string, clientId: string) {
+    return withTenantTransaction(this.db, tenantId, (tx) => readInTx(tx, tenantId, clientId), { otherclientId });
+  }
+`;
+    expect(stampsClient(bodyOf(combined, 'portalThing')!)).toBe(true);
+    expect(stampsClient(bodyOf(otherClient, 'portalThing')!)).toBe(false);
+    expect(stampsClient(bodyOf(suffixed, 'portalThing')!)).toBe(false);
   });
 
   /**
@@ -2634,6 +2674,8 @@ describe('architecture: the client portal (story 21-7)', () => {
     tenancy: 'TenancyService',
     reporting: 'ReportingFacade',
     returns: 'ReturnsFacade',
+    // Story 3-7a — the recall report download's audit row only.
+    recalls: 'RecallsFacade',
   };
 
   /** Each PORTAL_READS file's class — the one the controller injects. */
@@ -2647,6 +2689,7 @@ describe('architecture: the client portal (story 21-7)', () => {
     [join(SRC_ROOT, 'modules', 'tenancy', 'tenancy.service.ts'), 'TenancyService'],
     [join(SRC_ROOT, 'modules', 'reporting', 'reporting.facade.ts'), 'ReportingFacade'],
     [join(SRC_ROOT, 'modules', 'returns', 'returns.facade.ts'), 'ReturnsFacade'],
+    [join(SRC_ROOT, 'modules', 'recalls', 'recalls.facade.ts'), 'RecallsFacade'],
   ]);
 
   /**
@@ -3191,13 +3234,29 @@ describe('architecture: the audit rule — every keyed command writes its audit 
     expect(KEY_WRITE.test('tx.select().from(idempotencyKeys)')).toBe(false);
   });
 
+  /**
+   * Story 3-7a (A1) — a keyed writer whose audit rows are written by a helper
+   * file it imports (the extracted block / unblock write, shared with the
+   * recall). Named, never inferred: the helper must reference `auditEvents`
+   * and the writer must import it.
+   */
+  const AUDIT_VIA_HELPER: readonly { writer: string; helper: string; specifier: string }[] = [
+    { writer: join(SRC_ROOT, 'modules', 'catalog', 'batch-block.command.ts'), helper: join(SRC_ROOT, 'modules', 'catalog', 'batch-block.ts'), specifier: './batch-block' },
+  ];
+
   it('every src/modules file that writes idempotencyKeys also references auditEvents', () => {
     const writers = files.filter((file) => file.path.startsWith(join(SRC_ROOT, 'modules')) && KEY_WRITE.test(file.source));
     // Meaningful: the keyed writers really are found (40 files when 9-3a landed).
     expect(writers.length).toBeGreaterThanOrEqual(35);
     expect(writers.some((file) => file.path.endsWith(join('invoicing', 'command.ts')))).toBe(true);
     expect(writers.some((file) => file.path.endsWith(join('billing', 'client-invoices.ts')))).toBe(true);
-    expect(writers.filter((file) => !AUDIT_REF.test(file.source)).map((file) => file.path)).toEqual([]);
+    const viaHelper = new Map(AUDIT_VIA_HELPER.map((entry) => [entry.writer, entry]));
+    const offenders = writers.filter((file) => {
+      if (AUDIT_REF.test(file.source)) return false;
+      const entry = viaHelper.get(file.path);
+      return entry === undefined || !file.source.includes(`from '${entry.specifier}'`) || !AUDIT_REF.test(readFileSync(entry.helper, 'utf8'));
+    });
+    expect(offenders.map((file) => file.path)).toEqual([]);
   });
 });
 
@@ -3561,5 +3620,114 @@ describe('architecture: the client-webhooks module (story 5-2a)', () => {
     const controller = readFileSync(join(SRC_ROOT, 'api', 'client-webhooks.controller.ts'), 'utf8');
     expect(controller).toContain('TenantSessionGuard');
     expect(controller).not.toContain('PortalSessionGuard');
+  });
+});
+
+describe('architecture: batch recalls are recalls-module-owned (story 3-7a)', () => {
+  const recallsRoot = join(SRC_ROOT, 'modules', 'recalls');
+  const SEAM = join(recallsRoot, 'open-recall-lines.ts');
+  /** The files that read recall lines across the module boundary — each through the seam, never the module. */
+  const SEAM_CALLERS = [
+    ['outbound', 'dispatch.command.ts'],
+    ['outbound', 'pick.command.ts'],
+    ['catalog', 'batch-block.command.ts'],
+    ['inbound', 'receiving.command.ts'],
+    ['inbound', 'receiving.facade.ts'],
+  ] as const;
+
+  it('only the recalls module writes batch_recalls and batch_recall_lines', () => {
+    const writers = files
+      .filter(
+        (file) =>
+          drizzleWriteOn('batchRecalls').test(file.source) ||
+          drizzleWriteOn('batchRecallLines').test(file.source) ||
+          rawWriteOn('batch_recalls').test(file.source) ||
+          rawWriteOn('batch_recall_lines').test(file.source),
+      )
+      .map((file) => file.path);
+    // Meaningful: the command really writes both.
+    const command = join(recallsRoot, 'recall.command.ts');
+    expect(writers).toContain(command);
+    expect(writers.filter((path) => !path.startsWith(recallsRoot))).toEqual([]);
+  });
+
+  it('the open-recall-lines seam imports only drizzle-orm and shared/; its callers import the file, never the module', () => {
+    const seam = readFileSync(SEAM, 'utf8');
+    expect(seam).toMatch(/export async function openLiveRecallLinesForBatchesInTx\(/);
+    const offenders = [...seam.matchAll(/from '([^']+)'/g)]
+      .map((match) => match[1]!)
+      .filter((target) => target !== 'drizzle-orm' && !target.startsWith('../../shared/'));
+    expect(offenders).toEqual([]);
+    for (const [module, file] of SEAM_CALLERS) {
+      const caller = readFileSync(join(SRC_ROOT, 'modules', module, file), 'utf8');
+      expect(caller).toContain(`from '../recalls/open-recall-lines'`);
+      expect(caller).not.toMatch(/from '\.\.\/recalls\/recalls\.(module|facade)'/);
+    }
+  });
+
+  it('outside the module only the facade, the module, the DTO, the seam and the wind-down file are imported — and only by the shells, reporting, clients and the seam callers', () => {
+    const reach = /from '(?:\.\.\/)+(?:modules\/)?recalls\/([^']+)'/g;
+    const allowedBy: Readonly<Record<string, (path: string) => boolean>> = {
+      'recalls.facade': (path) => path.startsWith(join(SRC_ROOT, 'api')) || path.startsWith(join(SRC_ROOT, 'modules', 'reporting')),
+      'recalls.module': (path) => path.startsWith(join(SRC_ROOT, 'api')) || path === join(SRC_ROOT, 'app.module.ts') || path.startsWith(join(SRC_ROOT, 'modules', 'reporting')),
+      'recall.dto': (path) => path.startsWith(join(SRC_ROOT, 'api')),
+      'open-recall-lines': (path) => SEAM_CALLERS.some(([module, file]) => path === join(SRC_ROOT, 'modules', module, file)),
+      'client-wind-down': (path) => path === join(SRC_ROOT, 'modules', 'clients', 'clients.command.ts'),
+    };
+    const offenders: string[] = [];
+    for (const file of files.filter((candidate) => !candidate.path.startsWith(recallsRoot))) {
+      for (const match of file.source.matchAll(reach)) {
+        const target = match[1]!;
+        const allowed = allowedBy[target];
+        if (allowed === undefined || !allowed(file.path)) offenders.push(`${file.path}: imports recalls/${target}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the recalls module reaches its siblings only through their facades and the declared file-level helpers', () => {
+    const ALLOWED = new Set([
+      '../catalog/catalog.facade',
+      '../inventory/inventory.facade',
+      '../outbound/outbound.facade',
+      '../clients/clients.facade',
+      '../tenancy/tenancy.service',
+      '../tenancy/permissions',
+      '../tenancy/idempotency-guard',
+      '../tenancy/registration.command',
+      '../tenancy/receiving-bin',
+      '../catalog/catalog.module',
+      '../inventory/inventory.module',
+      '../outbound/outbound.module',
+    ]);
+    const inside = files.filter((file) => file.path.startsWith(recallsRoot));
+    expect(inside.length).toBeGreaterThanOrEqual(7);
+    const offenders = inside.flatMap((file) =>
+      [...file.source.matchAll(/from '(\.\.\/[^']+)'/g)]
+        .map((match) => match[1]!)
+        .filter((target) => !target.startsWith('../../shared/') && !ALLOWED.has(target))
+        .map((target) => `${file.path}: ${target}`),
+    );
+    expect(offenders).toEqual([]);
+    // No sibling reads the recall tables except through the seam (reporting included).
+    const readers = files
+      .filter((file) => !file.path.startsWith(recallsRoot) && /\bbatchRecall(?:Line)?s\b|\bbatch_recall(?:_line)?s\b/.test(file.source))
+      .map((file) => file.path.slice(SRC_ROOT.length + 1));
+    expect(readers.sort()).toEqual(['shared/db/schema.ts']);
+  });
+
+  it('A7: every registered ledger type that carries an order line with the batch arm OPEN nets picks (PICK_NETTING_TYPES)', () => {
+    // The reference kinds whose arm carries `orderLineId` (ledger-registry.ts).
+    const registry = readFileSync(join(SRC_ROOT, 'modules', 'inventory', 'ledger-registry.ts'), 'utf8');
+    const kindsWithOrderLine = [...registry.matchAll(/readonly kind: '([\w-]+)';([\s\S]*?)\n {4}\}/g)]
+      .filter((match) => /readonly orderLineId: string/.test(match[2]!))
+      .map((match) => match[1]!);
+    expect(kindsWithOrderLine.sort()).toEqual(['dispatch', 'pack', 'pick']);
+    const carriers = registeredLedgerEventTypes().filter((type) => {
+      const definition = getLedgerEventType(type)!;
+      return definition.allowsBatchArm && definition.referenceKinds.some((kind) => kindsWithOrderLine.includes(kind));
+    });
+    // On this base exactly `pick.picked`; a packed-order cancel/unpack must join the list.
+    expect(carriers.sort()).toEqual([...PICK_NETTING_TYPES].sort());
   });
 });

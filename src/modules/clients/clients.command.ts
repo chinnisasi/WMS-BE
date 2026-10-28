@@ -69,6 +69,7 @@ import { clientWindDownBlockersInTx as returnsBlockersInTx } from '../returns/cl
 import { clientWindDownBlockersInTx as tenancyBlockersInTx } from '../tenancy/client-wind-down';
 import { clientWindDownBlockersInTx as billingBlockersInTx } from '../billing/client-wind-down';
 import { clientWindDownBlockersInTx as channelsBlockersInTx } from '../channels/client-wind-down';
+import { clientWindDownBlockersInTx as recallsBlockersInTx } from '../recalls/client-wind-down';
 
 export interface CreateClientCommand {
   readonly tenantId: string;
@@ -1275,6 +1276,8 @@ export async function clientWindDownBlockersInTx(
     ...(await tenancyBlockersInTx(tx, tenantId, clientId)),
     ...(await billingBlockersInTx(tx, tenantId, clientId)),
     ...(await channelsBlockersInTx(tx, tenantId, clientId)),
+    // Story 3-7a (A16) — open live recalls of the client's goods.
+    ...(await recallsBlockersInTx(tx, tenantId, clientId)),
   ];
   return [...all].sort((a, b) => WIND_DOWN_BLOCKER_KINDS.indexOf(a.kind) - WIND_DOWN_BLOCKER_KINDS.indexOf(b.kind));
 }

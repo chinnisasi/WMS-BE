@@ -1380,6 +1380,15 @@ export class BatchLifecycleDto {
 
   @ApiProperty({ description: 'The server judged the batch past its expiry instant — expired stock is on hand but never promised or default-drawn (blocked or not)' })
   expired!: boolean;
+
+  @ApiProperty({
+    required: false,
+    type: String,
+    nullable: true,
+    example: 'RCL-000001',
+    description: 'Story 3-7a — the OPEN LIVE recall naming this batch (release it by closing the recall); null when none. Absent on a response stored before 3-7a (read as null)',
+  })
+  recallCode?: string | null;
 }
 
 /** The block / unblock response. */

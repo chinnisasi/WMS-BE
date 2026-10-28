@@ -8340,7 +8340,7 @@
             }
           },
           "409": {
-            "description": "The batch is not blocked (batch-not-blocked), or a concurrent request on the same Idempotency-Key (conflict)",
+            "description": "The batch is not blocked (batch-not-blocked); story 3-7a — the batch is on an open live recall, released only by closing it (batch-under-recall, member recallCode); or a concurrent request on the same Idempotency-Key (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -10426,7 +10426,7 @@
             }
           },
           "409": {
-            "description": "The order is already dispatched under a different key, or is not packed — it reads accepted or cancelled (conflict, naming the status); or a concurrent idempotent request (conflict). Nothing is written",
+            "description": "The order is already dispatched under a different key, or is not packed — it reads accepted or cancelled (conflict, naming the status); story 3-7a — its picks drew a lot that is on an OPEN LIVE recall: release the lot from the recall (close it with the lot in releaseBatchIds) or wait for the packed-order cancel/unpack (order-holds-recalled-batch, members batchCodes and recallCodes); a lot blocked for any other reason still ships; or a concurrent idempotent request (conflict). Nothing is written",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -12536,7 +12536,7 @@
             }
           },
           "409": {
-            "description": "AD-14 case 3 — the bin’s state_epoch moved and it no longer covers the draw (pick-bin-short, naming the bin and its live on-hand; RE-PLANNABLE, the client keeps the op). AD-14 case 4 — a premise moved terminally: the hold is expired/terminal, or the line, picklist, wave or order was cancelled or already picked (pick-unresolvable; TERMINAL, the client quarantines with session attribution). Also: the wave is not yet released / the picklist is not yet ready (conflict, retryable), a concurrent idempotent request (conflict), or a serial that does not live in the scanned bin (serial-elsewhere). None of these persist anything and none consume the idempotency key",
+            "description": "AD-14 case 3 — the bin’s state_epoch moved and it no longer covers the draw (pick-bin-short, naming the bin and its live on-hand; RE-PLANNABLE, the client keeps the op). AD-14 case 4 — a premise moved terminally: the hold is expired/terminal, or the line, picklist, wave or order was cancelled or already picked (pick-unresolvable; TERMINAL, the client quarantines with session attribution). Also: the wave is not yet released / the picklist is not yet ready (conflict, retryable), a concurrent idempotent request (conflict), or a serial that does not live in the scanned bin (serial-elsewhere); story 3-7a — the scanned bin holds on-hand of a batch of this SKU on an OPEN LIVE recall: an unscanned draw cannot tell the recalled units from good ones, so move them out first (recalled-lot-in-bin, members binCode, batchCodes, recallCodes; TERMINAL for the queued op — it lands in review). None of these persist anything and none consume the idempotency key",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -24529,6 +24529,7 @@
                 "audit_export",
                 "batch",
                 "batch_alert",
+                "batch_recall",
                 "bin",
                 "bin_move",
                 "carrier_connection",
@@ -25492,7 +25493,7 @@
             }
           },
           "409": {
-            "description": "A departed client asked to be suspended — it can only be reactivated (client-not-active); a departure while work remains (client-not-wound-down — `blockers: [{kind, count, codes?}]` lists every blocker: stock, open-purchase-orders, open-asns, pending-over-receipts, open-orders, open-rmas, pending-adjustments, open-counts, open-review-items, unsettled-invoices, unbilled-charges — story 5-5a, channel-mappings); or a concurrent request with the same Idempotency-Key (conflict)",
+            "description": "A departed client asked to be suspended — it can only be reactivated (client-not-active); a departure while work remains (client-not-wound-down — `blockers: [{kind, count, codes?}]` lists every blocker: stock, open-purchase-orders, open-asns, pending-over-receipts, open-orders, open-rmas, open-recalls — story 3-7a, pending-adjustments, open-counts, open-review-items, unsettled-invoices, unbilled-charges — story 5-5a, channel-mappings); or a concurrent request with the same Idempotency-Key (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -34377,6 +34378,318 @@
         ]
       }
     },
+    "/tenants/{tenantId}/portal/recalls": {
+      "get": {
+        "operationId": "PortalController_portalRecalls",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque cursor from a previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalRecallListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed cursor (invalid-cursor) or a limit outside 1–100 (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 3-7a — this client's batch recalls (a live recall blocks the lots; a mock one is a drill), newest first (keyset)",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/recalls/{recallId}": {
+      "get": {
+        "operationId": "PortalController_portalRecall",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "recallId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalRecallDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed recallId path parameter (validation-failed — it must be a uuid)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such recall of this client — unknown, or another client's (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The read did not finish within its budget (report-unavailable)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 3-7a — one of this client's recalls: the reason and reference, every lot with its live figures (and those frozen at close), on hand per warehouse and location role, and its own open orders holding a lot",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/recalls/{recallId}/report": {
+      "get": {
+        "operationId": "PortalController_portalRecallReport",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "recallId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "format",
+            "required": true,
+            "in": "query",
+            "description": "`csv` (streamed, every row, ends in a `section=end` row carrying the count) or `xlsx` (built whole, capped at 200,000 rows)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "csv",
+                "xlsx"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The file",
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed recallId, or a format outside csv | xlsx (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such recall of this client — unknown, or another client's (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The XLSX would pass 200,000 rows — download the CSV (report-too-large)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A recall report is already being prepared, or the read did not finish within its budget (report-unavailable; Retry-After: 5)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 3-7a — one of this client's recall reports as a FILE (the staff report's rows less the warehouse's planned picks): CSV streams every row and ends in a `section=end` row carrying the count; XLSX at most 200,000 rows. Every download is audited",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
     "/tenants/{tenantId}/portal/invoices": {
       "get": {
         "operationId": "PortalController_invoices",
@@ -34901,6 +35214,1238 @@
         "summary": "Marks the panel opened by the caller (clears the dot)",
         "tags": [
           "notifications"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inventory/recalls/candidates": {
+      "get": {
+        "operationId": "RecallsController_candidates",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "query",
+            "description": "The client whose SKUs are searched",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "code",
+            "required": true,
+            "in": "query",
+            "description": "The lot code as printed — matched on letters and digits only, case-insensitively (`ab-12/3` finds `AB123`)",
+            "schema": {
+              "minLength": 1,
+              "maxLength": 100,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecallCandidatesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed clientId, or a code with no letter or digit (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — \"This is an operator surface.\" (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such client in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The read did not finish within its budget (report-unavailable)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 3-7a — the batches of ONE client's SKUs whose lot code matches (letters and digits only, case-insensitive — `exact` or `normalised`), with on-hand and whether an open recall already names the batch or its code — the open dialog's checklist",
+        "tags": [
+          "recalls"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inventory/recalls": {
+      "get": {
+        "operationId": "RecallsController_list",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "One client's recalls",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "open",
+                "closed"
+              ]
+            }
+          },
+          {
+            "name": "mode",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "live",
+                "mock"
+              ]
+            }
+          },
+          {
+            "name": "externalRef",
+            "required": false,
+            "in": "query",
+            "description": "The brand's reference, exactly (one vendor lot recalled for several clients shares it)",
+            "schema": {
+              "maxLength": 100,
+              "type": "string"
+            }
+          },
+          {
+            "name": "code",
+            "required": false,
+            "in": "query",
+            "description": "One recall by its code, exactly — how a link that names a recall code (a batch under recall) finds it",
+            "schema": {
+              "example": "RCL-000001",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from a previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecallListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed filter, cursor or limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — \"This is an operator surface.\" (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 3-7a — the tenant's batch recalls, newest first, filterable by client, status, mode and the brand's reference (keyset cursor)",
+        "tags": [
+          "recalls"
+        ]
+      },
+      "post": {
+        "operationId": "RecallsController_open",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenRecallDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecallResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key; 0 or over 50 batch ids, a malformed or repeated id, a blank or over-500-character reason note, an over-100-character reference, or a mode outside live | mock (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks qc.manage — owner and ops manager only (role-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A batch id names no batch of this tenant — every missing id is named (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The lots belong to more than one client (mixed-client); a live recall naming a lot already on an open live recall — the detail names it (batch-already-recalled, member recallCodes); or a concurrent request on the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A lot is being picked, dispatched, blocked or recalled right now and the command waited 5 s — nothing was changed, retry (recall-open-contended)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 3-7a — opens a batch recall over 1–50 lots of ONE client (qc.manage). A live recall blocks every active lot it names in every warehouse in the same transaction (3-3a's block, reason `recall`): ATP, the grant ceiling and channel quantities stop counting them, waves and picks never draw them, dispatch refuses an order holding one, and a pick refuses a bin holding one. A lot already blocked keeps its reason. A mock recall (a drill) blocks nothing. A suspended or departed client is not refused",
+        "tags": [
+          "recalls"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inventory/recalls/{recallId}": {
+      "get": {
+        "operationId": "RecallsController_detail",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "recallId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecallDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed recallId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — \"This is an operator surface.\" (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No recall with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The read did not finish within its budget (report-unavailable)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 3-7a — one recall: its lots with live figures (received, damaged, on hand, in transit, held in open orders, dispatched, returned, scrapped, written off, unaccounted) and the figures frozen at close, where the lots sit (per warehouse and location role), the open orders holding them and the planned picks that will refuse",
+        "tags": [
+          "recalls"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inventory/recalls/{recallId}/bins": {
+      "get": {
+        "operationId": "RecallsController_bins",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "recallId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque cursor from a previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecallBinsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed recallId, cursor or limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — \"This is an operator surface.\" (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No recall with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The read did not finish within its budget (report-unavailable)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 3-7a — every bin holding a lot of the recall (staff only — the client sees warehouses and roles, never bins), paged",
+        "tags": [
+          "recalls"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inventory/recalls/{recallId}/shipments": {
+      "get": {
+        "operationId": "RecallsController_shipments",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "recallId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque cursor from a previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecallShipmentsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed recallId, cursor or limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — \"This is an operator surface.\" (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No recall with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The read did not finish within its budget (report-unavailable)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 3-7a — where the recalled lots went: one row per dispatched pick of a lot — the order, consignee legal name and GSTIN, destination city / state / pincode, carrier and AWB (no contact names, phones or address lines), paged",
+        "tags": [
+          "recalls"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inventory/recalls/{recallId}/receipts": {
+      "get": {
+        "operationId": "RecallsController_receipts",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "recallId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque cursor from a previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecallReceiptsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed recallId, cursor or limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — \"This is an operator surface.\" (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No recall with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The read did not finish within its budget (report-unavailable)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 3-7a — where the recalled lots came from: one row per goods receipt of a lot (its GRN, document and vendor), paged",
+        "tags": [
+          "recalls"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inventory/recalls/{recallId}/report": {
+      "get": {
+        "operationId": "RecallsController_report",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "recallId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "format",
+            "required": true,
+            "in": "query",
+            "description": "`csv` (streamed, every row, ends in a `section=end` row carrying the count) or `xlsx` (built whole, capped at 200,000 rows)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "csv",
+                "xlsx"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The file",
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed recallId, or a format outside csv | xlsx (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — \"This is an operator surface.\" (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No recall with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The XLSX would pass 200,000 rows — download the CSV (report-too-large)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A recall report is already being prepared, or the read did not finish within its 60 s budget (report-unavailable; Retry-After: 5)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 3-7a — the client recall report as a FILE: one table with a `section` column (meta, figure_live, figure_at_close, on_hand, in_transit, held_in_open_order, planned_pick_in_recalled_bin — staff only —, dispatched, received, received_damaged, returned, return_scrapped, adjusted_out, end). CSV streams every row and ends in a `section=end` row carrying the count (a file without it was cut short); XLSX is built whole (a \"Recall\" facts sheet and a \"Trace\" sheet), at most 200,000 rows. Every download is audited",
+        "tags": [
+          "recalls"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inventory/recalls/{recallId}/batches": {
+      "post": {
+        "operationId": "RecallsController_addBatches",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "recallId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddRecallBatchesDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecallResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key; 0 or over 50 batch ids, or a malformed or repeated id (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks qc.manage — owner and ops manager only (role-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such recall, or a batch id names no batch of this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The recall is closed (recall-not-open); a lot of another client (mixed-client); a lot already on this or another open live recall (batch-already-recalled); more than 50 lots in all (recall-too-many-lots); or a concurrent request on the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A lot is being picked, dispatched, blocked or recalled right now and the command waited 5 s — nothing was changed, retry (recall-open-contended)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 3-7a — adds lots to an OPEN recall (qc.manage) — a matching batch found later (the candidates read flags it with sameCodeOnOpenRecall). The same rules as open: one client (the recall's), no lot on another open live recall, at most 50 lots in all; a live recall blocks every active one",
+        "tags": [
+          "recalls"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inventory/recalls/{recallId}/close": {
+      "post": {
+        "operationId": "RecallsController_close",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "recallId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloseRecallDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecallResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key; a blank or over-500-character note or override reason, over 50 or repeated release ids or disposition notes, or an over-200-character evidence reference (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks qc.manage — owner and ops manager only (role-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No recall with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The recall is already closed (recall-not-open); a release or note names a batch that is not a lot of this recall (recall-batch-not-on-recall); a lot this recall did not block, or no longer blocked for the recall (recall-release-not-eligible, member batchCodes); a released lot still has stock and no overrideReason (recall-release-has-stock, member batchCodes); a lot whose stock does not match its ledger and no acknowledgeUnaccounted (recall-unaccounted, member batchCodes); or a concurrent request on the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A lot is being picked, dispatched, blocked or recalled right now and the command waited 5 s — nothing was changed, retry (recall-open-contended)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 3-7a — closes a recall (qc.manage): freezes every lot’s figures as of now (the close summary) and unblocks the lots named in releaseBatchIds — only lots THIS recall blocked; a lot with stock on hand, in transit or in open orders needs an overrideReason; any lot whose stock does not match its ledger history needs acknowledgeUnaccounted. Every other lot stays blocked. No stock moves",
+        "tags": [
+          "recalls"
         ]
       }
     },
@@ -41682,6 +43227,12 @@
             "type": "boolean",
             "description": "Story 3-3a — the server judged the batch past its expiry instant: on hand, but never promised (ATP) or default-drawn"
           },
+          "recallCode": {
+            "type": "string",
+            "nullable": true,
+            "example": "RCL-000001",
+            "description": "Story 3-7a — the OPEN LIVE recall naming this batch (it is unblocked only by closing that recall); null when none"
+          },
           "quantity": {
             "type": "number",
             "description": "On-hand of this batch in the queried warehouse (the bin filter applied; 0 when none)"
@@ -41876,6 +43427,12 @@
             "type": "boolean",
             "description": "Story 3-3a — the server judged the batch past its expiry instant: on hand, but never promised (ATP) or default-drawn"
           },
+          "recallCode": {
+            "type": "string",
+            "nullable": true,
+            "example": "RCL-000001",
+            "description": "Story 3-7a — the OPEN LIVE recall naming this batch (it is unblocked only by closing that recall); null when none"
+          },
           "bins": {
             "description": "Per-bin on-hand rows across every warehouse of the tenant",
             "type": "array",
@@ -42005,6 +43562,12 @@
           "expired": {
             "type": "boolean",
             "description": "The server judged the batch past its expiry instant — expired stock is on hand but never promised or default-drawn (blocked or not)"
+          },
+          "recallCode": {
+            "type": "string",
+            "nullable": true,
+            "example": "RCL-000001",
+            "description": "Story 3-7a — the OPEN LIVE recall naming this batch (release it by closing the recall); null when none. Absent on a response stored before 3-7a (read as null)"
           }
         },
         "required": [
@@ -46150,6 +47713,27 @@
           "reason"
         ]
       },
+      "GoodsReceiptRecalledLotDto": {
+        "type": "object",
+        "properties": {
+          "batchId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "batchCode": {
+            "type": "string"
+          },
+          "recallCode": {
+            "type": "string",
+            "example": "RCL-000001"
+          }
+        },
+        "required": [
+          "batchId",
+          "batchCode",
+          "recallCode"
+        ]
+      },
       "GoodsReceiptDto": {
         "type": "object",
         "properties": {
@@ -46285,6 +47869,13 @@
             "type": "number",
             "minimum": 1,
             "description": "Story 1-2b — how many booked lines of a QC-on-receipt client were NOT held because the SKU is serial-tracked or catch-weight; present only when > 0"
+          },
+          "recalledLots": {
+            "description": "Story 3-7a — the booked lots that sit on an open live recall: the receipt is booked and the lot stays blocked — keep the units apart. Present only when there is one",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GoodsReceiptRecalledLotDto"
+            }
           }
         },
         "required": [
@@ -48196,6 +49787,11 @@
               "serial-tracked"
             ],
             "description": "Story 2-6a — QC on receipt was skipped for this serial line (it booked unheld; derived: serial rows, no receipt hold, and the receipt's client has QC on receipt NOW)"
+          },
+          "recallCode": {
+            "type": "string",
+            "example": "RCL-000001",
+            "description": "Story 3-7a — the OPEN LIVE recall naming this line's lot (the lot stays blocked — keep the units apart); present only when one does"
           }
         },
         "required": [
@@ -56109,6 +57705,7 @@
               "audit_export",
               "batch",
               "batch_alert",
+              "batch_recall",
               "bin",
               "bin_move",
               "carrier_connection",
@@ -56210,6 +57807,7 @@
               "audit_export",
               "batch",
               "batch_alert",
+              "batch_recall",
               "bin",
               "bin_move",
               "carrier_connection",
@@ -62688,6 +64286,302 @@
           "dispositions"
         ]
       },
+      "PortalRecallListEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "live",
+              "mock"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "closed"
+            ]
+          },
+          "externalRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "openedAt": {
+            "type": "string"
+          },
+          "closedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "lotCount": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "mode",
+          "status",
+          "externalRef",
+          "openedAt",
+          "closedAt",
+          "lotCount"
+        ]
+      },
+      "PortalRecallListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalRecallListEntryDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "RecallFiguresDto": {
+        "type": "object",
+        "properties": {
+          "received": {
+            "type": "number",
+            "description": "Σ received (grn.received), base units"
+          },
+          "receivedDamaged": {
+            "type": "number",
+            "description": "Σ received damaged (grn.damaged)"
+          },
+          "onHand": {
+            "type": "number",
+            "description": "On hand in every warehouse, excluding in-transit"
+          },
+          "inTransit": {
+            "type": "number",
+            "description": "In an IN-TRANSIT bin (a transfer not yet confirmed)"
+          },
+          "heldInOpenOrders": {
+            "type": "number",
+            "description": "Picked into open orders (net per order line)"
+          },
+          "dispatched": {
+            "type": "number",
+            "description": "Picked into dispatched orders (net per order line)"
+          },
+          "returned": {
+            "type": "number",
+            "description": "Σ returned (return.received)"
+          },
+          "returnScrapped": {
+            "type": "number",
+            "description": "Σ returned units scrapped (return.scrapped)"
+          },
+          "adjustedOut": {
+            "type": "number",
+            "description": "Σ written off (negative stock adjustments)"
+          },
+          "unaccounted": {
+            "type": "number",
+            "description": "The ledger history − on hand − in transit: 0 unless the projection diverged (or the lot sits in a quarantined scope)"
+          }
+        },
+        "required": [
+          "received",
+          "receivedDamaged",
+          "onHand",
+          "inTransit",
+          "heldInOpenOrders",
+          "dispatched",
+          "returned",
+          "returnScrapped",
+          "adjustedOut",
+          "unaccounted"
+        ]
+      },
+      "PortalRecallLotDto": {
+        "type": "object",
+        "properties": {
+          "batchId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "batchCode": {
+            "type": "string"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "uom": {
+            "type": "string"
+          },
+          "expiryDate": {
+            "type": "string",
+            "nullable": true
+          },
+          "figures": {
+            "$ref": "#/components/schemas/RecallFiguresDto"
+          },
+          "closeFigures": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RecallFiguresDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "batchId",
+          "batchCode",
+          "skuCode",
+          "skuName",
+          "uom",
+          "expiryDate",
+          "figures",
+          "closeFigures"
+        ]
+      },
+      "PortalRecallOnHandDto": {
+        "type": "object",
+        "properties": {
+          "warehouseCode": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "batchCode": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "warehouseCode",
+          "role",
+          "batchCode",
+          "quantity"
+        ]
+      },
+      "PortalRecallHeldOrderDto": {
+        "type": "object",
+        "properties": {
+          "orderLabel": {
+            "type": "string"
+          },
+          "clientOrderRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "batchCode": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "orderLabel",
+          "clientOrderRef",
+          "batchCode",
+          "quantity"
+        ]
+      },
+      "PortalRecallDetailResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "live",
+              "mock"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "closed"
+            ]
+          },
+          "externalRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "reasonNote": {
+            "type": "string"
+          },
+          "openedAt": {
+            "type": "string"
+          },
+          "closedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "closeNote": {
+            "type": "string",
+            "nullable": true
+          },
+          "lots": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalRecallLotDto"
+            }
+          },
+          "onHandByWarehouse": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalRecallOnHandDto"
+            }
+          },
+          "heldOrders": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalRecallHeldOrderDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "mode",
+          "status",
+          "externalRef",
+          "reasonNote",
+          "openedAt",
+          "closedAt",
+          "closeNote",
+          "lots",
+          "onHandByWarehouse",
+          "heldOrders"
+        ]
+      },
       "PortalInvoiceTotalsDto": {
         "type": "object",
         "properties": {
@@ -64606,6 +66500,1179 @@
         },
         "required": [
           "hasNew"
+        ]
+      },
+      "RecallOnRecallDto": {
+        "type": "object",
+        "properties": {
+          "recallId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "live",
+              "mock"
+            ]
+          }
+        },
+        "required": [
+          "recallId",
+          "code",
+          "mode"
+        ]
+      },
+      "RecallCandidateDto": {
+        "type": "object",
+        "properties": {
+          "batchId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "batchCode": {
+            "type": "string"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "uom": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "blocked"
+            ]
+          },
+          "blockedReason": {
+            "type": "string",
+            "nullable": true
+          },
+          "expiryDate": {
+            "type": "string",
+            "nullable": true
+          },
+          "match": {
+            "type": "string",
+            "enum": [
+              "exact",
+              "normalised"
+            ],
+            "description": "`exact` — the stored code equals the input; `normalised` — only letters and digits match: a similar code, check the label"
+          },
+          "onHand": {
+            "type": "number",
+            "description": "On hand across every warehouse (in transit included), base units"
+          },
+          "onRecall": {
+            "nullable": true,
+            "description": "The open recall naming this batch, null when none",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RecallOnRecallDto"
+              }
+            ]
+          },
+          "sameCodeOnOpenRecall": {
+            "type": "string",
+            "nullable": true,
+            "description": "An open recall of the client naming another batch of the same lot code — add this one to it (A14); null when none"
+          }
+        },
+        "required": [
+          "batchId",
+          "batchCode",
+          "skuId",
+          "skuCode",
+          "skuName",
+          "uom",
+          "status",
+          "blockedReason",
+          "expiryDate",
+          "match",
+          "onHand",
+          "onRecall",
+          "sameCodeOnOpenRecall"
+        ]
+      },
+      "RecallCandidatesResponse": {
+        "type": "object",
+        "properties": {
+          "normalisedCode": {
+            "type": "string",
+            "description": "The code as matched — letters and digits, upper-cased"
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "More batches matched than the 200 listed — narrow the code (the checklist is not complete)"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecallCandidateDto"
+            }
+          }
+        },
+        "required": [
+          "normalisedCode",
+          "truncated",
+          "items"
+        ]
+      },
+      "RecallListEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientCode": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "live",
+              "mock"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "closed"
+            ]
+          },
+          "reasonNote": {
+            "type": "string"
+          },
+          "externalRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "openedAt": {
+            "type": "string"
+          },
+          "closedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "lotCount": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "clientId",
+          "clientCode",
+          "mode",
+          "status",
+          "reasonNote",
+          "externalRef",
+          "openedAt",
+          "closedAt",
+          "lotCount"
+        ]
+      },
+      "RecallListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecallListEntryDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "OpenRecallDto": {
+        "type": "object",
+        "properties": {
+          "batchIds": {
+            "minItems": 1,
+            "maxItems": 50,
+            "description": "The batches (lots) recalled — 1–50 distinct batch ids, every one a SKU of ONE client (resolve them from client + lot code with GET …/inventory/recalls/candidates)",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "reasonNote": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "description": "Why the lot is recalled — VISIBLE TO THE CLIENT on its portal and in the report. Trimmed, 1–500 characters"
+          },
+          "externalRef": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 100,
+            "description": "The brand's own recall reference (one vendor lot across several clients is one recall per client, linked by this). Trimmed, blank = none, at most 100 characters"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "live",
+              "mock"
+            ],
+            "default": "live",
+            "description": "`live` blocks every active lot it names; `mock` (a drill) blocks nothing and affects no pick, dispatch, unblock or wind-down — its trace and report are identical, labelled MOCK"
+          }
+        },
+        "required": [
+          "batchIds",
+          "reasonNote"
+        ]
+      },
+      "CloseSummaryLotDto": {
+        "type": "object",
+        "properties": {
+          "batchId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "batchCode": {
+            "type": "string"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "figures": {
+            "$ref": "#/components/schemas/RecallFiguresDto"
+          },
+          "adjustedOutByReason": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "number"
+            },
+            "description": "Written off per adjustment reason code"
+          },
+          "released": {
+            "type": "boolean"
+          },
+          "overrideReason": {
+            "type": "string",
+            "nullable": true
+          },
+          "dispositionNote": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "batchId",
+          "batchCode",
+          "skuId",
+          "figures",
+          "adjustedOutByReason",
+          "released",
+          "overrideReason",
+          "dispositionNote"
+        ]
+      },
+      "CloseSummaryDto": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "number",
+            "enum": [
+              1
+            ]
+          },
+          "asOf": {
+            "type": "string",
+            "description": "The close instant the figures are as of"
+          },
+          "lots": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CloseSummaryLotDto"
+            }
+          },
+          "acknowledgedUnaccounted": {
+            "type": "boolean"
+          },
+          "evidenceRef": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "v",
+          "asOf",
+          "lots",
+          "acknowledgedUnaccounted",
+          "evidenceRef"
+        ]
+      },
+      "RecallLotSnapshotDto": {
+        "type": "object",
+        "properties": {
+          "batchId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "batchCode": {
+            "type": "string"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "blockedByRecall": {
+            "type": "boolean",
+            "description": "True when this recall blocked the lot; false when it was already blocked for another reason (it keeps that reason), and on every mock lot"
+          }
+        },
+        "required": [
+          "batchId",
+          "batchCode",
+          "skuId",
+          "blockedByRecall"
+        ]
+      },
+      "RecallSnapshotDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "example": "RCL-000001"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "live",
+              "mock"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "closed"
+            ]
+          },
+          "reasonNote": {
+            "type": "string"
+          },
+          "externalRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "openedAt": {
+            "type": "string"
+          },
+          "openedBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "closedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "closedBy": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "closeNote": {
+            "type": "string",
+            "nullable": true
+          },
+          "releasedBatchIds": {
+            "nullable": true,
+            "description": "The lots the close unblocked; null while open",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "closeSummary": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CloseSummaryDto"
+              }
+            ]
+          },
+          "lots": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecallLotSnapshotDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "clientId",
+          "mode",
+          "status",
+          "reasonNote",
+          "externalRef",
+          "openedAt",
+          "openedBy",
+          "closedAt",
+          "closedBy",
+          "closeNote",
+          "releasedBatchIds",
+          "closeSummary",
+          "lots"
+        ]
+      },
+      "RecallResponse": {
+        "type": "object",
+        "properties": {
+          "recall": {
+            "$ref": "#/components/schemas/RecallSnapshotDto"
+          }
+        },
+        "required": [
+          "recall"
+        ]
+      },
+      "RecallHeaderDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "live",
+              "mock"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "closed"
+            ]
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientCode": {
+            "type": "string"
+          },
+          "clientName": {
+            "type": "string"
+          },
+          "reasonNote": {
+            "type": "string"
+          },
+          "externalRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "openedAt": {
+            "type": "string"
+          },
+          "openedBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "openedByName": {
+            "type": "string",
+            "nullable": true
+          },
+          "closedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "closedBy": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "closedByName": {
+            "type": "string",
+            "nullable": true
+          },
+          "closeNote": {
+            "type": "string",
+            "nullable": true
+          },
+          "evidenceRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "acknowledgedUnaccounted": {
+            "type": "boolean",
+            "nullable": true
+          },
+          "firstReportAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "The first report download (any surface)"
+          },
+          "timeToReportSeconds": {
+            "type": "number",
+            "nullable": true,
+            "description": "Seconds from open to the first report download — null before one"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "mode",
+          "status",
+          "clientId",
+          "clientCode",
+          "clientName",
+          "reasonNote",
+          "externalRef",
+          "openedAt",
+          "openedBy",
+          "openedByName",
+          "closedAt",
+          "closedBy",
+          "closedByName",
+          "closeNote",
+          "evidenceRef",
+          "acknowledgedUnaccounted",
+          "firstReportAt",
+          "timeToReportSeconds"
+        ]
+      },
+      "RecallLotDto": {
+        "type": "object",
+        "properties": {
+          "batchId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "batchCode": {
+            "type": "string"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "uom": {
+            "type": "string"
+          },
+          "expiryDate": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "blocked"
+            ],
+            "description": "The batch now"
+          },
+          "blockedReason": {
+            "type": "string",
+            "nullable": true
+          },
+          "expired": {
+            "type": "boolean"
+          },
+          "blockedByRecall": {
+            "type": "boolean"
+          },
+          "released": {
+            "type": "boolean",
+            "description": "The close released this lot"
+          },
+          "figures": {
+            "description": "Live, as of the read",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RecallFiguresDto"
+              }
+            ]
+          },
+          "adjustedOutByReason": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "number"
+            }
+          },
+          "closeFigures": {
+            "nullable": true,
+            "description": "Frozen at close; null while open",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RecallFiguresDto"
+              }
+            ]
+          },
+          "closeAdjustedOutByReason": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "number"
+            },
+            "nullable": true
+          },
+          "overrideReason": {
+            "type": "string",
+            "nullable": true
+          },
+          "dispositionNote": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "batchId",
+          "batchCode",
+          "skuId",
+          "skuCode",
+          "skuName",
+          "uom",
+          "expiryDate",
+          "status",
+          "blockedReason",
+          "expired",
+          "blockedByRecall",
+          "released",
+          "figures",
+          "adjustedOutByReason",
+          "closeFigures",
+          "closeAdjustedOutByReason",
+          "overrideReason",
+          "dispositionNote"
+        ]
+      },
+      "RecallOnHandDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseCode": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "description": "`storage`, or a system bin: RECEIVING, QC-HOLD, DAMAGED, RETURNS, IN-TRANSIT"
+          },
+          "batchId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "batchCode": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "warehouseId",
+          "warehouseCode",
+          "role",
+          "batchId",
+          "batchCode",
+          "quantity"
+        ]
+      },
+      "RecallHeldOrderDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLabel": {
+            "type": "string",
+            "description": "The client's order number, else the channel reference, else the id's last eight characters"
+          },
+          "clientOrderRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "channelOrderRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "type": "string"
+          },
+          "warehouseId": {
+            "type": "string"
+          },
+          "warehouseCode": {
+            "type": "string"
+          },
+          "batchId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "batchCode": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "number"
+          },
+          "lastPickedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "orderId",
+          "orderLabel",
+          "clientOrderRef",
+          "channelOrderRef",
+          "status",
+          "warehouseId",
+          "warehouseCode",
+          "batchId",
+          "batchCode",
+          "quantity",
+          "lastPickedAt"
+        ]
+      },
+      "RecallPlannedPickDto": {
+        "type": "object",
+        "properties": {
+          "picklistLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLabel": {
+            "type": "string"
+          },
+          "warehouseCode": {
+            "type": "string"
+          },
+          "binCode": {
+            "type": "string"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "picklistLineId",
+          "orderId",
+          "orderLabel",
+          "warehouseCode",
+          "binCode",
+          "skuCode",
+          "quantity"
+        ]
+      },
+      "RecallDetailResponse": {
+        "type": "object",
+        "properties": {
+          "recall": {
+            "$ref": "#/components/schemas/RecallHeaderDto"
+          },
+          "asOf": {
+            "type": "string",
+            "description": "The instant the live figures are as of"
+          },
+          "lots": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecallLotDto"
+            }
+          },
+          "onHandByWarehouse": {
+            "description": "Per lot × warehouse × location role — never a bin",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecallOnHandDto"
+            }
+          },
+          "heldOrders": {
+            "description": "Open orders holding picked units — dispatch refuses them while the recall is open",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecallHeldOrderDto"
+            }
+          },
+          "plannedPicks": {
+            "description": "Planned picks at a bin holding a recalled lot — they refuse until the recalled units are moved out",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecallPlannedPickDto"
+            }
+          }
+        },
+        "required": [
+          "recall",
+          "asOf",
+          "lots",
+          "onHandByWarehouse",
+          "heldOrders",
+          "plannedPicks"
+        ]
+      },
+      "RecallBinDto": {
+        "type": "object",
+        "properties": {
+          "warehouseCode": {
+            "type": "string"
+          },
+          "binCode": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "batchCode": {
+            "type": "string"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "warehouseCode",
+          "binCode",
+          "role",
+          "batchCode",
+          "skuCode",
+          "quantity"
+        ]
+      },
+      "RecallBinsResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecallBinDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "RecallShipmentDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLabel": {
+            "type": "string"
+          },
+          "clientOrderRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "channelOrderRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "consigneeLegalName": {
+            "type": "string",
+            "nullable": true
+          },
+          "consigneeGstin": {
+            "type": "string",
+            "nullable": true
+          },
+          "destinationCity": {
+            "type": "string",
+            "nullable": true
+          },
+          "destinationState": {
+            "type": "string",
+            "nullable": true
+          },
+          "destinationPincode": {
+            "type": "string",
+            "nullable": true
+          },
+          "warehouseCode": {
+            "type": "string"
+          },
+          "batchCode": {
+            "type": "string"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "number"
+          },
+          "dispatchedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "carrier": {
+            "type": "string",
+            "nullable": true
+          },
+          "awb": {
+            "type": "string",
+            "nullable": true
+          },
+          "duringRecall": {
+            "type": "boolean",
+            "description": "Dispatched after the recall opened"
+          }
+        },
+        "required": [
+          "orderId",
+          "orderLabel",
+          "clientOrderRef",
+          "channelOrderRef",
+          "consigneeLegalName",
+          "consigneeGstin",
+          "destinationCity",
+          "destinationState",
+          "destinationPincode",
+          "warehouseCode",
+          "batchCode",
+          "skuCode",
+          "quantity",
+          "dispatchedAt",
+          "carrier",
+          "awb",
+          "duringRecall"
+        ]
+      },
+      "RecallShipmentsResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecallShipmentDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "RecallReceiptDto": {
+        "type": "object",
+        "properties": {
+          "grnCode": {
+            "type": "string"
+          },
+          "document": {
+            "type": "string",
+            "nullable": true,
+            "description": "`PO <code>`, `ASN <code>` or `blind <reason>`"
+          },
+          "vendorName": {
+            "type": "string",
+            "nullable": true,
+            "description": "The PO's vendor; null on an ASN or blind receipt"
+          },
+          "warehouseCode": {
+            "type": "string"
+          },
+          "batchCode": {
+            "type": "string"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "number"
+          },
+          "receivedAt": {
+            "type": "string"
+          },
+          "duringRecall": {
+            "type": "boolean",
+            "description": "Received after the recall opened (the lot stayed blocked)"
+          }
+        },
+        "required": [
+          "grnCode",
+          "document",
+          "vendorName",
+          "warehouseCode",
+          "batchCode",
+          "skuCode",
+          "quantity",
+          "receivedAt",
+          "duringRecall"
+        ]
+      },
+      "RecallReceiptsResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecallReceiptDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "AddRecallBatchesDto": {
+        "type": "object",
+        "properties": {
+          "batchIds": {
+            "minItems": 1,
+            "maxItems": 50,
+            "description": "1–50 more batches of the recall's client",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        },
+        "required": [
+          "batchIds"
+        ]
+      },
+      "RecallDispositionNoteDto": {
+        "type": "object",
+        "properties": {
+          "batchId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "A lot of this recall"
+          },
+          "note": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "description": "What became of the lot (destroyed under certificate …, returned to the brand …) — 1–500 characters"
+          }
+        },
+        "required": [
+          "batchId",
+          "note"
+        ]
+      },
+      "CloseRecallDto": {
+        "type": "object",
+        "properties": {
+          "note": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "description": "Why the recall is closed — trimmed, 1–500 characters"
+          },
+          "releaseBatchIds": {
+            "maxItems": 50,
+            "description": "The lots to unblock (0–50, distinct): each must be one THIS recall blocked and still blocked for the recall. A lot with stock on hand, in transit or in open orders needs overrideReason. Every other lot stays blocked (unblock it later through the batch)",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "overrideReason": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 500,
+            "description": "Why released lots may carry stock — audited on each lot’s unblock. Trimmed, blank = none"
+          },
+          "acknowledgeUnaccounted": {
+            "type": "boolean",
+            "default": false,
+            "description": "Close even though a lot’s stock does not match its ledger history (unaccounted ≠ 0) — audited"
+          },
+          "dispositionNotes": {
+            "maxItems": 50,
+            "description": "Up to one note per lot, frozen in the close summary",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecallDispositionNoteDto"
+            }
+          },
+          "evidenceRef": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200,
+            "description": "A destruction certificate number or similar — 1–200 characters, blank = none"
+          }
+        },
+        "required": [
+          "note"
         ]
       },
       "ReturnAuthorizationLineInputDto": {

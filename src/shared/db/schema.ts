@@ -1,6 +1,7 @@
 import { sql } from 'drizzle-orm';
 import { bigint, boolean, customType, date, index, integer, jsonb, numeric, pgEnum, pgTable, primaryKey, smallint, text, timestamp, unique, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import { uuidv7 } from '../primitives/ids';
+import { LOT_CODE_NORM_SQL } from '../primitives/lot-code';
 
 /**
  * Infrastructure-only table proving the Drizzle migration pipeline (Story 1.1).
@@ -1230,6 +1231,11 @@ export const batches = pgTable(
     // queue's FEFO expiry sort is done in JS — it ships so a future
     // catalog-side expiry-range read never needs a migration of its own.
     index('batches_tenant_expiry_idx').on(table.tenantId, table.expiryDate),
+    // Story 3-7a (0101, A9) — the recall candidates' NORMALISED lot-code match
+    // (letters and digits only, upper-cased). The expression is ONE constant,
+    // `LOT_CODE_NORM_SQL` (shared/primitives/lot-code.ts), which the
+    // query states verbatim so the planner can use this index.
+    index('batches_tenant_code_norm_idx').on(table.tenantId, sql`(${LOT_CODE_NORM_SQL})`),
   ],
 );
 
@@ -3180,6 +3186,13 @@ export const orders = pgTable(
     index('orders_external_event_client_idx')
       .on(table.tenantId, table.externalEventId, table.clientId)
       .where(sql`external_event_id is not null`),
+    // Story 3-7a (0101, A8) — a client's OPEN orders per warehouse: the recall
+    // trace's "held in open orders" starts here (a small partial index), never
+    // by walking every pick of the lot. The predicate is `ORDER_OPEN_STATUSES`
+    // (outbound/client-wind-down.ts), stated verbatim by the query.
+    index('orders_tenant_client_open_idx')
+      .on(table.tenantId, table.clientId, table.warehouseId)
+      .where(sql`"status" IN ('accepted','ready_to_dispatch')`),
   ],
 );
 
@@ -6730,3 +6743,76 @@ export const webhookDeliveries = pgTable(
 );
 
 export type WebhookDeliveryRow = typeof webhookDeliveries.$inferSelect;
+
+/**
+ * Story 3-7a — a batch recall: one client's lots (1–50 batches, by id) under
+ * one document `RCL-nnnnnn`, opened with the brand's reason (shown to the
+ * client) and reference, closed with server-derived figures frozen in
+ * `close_summary` (schema v1, `recalls/close-summary.ts`). A `live` recall
+ * blocks every active batch it names (3-3a's block, reason `recall`); a
+ * `mock` one (a drill) blocks nothing and affects no pick, dispatch, unblock
+ * or wind-down. Owned and written ONLY by `src/modules/recalls`; never
+ * deleted (retention: recall evidence outlives the client). CHECKs and RLS
+ * (the 0041 client shape on `client_id`) in `drizzle/0101_batch_recalls.sql`.
+ */
+export const batchRecalls = pgTable(
+  'batch_recalls',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    code: text('code').notNull(),
+    mode: text('mode').notNull().default('live'),
+    status: text('status').notNull().default('open'),
+    reasonNote: text('reason_note').notNull(),
+    externalRef: text('external_ref'),
+    openedAt: timestamp('opened_at', { withTimezone: true, mode: 'string' }).notNull(),
+    openedBy: uuid('opened_by').notNull(),
+    closedAt: timestamp('closed_at', { withTimezone: true, mode: 'string' }),
+    closedBy: uuid('closed_by'),
+    closeNote: text('close_note'),
+    closeSummary: jsonb('close_summary'),
+    releasedBatchIds: uuid('released_batch_ids').array(),
+    /** The first report download (any surface, any mode) — the "time to report" figure. */
+    firstReportAt: timestamp('first_report_at', { withTimezone: true, mode: 'string' }),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('batch_recalls_tenant_code_unique').on(table.tenantId, table.code),
+    index('batch_recalls_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
+    index('batch_recalls_tenant_client_created_at_id_idx').on(table.tenantId, table.clientId, table.createdAt, table.id),
+    index('batch_recalls_tenant_external_ref_idx').on(table.tenantId, table.externalRef),
+  ],
+);
+
+export type BatchRecallRow = typeof batchRecalls.$inferSelect;
+
+/**
+ * Story 3-7a — one lot of a recall: the batch (and its SKU and code, frozen
+ * at open), and whether THIS recall blocked it (`blocked_by_recall` — false
+ * for a lot already blocked for another reason, and on every mock line).
+ * Tenant-only RLS; the portal reaches a line only by joining its recall.
+ */
+export const batchRecallLines = pgTable(
+  'batch_recall_lines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    recallId: uuid('recall_id').notNull(),
+    batchId: uuid('batch_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    batchCode: text('batch_code').notNull(),
+    blockedByRecall: boolean('blocked_by_recall').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('batch_recall_lines_tenant_recall_batch_unique').on(table.tenantId, table.recallId, table.batchId),
+    index('batch_recall_lines_tenant_batch_idx').on(table.tenantId, table.batchId),
+  ],
+);
+
+export type BatchRecallLineRow = typeof batchRecallLines.$inferSelect;

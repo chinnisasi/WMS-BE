@@ -785,6 +785,9 @@ export class BatchListItemDto {
   @ApiProperty({ description: 'Story 3-3a — the server judged the batch past its expiry instant: on hand, but never promised (ATP) or default-drawn' })
   expired!: boolean;
 
+  @ApiProperty({ required: false, type: String, nullable: true, example: 'RCL-000001', description: 'Story 3-7a — the OPEN LIVE recall naming this batch (it is unblocked only by closing that recall); null when none' })
+  recallCode?: string | null;
+
   @ApiProperty({ description: 'On-hand of this batch in the queried warehouse (the bin filter applied; 0 when none)' })
   quantity!: number;
 }
@@ -880,6 +883,9 @@ export class BatchDetailResponse {
 
   @ApiProperty({ description: 'Story 3-3a — the server judged the batch past its expiry instant: on hand, but never promised (ATP) or default-drawn' })
   expired!: boolean;
+
+  @ApiProperty({ required: false, type: String, nullable: true, example: 'RCL-000001', description: 'Story 3-7a — the OPEN LIVE recall naming this batch (it is unblocked only by closing that recall); null when none' })
+  recallCode?: string | null;
 
   @ApiProperty({ type: [BatchBinOnHandDto], description: 'Per-bin on-hand rows across every warehouse of the tenant' })
   bins!: readonly BatchBinOnHandDto[];

@@ -1,4 +1,5 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, Res, UseGuards } from '@nestjs/common';
+import type { Response } from 'express';
 import {
   ApiBearerAuth,
   ApiBody,
@@ -7,6 +8,7 @@ import {
   ApiOkResponse,
   ApiOperation,
   ApiParam,
+  ApiProduces,
   ApiResponse,
   ApiTags,
 } from '@nestjs/swagger';
@@ -24,6 +26,13 @@ import { CatalogFacade } from '../modules/catalog/catalog.facade';
 import { TenancyService } from '../modules/tenancy/tenancy.service';
 import { ReportingFacade } from '../modules/reporting/reporting.facade';
 import { ReturnsFacade } from '../modules/returns/returns.facade';
+import { RecallsFacade } from '../modules/recalls/recalls.facade';
+import { XLSX_CONTENT_TYPE } from '../modules/reporting/reporting.facade';
+import { PortalRecallDetailResponse, PortalRecallListResponse } from '../modules/recalls/recall.dto';
+// Bound to @Query() — value imports (the ValidationPipe reads the classes).
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { RecallPageQueryDto, RecallReportQueryDto } from '../modules/recalls/recall.dto';
+import { finishRecallReport, recallReportSink } from './recall-report-sink';
 // Bound to @Query() — a value import (the query class is read by the ValidationPipe).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { PortalReturnDetailResponse, PortalReturnPageResponse, PortalReturnsQuery } from '../modules/returns/returns.dto';
@@ -107,6 +116,8 @@ export class PortalController {
     @Inject(TenancyService) private readonly tenancy: TenancyService,
     @Inject(ReportingFacade) private readonly reporting: ReportingFacade,
     @Inject(ReturnsFacade) private readonly returns: ReturnsFacade,
+    // Story 3-7a — only the report download's audit row (stamped).
+    @Inject(RecallsFacade) private readonly recalls: RecallsFacade,
   ) {}
 
   @Get(':tenantId/portal/me')
@@ -615,6 +626,98 @@ export class PortalController {
     };
   }
 
+  // ── story 3-7a: the client's batch recalls (A11) ──────────────────────────
+  // Read only: the list, one recall (lots, figures, per-warehouse on hand —
+  // never a bin, never another client's order, never an actor) and its
+  // report. A recall is visible the moment it commits; a suspended or
+  // departed client is refused by the guard before any header.
+
+  @Get(':tenantId/portal/recalls')
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: "Story 3-7a — this client's batch recalls (a live recall blocks the lots; a mock one is a drill), newest first (keyset)" })
+  @ApiOkResponse({ type: PortalRecallListResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed cursor (invalid-cursor) or a limit outside 1–100 (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async portalRecalls(
+    @Param('tenantId') tenantId: string,
+    @CurrentPortalSession() session: PortalSession,
+    @Query() query: RecallPageQueryDto,
+  ): Promise<PortalRecallListResponse> {
+    assertOwnTenant(session, tenantId);
+    const page = await this.reporting.portalRecalls(tenantId, session.clientId, {
+      ...(query.cursor === undefined ? {} : { cursor: query.cursor }),
+      ...(query.limit === undefined ? {} : { limit: query.limit }),
+    });
+    return { items: page.items.map((item) => ({ ...item })), nextCursor: page.nextCursor };
+  }
+
+  @Get(':tenantId/portal/recalls/:recallId')
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Story 3-7a — one of this client's recalls: the reason and reference, every lot with its live figures (and those frozen at close), on hand per warehouse and location role, and its own open orders holding a lot",
+  })
+  @ApiOkResponse({ type: PortalRecallDetailResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed recallId path parameter (validation-failed — it must be a uuid)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("No such recall of this client — unknown, or another client's (not-found)") })
+  @ApiResponse({ status: 503, ...problemJsonResponse('The read did not finish within its budget (report-unavailable)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'recallId', format: 'uuid' })
+  async portalRecall(
+    @Param('tenantId') tenantId: string,
+    @Param('recallId') recallId: string,
+    @CurrentPortalSession() session: PortalSession,
+  ): Promise<PortalRecallDetailResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(recallId, 'recallId');
+    return JSON.parse(JSON.stringify(await this.reporting.portalRecall(tenantId, session.clientId, recallId))) as PortalRecallDetailResponse;
+  }
+
+  @Get(':tenantId/portal/recalls/:recallId/report')
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Story 3-7a — one of this client's recall reports as a FILE (the staff report's rows less the warehouse's planned picks): CSV streams every row and ends in a `section=end` row carrying the count; XLSX at most 200,000 rows. Every download is audited",
+  })
+  @ApiProduces('text/csv', XLSX_CONTENT_TYPE)
+  @ApiOkResponse({ description: 'The file', content: { 'text/csv': { schema: { type: 'string', format: 'binary' } }, [XLSX_CONTENT_TYPE]: { schema: { type: 'string', format: 'binary' } } } })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed recallId, or a format outside csv | xlsx (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("No such recall of this client — unknown, or another client's (not-found)") })
+  @ApiResponse({ status: 422, ...problemJsonResponse('The XLSX would pass 200,000 rows — download the CSV (report-too-large)') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('A recall report is already being prepared, or the read did not finish within its budget (report-unavailable; Retry-After: 5)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'recallId', format: 'uuid' })
+  async portalRecallReport(
+    @Param('tenantId') tenantId: string,
+    @Param('recallId') recallId: string,
+    @CurrentPortalSession() session: PortalSession,
+    @Query() query: RecallReportQueryDto,
+    @Res() res: Response,
+  ): Promise<void> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(recallId, 'recallId');
+    await finishRecallReport(res, () =>
+      this.reporting.portalRecallReport(
+        tenantId,
+        session.clientId,
+        recallId,
+        query.format,
+        recallReportSink(res, (rowCount) =>
+          this.recalls.portalRecordReportDownload(tenantId, session.clientId, session.userId, recallId, query.format, rowCount),
+        ),
+      ),
+    );
+  }
+
   @Get(':tenantId/portal/invoices')
   @UseGuards(PortalSessionGuard)
   @ApiBearerAuth()
@@ -721,7 +824,7 @@ function assertOwnTenant(session: PortalSession, tenantId: string): void {
   }
 }
 
-function assertUuidParam(value: string, name: 'orderId' | 'asnId' | 'poId' | 'grnId' | 'rmaId'): void {
+function assertUuidParam(value: string, name: 'orderId' | 'asnId' | 'poId' | 'grnId' | 'rmaId' | 'recallId'): void {
   if (!UUID_RE.test(value)) {
     throw new ProblemException(
       'validation-failed',

@@ -146,6 +146,22 @@ export async function getWarehouseCodeInTx(tx: TenantTx, tenantId: string, wareh
 }
 
 /**
+ * Story 3-7a — every warehouse of the tenant (id → code), in the caller's
+ * transaction: a recall is lot-wide, so its on-hand read names the tenant's
+ * warehouses explicitly (`warehouse_id = any(…)` — the batch_on_hand
+ * `(tenant, warehouse, sku)` index prefix) and prints their codes.
+ */
+export async function warehouseCodesOfTenantInTx(tx: TenantTx, tenantId: string): Promise<Map<string, string>> {
+  await rearmTxDeadline(tx);
+  const rows = await tx
+    .select({ id: warehouses.id, code: warehouses.code })
+    .from(warehouses)
+    .where(eq(warehouses.tenantId, tenantId))
+    .orderBy(warehouses.code);
+  return new Map(rows.map((row) => [row.id, row.code]));
+}
+
+/**
  * Story 4-1a — a warehouse's display name, in the caller's transaction (the
  * portal order's response names the warehouse it was placed into). 404 when
  * absent, like `getWarehouseCodeInTx`.

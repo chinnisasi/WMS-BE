@@ -17,6 +17,10 @@ import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import type { LedgerReferenceDoc } from '../inventory/inventory.facade';
+import { CatalogFacade } from '../catalog/catalog.facade';
+// Story 3-7a — the open-live-recall seam (a free-function file, guide §7h):
+// outbound imports it, never the recalls module (which depends on outbound).
+import { openLiveRecallLinesForBatchesInTx } from '../recalls/open-recall-lines';
 import { ORDER_OWNER_TYPE } from './order.command';
 import type { OrderSource, OrderStatus } from './order.command';
 
@@ -169,6 +173,8 @@ export class DispatchCommandService {
     // `InventoryFacade`'s in-tx passthroughs inside THIS command's
     // transaction — the outbound module writes no inventory table.
     @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
+    // Story 3-7a (A3) — the key-share lock on every picked batch.
+    @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
   ) {}
 
   /**
@@ -270,6 +276,36 @@ export class DispatchCommandService {
         throw dispatchConflict(
           'Order is not dispatchable',
           `Order "${order.id}" reads "${order.status}" — only a packed (ready_to_dispatch) order is dispatched.`,
+        );
+      }
+
+      // ── story 3-7a (A2/A3): no recalled lot leaves the building ─────────
+      // The batches this order's picks drew (the `pick.picked` events — the
+      // per-batch record; `picks.batch_id` is null on a multi-batch draw),
+      // EVERY one locked `FOR KEY SHARE` in id order with no status filter:
+      // it conflicts with the `FOR UPDATE` every block and recall command
+      // takes, so "the recall or the dispatch, whichever commits first" is
+      // well defined — a recall committed first is seen below (409), and a
+      // recall arriving later waits for this dispatch, which then appears in
+      // its `dispatched` trace. Only an OPEN LIVE recall refuses: a lot
+      // blocked for any other reason (qc-failed, expiry-review …) still
+      // ships, exactly as 3-3a left it, and a mock recall is a drill. Lock
+      // order: order row → batch key-share → (the appends below) the
+      // warehouse advisory — guide §1, A15.
+      const pickedBatchIds = await this.inventory.pickedBatchRefsOfOrderInTx(tx, command.tenantId, order.id);
+      await this.catalog.keyShareLockBatchesInTx(tx, command.tenantId, pickedBatchIds);
+      const recalled = await openLiveRecallLinesForBatchesInTx(tx, command.tenantId, pickedBatchIds);
+      if (recalled.length > 0) {
+        const batchCodes = (await this.catalog.batchFactsByIdsInTx(tx, command.tenantId, recalled.map((line) => line.batchId)));
+        const codes = [...new Set(recalled.map((line) => batchCodes.get(line.batchId)?.code ?? line.batchId))].sort();
+        const recallCodes = [...new Set(recalled.map((line) => line.recallCode))].sort();
+        throw new ProblemException(
+          'order-holds-recalled-batch',
+          409,
+          'Order holds a recalled lot',
+          `Order "${order.clientOrderRef ?? order.externalEventId ?? order.id.slice(-8)}" holds units of lot ${codes.join(', ')} under recall ${recallCodes.join(', ')} — it cannot ship. ` +
+            `Release the lot from the recall (close ${recallCodes.join(', ')} with it in releaseBatchIds), or wait for the packed-order cancel/unpack (deferred from 4.2).`,
+          { batchCodes: codes, recallCodes },
         );
       }
 

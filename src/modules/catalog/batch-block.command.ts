@@ -2,18 +2,22 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, eq } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { auditEvents, BATCH_BLOCK_REASONS, batches, idempotencyKeys, type BatchBlockReason } from '../../shared/db/schema';
+import { BATCH_BLOCK_REASONS, batches, idempotencyKeys, type BatchBlockReason } from '../../shared/db/schema';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
-import { nowIso } from '../../shared/primitives/time';
 import { batchExpiryClock, isBatchExpiredAt } from '../../shared/primitives/batch-expiry';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { getMemberRoleIn, memberDisplayNamesInTx, userEmailsInTx } from '../tenancy/tenancy.service';
+// Story 3-7a — the write is shared with the recall (open blocks, close
+// releases); the open-live-recall seam is a free-function file (guide §7h),
+// never the recalls module, which depends on catalog.
+import { applyBatchBlockInTx, applyBatchUnblockInTx, type ApplyBatchBlockInput, type ApplyBatchUnblockInput } from './batch-block';
+import { openLiveRecallLinesForBatchesInTx } from '../recalls/open-recall-lines';
 
 /** Story 3-3a (decision 4) — the reason vocabulary lives beside the table (`schema.ts`). */
 export { BATCH_BLOCK_REASONS, type BatchBlockReason };
@@ -57,6 +61,12 @@ export interface BatchLifecycleView {
   /** The blocker's display name (the member's email local part — `memberDisplayNamesInTx`), null when not blocked or the blocker is no longer a member. */
   readonly blockedByName: string | null;
   readonly expired: boolean;
+  /**
+   * Story 3-7a (A4) — the code of the OPEN LIVE recall naming this batch
+   * (`RCL-000001`), null when none. Optional: a block snapshot stored before
+   * 3-7a replays without it (guide §9) — a reader treats absent as null.
+   */
+  readonly recallCode?: string | null;
 }
 
 /** The block / unblock answer — the stored idempotency snapshot. */
@@ -83,6 +93,9 @@ export async function batchLifecycleViewsInTx(
   const members = blockers.length === 0 ? new Map<string, string>() : await userEmailsInTx(tx, tenantId, blockers);
   const names = members.size === 0 ? new Map<string, string>() : await memberDisplayNamesInTx(tx, tenantId, [...members.keys()]);
   const at = batchExpiryClock.now();
+  const recalls = new Map(
+    (await openLiveRecallLinesForBatchesInTx(tx, tenantId, rows.map((row) => row.id))).map((line) => [line.batchId, line.recallCode]),
+  );
   return rows.map((row) => ({
     id: row.id,
     skuId: row.skuId,
@@ -97,6 +110,7 @@ export async function batchLifecycleViewsInTx(
     blockedBy: row.blockedBy,
     blockedByName: row.blockedBy === null ? null : (names.get(row.blockedBy) ?? null),
     expired: isBatchExpiredAt(row.expiryDate, at),
+    recallCode: recalls.get(row.id) ?? null,
   }));
 }
 
@@ -180,44 +194,15 @@ export class BatchBlockCommand {
         );
       }
 
-      const blockedAt = nowIso();
-      const updated = await tx
-        .update(batches)
-        .set({
-          status: 'blocked',
-          blockedReason: command.reason,
-          blockedAt,
-          blockedBy: command.actorUserId,
-          blockedNote: note,
-          updatedAt: blockedAt,
-        })
-        .where(and(eq(batches.tenantId, command.tenantId), eq(batches.id, locked.id), eq(batches.status, 'active')))
-        .returning();
-      const row = updated[0]!;
-      const snapshot: BatchBlockSnapshot = { batch: (await batchLifecycleViewsInTx(tx, command.tenantId, [row]))[0]! };
-
-      await this.outbox.append(tx, {
-        messageId: uuidv7(),
-        tenantId: command.tenantId,
-        type: 'batch.blocked',
-        occurredAt: blockedAt,
-        payload: { batchId: row.id, skuId: row.skuId, code: row.code, reason: command.reason, note },
-      });
-      await tx.insert(auditEvents).values({
-        id: uuidv7(),
+      const row = await applyBatchBlockInTx(tx, this.outbox, {
         tenantId: command.tenantId,
         actorUserId: command.actorUserId,
-        action: 'batch.blocked',
-        targetType: 'batch',
-        targetId: row.id,
+        locked,
+        reason: command.reason,
+        note,
         reference: idempotencyKey,
-        changes: {
-          status: { before: locked.status, after: 'blocked' },
-          reason: { before: null, after: command.reason },
-          note: { before: null, after: note },
-        },
-        occurredAt: nowIso(),
       });
+      const snapshot: BatchBlockSnapshot = { batch: (await batchLifecycleViewsInTx(tx, command.tenantId, [row]))[0]! };
       await this.storeKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
       return snapshot;
     });
@@ -254,47 +239,50 @@ export class BatchBlockCommand {
           `Batch "${locked.code}" is not blocked (status "${locked.status}") — there is nothing to unblock.`,
         );
       }
+      // Story 3-7a (A4) — a lot on an OPEN LIVE recall is released only by
+      // closing the recall (with `releaseBatchIds`): the recall is the one
+      // place that records why the lot came back. Behind the replay and under
+      // the batch lock (the recall commands lock the same row FOR UPDATE, so
+      // an open or a close cannot commit between this read and the write).
+      // Never in `applyBatchUnblockInTx` — the close itself releases through
+      // it. A mock recall blocks nothing and never refuses (the seam returns
+      // live lines only).
+      const underRecall = (await openLiveRecallLinesForBatchesInTx(tx, command.tenantId, [locked.id]))[0];
+      if (underRecall !== undefined) {
+        throw new ProblemException(
+          'batch-under-recall',
+          409,
+          'Batch under recall',
+          `Batch "${locked.code}" is under recall ${underRecall.recallCode} — release it from the recall (close ${underRecall.recallCode} with this lot in releaseBatchIds) instead.`,
+          { recallCode: underRecall.recallCode },
+        );
+      }
 
-      const at = nowIso();
-      const updated = await tx
-        .update(batches)
-        .set({ status: 'active', blockedReason: null, blockedAt: null, blockedBy: null, blockedNote: null, updatedAt: at })
-        .where(and(eq(batches.tenantId, command.tenantId), eq(batches.id, locked.id), eq(batches.status, 'blocked')))
-        .returning();
-      const row = updated[0]!;
+      const row = await applyBatchUnblockInTx(tx, this.outbox, {
+        tenantId: command.tenantId,
+        actorUserId: command.actorUserId,
+        locked,
+        note,
+        reference: idempotencyKey,
+      });
       // An unblocked batch that is past its expiry stays unpromisable — the
       // view's `expired` says so (A8).
       const snapshot: BatchBlockSnapshot = { batch: (await batchLifecycleViewsInTx(tx, command.tenantId, [row]))[0]! };
-
-      await this.outbox.append(tx, {
-        messageId: uuidv7(),
-        tenantId: command.tenantId,
-        type: 'batch.unblocked',
-        occurredAt: at,
-        payload: { batchId: row.id, skuId: row.skuId, code: row.code, reason: locked.blockedReason, note },
-      });
-      await tx.insert(auditEvents).values({
-        id: uuidv7(),
-        tenantId: command.tenantId,
-        actorUserId: command.actorUserId,
-        action: 'batch.unblocked',
-        targetType: 'batch',
-        targetId: row.id,
-        reference: idempotencyKey,
-        changes: {
-          status: { before: 'blocked', after: 'active' },
-          reason: { before: locked.blockedReason, after: null },
-          // `before` is the block's own note (cleared from the row now);
-          // `after` is why the block was lifted.
-          note: { before: locked.blockedNote, after: note },
-          blockedAt: { before: canonical(locked.blockedAt), after: null },
-          blockedBy: { before: locked.blockedBy, after: null },
-        },
-        occurredAt: nowIso(),
-      });
       await this.storeKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
       return snapshot;
     });
+  }
+
+  // ── story 3-7a: the in-transaction seams a recall composes (A1, A3) ──────
+
+  /** Block one locked, active batch inside the caller's transaction (the recall's open). */
+  async blockInTx(tx: TenantTx, input: ApplyBatchBlockInput): Promise<BatchRow> {
+    return applyBatchBlockInTx(tx, this.outbox, input);
+  }
+
+  /** Unblock one locked, blocked batch inside the caller's transaction (the recall's close). */
+  async unblockInTx(tx: TenantTx, input: ApplyBatchUnblockInput): Promise<BatchRow> {
+    return applyBatchUnblockInTx(tx, this.outbox, input);
   }
 
   /** Lock the batch row in the tenant, 404 when absent — nothing else (guide §1, the `loadOpenPo` lesson). */

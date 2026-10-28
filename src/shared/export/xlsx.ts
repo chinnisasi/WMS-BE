@@ -44,6 +44,28 @@ export async function buildXlsx(
   columns: readonly ExportColumn[],
   rows: readonly (readonly ExportCell[])[],
 ): Promise<Buffer> {
+  return buildXlsxWorkbook([{ name: sheetName, columns, rows }]);
+}
+
+/** One worksheet of a workbook: its name, typed columns and rows. */
+export interface XlsxSheet {
+  readonly name: string;
+  readonly columns: readonly ExportColumn[];
+  readonly rows: readonly (readonly ExportCell[])[] | AsyncIterable<readonly ExportCell[]>;
+}
+
+/**
+ * Story 3-7a — several worksheets in ONE `.xlsx` file (the recall report's
+ * "Recall" facts sheet beside its trace), each written exactly as `buildXlsx`
+ * writes its one sheet — which is now this function with a single sheet, so
+ * its bytes are unchanged (pinned by `test/recalls.spec.ts` against the
+ * single-sheet path, and by `test/registers.spec.ts`). A sheet's rows may be
+ * an ASYNC iterable: each row is committed to the streaming writer as it
+ * arrives, so a large trace is never held as cells — only the (compressed)
+ * file is, and a refusal the iterable throws mid-way (a row cap) discards the
+ * whole workbook.
+ */
+export async function buildXlsxWorkbook(sheets: readonly XlsxSheet[]): Promise<Buffer> {
   const sink = new PassThrough();
   const chunks: Buffer[] = [];
   sink.on('data', (chunk: Buffer) => chunks.push(chunk));
@@ -54,21 +76,23 @@ export async function buildXlsx(
   finished.catch(() => undefined);
 
   const workbook = new excelStream.xlsx.WorkbookWriter({ stream: sink, useSharedStrings: false, useStyles: true });
-  // Excel caps a sheet name at 31 characters and refuses `[]:*?/\`.
-  const sheet = workbook.addWorksheet(sheetName.replace(/[[\]:*?/\\]/g, '-').slice(0, 31));
-  sheet.columns = columns.map((column) => ({
-    header: column.header,
-    key: column.header,
-    width: Math.max(10, Math.min(40, column.header.length + 2)),
-    ...(column.kind === 'instant' || column.kind === 'date' ? { style: { numFmt: NUMBER_FORMAT[column.kind] } } : {}),
-  }));
-  for (const row of rows) {
-    if (row.length !== columns.length) {
-      throw new TypeError(`XLSX row has ${row.length} cells for ${columns.length} columns`);
+  for (const { name, columns, rows } of sheets) {
+    // Excel caps a sheet name at 31 characters and refuses `[]:*?/\`.
+    const sheet = workbook.addWorksheet(name.replace(/[[\]:*?/\\]/g, '-').slice(0, 31));
+    sheet.columns = columns.map((column) => ({
+      header: column.header,
+      key: column.header,
+      width: Math.max(10, Math.min(40, column.header.length + 2)),
+      ...(column.kind === 'instant' || column.kind === 'date' ? { style: { numFmt: NUMBER_FORMAT[column.kind] } } : {}),
+    }));
+    for await (const row of rows) {
+      if (row.length !== columns.length) {
+        throw new TypeError(`XLSX row has ${row.length} cells for ${columns.length} columns`);
+      }
+      sheet.addRow(row.map((value, index) => xlsxValue(columns[index]!, value))).commit();
     }
-    sheet.addRow(row.map((value, index) => xlsxValue(columns[index]!, value))).commit();
+    sheet.commit();
   }
-  sheet.commit();
   await workbook.commit();
   await finished;
   return Buffer.concat(chunks);
