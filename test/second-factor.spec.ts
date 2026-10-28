@@ -380,7 +380,8 @@ describe('two-factor sign-in (e2e, story 6-1b)', () => {
       expect(first.body).toMatchObject({ challenge: 'enroll', expiresInSeconds: 600, enrolmentCodeRequired: false });
       expect(first.body.otpauthUri).toContain(`otpauth://totp/WMS%20(2FA%20`);
       expect(first.body.otpauthUri).toContain(`secret=${first.body.secret as string}`);
-      expect(first.headers['set-cookie']).toBeUndefined();
+      // Story 6-1c (A1) — still no refresh cookie (no session exists); only the device cookie a right password earns.
+      expect(((first.headers['set-cookie'] as unknown as string[] | undefined) ?? []).map((line) => line.split('=')[0])).toEqual(['wms_device']);
       // AC: right password only → no session row.
       expect(await sql`select id from sessions where user_id = ${t.ownerId}`).toHaveLength(0);
 
@@ -410,7 +411,8 @@ describe('two-factor sign-in (e2e, story 6-1b)', () => {
       const first = await passwordStep(t.email).expect(200);
       expect(Object.keys(first.body).sort()).toEqual(['challenge', 'challengeToken', 'expiresInSeconds']);
       expect(first.body).toMatchObject({ challenge: 'totp', expiresInSeconds: 300 });
-      expect(first.headers['set-cookie']).toBeUndefined();
+      // Story 6-1c (A1) — still no refresh cookie (no session exists); only the device cookie a right password earns.
+      expect(((first.headers['set-cookie'] as unknown as string[] | undefined) ?? []).map((line) => line.split('=')[0])).toEqual(['wms_device']);
       expect(await sql`select id from sessions where user_id = ${t.ownerId}`).toHaveLength(before.length);
       const { code } = await nextTotpCode(t.email);
       const done = await codeStep(first.body.challengeToken as string, code).expect(200);

@@ -186,6 +186,7 @@ export class MailSender {
           if (!TEMPLATES.has(row.template) || config.webBaseUrl === null) throw new Error('cannot render');
           const rendered = renderEmail(row.template as EmailTemplate, row.params, {
             tenantId: row.tenantId,
+            to: row.toEmail,
             webBaseUrl: config.webBaseUrl,
             secret,
           });

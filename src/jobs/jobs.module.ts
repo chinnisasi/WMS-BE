@@ -29,6 +29,7 @@ import { AUDIT_EXPORT_STALE_MINUTES } from '../modules/tenancy/audit-export.runn
 import { purgeEndedSessions } from '../modules/tenancy/sessions';
 import { purgeAuthCounters } from '../modules/tenancy/auth-attempts';
 import { purgeSecondFactorState } from '../modules/tenancy/second-factor';
+import { purgeResetTokens } from '../modules/tenancy/password-reset';
 import { ComplianceModule } from '../modules/compliance/compliance.module';
 import { MailModule } from '../modules/mail/mail.module';
 import { AttachmentsModule } from '../modules/attachments/attachments.module';
@@ -2007,6 +2008,20 @@ export class SessionPurgeWorker implements OnApplicationBootstrap, BeforeApplica
         );
       } catch (error) {
         this.logger.error(`Second-factor purge failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      // Story 6-1c — its own block: reset tokens expired or spent over a day
+      // ago, per tenant (A19: one beat per tenant inside).
+      this.ticks.beat();
+      try {
+        await purgeResetTokens(
+          this.db,
+          this.authDb,
+          (tenantId, error) =>
+            this.logger.error(`Reset-token purge failed for tenant ${tenantId}: ${error instanceof Error ? error.message : String(error)}`),
+          () => this.ticks.beat(),
+        );
+      } catch (error) {
+        this.logger.error(`Reset-token purge failed: ${error instanceof Error ? error.message : String(error)}`);
       }
       return purged;
     } finally {

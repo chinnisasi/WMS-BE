@@ -126,4 +126,5 @@ const SESSION_END_DETAIL: Record<SessionEndReason, string> = {
   legacy: 'Sessions were upgraded — sign in again.',
   'second-factor-reset': 'An owner reset your two-factor sign-in — sign in and set it up again.',
   'second-factor-changed': 'Your two-factor settings changed on another device — sign in again.',
+  'password-reset': 'Your password was reset — sign in with the new password.',
 };

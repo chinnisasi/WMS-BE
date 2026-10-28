@@ -578,6 +578,66 @@ export class SecondFactorSignInDto {
   enrolmentCode?: string;
 }
 
+/** Story 6-1c — asks for a password-reset link. */
+export class PasswordResetRequestDto {
+  @ApiProperty({ example: 'priya@example.com', format: 'email' })
+  @Trimmed()
+  @IsEmail()
+  email!: string;
+}
+
+/** Story 6-1c — the one answer `POST /tenants/password-reset` gives, for every email. */
+export class PasswordResetRequestedResponse {
+  @ApiProperty({ example: "If an account exists for that email, we've sent a link to reset its password. It expires in 60 minutes." })
+  message!: string;
+}
+
+/** Story 6-1c — the reset link's token (from the link's fragment). */
+export class PasswordResetCheckDto {
+  @ApiProperty({ description: 'The token from the reset link (`#token=…`)' })
+  @IsString()
+  @Length(1, 200)
+  token!: string;
+}
+
+export class PasswordResetCheckResponse {
+  @ApiProperty({ example: 'priya@example.com', description: 'The account the link resets' })
+  email!: string;
+
+  @ApiProperty({ format: 'date-time', description: 'When the link stops working' })
+  expiresAt!: string;
+
+  @ApiProperty({ description: 'The account uses two-factor sign-in: the confirm needs a code (TOTP or backup)' })
+  secondFactorRequired!: boolean;
+}
+
+export class PasswordResetConfirmDto {
+  @ApiProperty({ description: 'The token from the reset link (`#token=…`)' })
+  @IsString()
+  @Length(1, 200)
+  token!: string;
+
+  @ApiProperty({ example: 'correct-horse-battery', minLength: 8, maxLength: 200 })
+  @IsString()
+  @Length(8, 200)
+  password!: string;
+
+  @ApiProperty({
+    required: false,
+    example: '123456',
+    description: 'Required when `secondFactorRequired`: a 6-digit code from the authenticator app, or a backup code `XXXXX-XXXXX`',
+  })
+  @IsOptional()
+  @IsString()
+  @Length(1, 40)
+  code?: string;
+}
+
+export class PasswordResetConfirmResponse {
+  @ApiProperty({ example: 'priya@example.com', description: 'The account whose password was set — sign in with it' })
+  email!: string;
+}
+
 /** Story 6-1b — the second step's answer: the sign-in body, plus what this step adds. */
 export class SecondFactorSignInResponse extends SignInResponse {
   @ApiProperty({

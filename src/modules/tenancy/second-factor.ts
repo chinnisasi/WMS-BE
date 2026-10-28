@@ -7,7 +7,7 @@ import { userBackupCodes } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
-import { hitRateLimit, minutesText, SIGNIN_LIMIT_PER_IP_PER_MINUTE } from './auth-attempts';
+import { hitRateLimit, ipKey, minutesText, SIGNIN_LIMIT_PER_IP_PER_MINUTE } from './auth-attempts';
 import { auditSecurityEventInTx, hashSecret, newSecret, sameHash } from './sessions';
 import {
   backupCodeHash,
@@ -433,6 +433,15 @@ export interface VerifyInput {
   readonly invalidStatus: 401 | 422;
   /** The reset's one-time code, checked on an `enroll` challenge when the user holds one. */
   readonly enrolmentCode?: string | null;
+  /**
+   * Story 6-1c (A8) — where a wrong code is counted. `'user'` (the default:
+   * every 6-1b caller, unchanged) feeds the user's escalating lock. A
+   * password-reset page counts on its token instead (`password_resets.
+   * code_failures`; the 5th wrong code spends it): the user's live 2FA lock
+   * is HONOURED (423) but never fed, so a mailbox holder alone cannot lock
+   * an owner's second factor — and tx2 resets no user counter.
+   */
+  readonly countOn?: 'user' | { readonly resetId: string };
 }
 
 export interface VerifiedFactor {
@@ -447,10 +456,14 @@ export interface VerifiedFactor {
   /** The wrong-code detail this attempt answers (the enrolment step after a reset names both codes). */
   readonly invalidDetail?: string;
   readonly match: { readonly kind: 'totp'; readonly step: number } | { readonly kind: 'backup'; readonly hashes: readonly string[] };
+  /** Story 6-1c (A8) — the reset token the attempt was counted on (absent: the user). */
+  readonly resetId?: string;
 }
 
 type Tx1Outcome =
   | { readonly kind: 'challenge-ended' }
+  /** Story 6-1c — the reset token is spent, expired, out of attempts or not this user's. */
+  | { readonly kind: 'reset-ended' }
   | { readonly kind: 'no-factor' }
   | { readonly kind: 'unavailable' }
   | { readonly kind: 'locked'; readonly retryAfterSeconds: number | null }
@@ -480,12 +493,16 @@ export async function verifySecondFactorInput(
   db: Database,
   input: VerifyInput,
   missingFactor: () => ProblemException = challengeEnded,
+  /** Story 6-1c — the refusal when the reset token (`countOn.resetId`) is no longer usable. */
+  resetEnded: () => ProblemException = challengeEnded,
 ): Promise<VerifiedFactor> {
-  // 1. The per-IP attempt limit.
-  await hitRateLimit(db, `second-factor-ip:${input.ip}`, SIGNIN_LIMIT_PER_IP_PER_MINUTE);
+  // 1. The per-IP attempt limit (story 6-1c, A11: the address key — an IPv6 /64).
+  await hitRateLimit(db, `second-factor-ip:${ipKey(input.ip)}`, SIGNIN_LIMIT_PER_IP_PER_MINUTE);
+  const resetId = typeof input.countOn === 'object' ? input.countOn.resetId : undefined;
 
   // 2. tx1 — validate, check the lock, open the secret, count, commit.
   const outcome = await withTenantTransaction(db, input.tenantId, (tx) => countAttemptInTx(tx, input));
+  if (outcome.kind === 'reset-ended') throw resetEnded();
   if (outcome.kind === 'challenge-ended') throw challengeEnded();
   if (outcome.kind === 'no-factor') throw missingFactor();
   if (outcome.kind === 'unavailable') throw secondFactorUnavailable();
@@ -516,7 +533,10 @@ export async function verifySecondFactorInput(
   }
   const invalidDetail = enrolmentStep ? ENROLMENT_INVALID_DETAIL : undefined;
   if (match === null) {
-    const left = await settleWrongCode(db, input.tenantId, input.userId, input.ip, input.challenge?.id ?? null);
+    const left =
+      resetId === undefined
+        ? await settleWrongCode(db, input.tenantId, input.userId, input.ip, input.challenge?.id ?? null)
+        : await settleWrongResetCode(db, input.tenantId, resetId);
     throw secondFactorInvalid(input.invalidStatus, left, invalidDetail);
   }
   return {
@@ -529,6 +549,7 @@ export async function verifySecondFactorInput(
     invalidStatus: input.invalidStatus,
     ...(invalidDetail === undefined ? {} : { invalidDetail }),
     match,
+    ...(resetId === undefined ? {} : { resetId }),
   };
 }
 
@@ -584,6 +605,22 @@ async function countAttemptInTx(tx: TenantTx, input: VerifyInput): Promise<Tx1Ou
     }
     purpose = row.purpose;
   }
+  // Story 6-1c (A8, A9) — a reset page's attempt: the token row, locked
+  // AFTER the user (the user-then-token order everywhere), must be open,
+  // unexpired, under its attempt limit and this user's.
+  const resetId = typeof input.countOn === 'object' ? input.countOn.resetId : undefined;
+  if (resetId !== undefined) {
+    const rows = (await tx.execute(sql`
+      select user_id, code_failures, (consumed_at is null and expires_at > now()) as open
+        from password_resets
+       where id = ${resetId} and tenant_id = ${input.tenantId}
+       for update
+    `)) as unknown as Array<{ user_id: string; code_failures: number; open: boolean }>;
+    const row = rows[0];
+    if (row === undefined || !row.open || row.code_failures >= MAX_SECOND_FACTOR_FAILURES || row.user_id !== userId) {
+      return { kind: 'reset-ended' };
+    }
+  }
 
   if (user === undefined || user.status !== 'active') return { kind: 'challenge-ended' };
   if (user.locked) {
@@ -608,8 +645,9 @@ async function countAttemptInTx(tx: TenantTx, input: VerifyInput): Promise<Tx1Ou
     return { kind: 'unavailable' };
   }
   // Backstop: a count already at the limit with no lock (a crash between the
-  // count and the settle) locks now.
-  if (user.mfa_failures >= MAX_SECOND_FACTOR_FAILURES) {
+  // count and the settle) locks now. Never on a reset page (A8: the user's
+  // counters are honoured, never fed).
+  if (resetId === undefined && user.mfa_failures >= MAX_SECOND_FACTOR_FAILURES) {
     const lock = await setLockInTx(tx, input.tenantId, userId);
     if (lock !== null) {
       await auditSecurityEventInTx(tx, {
@@ -624,10 +662,17 @@ async function countAttemptInTx(tx: TenantTx, input: VerifyInput): Promise<Tx1Ou
     }
   }
 
-  await tx.execute(sql`
-    update users set mfa_failures = mfa_failures + 1, mfa_failed_since_success = mfa_failed_since_success + 1
-     where tenant_id = ${input.tenantId} and id = ${userId}
-  `);
+  if (resetId !== undefined) {
+    await tx.execute(sql`
+      update password_resets set code_failures = code_failures + 1
+       where id = ${resetId} and tenant_id = ${input.tenantId}
+    `);
+  } else {
+    await tx.execute(sql`
+      update users set mfa_failures = mfa_failures + 1, mfa_failed_since_success = mfa_failed_since_success + 1
+       where tenant_id = ${input.tenantId} and id = ${userId}
+    `);
+  }
   if (input.challenge !== undefined) {
     await tx.execute(sql`
       update sign_in_challenges set failures = failures + 1
@@ -709,6 +754,25 @@ async function settleWrongCode(
   });
 }
 
+/**
+ * Story 6-1c (A8) — after a wrong code on a reset page: the token's count
+ * stands (tx1 committed it); the 5th spends the token. Answers the attempts
+ * really left on it. The user's 2FA counters are untouched.
+ */
+async function settleWrongResetCode(db: Database, tenantId: string, resetId: string): Promise<number> {
+  return withTenantTransaction(db, tenantId, async (tx) => {
+    const rows = (await tx.execute(sql`
+      update password_resets
+         set consumed_at = case when code_failures >= ${MAX_SECOND_FACTOR_FAILURES} and consumed_at is null
+                                then now() else consumed_at end
+       where id = ${resetId} and tenant_id = ${tenantId}
+      returning code_failures
+    `)) as unknown as Array<{ code_failures: number }>;
+    const row = rows[0];
+    return row === undefined ? 0 : Math.max(0, MAX_SECOND_FACTOR_FAILURES - row.code_failures);
+  });
+}
+
 /** A step already spent or a backup code already used, found under tx2's lock. */
 class SecondFactorReuse extends Error {}
 
@@ -728,7 +792,10 @@ export async function withCommittedFactor<T>(
     return await withTenantTransaction(db, verified.tenantId, async (tx) => work(tx, await commitSecondFactorInTx(tx, verified, options)));
   } catch (error) {
     if (!(error instanceof SecondFactorReuse)) throw error;
-    const left = await settleWrongCode(db, verified.tenantId, verified.userId, verified.ip, verified.challenge?.id ?? null);
+    const left =
+      verified.resetId === undefined
+        ? await settleWrongCode(db, verified.tenantId, verified.userId, verified.ip, verified.challenge?.id ?? null)
+        : await settleWrongResetCode(db, verified.tenantId, verified.resetId);
     throw secondFactorInvalid(verified.invalidStatus, left, verified.invalidDetail);
   }
 }
@@ -809,6 +876,9 @@ export async function commitSecondFactorInTx(
     await tx.execute(sql`update sign_in_challenges set consumed_at = now() where tenant_id = ${tenantId} and id = ${verified.challenge.id}`);
   }
   const failedSinceSuccess = Math.max(0, user.mfa_failed_since_success - 1);
+  // Story 6-1c (A8) — a reset page counted nothing on the user, so it resets
+  // nothing on the user (a live lock was refused at tx1).
+  if (verified.resetId !== undefined) return { failedSinceSuccess: user.mfa_failed_since_success, usedBackupCode };
   await tx.execute(sql`
     update users set mfa_failures = 0, mfa_lock_cycles = 0, mfa_locked_until = null,
                      mfa_failed_since_success = ${options.signIn ? 0 : failedSinceSuccess}

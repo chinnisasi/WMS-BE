@@ -1192,7 +1192,10 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // the 0041 shape on its own client_id) and batch_recall_lines
       // (tenant-only; the portal reaches a line only through its recall).
       // Retargeted 143 → 145.
-      expect(policies).toHaveLength(145);
+      // Story 6-1c: + one (0103) — password_resets, tenant-only (no portal
+      // read; a reset token is the user's, looked up on AUTH_DATABASE).
+      // Retargeted 145 → 146.
+      expect(policies).toHaveLength(146);
       {
         const recalls = policies.find((row) => row.policyname === 'batch_recalls_tenant_isolation')!;
         expect(recalls.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");

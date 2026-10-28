@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isIPv6 } from 'node:net';
 import { sql } from 'drizzle-orm';
 import type { Database } from '../../shared/db/db';
 import type { TenantTx } from '../../shared/db/tenant-scope';
@@ -19,13 +20,83 @@ import { ProblemException } from '../../shared/problem-details/problem.exception
  *   own network.
  * - PIN (A1): keyed on the device — the PIN is the device's.
  * - Attempt limits (A2): sign-in per client IP, badge-in per device; fixed
- *   one-minute windows in `auth_rate_limits`.
+ *   windows in `auth_rate_limits` (one minute, or — story 6-1c — the hour and
+ *   day windows a bucket names; every window is epoch-aligned, so a day
+ *   window starts at 00:00 UTC = 05:30 IST).
+ *
+ * Story 6-1c — every per-address key is an `IpKey` (`ipKey`: an IPv4 address
+ * as it is, an IPv6 address cut to its /64), so one host rotating through
+ * its /64 is one key. Untrusted sign-in attempts (no valid `wms_device`
+ * cookie) also meet an account-hour and an address-hour bucket; a trusted
+ * attempt counts on its own cookie (`deviceAttemptKey`) and meets neither.
  */
 
 export const MAX_CONSECUTIVE_FAILURES = 5;
 export const LOCK_SECONDS = 15 * 60;
 export const SIGNIN_LIMIT_PER_IP_PER_MINUTE = 300;
 export const BADGE_IN_LIMIT_PER_DEVICE_PER_MINUTE = 30;
+
+/** Story 6-1c — untrusted sign-in attempts per account (email digest, any email) per hour. */
+export const SIGNIN_UNTRUSTED_LIMIT_PER_ACCOUNT_PER_HOUR = 20;
+/** Story 6-1c — untrusted sign-in attempts per address key per hour. */
+export const SIGNIN_UNTRUSTED_LIMIT_PER_IP_PER_HOUR = 200;
+/** Story 6-1c — reset requests per address key per hour (429 past it). */
+export const RESET_REQUEST_LIMIT_PER_IP_PER_HOUR = 20;
+/** Story 6-1c — reset checks and confirms per address key per minute. */
+export const RESET_LIMIT_PER_IP_PER_MINUTE = 30;
+/** Story 6-1c (A8) — second-factor codes tried on reset pages per user per day (5 tokens × 5). */
+export const RESET_CODE_LIMIT_PER_USER_PER_DAY = 25;
+
+export const ONE_HOUR_SECONDS = 60 * 60;
+export const ONE_DAY_SECONDS = 24 * 60 * 60;
+
+declare const attemptKeyBrand: unique symbol;
+/**
+ * Story 6-1c (A11) — the key a lockout pair is counted on: an address key
+ * (`ipKey`) or a device cookie's nonce (`deviceAttemptKey`). Branded, so a
+ * raw address can never reach a counter by accident.
+ */
+export type AttemptKey = string & { readonly [attemptKeyBrand]: true };
+declare const ipKeyBrand: unique symbol;
+export type IpKey = AttemptKey & { readonly [ipKeyBrand]: true };
+
+/**
+ * Story 6-1c (A11) — the ONE address key every per-address limit and lock
+ * uses: an IPv6 address (any zone dropped, `::` expanded, lower-cased,
+ * leading zeros dropped) cut to its /64 as `a:b:c:d::/64`; an IPv4-mapped
+ * IPv6 address in hex form keys as its IPv4 address; IPv4 (already
+ * normalised by `clientIpOf`), `unknown` and anything else pass through
+ * unchanged. Audit references keep the full address.
+ */
+export function ipKey(address: string): IpKey {
+  const bare = address.split('%')[0]!;
+  if (!isIPv6(bare)) return address as IpKey;
+  const hextets = expandIpv6(bare.toLowerCase());
+  if (hextets.slice(0, 5).every((h) => h === 0) && hextets[5] === 0xffff) {
+    return `${hextets[6]! >> 8}.${hextets[6]! & 0xff}.${hextets[7]! >> 8}.${hextets[7]! & 0xff}` as IpKey;
+  }
+  return `${hextets.slice(0, 4).map((h) => h.toString(16)).join(':')}::/64` as IpKey;
+}
+
+/** The eight hextets of a valid IPv6 address (an embedded IPv4 tail becomes the last two). */
+function expandIpv6(address: string): number[] {
+  let text = address;
+  const tail = /(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(text);
+  if (tail !== null) {
+    const [a, b, c, d] = tail.slice(1).map(Number) as [number, number, number, number];
+    text = `${text.slice(0, tail.index)}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+  const [head, rest] = text.includes('::') ? (text.split('::') as [string, string]) : [text, null];
+  const left = head === '' ? [] : head.split(':');
+  const right = rest === null || rest === '' ? [] : rest.split(':');
+  const fill = rest === null ? [] : Array.from({ length: 8 - left.length - right.length }, () => '0');
+  return [...left, ...fill, ...right].map((h) => Number.parseInt(h, 16));
+}
+
+/** Story 6-1c (A2) — a trusted attempt's lockout key: its device cookie's nonce. */
+export function deviceAttemptKey(nonce: string): AttemptKey {
+  return `device:${nonce}` as AttemptKey;
+}
 
 export function emailDigest(email: string): string {
   return createHash('sha256').update(email.trim().toLowerCase(), 'utf8').digest('hex');
@@ -56,7 +127,10 @@ export function rateLimited(retryAfterSeconds: number): ProblemException {
     'rate-limited',
     429,
     'Too many attempts',
-    `Too many attempts. Try again in ${retryAfterSeconds} seconds.`,
+    // Story 6-1c (A12) — an hour bucket's wait is said in minutes.
+    retryAfterSeconds > 120
+      ? `Too many attempts. Try again in ${minutesText(retryAfterSeconds)}.`
+      : `Too many attempts. Try again in ${retryAfterSeconds} seconds.`,
     { retryAfterSeconds },
   );
 }
@@ -66,29 +140,54 @@ export function minutesText(seconds: number): string {
   return minutes === 1 ? '1 minute' : `${minutes} minutes`;
 }
 
+/** The hit a refund gives back: the bucket and the window it was counted in. */
+export interface RateLimitHit {
+  readonly bucket: string;
+  readonly windowStart: string;
+}
+
 /**
- * One hit on a fixed one-minute window. Throws 429 `rate-limited` past the
- * limit. Autocommitted on its own (no surrounding transaction).
+ * One hit on a fixed window of `windowSeconds` (default one minute; story
+ * 6-1c — each bucket name has ONE fixed window). The window starts at
+ * `to_timestamp(floor(epoch / w) * w)` — for w = 60 that is
+ * `date_trunc('minute', now())`. Throws 429 `rate-limited` past the limit,
+ * with `retryAfterSeconds` to the window's own end. Autocommitted on its own
+ * (no surrounding transaction).
  */
-export async function hitRateLimit(db: Database, bucket: string, limit: number): Promise<void> {
+export async function hitRateLimit(db: Database, bucket: string, limit: number, windowSeconds = 60): Promise<RateLimitHit> {
+  const windowStart = sql`to_timestamp(floor(extract(epoch from now()) / ${windowSeconds}) * ${windowSeconds})`;
   const rows = (await db.execute(sql`
     insert into auth_rate_limits (bucket, window_start, count)
-    values (${bucket}, date_trunc('minute', now()), 1)
+    values (${bucket}, ${windowStart}, 1)
     on conflict (bucket) do update set
-      count = case when auth_rate_limits.window_start = date_trunc('minute', now())
+      count = case when auth_rate_limits.window_start = ${windowStart}
                    then auth_rate_limits.count + 1 else 1 end,
-      window_start = date_trunc('minute', now())
-    returning count,
-      greatest(1, ceil(extract(epoch from (date_trunc('minute', now()) + interval '1 minute' - now()))))::int as retry_after
-  `)) as unknown as Array<{ count: number; retry_after: number }>;
+      window_start = ${windowStart}
+    returning count, window_start::text as window_start,
+      greatest(1, ceil(extract(epoch from (${windowStart} + make_interval(secs => ${windowSeconds}) - now()))))::int as retry_after
+  `)) as unknown as Array<{ count: number; window_start: string; retry_after: number }>;
   const row = rows[0]!;
   if (row.count > limit) throw rateLimited(row.retry_after);
+  return { bucket, windowStart: row.window_start };
+}
+
+/**
+ * Story 6-1c (B7) — gives one hit back: a right password must not use up
+ * anyone's untrusted budget. Only in the window it was counted in (a window
+ * that has rolled over since starts from zero anyway).
+ */
+export async function refundRateLimit(db: Database, hit: RateLimitHit): Promise<void> {
+  await db.execute(sql`
+    update auth_rate_limits set count = greatest(0, count - 1)
+     where bucket = ${hit.bucket} and window_start = ${hit.windowStart}::timestamptz
+  `);
 }
 
 type Counted = { failures: number; locked: boolean; retry_after: number };
 
 /**
- * Counts a sign-in attempt for (email, IP) before the password is checked.
+ * Counts a sign-in attempt for (email, key) before the password is checked —
+ * the key is the address key, or (story 6-1c) a trusted attempt's device key.
  * A lapsed lock starts a fresh count. Throws 423 while locked, and locks (and
  * throws) when this attempt is past the limit — a parallel burst never
  * reaches scrypt.
@@ -101,7 +200,7 @@ export interface AttemptCount {
   readonly newlyLocked: boolean;
 }
 
-export async function countSignInAttempt(db: Database, email: string, ip: string): Promise<AttemptCount> {
+export async function countSignInAttempt(db: Database, email: string, ip: AttemptKey): Promise<AttemptCount> {
   const rows = (await db.execute(sql`
     insert into signin_attempts (email_hash, ip, failures, updated_at)
     values (${emailDigest(email)}, ${ip}, 1, now())
@@ -126,7 +225,7 @@ export async function countSignInAttempt(db: Database, email: string, ip: string
 }
 
 /** A wrong password on the attempt that reached the limit locks the pair. */
-export async function settleSignInFailure(db: Database, email: string, ip: string): Promise<boolean> {
+export async function settleSignInFailure(db: Database, email: string, ip: AttemptKey): Promise<boolean> {
   const rows = (await db.execute(sql`
     update signin_attempts
        set locked_until = now() + make_interval(secs => ${LOCK_SECONDS}), updated_at = now()
@@ -138,7 +237,7 @@ export async function settleSignInFailure(db: Database, email: string, ip: strin
 }
 
 /** A correct password resets the pair's count. */
-export async function clearSignInAttempts(db: Database, email: string, ip: string): Promise<void> {
+export async function clearSignInAttempts(db: Database, email: string, ip: AttemptKey): Promise<void> {
   await db.execute(sql`delete from signin_attempts where email_hash = ${emailDigest(email)} and ip = ${ip}`);
 }
 

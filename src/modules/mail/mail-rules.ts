@@ -3,8 +3,12 @@
  * classification table. Pure: no database, no network, no env.
  */
 
-/** The code-defined templates (`templates/*.ts`). Mirrored by `email_messages_template_check` (0089). */
-export const EMAIL_TEMPLATES = ['user-invite'] as const;
+/**
+ * The code-defined templates (`templates/*.ts`). Mirrored by
+ * `email_messages_template_check` (0089; story 6-1c re-added it in 0103 with
+ * the reset link and the password-changed notice).
+ */
+export const EMAIL_TEMPLATES = ['user-invite', 'password-reset', 'password-changed'] as const;
 export type EmailTemplate = (typeof EMAIL_TEMPLATES)[number];
 
 /**

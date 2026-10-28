@@ -72,10 +72,10 @@ describe('the invite email (story 5-1a)', () => {
   });
 
   it('renderEmail builds the accept link from the base URL and the opened secret, and refuses a missing secret or bad params', () => {
-    const mail = renderEmail('user-invite', PARAMS, { tenantId: 't-1', webBaseUrl: 'https://app.wms.in', secret: 'tok_en-1' });
+    const mail = renderEmail('user-invite', PARAMS, { tenantId: 't-1', to: 'a@x.in', webBaseUrl: 'https://app.wms.in', secret: 'tok_en-1' });
     expect(mail.text).toContain(URL_);
-    expect(() => renderEmail('user-invite', PARAMS, { tenantId: 't-1', webBaseUrl: 'https://app.wms.in', secret: null })).toThrow();
-    expect(() => renderEmail('user-invite', { ...PARAMS, tenantName: 5 }, { tenantId: 't-1', webBaseUrl: 'https://app.wms.in', secret: 's' })).toThrow();
+    expect(() => renderEmail('user-invite', PARAMS, { tenantId: 't-1', to: 'a@x.in', webBaseUrl: 'https://app.wms.in', secret: null })).toThrow();
+    expect(() => renderEmail('user-invite', { ...PARAMS, tenantName: 5 }, { tenantId: 't-1', to: 'a@x.in', webBaseUrl: 'https://app.wms.in', secret: 's' })).toThrow();
     expect(() => decodeInviteParams({ ...PARAMS, expiresAt: 'soon' })).toThrow();
   });
 

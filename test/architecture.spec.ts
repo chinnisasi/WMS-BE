@@ -3410,6 +3410,23 @@ describe('architecture: no suite deletes the audit guard\'s evidence before the 
   });
 });
 
+describe('architecture: the device cookie’s key has one home (story 6-1c, A1)', () => {
+  const OWNER = join(SRC_ROOT, 'modules', 'tenancy', 'device-cookie.ts');
+  /** The HKDF info string, or an HKDF over the session secret — the key derivation itself. */
+  const DERIVES = /['"]device-cookie['"]|hkdf(?:Sync)?\s*\([^)]*(?:tenantSessionSecret|JWT_SECRET)/;
+
+  it('only device-cookie.ts names the `device-cookie` info or derives a key from the session secret', () => {
+    expect(DERIVES.test("hkdfSync('sha256', tenantSessionSecret(), salt, 'x', 32)")).toBe(true);
+    expect(DERIVES.test("hkdfSync('sha256', mfaKey, salt, 'backup-codes', 32)")).toBe(false);
+    const source = files.filter((file) => !file.path.endsWith('.spec.ts'));
+    expect(source.filter((file) => DERIVES.test(file.source)).map((file) => file.path)).toEqual([OWNER]);
+    // Meaningful: the owner derives from JWT_SECRET through tenantSessionSecret, bound to the password hash.
+    const owner = readFileSync(OWNER, 'utf8');
+    expect(owner).toContain("hkdfSync('sha256', tenantSessionSecret()");
+    expect(owner).toContain('passwordHash');
+  });
+});
+
 describe('architecture: the second factor’s key material has one home (story 6-1b; story 5-1a extracted seal.ts)', () => {
   const tenancyRoot = join(SRC_ROOT, 'modules', 'tenancy');
   const SECRETS_OWNER = join(tenancyRoot, 'second-factor-secrets.ts');

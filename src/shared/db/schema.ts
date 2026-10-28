@@ -248,6 +248,38 @@ export const userBackupCodes = pgTable(
 );
 
 /**
+ * Story 6-1c — a password-reset link's token. `<id>.<secret>`, the secret
+ * stored as sha256 (the 6-1b challenge precedent). One user holds at most
+ * five live tokens; completing any one spends them all. `code_failures`
+ * counts wrong second-factor codes tried on the reset page (0..5 — the 5th
+ * spends the token; story 6-1c A8), never on the user. `requested_ip` keeps
+ * the full address (audit), `email_message_id` the mail that carries it
+ * (cancelled when a sixth request spends this one). CHECKs and RLS live only
+ * in migration 0103.
+ */
+export const passwordResets = pgTable(
+  'password_resets',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    userId: uuid('user_id').notNull(),
+    secretHash: text('secret_hash').notNull(),
+    requestedIp: text('requested_ip').notNull(),
+    emailMessageId: uuid('email_message_id'),
+    codeFailures: integer('code_failures').notNull().default(0),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+    expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'string' }).notNull(),
+    consumedAt: timestamp('consumed_at', { withTimezone: true, mode: 'string' }),
+  },
+  (table) => [
+    index('password_resets_user_created_idx').on(table.tenantId, table.userId, table.createdAt),
+    index('password_resets_expires_at_idx').on(table.expiresAt),
+  ],
+);
+
+/**
  * Story 6-1a — password lockout counters, keyed on (sha256 of the normalised
  * email, client IP) whether or not the account exists (A3), so an unknown
  * email is indistinguishable and an attacker cannot lock an owner out of

@@ -36,6 +36,7 @@ import {
   readCookie,
   refreshCookieHeader,
 } from './session-cookie';
+import { DEVICE_COOKIE_NAME, deviceCookieHeader, issueDeviceCookie } from './device-cookie';
 
 /** Story 6-1b — the header a web build that can complete the second step sends on sign-in. */
 const SECOND_FACTOR_HEADER = 'x-wms-second-factor';
@@ -47,13 +48,14 @@ interface SessionHttpRequest {
   socket?: { remoteAddress?: string };
 }
 interface SessionHttpResponse {
-  setHeader(name: string, value: string): unknown;
+  setHeader(name: string, value: string | string[]): unknown;
 }
 // Constructor params are types here but must stay value imports: Nest DI needs
 // the runtime class tokens for decorator metadata (eslint rule bends for them).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import {
   BinCommand,
+  PasswordResetCommand,
   RegistrationCommand,
   SessionCommand,
   SecondFactorCommand,
@@ -82,6 +84,12 @@ import {
   EnrollChallengeResponse,
   SecondFactorSignInDto,
   SecondFactorSignInResponse,
+  PasswordResetRequestDto,
+  PasswordResetRequestedResponse,
+  PasswordResetCheckDto,
+  PasswordResetCheckResponse,
+  PasswordResetConfirmDto,
+  PasswordResetConfirmResponse,
   RefreshResponse,
   TenantRegistrationResponse,
   WarehouseListResponse,
@@ -134,6 +142,7 @@ export class TenancyController {
     private readonly registrationCommand: RegistrationCommand,
     private readonly signInCommand: SignInCommand,
     private readonly secondFactorCommand: SecondFactorCommand,
+    private readonly passwordResetCommand: PasswordResetCommand,
     private readonly sessionCommand: SessionCommand,
     private readonly warehouseCommand: WarehouseCommand,
     private readonly zoneCommand: ZoneCommand,
@@ -195,23 +204,31 @@ export class TenancyController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Unknown email, wrong password, or a deactivated account (unauthenticated — one answer for all three)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Invitation not yet accepted (invite-pending), a client-portal user whose client is suspended (client-suspended, story 21-7) or has departed (client-departed, story 1-2a), or — story 6-1b — an owner reset this user’s two-factor sign-in and the enrolment code has expired (enrolment-code-expired: ask for another reset; nothing counted)') })
   @ApiResponse({ status: 409, ...problemJsonResponse('Story 6-1b — the second step is needed and the client did not send `X-WMS-Second-Factor: 1` (client-outdated: "Reload this page to sign in"); nothing was written') })
-  @ApiResponse({ status: 423, ...problemJsonResponse('Too many failed attempts for this email from this address (sign-in-locked; `retryAfterSeconds`)') })
-  @ApiResponse({ status: 429, ...problemJsonResponse('Too many attempts from this address (rate-limited; `retryAfterSeconds`)') })
+  @ApiResponse({ status: 423, ...problemJsonResponse('Too many failed attempts for this email from this address — or, story 6-1c, on this browser’s device cookie (sign-in-locked; `retryAfterSeconds`)') })
+  @ApiResponse({ status: 429, ...problemJsonResponse('Too many attempts from this address, or (story 6-1c) too many untrusted attempts for this account or from this address this hour (rate-limited; `retryAfterSeconds`)') })
   async signIn(
     @Body() dto: SignInDto,
     @Req() request: SessionHttpRequest,
     @Res({ passthrough: true }) response: SessionHttpResponse,
   ): Promise<SignInResponse | TotpChallengeResponse | EnrollChallengeResponse> {
-    const outcome = await this.signInCommand.execute({
+    const { outcome, deviceCookie } = await this.signInCommand.execute({
       email: dto.email,
       password: dto.password,
       ip: clientIpOf(request),
       secondFactorCapable: request.headers[SECOND_FACTOR_HEADER] === '1',
+      deviceCookie: readCookie(request.headers.cookie, DEVICE_COOKIE_NAME),
     });
-    // Story 6-1b — a challenge creates no session and sets no cookie.
-    if ('challenge' in outcome) return outcome;
+    // Story 6-1b — a challenge creates no session and sets no refresh cookie;
+    // story 6-1c — every arm sets the device cookie (a right password).
+    if ('challenge' in outcome) {
+      response.setHeader('Set-Cookie', deviceCookieHeader(deviceCookie));
+      return outcome;
+    }
     const { refreshCookie, ...body } = outcome;
-    response.setHeader('Set-Cookie', refreshCookieHeader(refreshCookie, body.refreshExpiresInSeconds));
+    response.setHeader('Set-Cookie', [
+      refreshCookieHeader(refreshCookie, body.refreshExpiresInSeconds),
+      deviceCookieHeader(deviceCookie),
+    ]);
     return body;
   }
 
@@ -242,6 +259,72 @@ export class TenancyController {
     });
     response.setHeader('Set-Cookie', refreshCookieHeader(refreshCookie, body.refreshExpiresInSeconds));
     return body;
+  }
+
+  // ── Story 6-1c — password reset (literal paths, before any `:tenantId` route) ──
+
+  @Post('password-reset')
+  @HttpCode(HttpStatus.ACCEPTED)
+  @ApiOperation({
+    summary: 'Story 6-1c — asks for a password-reset link by email',
+    description:
+      'Unauthenticated and unkeyed. Answers 202 with ONE body for every email: a link (single use, 60 minutes) is mailed only to an active user — and for a client-portal user, only while their client is active. An unknown, invited or deactivated email queues nothing. A user holds at most 5 live links (a sixth request spends the oldest); at most 5 links are mailed per user per rolling hour (past that, the same 202 and nothing queued). 20 requests an hour per client address answer 429.',
+  })
+  @ApiBody({ type: PasswordResetRequestDto })
+  @ApiResponse({ status: HttpStatus.ACCEPTED, type: PasswordResetRequestedResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Invalid body') })
+  @ApiResponse({ status: 429, ...problemJsonResponse('Too many reset requests from this address this hour (rate-limited; `retryAfterSeconds`)') })
+  async requestPasswordReset(
+    @Body() dto: PasswordResetRequestDto,
+    @Req() request: SessionHttpRequest,
+  ): Promise<PasswordResetRequestedResponse> {
+    return this.passwordResetCommand.request({ email: dto.email, ip: clientIpOf(request) });
+  }
+
+  @Post('password-reset/check')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Story 6-1c — validates a reset link; changes nothing',
+    description:
+      'The reset page calls it on load (opening the link spends nothing). One 400 `reset-link-invalid` for a malformed, unknown, wrong, expired or spent token, a user who is not active and a client-portal user whose client is not active.',
+  })
+  @ApiBody({ type: PasswordResetCheckDto })
+  @ApiOkResponse({ type: PasswordResetCheckResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Invalid body, or the link is not valid (reset-link-invalid)') })
+  @ApiResponse({ status: 429, ...problemJsonResponse('Too many reset attempts from this address (rate-limited; `retryAfterSeconds`)') })
+  async checkPasswordReset(@Body() dto: PasswordResetCheckDto, @Req() request: SessionHttpRequest): Promise<PasswordResetCheckResponse> {
+    return this.passwordResetCommand.check({ token: dto.token, ip: clientIpOf(request) });
+  }
+
+  @Post('password-reset/confirm')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Story 6-1c — sets a new password from a reset link',
+    description:
+      'Unkeyed; signs no one in and issues no session (the next sign-in runs the lockout and, for an enrolled user, the second step unchanged). An enrolled user must send `code` (TOTP or backup code); wrong codes are counted on the link (the 5th spends it), never on the user, and a live two-factor lock answers 423. On success every session of the user ends (`password-reset`), every link is spent, open sign-in steps end, every lockout for the email clears, and a password-changed notice is mailed. Sets the `wms_device` cookie (the browser that completed the reset is trusted at its next sign-in). A retry after success answers 400 `reset-link-invalid`.',
+  })
+  @ApiBody({ type: PasswordResetConfirmDto })
+  @ApiOkResponse({ type: PasswordResetConfirmResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Invalid body (the password is 8–200 characters), or the link is not valid (reset-link-invalid)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('The account uses two-factor sign-in and no code was sent, or its factor changed since the check (second-factor-needed — nothing counted); or the code is wrong (second-factor-invalid; `attemptsLeft`)') })
+  @ApiResponse({ status: 423, ...problemJsonResponse('Two-factor sign-in is locked for this account (second-factor-locked; `retryAfterSeconds`, null until an owner unlocks)') })
+  @ApiResponse({ status: 429, ...problemJsonResponse('Too many reset attempts from this address, or too many codes tried on reset links for this account today (rate-limited; `retryAfterSeconds`)') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('The stored second-factor secret cannot be opened with the configured key (second-factor-unavailable); nothing was counted') })
+  async confirmPasswordReset(
+    @Body() dto: PasswordResetConfirmDto,
+    @Req() request: SessionHttpRequest,
+    @Res({ passthrough: true }) response: SessionHttpResponse,
+  ): Promise<PasswordResetConfirmResponse> {
+    const confirmed = await this.passwordResetCommand.confirm({
+      token: dto.token,
+      password: dto.password,
+      code: dto.code ?? null,
+      ip: clientIpOf(request),
+    });
+    // A1 — the cookie is bound to the NEW password hash; its path is the
+    // sign-in route, so the browser presents it at the next sign-in.
+    response.setHeader('Set-Cookie', deviceCookieHeader(issueDeviceCookie(confirmed.email, confirmed.passwordHash)));
+    return { email: confirmed.email };
   }
 
   @Post('session/refresh')
