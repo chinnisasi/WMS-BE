@@ -267,6 +267,9 @@ export const shopifyRevokeArm: ChannelRevokeArm = async (args) => {
   return { status: 'revoked' };
 };
 
+/** Story 4-2b — fulfillment statuses that need no cancel before the order's (never fulfilled, or already cancelled). */
+const SETTLED_FULFILLMENT_STATUSES: ReadonlySet<string> = new Set(['cancelled', 'error', 'failure']);
+
 /**
  * The Shopify writeback arm (RD-7): state-specific read-back, then the
  * write. The channel's own fulfillment state is READ (`orders/{id}/
@@ -278,10 +281,10 @@ export const shopifyRevokeArm: ChannelRevokeArm = async (args) => {
  *                fulfillment → POST tracking_info onto it; none at all →
  *                create ONE fulfillment carrying the tracking (the
  *                reordering convergence — RD-7/T5);
- *   cancelled  — channel already cancelled → noop; else POST cancel.
+ *   cancelled  — channel already cancelled → noop; else (story 4-2b) POST
+ *                fulfillments/{id}/cancel.json for each live fulfillment
+ *                (status not cancelled / error / failure), then POST cancel.
  */
-/** Story 4-2b — fulfillment statuses that need no cancel before the order's (never fulfilled, or already cancelled). */
-const SETTLED_FULFILLMENT_STATUSES: ReadonlySet<string> = new Set(['cancelled', 'error', 'failure']);
 
 export async function shopifyOrderWritebackArm(
   credential: ChannelCredential,

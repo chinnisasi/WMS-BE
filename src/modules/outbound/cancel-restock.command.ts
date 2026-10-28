@@ -38,6 +38,13 @@ import type { ShipmentStatus } from './shipment.command';
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
 /**
+ * Carriers whose labels exist only in this system (no AWB at a courier), so
+ * a cancel may void them locally (decision 8). Today the sandbox is the only
+ * label-producing carrier; the DIRECT carriers' label arms are the typed 501.
+ */
+export const LOCALLY_VOIDABLE_CARRIERS: ReadonlySet<string> = new Set(['sandbox']);
+
+/**
  * The COMMAND discriminator (outbound Gotcha 8): with no `restockBinId` the
  * hashed object would otherwise be exactly `{tenantId, orderId}` —
  * byte-identical to `cancelOrder`'s — and one key reused across the two
@@ -336,6 +343,19 @@ export class CancelRestockCommandService {
         throw shipmentManifested(order, manifested);
       }
       const labelled: Shipment | null = shipmentRows.find((row) => row.status === 'labelled') ?? null;
+      // Decision 8's precondition, enforced: a label is voided LOCALLY only
+      // while it was produced by a carrier with no AWB at a real courier.
+      // A transport story that gives a DIRECT carrier a real label arm must
+      // add its AWB cancel here before its labels can be voided.
+      if (labelled !== null && !LOCALLY_VOIDABLE_CARRIERS.has(labelled.carrierCode)) {
+        throw new ProblemException(
+          'shipment-void-unsupported',
+          409,
+          'Label cannot be voided here',
+          `Order ${orderLabel(order)}'s label ${labelled.carrierName} ${labelled.trackingNumber} was booked with the courier, and this build cannot cancel the AWB there — cancel it with ${labelled.carrierName} first. Nothing was written.`,
+          { shipmentId: labelled.id, carrierCode: labelled.carrierCode },
+        );
+      }
 
       // ── the pre-lock read: which bins, serials and cases to lock ────────
       const preEvents = await this.inventory.ledgerEventsByOrderRefInTx(tx, command.tenantId, order.warehouseId, order.id);
@@ -647,7 +667,8 @@ export class CancelRestockCommandService {
         targetType: 'order',
         targetId: order.id,
         reference: idempotencyKey,
-        occurredAt: nowIso(),
+        // One instant for the whole cancel: the ledger, outbox, void and audit agree.
+        occurredAt: restockedAt,
       });
       if (voidedRow !== null) {
         // A12 — the label precedent: the shipment's audit rows target the order.
@@ -659,7 +680,7 @@ export class CancelRestockCommandService {
           targetType: 'order',
           targetId: order.id,
           reference: idempotencyKey,
-          occurredAt: nowIso(),
+          occurredAt: restockedAt,
         });
       }
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);

@@ -10472,7 +10472,7 @@
             }
           },
           "409": {
-            "description": "The order is dispatched — receive it back as a return (order-dispatched); its shipment is manifested, naming the manifest (shipment-manifested); a destination bin refuses the intake, naming the bin, with the gate’s own code (bin-retired, bin-blocked, bin-storage-mismatch, bin-client-mismatch, bin-occupancy-conflict, bin-segregation-conflict, hazard-segregation-conflict, bin-full, bin-overweight, bin-volume-exceeded, bin-item-oversize); a (SKU, destination) under an open reconcile quarantine (restock-scope-quarantined); a serial no longer this order’s draw — counted, adjusted or moved while in the tote (restock-serial-moved); a case the pack recorded is no longer packed into the order (handling-unit-not-packed); the order was picked while it was being cancelled, or a concurrent idempotent request (conflict). Nothing is written on any refusal",
+            "description": "The order is dispatched — receive it back as a return (order-dispatched); its shipment is manifested, naming the manifest (shipment-manifested); its label was booked with a real courier whose AWB this build cannot cancel (shipment-void-unsupported); a destination bin refuses the intake, naming the bin, with the gate’s own code (bin-retired, bin-blocked, bin-storage-mismatch, bin-client-mismatch, bin-occupancy-conflict, bin-segregation-conflict, hazard-segregation-conflict, bin-full, bin-overweight, bin-volume-exceeded, bin-item-oversize); a (SKU, destination) under an open reconcile quarantine (restock-scope-quarantined); a serial no longer this order’s draw — counted, adjusted or moved while in the tote (restock-serial-moved); a case the pack recorded is no longer packed into the order (handling-unit-not-packed); the order was picked while it was being cancelled, or a concurrent idempotent request (conflict). Nothing is written on any refusal",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -10827,7 +10827,7 @@
             }
           },
           "409": {
-            "description": "The order is already dispatched under a different key, or is not packed — it reads accepted or cancelled (conflict, naming the status); story 3-7a — its picks drew a lot that is on an OPEN LIVE recall: release the lot from the recall (close it with the lot in releaseBatchIds) or wait for the packed-order cancel/unpack (order-holds-recalled-batch, members batchCodes and recallCodes); a lot blocked for any other reason still ships; or a concurrent idempotent request (conflict). Nothing is written",
+            "description": "The order is already dispatched under a different key, or is not packed — it reads accepted or cancelled (conflict, naming the status); story 3-7a — its picks drew a lot that is on an OPEN LIVE recall: release the lot from the recall (close it with the lot in releaseBatchIds) or cancel the order with restock (order-holds-recalled-batch, members batchCodes and recallCodes); a lot blocked for any other reason still ships; or a concurrent idempotent request (conflict). Nothing is written",
             "content": {
               "application/problem+json": {
                 "schema": {

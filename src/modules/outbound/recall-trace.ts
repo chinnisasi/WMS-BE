@@ -85,6 +85,8 @@ export async function orderTraceFactsByIdsInTx(tx: TenantTx, tenantId: string, o
     left join lateral (
       select s.carrier_name, s.tracking_number from shipments s
       where s.tenant_id = o.tenant_id and s.order_id = o.id
+        -- Story 4-2b — a voided label is not the order's shipment (the register's rule).
+        and s.status <> 'voided'
       order by s.labelled_at desc, s.id desc
       limit 1
     ) sh on true

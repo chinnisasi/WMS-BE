@@ -993,6 +993,13 @@ export class PickCommandService {
         line.reservationId === null
           ? null
           : await this.inventory.holdLivenessInTx(tx, command.tenantId, line.reservationId);
+      if (line.reservationId !== null && (hold === null || hold.state !== 'held')) {
+        // Story 4-2b: a cancel-with-restock that committed while this pick
+        // waited on the warehouse lock ended the hold and withdrew the line —
+        // say THAT (the operator may be holding units to put back), not the
+        // hold's bare state.
+        await this.refuseIfOrderCancelledInTx(tx, command.tenantId, line.orderId);
+      }
       if (line.reservationId !== null) {
         if (hold === null) {
           throw pickUnresolvable(
@@ -1165,6 +1172,9 @@ export class PickCommandService {
         )
         .returning({ id: picklistLines.id });
       if (flipped[0] === undefined) {
+        // Story 4-2b: the line may have been withdrawn by a cancel-with-restock
+        // that committed while this pick waited — name the cancel.
+        await this.refuseIfOrderCancelledInTx(tx, command.tenantId, line.orderId);
         // A concurrent pick of the same line won the flip — this transaction
         // carries no new state and rolls back whole. Terminal like the gate
         // above it (story 4.3b): the line is drawn, and no retry undraws it.
@@ -1555,6 +1565,23 @@ export class PickCommandService {
    * is a tidiness guarantee, not a correctness one, and it is recorded here
    * rather than claimed for the wrong lock.
    */
+  /**
+   * Story 4-2b — when a pick meets a terminal hold or loses its line flip,
+   * re-read the order (in this transaction, after the warehouse lock): a
+   * cancel-with-restock that committed meanwhile is the real cause, and the
+   * refusal must name it.
+   */
+  private async refuseIfOrderCancelledInTx(tx: TenantTx, tenantId: string, orderId: string): Promise<void> {
+    const rows = await tx
+      .select({ status: orders.status })
+      .from(orders)
+      .where(and(eq(orders.id, orderId), eq(orders.tenantId, tenantId)))
+      .limit(1);
+    if (rows[0]?.status === 'cancelled') {
+      throw orderNotAcceptedRefusal(orderId, 'cancelled');
+    }
+  }
+
   private async insertReplanSlices(
     tx: TenantTx,
     input: {
@@ -2196,7 +2223,7 @@ function orderNotAcceptedRefusal(orderId: string, status: OrderStatus): ProblemE
     case 'cancelled':
       return pickUnresolvable(
         'Order was cancelled',
-        `Order "${orderId}" reads "cancelled" — its units are not picked.`,
+        `Order "${orderId}" reads "cancelled" — its units are not picked. If you already took units off the shelf for this stop, put them back in the bin you picked from.`,
       );
     case 'ready_to_dispatch':
       // A packed order's units WERE picked — that is why it is packed. Saying

@@ -95,6 +95,8 @@ describe('story 4-2b: cancel with restock (e2e)', () => {
   let acme: string;
   let sandboxConnectionId: string;
   const skuIds = new Map<string, string>();
+  /** Shipments the suite inserted by hand (deleted in their own test). */
+  const seededShipments: string[] = [];
   const http = () => request(app.getHttpServer());
   const sku = (code: string): string => {
     const id = skuIds.get(code);
@@ -123,6 +125,7 @@ describe('story 4-2b: cancel with restock (e2e)', () => {
     'CR-QUA,Quarantined scope,pcs,,1800,,false,false,false,,,',
     'CR-SER,Serial tracked,pcs,,1800,,false,true,false,,,',
     'CR-SMV,Serial moved,pcs,,1800,,false,true,false,,,',
+    'CR-SMV2,Serial drawn again,pcs,,1800,,false,true,false,,,',
     'CR-MAN,Manifested,pcs,,1800,,false,false,false,,,',
     'CR-DSP,Dispatched,pcs,,1800,,false,false,false,,,',
     'CR-AGN,Already cancelled,pcs,,1800,,false,false,false,,,',
@@ -242,6 +245,17 @@ describe('story 4-2b: cancel with restock (e2e)', () => {
         .set('Authorization', `Bearer ${ownerToken}`)
         .set(KEY_HEADER, ulid())
         .send({ code, capacity: 1_000_000, type: 'shelf', ...(storageClass === undefined ? {} : { storageClass }) })
+        .expect(201)
+    ).body.id as string;
+  }
+
+  async function createBinWithCapacity(code: string, capacity: number): Promise<string> {
+    return (
+      await http()
+        .post(`${API}/${tenantId}/warehouses/${wh}/zones/${zoneId}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code, capacity, type: 'shelf' })
         .expect(201)
     ).body.id as string;
   }
@@ -699,6 +713,87 @@ describe('story 4-2b: cancel with restock (e2e)', () => {
     expect((await cancelRestock(orderId, {}, key, operatorToken).expect(403)).body.code).toBe('role-denied');
     expect(await keyStored(key)).toBe(false);
     await cancelRestock(orderId).expect(200);
+  });
+
+  // ── code review: the remaining destination arms, the void precondition ──
+
+  it('code review: a named bin that cannot take the summed intake is refused by its load gate (bin-full) — nothing written', async () => {
+    const small = await createBinWithCapacity('S-01-01', 1);
+    await seed('CR-ONE', binA, 5);
+    const { orderId, picklist } = await fixtures.releasedWave([{ skuId: sku('CR-ONE'), quantity: 3 }]);
+    await fixtures.pickAllLines(picklist);
+    const key = ulid();
+    const res = await cancelRestock(orderId, { restockBinId: small }, key).expect(409);
+    expect(res.body.code).toBe('bin-full');
+    expect(res.body.detail).toContain('S-01-01');
+    await expectUntouched(orderId, key, 'accepted', ['committed']);
+    await cancelRestock(orderId).expect(200);
+  });
+
+  it('code review: on an order with no draws a named bin still meets the structural arms — retired and blocked are refused by their own codes', async () => {
+    const retired = await createBin(wh, zoneId, 'T-01-01');
+    const blocked = await createBin(wh, zoneId, 'T-01-02');
+    await sql`update bins set retired_at = now(), retired_by = ${opsUserId} where id = ${retired}`;
+    await sql`update bins set blocked = true where id = ${blocked}`;
+    await seed('CR-ARM', binA, 3);
+    const orderId = await fixtures.createOrder([{ skuId: sku('CR-ARM'), quantity: 1 }]);
+    expect((await cancelRestock(orderId, { restockBinId: retired }).expect(409)).body.code).toBe('bin-retired');
+    expect((await cancelRestock(orderId, { restockBinId: blocked }).expect(409)).body.code).toBe('bin-blocked');
+    expect((await orderRow(orderId)).status).toBe('accepted');
+    await cancelRestock(orderId).expect(200);
+  });
+
+  it('code review: a serial drawn again by another event while in the tote is restock-serial-moved ("drawn by another event")', async () => {
+    await seed('CR-SMV2', binB, 1, { serials: ['CR-M9'] });
+    const { orderId, picklist } = await fixtures.releasedWave([{ skuId: sku('CR-SMV2'), quantity: 1 }]);
+    await fixtures.pickAllLines(picklist, undefined, new Map([[picklist.lines[0]!.id, ['CR-M9']]]));
+    // Found, booked in, and written off again — its latest event is another draw.
+    await adjust({ skuId: sku('CR-SMV2'), binId: binC, quantityDelta: 1, serials: ['CR-M9'] }).expect(201);
+    await adjust({ skuId: sku('CR-SMV2'), binId: binC, quantityDelta: -1, serials: ['CR-M9'], reasonCode: 'damaged' }).expect(201);
+    const key = ulid();
+    const res = await cancelRestock(orderId, {}, key).expect(409);
+    expect(res.body.code).toBe('restock-serial-moved');
+    expect(res.body.detail).toContain('CR-M9 was drawn by another event');
+    await expectUntouched(orderId, key, 'accepted', ['committed']);
+  });
+
+  it('code review: a label booked with a real courier is not voided locally — shipment-void-unsupported, nothing written', async () => {
+    await seed('CR-MAN', binA, 3);
+    const orderId = await packedOrder('CR-MAN', 1);
+    const shipmentId = uuidv7();
+    seededShipments.push(shipmentId);
+    await sql`insert into shipments (id, tenant_id, warehouse_id, order_id, status, carrier_connection_id, carrier_code, carrier_name, tracking_number, label_document_ref, labelled_by, labelled_at)
+      values (${shipmentId}, ${tenantId}, ${wh}, ${orderId}, 'labelled', ${sandboxConnectionId}, 'delhivery', 'Delhivery', 'DLV-1', 'delhivery://label/1', ${opsUserId}, now())`;
+    try {
+      const key = ulid();
+      const res = await cancelRestock(orderId, {}, key).expect(409);
+      expect(res.body.code).toBe('shipment-void-unsupported');
+      expect(res.body).toMatchObject({ shipmentId, carrierCode: 'delhivery' });
+      await expectUntouched(orderId, key, 'ready_to_dispatch', ['committed']);
+      expect(((await sql`select status from shipments where id = ${shipmentId}`) as unknown as { status: string }[])[0]!.status).toBe('labelled');
+    } finally {
+      await sql`delete from shipments where id = ${shipmentId}`;
+    }
+    await cancelRestock(orderId).expect(200);
+  });
+
+  it('code review: a pick that waited on the warehouse lock behind a cancel is refused naming the cancel, and tells the picker to put the units back', async () => {
+    await seed('CR-PRE', binX, 5);
+    const { orderId, picklist } = await fixtures.releasedWave([{ skuId: sku('CR-PRE'), quantity: 1 }]);
+    let picking: Promise<request.Response> | undefined;
+    let cancelling: Promise<request.Response> | undefined;
+    await holdingAdvisory(async () => {
+      cancelling = (async () => cancelRestock(orderId))();
+      await waitParked(1);
+      picking = (async () => pickLine(picklist.lines[0]!))();
+      await waitParked(2);
+    });
+    expect((await cancelling!).status).toBe(200);
+    const res = await picking!;
+    expect([res.status, res.body.code]).toEqual([409, 'pick-unresolvable']);
+    expect(res.body.detail).toContain('reads "cancelled"');
+    expect(res.body.detail).toContain('put them back in the bin you picked from');
+    expect(await events(orderId, 'pick.picked')).toEqual([]);
   });
 
   // ── the races ──────────────────────────────────────────────────────────────
