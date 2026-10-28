@@ -429,6 +429,14 @@ export const clients = pgTable(
      * `expiry_required`, by decision).
      */
     minOutboundShelfLifeDays: integer('min_outbound_shelf_life_days'),
+    /**
+     * Story 2-4b — receiving: a batch-tracked line with a mfg date and no
+     * typed expiry gets its batch expiry set from the SKU's shelf life (mfg +
+     * `skus.shelf_life_days`). Default on; an owner turns it off for a client
+     * that insists on the label's date. Written only by
+     * `ClientsCommand.updateReceivingPolicy` (`clients.manage`).
+     */
+    deriveExpiry: boolean('derive_expiry').notNull().default(true),
   },
   (table) => [
     uniqueIndex('clients_tenant_id_code_unique').on(table.tenantId, table.code),
@@ -1293,6 +1301,17 @@ export const batches = pgTable(
     blockedBy: uuid('blocked_by'),
     /** Story 3-3a — the block's note (required with reason `other`); cleared by the unblock. */
     blockedNote: text('blocked_note'),
+    /**
+     * Story 2-4b — where the batch's expiry came from, set by a RECEIPT only:
+     * `typed` (the label's date, typed on a receipt line) or `derived` (the
+     * receipt set it from the mfg date + the SKU's `shelf_life_days`). NULL
+     * on every older row and on every other batch-creating path — read as
+     * typed or unknown, never overwritten. A typed receipt line replaces a
+     * `derived` expiry (never a typed or NULL-source one). The CHECKs
+     * (`batches_expiry_source_check`, `batches_expiry_source_dated`) live
+     * ONLY in `drizzle/0108_expiry_from_shelf_life.sql`.
+     */
+    expirySource: text('expiry_source'),
     ...tenantTimestamps,
   },
   (table) => [

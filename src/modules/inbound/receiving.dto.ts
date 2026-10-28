@@ -38,6 +38,7 @@ import { DAMAGE_REASON_CODES, SHORT_REASON_CODES } from './receipt-condition';
 import { RECEIPT_PHOTOS_MAX_PER_LINE } from '../attachments/attachment-records';
 import { GRN_LINE_SERIAL_STATES, MAX_GRN_SERIALS_PER_LINE, SERIAL_FORMATS } from '../../shared/primitives/serial';
 import { ADJUSTMENT_REASON_CODES } from '../inventory/inventory.facade';
+import { BATCH_EXPIRY_SOURCES } from '../catalog/catalog.facade';
 // Story 3.5 (additive): the snapshot's putaway decision fields reuse the
 // putaway module's DTOs (one shape on every surface).
 import { PutawayBinDto, PutawayTaskDto } from '../putaway/putaway.dto';
@@ -97,7 +98,8 @@ export class GrnLineInputDto {
     required: false,
     type: String,
     nullable: true,
-    description: 'Optional batch mfg date (ISO-8601 UTC, Z-suffixed)',
+    description:
+      "Optional batch mfg date (ISO-8601 UTC, Z-suffixed). Story 2-4b — a date-only mfg is sent as its date at midnight UTC (`YYYY-MM-DDT00:00:00Z`); ONLY that shape feeds the shelf-life derivation (a batch-tracked line with no typed expiry gets expiry = the mfg's IST date + the SKU's shelfLifeDays). Any other instant is stored as before and derives nothing (a pre-2-4b handheld's misread date arrives as an IST-midnight instant)",
     minLength: 20,
     maxLength: 35,
   })
@@ -330,6 +332,18 @@ export class SubmitGoodsReceiptDto {
 
 // ── grn responses ────────────────────────────────────────────────────────────
 
+/** Story 2-4b — an expiry the receipt derived from the mfg date and the SKU's shelf life. */
+export class DerivedExpiryDto {
+  @ApiProperty({ example: '2027-02-28', description: 'The derived expiry (YYYY-MM-DD, IST)' })
+  expiryDate!: string;
+
+  @ApiProperty({ example: '2026-09-01', description: 'The mfg date it was derived from (YYYY-MM-DD, IST) — the batch\'s stored mfg, else the first line\'s' })
+  mfgDate!: string;
+
+  @ApiProperty({ type: 'integer', minimum: 1, maximum: 3650, example: 180, description: "The SKU's shelf life used, in days from manufacture" })
+  shelfLifeDays!: number;
+}
+
 /** One GRN line as every surface returns it. */
 export class GrnLineDto {
   @ApiProperty({ format: 'uuid' })
@@ -405,6 +419,21 @@ export class GrnLineDto {
 
   @ApiProperty({ required: false, enum: ['serial-tracked'], description: "Story 2-6a — present on a serial line of a QC-on-receipt client's receipt: it booked UNHELD (QC on receipt does not hold serial-tracked lines)" })
   qcSkipped?: 'serial-tracked';
+
+  @ApiProperty({
+    required: false,
+    type: () => DerivedExpiryDto,
+    description:
+      "Story 2-4b — present only when this receipt DERIVED the line's batch expiry: no line typed one and the batch had none, so it is the mfg's IST date + the SKU's shelf life",
+  })
+  derivedExpiry?: DerivedExpiryDto;
+
+  @ApiProperty({
+    required: false,
+    example: '2027-02-28',
+    description: "Story 2-4b — present only when a typed expiry on this receipt REPLACED the batch's earlier derived one: that derived date (YYYY-MM-DD, IST)",
+  })
+  replacedDerivedExpiry?: string;
 }
 
 /** Story 2-6a — where one refused serial is (in stock / in transit), or the other IMEI SKU that holds it. */
@@ -507,6 +536,14 @@ export class RejectedGrnLineDto {
 
   @ApiProperty({ required: false, type: 'integer', minimum: 1, description: "Story 2-6a — a whole-line refusal's unreadable units (not booked); present only when > 0" })
   unreadableSerialQty?: number;
+
+  @ApiProperty({
+    required: false,
+    type: () => DerivedExpiryDto,
+    description:
+      'Story 2-4b — present only on an expiry refusal whose judged expiry the receipt DERIVED from mfg + shelf life (`shelf-life-short`, or a `batch-expiry-mismatch` after a concurrent receipt set the batch\'s expiry first)',
+  })
+  derivedExpiry?: DerivedExpiryDto;
 }
 
 /** Story 21-6 — one request line that settled unmatched (applied in full, no line credited). */
@@ -856,6 +893,21 @@ export class GoodsReceiptLineEntryDto {
   @ApiProperty({ type: String, nullable: true })
   batchCode!: string | null;
 
+  @ApiProperty({ type: String, nullable: true, example: '2026-09-01', description: "Story 2-4b — the batch's mfg date (YYYY-MM-DD, IST); null when unset or no batch" })
+  batchMfgDate!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, example: '2027-02-28', description: "Story 2-4b — the batch's expiry date (YYYY-MM-DD, IST); null when unset or no batch" })
+  batchExpiryDate!: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    enum: [...BATCH_EXPIRY_SOURCES, null],
+    description:
+      "Story 2-4b — where the batch's expiry came from: `derived` (mfg + the SKU's shelf life — shown as \"from shelf life\"), `typed` (a receipt line's label date), or null (no expiry, or set before 2-4b / outside a receipt)",
+  })
+  expirySource!: 'typed' | 'derived' | null;
+
   @ApiProperty({ minimum: 0, description: 'The good units (0 on an all-damaged line)' })
   qty!: number;
 
@@ -1194,6 +1246,16 @@ export class CatalogSnapshotSkuDto {
   storageClass!: string;
 
   @ApiProperty({
+    type: 'integer',
+    nullable: true,
+    minimum: 1,
+    maximum: 3650,
+    description:
+      "Story 2-4b: the SKU's total shelf life in days from manufacture, or null. A receipt line of a batch-tracked SKU with a mfg date and no typed expiry gets expiry = mfg + this (server-side); the handheld previews it. Absent (an older server) or null = no preview",
+  })
+  shelfLifeDays!: number | null;
+
+  @ApiProperty({
     format: 'uuid',
     description:
       'Story 1-1: the client the SKU belongs to. Code and barcode are unique per (tenant, client), so one barcode may name several SKUs; the device resolves a scan through the work\'s own SKUs first, then the document\'s client (`clients` names each)',
@@ -1262,6 +1324,13 @@ export class CatalogClientReceivingPolicyDto {
 
   @ApiProperty({ type: 'integer', nullable: true, description: 'Minimum remaining shelf life in IST calendar days, or null' })
   minShelfLifeDays!: number | null;
+
+  @ApiProperty({
+    required: false,
+    description:
+      "Story 2-4b — the server sets a batch's expiry from mfg + the SKU's shelfLifeDays when no expiry is typed (the device previews it). Absent (an older server) reads as true",
+  })
+  deriveExpiry?: boolean;
 }
 
 /** Story 1-1 — one client named by the device snapshot (a SKU's or an open document's). */

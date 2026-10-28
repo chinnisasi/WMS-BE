@@ -95,14 +95,20 @@ export interface ClientReceivingPolicy {
   readonly qcOnReceipt: boolean;
   readonly expiryRequired: boolean;
   readonly minShelfLifeDays: number | null;
+  /**
+   * Story 2-4b — a batch-tracked line with a mfg date and no typed expiry
+   * gets its batch expiry from mfg + the SKU's shelf life (default on).
+   */
+  readonly deriveExpiry: boolean;
 }
 
-/** Story 1-2b — the policy every client starts with: the pre-1-2b receipt. */
+/** Story 1-2b — the policy every client starts with: the pre-1-2b receipt (2-4b: deriving, the column's default). */
 export const DEFAULT_RECEIVING_POLICY: ClientReceivingPolicy = {
   receivingToleranceBps: 0,
   qcOnReceipt: false,
   expiryRequired: false,
   minShelfLifeDays: null,
+  deriveExpiry: true,
 };
 
 /** Story 1-2b — the policy columns of a client row. */
@@ -111,12 +117,14 @@ export function receivingPolicyOf(row: {
   readonly qcOnReceipt: boolean;
   readonly expiryRequired: boolean;
   readonly minShelfLifeDays: number | null;
+  readonly deriveExpiry: boolean;
 }): ClientReceivingPolicy {
   return {
     receivingToleranceBps: row.receivingToleranceBps,
     qcOnReceipt: row.qcOnReceipt,
     expiryRequired: row.expiryRequired,
     minShelfLifeDays: row.minShelfLifeDays,
+    deriveExpiry: row.deriveExpiry,
   };
 }
 
@@ -126,7 +134,8 @@ export function isDefaultReceivingPolicy(policy: ClientReceivingPolicy): boolean
     policy.receivingToleranceBps === 0 &&
     !policy.qcOnReceipt &&
     !policy.expiryRequired &&
-    policy.minShelfLifeDays === null
+    policy.minShelfLifeDays === null &&
+    policy.deriveExpiry
   );
 }
 
@@ -285,6 +294,7 @@ export class ClientsFacade {
           qcOnReceipt: clients.qcOnReceipt,
           expiryRequired: clients.expiryRequired,
           minShelfLifeDays: clients.minShelfLifeDays,
+          deriveExpiry: clients.deriveExpiry,
         })
         .from(clients)
         .where(and(eq(clients.tenantId, tenantId), inArray(clients.id, wanted)))
@@ -328,6 +338,7 @@ export class ClientsFacade {
           qcOnReceipt: clients.qcOnReceipt,
           expiryRequired: clients.expiryRequired,
           minShelfLifeDays: clients.minShelfLifeDays,
+          deriveExpiry: clients.deriveExpiry,
         })
         .from(clients)
         .where(and(eq(clients.tenantId, tenantId), eq(clients.id, clientId)))
@@ -584,6 +595,7 @@ export async function receivingPoliciesInTx(
       qcOnReceipt: clients.qcOnReceipt,
       expiryRequired: clients.expiryRequired,
       minShelfLifeDays: clients.minShelfLifeDays,
+      deriveExpiry: clients.deriveExpiry,
     })
     .from(clients)
     .where(and(eq(clients.tenantId, tenantId), inArray(clients.id, distinct)));

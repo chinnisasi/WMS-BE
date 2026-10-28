@@ -393,6 +393,13 @@ export class ClientReceivingPolicyDto {
       "The minimum remaining shelf life, in IST calendar days from the receipt's business date to the expiry date; a shorter line is refused (`shelf-life-short`, its own review row, Accept anyway with a note). Only beside expiryRequired; null = none",
   })
   minShelfLifeDays!: number | null;
+
+  @ApiProperty({
+    required: false,
+    description:
+      "Story 2-4b — a batch-tracked receipt line with a mfg date and no typed expiry gets its batch expiry set from the SKU's shelf life (mfg + shelfLifeDays), judged by the rules above like a typed one. Default true; false makes this client's receipts take only the label's typed date. Optional: a mutation answer stored before 2-4b replays without it; every fresh read carries it",
+  })
+  deriveExpiry?: boolean;
 }
 
 /**
@@ -423,6 +430,15 @@ export class UpdateClientReceivingPolicyDto {
   @ValidateIf((_, value) => value !== null)
   @IsInt()
   minShelfLifeDays!: number | null;
+
+  @ApiProperty({
+    required: false,
+    description:
+      "Story 2-4b — set a received batch's expiry from the SKU's shelf life when the label's expiry is not typed. Optional (the one field a PUT may omit): absent keeps the client's current value",
+  })
+  @IsOptional()
+  @IsBoolean()
+  deriveExpiry?: boolean;
 }
 
 /** Story 1-2b — `GET …/clients/{c}/receiving-policy`. */

@@ -43287,7 +43287,7 @@
             "type": "number",
             "nullable": true,
             "example": 365,
-            "description": "Story 1-4 — total shelf life in days from manufacture (1–3650), or null when unset. Not the client policy's minimum REMAINING shelf life."
+            "description": "Story 1-4 — total shelf life in days from manufacture (1–3650), or null when unset. Not the client policy's minimum REMAINING shelf life. Story 2-4b — a received batch with a mfg date and no typed expiry gets its expiry set from it (mfg + this many days), unless the client's receiving policy turns that off."
           },
           "barcodes": {
             "description": "Story 1-4 — every barcode of the SKU with its level: the primary first, then by (uom, barcode). Empty only on a replayed response stored before 1-4",
@@ -43886,7 +43886,7 @@
             "example": 365,
             "minimum": 1,
             "maximum": 3650,
-            "description": "Total shelf life in days from manufacture"
+            "description": "Total shelf life in days from manufacture. Story 2-4b — a received batch with a mfg date and no typed expiry gets its expiry set from it (mfg + this many days), unless the client's receiving policy turns that off."
           },
           "clientId": {
             "type": "string",
@@ -44467,7 +44467,7 @@
             "example": 365,
             "minimum": 1,
             "maximum": 3650,
-            "description": "Total shelf life in days from manufacture (1–3650). Omit to leave unchanged; null to clear."
+            "description": "Total shelf life in days from manufacture (1–3650). Omit to leave unchanged; null to clear. Story 2-4b — a received batch with a mfg date and no typed expiry gets its expiry set from it (mfg + this many days), unless the client's receiving policy turns that off. Editing it never re-dates a batch already received."
           },
           "productId": {
             "type": "string",
@@ -51483,7 +51483,7 @@
           "mfgDate": {
             "type": "string",
             "nullable": true,
-            "description": "Optional batch mfg date (ISO-8601 UTC, Z-suffixed)",
+            "description": "Optional batch mfg date (ISO-8601 UTC, Z-suffixed). Story 2-4b — a date-only mfg is sent as its date at midnight UTC (`YYYY-MM-DDT00:00:00Z`); ONLY that shape feeds the shelf-life derivation (a batch-tracked line with no typed expiry gets expiry = the mfg's IST date + the SKU's shelfLifeDays). Any other instant is stored as before and derives nothing (a pre-2-4b handheld's misread date arrives as an IST-midnight instant)",
             "minLength": 20,
             "maxLength": 35
           },
@@ -51665,6 +51665,33 @@
           "reason"
         ]
       },
+      "DerivedExpiryDto": {
+        "type": "object",
+        "properties": {
+          "expiryDate": {
+            "type": "string",
+            "example": "2027-02-28",
+            "description": "The derived expiry (YYYY-MM-DD, IST)"
+          },
+          "mfgDate": {
+            "type": "string",
+            "example": "2026-09-01",
+            "description": "The mfg date it was derived from (YYYY-MM-DD, IST) — the batch's stored mfg, else the first line's"
+          },
+          "shelfLifeDays": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3650,
+            "example": 180,
+            "description": "The SKU's shelf life used, in days from manufacture"
+          }
+        },
+        "required": [
+          "expiryDate",
+          "mfgDate",
+          "shelfLifeDays"
+        ]
+      },
       "GrnLineDto": {
         "type": "object",
         "properties": {
@@ -51785,6 +51812,19 @@
               "serial-tracked"
             ],
             "description": "Story 2-6a — present on a serial line of a QC-on-receipt client's receipt: it booked UNHELD (QC on receipt does not hold serial-tracked lines)"
+          },
+          "derivedExpiry": {
+            "description": "Story 2-4b — present only when this receipt DERIVED the line's batch expiry: no line typed one and the batch had none, so it is the mfg's IST date + the SKU's shelf life",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/DerivedExpiryDto"
+              }
+            ]
+          },
+          "replacedDerivedExpiry": {
+            "type": "string",
+            "example": "2027-02-28",
+            "description": "Story 2-4b — present only when a typed expiry on this receipt REPLACED the batch's earlier derived one: that derived date (YYYY-MM-DD, IST)"
           }
         },
         "required": [
@@ -51992,6 +52032,14 @@
             "type": "integer",
             "minimum": 1,
             "description": "Story 2-6a — a whole-line refusal's unreadable units (not booked); present only when > 0"
+          },
+          "derivedExpiry": {
+            "description": "Story 2-4b — present only on an expiry refusal whose judged expiry the receipt DERIVED from mfg + shelf life (`shelf-life-short`, or a `batch-expiry-mismatch` after a concurrent receipt set the batch's expiry first)",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/DerivedExpiryDto"
+              }
+            ]
           }
         },
         "required": [
@@ -52556,6 +52604,13 @@
             "example": "ambient",
             "description": "Story 12.8 (UX-DR29): the SKU's storage class (defaults to `ambient`). It rides the snapshot beside the bin arm's class so the device's offline conformance mirror can refuse a non-conforming placement or draw in the Rejected banner — a refusal only the server knew about would queue in a dead zone and come back hours later as a rejection the operator can no longer act on."
           },
+          "shelfLifeDays": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 3650,
+            "description": "Story 2-4b: the SKU's total shelf life in days from manufacture, or null. A receipt line of a batch-tracked SKU with a mfg date and no typed expiry gets expiry = mfg + this (server-side); the handheld previews it. Absent (an older server) or null = no preview"
+          },
           "clientId": {
             "type": "string",
             "format": "uuid",
@@ -52620,6 +52675,7 @@
           "variantValues",
           "axes",
           "storageClass",
+          "shelfLifeDays",
           "clientId",
           "packBarcodes",
           "status",
@@ -53600,6 +53656,10 @@
             "type": "integer",
             "nullable": true,
             "description": "Minimum remaining shelf life in IST calendar days, or null"
+          },
+          "deriveExpiry": {
+            "type": "boolean",
+            "description": "Story 2-4b — the server sets a batch's expiry from mfg + the SKU's shelfLifeDays when no expiry is typed (the device previews it). Absent (an older server) reads as true"
           }
         },
         "required": [
@@ -54207,6 +54267,28 @@
             "type": "string",
             "nullable": true
           },
+          "batchMfgDate": {
+            "type": "string",
+            "nullable": true,
+            "example": "2026-09-01",
+            "description": "Story 2-4b — the batch's mfg date (YYYY-MM-DD, IST); null when unset or no batch"
+          },
+          "batchExpiryDate": {
+            "type": "string",
+            "nullable": true,
+            "example": "2027-02-28",
+            "description": "Story 2-4b — the batch's expiry date (YYYY-MM-DD, IST); null when unset or no batch"
+          },
+          "expirySource": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "typed",
+              "derived",
+              null
+            ],
+            "description": "Story 2-4b — where the batch's expiry came from: `derived` (mfg + the SKU's shelf life — shown as \"from shelf life\"), `typed` (a receipt line's label date), or null (no expiry, or set before 2-4b / outside a receipt)"
+          },
           "qty": {
             "type": "number",
             "minimum": 0,
@@ -54292,6 +54374,9 @@
           "skuName",
           "batchId",
           "batchCode",
+          "batchMfgDate",
+          "batchExpiryDate",
+          "expirySource",
           "qty",
           "appliedQty",
           "photoCount",
@@ -63295,6 +63380,10 @@
             "minimum": 1,
             "maximum": 3650,
             "description": "The minimum remaining shelf life, in IST calendar days from the receipt's business date to the expiry date; a shorter line is refused (`shelf-life-short`, its own review row, Accept anyway with a note). Only beside expiryRequired; null = none"
+          },
+          "deriveExpiry": {
+            "type": "boolean",
+            "description": "Story 2-4b — a batch-tracked receipt line with a mfg date and no typed expiry gets its batch expiry set from the SKU's shelf life (mfg + shelfLifeDays), judged by the rules above like a typed one. Default true; false makes this client's receipts take only the label's typed date. Optional: a mutation answer stored before 2-4b replays without it; every fresh read carries it"
           }
         },
         "required": [
@@ -63641,6 +63730,10 @@
             "maximum": 3650,
             "description": "The minimum remaining shelf life, in IST calendar days from the receipt's business date to the expiry date; a shorter line is refused (`shelf-life-short`, its own review row, Accept anyway with a note). Only beside expiryRequired; null = none"
           },
+          "deriveExpiry": {
+            "type": "boolean",
+            "description": "Story 2-4b — a batch-tracked receipt line with a mfg date and no typed expiry gets its batch expiry set from the SKU's shelf life (mfg + shelfLifeDays), judged by the rules above like a typed one. Default true; false makes this client's receipts take only the label's typed date. Optional: a mutation answer stored before 2-4b replays without it; every fresh read carries it"
+          },
           "clientId": {
             "type": "string",
             "format": "uuid"
@@ -63682,6 +63775,10 @@
             "minimum": 1,
             "maximum": 3650,
             "description": "IST calendar days; null for none. Requires expiryRequired"
+          },
+          "deriveExpiry": {
+            "type": "boolean",
+            "description": "Story 2-4b — set a received batch's expiry from the SKU's shelf life when the label's expiry is not typed. Optional (the one field a PUT may omit): absent keeps the client's current value"
           }
         },
         "required": [

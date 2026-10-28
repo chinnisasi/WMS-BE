@@ -1506,6 +1506,11 @@ describe('story 3-7a: batch recall (e2e)', () => {
   // ── the bounded reads' plans (A8, A9) ──────────────────────────────────────
 
   it('EXPLAIN: the candidates, open orders, held picks, picked lots and on-hand statements plan on their indexes', async () => {
+    // Story 2-4b — the suite's tables are never analyzed, so the planner
+    // guesses their row counts from the row WIDTH; 0108's `batches.expiry_source`
+    // widened the row and tipped the tiny-table tie toward
+    // `batches_tenant_sku_idx`. Analyze first, so each plan reads real stats.
+    await db.execute(dsql`analyze batches, skus`);
     const plan = async (statement: ReturnType<typeof batchCandidatesQuery>): Promise<string> =>
       withTenantTransaction(db, tenantId, async (tx) => {
         await tx.execute(dsql`set local enable_seqscan = off`);

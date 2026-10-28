@@ -509,7 +509,8 @@ describe('story 4-3a: client allocation rules (e2e)', () => {
       const res = await putPolicy(client('POL'), body, key).expect(200);
       expect(res.body.client.allocationPolicy).toEqual(body);
       // The receiving policy is untouched.
-      expect(res.body.client.receivingPolicy).toEqual({ receivingToleranceBps: 0, qcOnReceipt: false, expiryRequired: false, minShelfLifeDays: null });
+      // Story 2-4b — the receiving policy gains the derivation switch (explicit pin update).
+      expect(res.body.client.receivingPolicy).toEqual({ receivingToleranceBps: 0, qcOnReceipt: false, expiryRequired: false, minShelfLifeDays: null, deriveExpiry: true });
       await expectAuditRow({ tenantId, key, action: 'client.allocation_policy_updated', targetType: 'client', targetId: client('POL'), actorUserId: ownerUserId });
       const replay = await putPolicy(client('POL'), body, key).expect(200);
       expect(replay.body).toEqual(res.body);
@@ -623,7 +624,8 @@ describe('story 4-3a: client allocation rules (e2e)', () => {
         .send(body)
         .expect(200);
       expect(replay.body.client.allocationPolicy).toBeUndefined();
-      expect(replay.body.client.receivingPolicy).toEqual(body);
+      // Story 2-4b — the stored answer was written by this build, so its policy carries the switch (explicit pin update).
+      expect(replay.body.client.receivingPolicy).toEqual({ ...body, deriveExpiry: true });
     });
 
     it('the GET and the PUT are in the OpenAPI document with their documented arms', async () => {

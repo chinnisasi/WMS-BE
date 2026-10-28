@@ -786,7 +786,8 @@ describe('story 1-1: per-client SKU identity (e2e)', () => {
       const clients = res.body.clients as { id: string; code: string; name: string; active: boolean }[];
       // Story 1-2b added each client's receiving policy (additive; the
       // defaults here) — the 1-1 fields are pinned unchanged beside it.
-      const defaults = { receivingToleranceBps: 0, qcOnReceipt: false, expiryRequired: false, minShelfLifeDays: null };
+      // Story 2-4b — the default policy carries the derivation switch, on (explicit pin update).
+      const defaults = { receivingToleranceBps: 0, qcOnReceipt: false, expiryRequired: false, minShelfLifeDays: null, deriveExpiry: true };
       expect(clients).toEqual(
         expect.arrayContaining([
           { id: acme, code: 'ACME', name: 'Acme Apparel', active: true, receivingPolicy: defaults },
