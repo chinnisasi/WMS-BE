@@ -2212,6 +2212,55 @@ describe('architecture: advance shipment notices are inbound-module-owned (story
   });
 });
 
+describe('architecture: licence plates (LPNs) are inbound-module-owned (story 2-10b)', () => {
+  /**
+   * Story 2-10b — `lpns` is written ONLY by `inbound/lpn.command.ts` (mint,
+   * void) and `inbound/lpn.store.ts` (the placement's lock and mark). The
+   * putaway placement reaches the table only through that free-function seam,
+   * which imports only drizzle-orm and shared/ (guide §7h) — inbound imports
+   * putaway, so a module edge back would cycle. Putaway's task derivation
+   * READS `lpns` (as it reads `goods_receipt_lines`); nothing else writes.
+   */
+  const inboundRoot = join(SRC_ROOT, 'modules', 'inbound');
+  const WRITERS = [join(inboundRoot, 'lpn.command.ts'), join(inboundRoot, 'lpn.store.ts')];
+
+  it('no lpns write happens outside lpn.command.ts and lpn.store.ts', () => {
+    const offenders: string[] = [];
+    for (const file of files.filter((f) => !WRITERS.includes(f.path))) {
+      for (const pattern of [drizzleWriteOn('lpns'), new RegExp('\\b(insert into|update|delete from)\\s+"?lpns\\b', 'i')]) {
+        if (pattern.test(file.source)) offenders.push(`${file.path}: /${pattern.source}/`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('both writers really write the table (the test is meaningful)', () => {
+    const command = readFileSync(WRITERS[0]!, 'utf8');
+    expect(/\.insert\(\s*lpns\b/.test(command)).toBe(true);
+    expect(/\.update\(\s*lpns\b/.test(command)).toBe(true);
+    const store = readFileSync(WRITERS[1]!, 'utf8');
+    expect(/\.update\(\s*lpns\b/.test(store)).toBe(true);
+  });
+
+  it('inbound/lpn.store.ts imports only drizzle-orm and shared/; the putaway command imports it, never the inbound module', () => {
+    const source = readFileSync(WRITERS[1]!, 'utf8');
+    expect(source).toMatch(/export async function lockLpnByCodeInTx\(/);
+    expect(source).toMatch(/export async function markLpnPlacedInTx\(/);
+    const offenders: string[] = [];
+    for (const match of source.matchAll(/from '([^']+)'/g)) {
+      const target = match[1]!;
+      if (target !== 'drizzle-orm' && !target.startsWith('../../shared/')) offenders.push(`imports ${target}`);
+    }
+    expect(offenders).toEqual([]);
+    const putawayRoot = join(SRC_ROOT, 'modules', 'putaway');
+    const reaches = files
+      .filter((file) => file.path.startsWith(putawayRoot))
+      .flatMap((file) => [...file.source.matchAll(/from '\.\.\/inbound\/([^']+)'/g)].map((m) => m[1]!));
+    expect([...new Set(reaches)]).toEqual(['lpn.store']);
+    expect(readFileSync(join(putawayRoot, 'putaway.command.ts'), 'utf8')).toContain(`from '../inbound/lpn.store'`);
+  });
+});
+
 describe('architecture: return authorizations are returns-module-owned (story 13-1)', () => {
   /**
    * Story 13-1 stands up the returns module (Epic 13). `return_authorizations`

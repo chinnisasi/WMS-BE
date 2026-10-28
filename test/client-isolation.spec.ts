@@ -1200,7 +1200,9 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // view is 2-8c). Retargeted 146 → 148. Story 3-5b adds
       // `stock_takes` and `stock_freeze_bins`, both tenant-only (a take is
       // the warehouse's own count; its portal view is 3-5c). Retargeted 148 → 150.
-      expect(policies).toHaveLength(150);
+      // Story 2-10b: + one (0109) — lpns, tenant-only (a licence plate is the
+      // dock's label; no portal read). Retargeted 150 → 151.
+      expect(policies).toHaveLength(151);
       {
         const recalls = policies.find((row) => row.policyname === 'batch_recalls_tenant_isolation')!;
         expect(recalls.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");

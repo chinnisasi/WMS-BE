@@ -2,16 +2,17 @@ import { encodeCode128B, moduleCount } from './code128';
 import {
   LABEL_GEOMETRY,
   QUIET_ZONE_MODULES,
-  binLabelText,
+  binLabelLines,
   fitModuleWidth,
   labelPrintableDots,
   type BinLabel,
+  type LabelLines,
   type LabelSize,
 } from './layout';
 import { zplEscapeBarcode, zplEscapeText } from './text';
 
 /**
- * Story 2-10a — bin labels as ZPL II for a 203-dpi Zebra thermal printer.
+ * Story 2-10a — labels (bin labels; 2-10b LPN labels) as ZPL II for a 203-dpi Zebra thermal printer.
  *
  * One `^XA…^XZ` per label: `^PW`/`^LL` size the label, `^CI0` pins the 7-bit
  * character set, the text fields print through `^FH` with the hex escapes of
@@ -28,6 +29,15 @@ import { zplEscapeBarcode, zplEscapeText } from './text';
  * label that does not fit throws (a programming error, never a user refusal).
  */
 export function renderBinLabelsZpl(labels: readonly BinLabel[], size: LabelSize): string {
+  return renderLabelsZpl(labels.map(binLabelLines), size);
+}
+
+/**
+ * Story 2-10b — the generalised renderer: any label as ready-made lines (the
+ * bin label and the LPN label both come through here). The barcode encodes
+ * `payload` byte for byte; the text fields print the folded lines.
+ */
+export function renderLabelsZpl(labels: readonly LabelLines[], size: LabelSize): string {
   return labels.map((label) => renderOne(label, size)).join('');
 }
 
@@ -45,17 +55,16 @@ function textField(x: number, y: number, height: number, printable: number, minW
   return `^FO${x},${y}^A0N,${height},${fitted.width}^FH^FD${zplEscapeText(fitted.text)}^FS\n`;
 }
 
-function renderOne(label: BinLabel, size: LabelSize): string {
+function renderOne(text: LabelLines, size: LabelSize): string {
   const g = LABEL_GEOMETRY[size];
   const printable = labelPrintableDots(size);
-  const modules = moduleCount(label.code.length);
+  const modules = moduleCount(text.payload.length);
   const moduleWidth = fitModuleWidth(modules, printable);
   if (moduleWidth === null) {
-    throw new Error(`bin code "${label.code}" does not fit a ${size} label`);
+    throw new Error(`label code "${text.payload}" does not fit a ${size} label`);
   }
   // Encoding here also asserts the payload is subset-B printable.
-  encodeCode128B(label.code);
-  const text = binLabelText(label);
+  encodeCode128B(text.payload);
   const minWidth = size === '4x2' ? 14 : 8;
   const x = g.marginDots;
   const barcodeX = g.marginDots + QUIET_ZONE_MODULES * moduleWidth;
@@ -63,7 +72,7 @@ function renderOne(label: BinLabel, size: LabelSize): string {
   // the printer has stored (format-level commands, not configuration).
   let zpl = `^XA\n^LH0,0\n^PON\n^PW${g.widthDots}\n^LL${g.heightDots}\n^CI0\n`;
   zpl += textField(x, g.code[0], g.code[1], printable, minWidth, text.code);
-  zpl += `^FO${barcodeX},${g.barcode[0]}^BY${moduleWidth}^BCN,${g.barcode[1]},N,N,N,N^FH^FD>:${zplEscapeBarcode(label.code)}^FS\n`;
+  zpl += `^FO${barcodeX},${g.barcode[0]}^BY${moduleWidth}^BCN,${g.barcode[1]},N,N,N,N^FH^FD>:${zplEscapeBarcode(text.payload)}^FS\n`;
   zpl += textField(x, g.line1[0], g.line1[1], printable, minWidth, text.line1);
   if (text.line2.length > 0) {
     zpl += textField(x, g.line2[0], g.line2[1], printable, minWidth, text.line2);

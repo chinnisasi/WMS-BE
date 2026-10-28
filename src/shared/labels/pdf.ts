@@ -7,16 +7,17 @@ import {
   POINTS_PER_DOT,
   POINTS_PER_MM,
   QUIET_ZONE_MODULES,
-  binLabelText,
+  binLabelLines,
   fitModuleWidth,
   printableUnitsOf,
   type BinLabel,
+  type LabelLines,
   type LabelSize,
   type LabelTarget,
 } from './layout';
 
 /**
- * Story 2-10a — bin labels as a PDF (pdf-lib, Helvetica-Bold). The bars are
+ * Story 2-10a — labels (bin labels; 2-10b LPN labels) as a PDF (pdf-lib, Helvetica-Bold). The bars are
  * drawn as filled rectangles straight from `encodeCode128B`, one rectangle
  * per bar, so the symbol is exactly the one the fit check measured and the
  * one a test decodes back.
@@ -26,7 +27,7 @@ import {
  * - `a4` layout: 24 labels per A4 page, 3 × 8 cells of 70 × 36 mm, 4.5 mm
  *   top and bottom margins, 2 mm inner padding (decision 4).
  *
- * Every string is ASCII-folded (`binLabelText`) before it reaches pdf-lib —
+ * Every string is ASCII-folded (`binLabelText`, `lpnLabelText`) before it reaches pdf-lib —
  * the standard fonts' WinAnsi encoding throws on anything else.
  */
 export interface PdfLabelOptions {
@@ -52,9 +53,18 @@ const BLACK = rgb(0, 0, 0);
 const MIN_FONT_PT = 4;
 
 export async function renderBinLabelsPdf(labels: readonly BinLabel[], options: PdfLabelOptions): Promise<Buffer> {
+  return renderLabelsPdf(labels.map(binLabelLines), { ...options, title: 'Bin labels' });
+}
+
+/**
+ * Story 2-10b — the generalised renderer: any label as ready-made lines (the
+ * bin label and the LPN label both come through here), with the document's
+ * title. The bars encode `payload` byte for byte.
+ */
+export async function renderLabelsPdf(labels: readonly LabelLines[], options: PdfLabelOptions & { readonly title: string }): Promise<Buffer> {
   const doc = await PDFDocument.create();
-  doc.setTitle('Bin labels');
-  doc.setProducer('WMS bin labels');
+  doc.setTitle(options.title);
+  doc.setProducer(`WMS ${options.title.toLowerCase()}`);
   doc.setCreator('WMS');
   const font = await doc.embedFont(StandardFonts.HelveticaBold);
 
@@ -117,14 +127,13 @@ function a4Frame(cell: number, pageHeight: number): Frame {
   };
 }
 
-function drawLabel(page: PDFPage, font: PDFFont, label: BinLabel, frame: Frame, target: LabelTarget): void {
-  const modules = moduleCount(label.code.length);
+function drawLabel(page: PDFPage, font: PDFFont, text: LabelLines, frame: Frame, target: LabelTarget): void {
+  const modules = moduleCount(text.payload.length);
   const moduleUnits = fitModuleWidth(modules, frame.printableUnits);
   if (moduleUnits === null) {
     const where = target.layout === 'a4' ? 'an A4 cell' : `a ${target.size} label`;
-    throw new Error(`bin code "${label.code}" does not fit ${where}`);
+    throw new Error(`label code "${text.payload}" does not fit ${where}`);
   }
-  const text = binLabelText(label);
   drawFittedText(page, font, text.code, frame, frame.code);
 
   // The bars: alternating bar/space widths, bar first, after the quiet zone.
@@ -133,7 +142,7 @@ function drawLabel(page: PDFPage, font: PDFFont, label: BinLabel, frame: Frame, 
   const barHeight = frame.barcode[1];
   let x = frame.left + QUIET_ZONE_MODULES * moduleWidth;
   let bar = true;
-  for (const widthModules of encodeCode128B(label.code)) {
+  for (const widthModules of encodeCode128B(text.payload)) {
     const width = widthModules * moduleWidth;
     if (bar) {
       page.drawRectangle({ x, y: barTop - barHeight, width, height: barHeight, color: BLACK, borderWidth: 0 });

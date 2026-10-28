@@ -59,6 +59,8 @@ import {
   RECEIPT_PHOTOS_MAX_PER_RECEIPT,
 } from '../attachments/attachment-records';
 import { DAMAGE_REASON_CODES, SHORT_REASON_CODES } from './receipt-condition';
+import { LpnCommand, type LpnListSnapshot, type MintLpnsCommand, type MintLpnsSnapshot, type VoidLpnCommand, type VoidLpnSnapshot } from './lpn.command';
+import { LpnLabelsService, type LpnLabelsFile, type LpnLabelsRequest } from './lpn-labels';
 
 /** One GRN header row of the GRN-list read (line counts + unit sums ride along). */
 export interface GoodsReceiptEntry {
@@ -296,6 +298,8 @@ export interface CatalogSnapshot {
     readonly rationale: string;
     /** Story 2-6a (A14): a serial task's serials in Receiving (present only on a serial-tracked task). */
     readonly serialNumbers?: readonly string[];
+    /** Story 2-10b (decision 8): the line's ACTIVE LPNs in code order (base units) — the handheld's LPN scan. */
+    readonly lpns: readonly { readonly code: string; readonly qty: number }[];
   }[];
   /** Story 2-3a (additive): the open gate-ins the dock unloads and receives against (decision 15). */
   readonly openGateIns: readonly OpenGateInView[];
@@ -362,7 +366,37 @@ export class ReceivingFacade {
     @Inject(AttachmentsFacade) private readonly attachments: AttachmentsFacade,
     // Story 2-5a — damage photos (this module's own command).
     @Inject(ReceiptPhotoCommand) private readonly photos: ReceiptPhotoCommand,
+    // Story 2-10b — LPNs at receiving (this module's own command and labels).
+    @Inject(LpnCommand) private readonly lpns: LpnCommand,
+    @Inject(LpnLabelsService) private readonly lpnLabels: LpnLabelsService,
   ) {}
+
+  // ── story 2-10b: LPNs (licence plates) at receiving ──────────────────────
+
+  /** `lpn.mint` — label a recorded receipt's lines (`labels.execute`, keyed). */
+  async mintLpns(command: MintLpnsCommand, idempotencyKey: string): Promise<MintLpnsSnapshot> {
+    return this.lpns.mint(command, idempotencyKey);
+  }
+
+  /** `lpn.void` — void an active LPN (`labels.execute`, keyed). */
+  async voidLpn(command: VoidLpnCommand, idempotencyKey: string): Promise<VoidLpnSnapshot> {
+    return this.lpns.void(command, idempotencyKey);
+  }
+
+  /** Every LPN of a receipt in code order, with SKU and batch codes, base units, and each line's unlabelled quantity — any member (A12). */
+  async listLpns(tenantId: string, grnId: string): Promise<LpnListSnapshot> {
+    return this.lpns.list(tenantId, grnId);
+  }
+
+  /** The print's authority alone (403 before any 400). */
+  async assertCanPrintLpnLabels(tenantId: string, actorUserId: string): Promise<void> {
+    return this.lpnLabels.assertCanPrint(tenantId, actorUserId);
+  }
+
+  /** LPN labels as ZPL or PDF (a read: no key, no audit). */
+  async printLpnLabels(request: LpnLabelsRequest): Promise<LpnLabelsFile> {
+    return this.lpnLabels.render(request);
+  }
 
   // ── story 2-5a: damage photos on a receipt line ───────────────────────────
 

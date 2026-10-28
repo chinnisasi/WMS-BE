@@ -18,6 +18,8 @@ import { GateInCommand } from './gate-in.command';
 import { GateInFacade } from './gate-in.facade';
 import { VendorReturnCommand } from './vendor-return.command';
 import { VendorReturnFacade } from './vendor-return.facade';
+import { LpnCommand } from './lpn.command';
+import { LpnLabelsService } from './lpn-labels';
 
 /**
  * Inbound module (Story 3.1): the purchase-order lifecycle — the upstream
@@ -77,6 +79,9 @@ import { VendorReturnFacade } from './vendor-return.facade';
     // Story 2-8b — the return to vendor (DAMAGED stock back to its vendor).
     VendorReturnCommand,
     VendorReturnFacade,
+    // Story 2-10b — LPNs at receiving: mint / void, and their labels.
+    LpnCommand,
+    LpnLabelsService,
   ],
   exports: [InboundFacade, ReceivingFacade, QcFacade, GateInFacade, VendorReturnFacade],
 })

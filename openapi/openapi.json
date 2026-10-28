@@ -14507,6 +14507,479 @@
         ]
       }
     },
+    "/tenants/{tenantId}/receiving/goods-receipts/{grnId}/lpns": {
+      "get": {
+        "operationId": "ReceivingController_listLpns",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "grnId",
+            "required": true,
+            "in": "path",
+            "description": "The goods receipt",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LpnListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed grnId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such goods receipt in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 2-10b — one goods receipt's LPNs (licence plates) in code order, every status, with SKU and batch codes — open to any member",
+        "tags": [
+          "receiving"
+        ]
+      },
+      "post": {
+        "description": "Each label is `LPN-<n>` (the tenant number, zero-padded to 6 digits). For each line, the labelled total (its active and placed LPNs) never exceeds the line's putaway quantity — applied units plus approved over-receipt excess, minus units that failed a QC inspection (pending excess is not labellable until approved). A line holds at most 5000 labels that are not voided; one mint creates at most 1000.",
+        "operationId": "ReceivingController_mintLpns",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "grnId",
+            "required": true,
+            "in": "path",
+            "description": "The goods receipt",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MintLpnsRequestDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MintLpnsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed grnId or body, a line named twice, more than 1000 labels, or a quantity finer than the SKU's unit allows (validation-failed naming `quantities`)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks labels.execute (role-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such goods receipt, or a line that is not of this receipt (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse), more than the line can carry on labels (lpn-quantity-exceeds-line, with `remaining`, `putawayQty` and `labelled` in base units), or more than 5000 labels on a line (too-many-labels, with `count`)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 2-10b — mints LPNs for lines of a recorded goods receipt: one per declared quantity (labels.execute; audited). Moves no stock",
+        "tags": [
+          "receiving"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/goods-receipts/{grnId}/lpns/labels": {
+      "post": {
+        "description": "labels.execute (owner, ops manager, operator). Send `lpnIds` (1–1000 distinct LPNs of this receipt — a reprint), or `grnLineId` (the line's LPNs that are not voided), or neither (every LPN of the receipt that is not voided; more than 1000 is refused — print in parts). Labels come out in code order. Each carries the code in large text, a Code 128 (start B) of exactly the code, `<SKU> x <qty> <uom>`, and `<GRN> | B <batch> EXP <date> | CLIENT <code>` (the batch part when batched, the expiry when set, the client when not the tenant's own). A placed LPN still prints. `layout=label` prints one label per page / per ^XA…^XZ at `size` 4x2 (default) or 2x1 in; `layout=a4` (PDF only) prints 24 per A4 sheet. The listing refusals carry `lpnCodes` (the first 50 offenders). The `Content-Disposition` filename (`lpn-labels-<GRN>-<YYYYMMDD>.<ext>`, the IST date) is not readable cross-origin — a client builds the same name itself.",
+        "operationId": "ReceivingController_printLpnLabels",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "grnId",
+            "required": true,
+            "in": "path",
+            "description": "The goods receipt",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LpnLabelsRequestDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The labels: ZPL as `text/plain; charset=us-ascii`, or a PDF",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid body (validation-failed): both lpnIds and grnLineId, more than 1000 or duplicate ids, size with the a4 layout, the a4 layout with zpl, or a malformed grnId",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks labels.execute (role-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The goods receipt, the line or a listed LPN is not in this tenant and receipt (not-found), or nothing to print (no-lpns-to-print)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A listed LPN is voided (lpn-voided), or a code too long for the size or A4 cell at a 2-dot bar (lpn-code-too-long-for-label) — each with `lpnCodes`; or more than 1000 labels (too-many-labels, with `count`)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 2-10b — prints LPN labels: ZPL (Zebra, 203 dpi) or PDF, the barcode a Code 128 of exactly the LPN code",
+        "tags": [
+          "receiving"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/goods-receipts/{grnId}/lpns/{lpnId}/void": {
+      "post": {
+        "operationId": "ReceivingController_voidLpn",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "grnId",
+            "required": true,
+            "in": "path",
+            "description": "The goods receipt",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "lpnId",
+            "required": true,
+            "in": "path",
+            "description": "The LPN",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VoidLpnRequestDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LpnResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed grnId or lpnId, an unknown reasonCode, a note over 200 characters, or `other` without a note (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks labels.execute (role-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such LPN on this goods receipt (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The LPN is already voided or was put away (lpn-not-active, with `lpnCode` and `lpnStatus`), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 2-10b — voids an active LPN, freeing its quantity (labels.execute; audited). Terminal: a voided LPN never prints; there is no edit — void and mint again",
+        "tags": [
+          "receiving"
+        ]
+      }
+    },
     "/tenants/{tenantId}/receiving/over-receipts": {
       "get": {
         "operationId": "ReceivingController_listOverReceipts",
@@ -26740,6 +27213,7 @@
                 "licence",
                 "licence_policy",
                 "ledger_event",
+                "lpn",
                 "manifest",
                 "order",
                 "order_import",
@@ -52906,6 +53380,23 @@
           "binCode"
         ]
       },
+      "PutawayTaskLpnDto": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "The LPN code — what the pallet or carton label's barcode encodes, byte for byte"
+          },
+          "qty": {
+            "type": "number",
+            "description": "The declared quantity on the label, base units"
+          }
+        },
+        "required": [
+          "code",
+          "qty"
+        ]
+      },
       "PutawayTaskDto": {
         "type": "object",
         "properties": {
@@ -52962,6 +53453,13 @@
             "items": {
               "type": "string"
             }
+          },
+          "lpns": {
+            "description": "Story 2-10b — the GRN line's ACTIVE LPNs (licence plates) in code order; empty when none. A handheld scan of one chooses this task, verified, with the quantity prefilled (min of the LPN's and the task's). Placed and voided LPNs never appear",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PutawayTaskLpnDto"
+            }
           }
         },
         "required": [
@@ -52974,7 +53472,8 @@
           "batchCode",
           "qty",
           "suggestedBin",
-          "rationale"
+          "rationale",
+          "lpns"
         ]
       },
       "PickTaskDto": {
@@ -54396,6 +54895,294 @@
         },
         "required": [
           "items"
+        ]
+      },
+      "LpnDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "description": "The licence plate code — `LPN-` and the tenant number, zero-padded to 6 digits; the barcode payload byte for byte"
+          },
+          "grnId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "grnLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "batchId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The SKU's client when the LPN was minted"
+          },
+          "qty": {
+            "type": "number",
+            "description": "The declared quantity, base units"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "placed",
+              "voided"
+            ],
+            "description": "`active` (labelled, rides its putaway task), `placed` (a placement consumed it), `voided` (terminal; frees its quantity)"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "placedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "When a placement consumed it (server clock)"
+          },
+          "voidedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "voidReasonCode": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "misprint",
+              "wrong-quantity",
+              "label-damaged",
+              "other",
+              null
+            ]
+          },
+          "voidNote": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "grnId",
+          "grnLineId",
+          "skuId",
+          "skuCode",
+          "batchId",
+          "batchCode",
+          "clientId",
+          "qty",
+          "status",
+          "createdAt",
+          "placedAt",
+          "voidedAt",
+          "voidReasonCode",
+          "voidNote"
+        ]
+      },
+      "LpnLineUnlabelledDto": {
+        "type": "object",
+        "properties": {
+          "grnLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "unlabelledQty": {
+            "type": "number",
+            "description": "Base units that may still go on labels: applied + approved over-receipt excess − failed-inspection units − Σ the line's placements − Σ its active LPNs, floored at 0 (the mint's own cap)"
+          }
+        },
+        "required": [
+          "grnLineId",
+          "unlabelledQty"
+        ]
+      },
+      "LpnListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "description": "Every LPN of the goods receipt (any status), in code order",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LpnDto"
+            }
+          },
+          "lines": {
+            "description": "One entry per line of the goods receipt, in receipt order",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LpnLineUnlabelledDto"
+            }
+          }
+        },
+        "required": [
+          "items",
+          "lines"
+        ]
+      },
+      "MintLpnsLineDto": {
+        "type": "object",
+        "properties": {
+          "grnLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "A line of this goods receipt"
+          },
+          "quantities": {
+            "minItems": 1,
+            "maxItems": 1000,
+            "description": "One declared quantity per label, in request order (base units, each > 0). A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded.",
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          }
+        },
+        "required": [
+          "grnLineId",
+          "quantities"
+        ]
+      },
+      "MintLpnsRequestDto": {
+        "type": "object",
+        "properties": {
+          "lines": {
+            "minItems": 1,
+            "maxItems": 200,
+            "description": "The lines to label (distinct), at most 1000 labels in total",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MintLpnsLineDto"
+            }
+          }
+        },
+        "required": [
+          "lines"
+        ]
+      },
+      "MintLpnsResponse": {
+        "type": "object",
+        "properties": {
+          "grnId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "lpns": {
+            "description": "The minted LPNs, in request order (code order)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LpnDto"
+            }
+          }
+        },
+        "required": [
+          "grnId",
+          "lpns"
+        ]
+      },
+      "LpnLabelsRequestDto": {
+        "type": "object",
+        "properties": {
+          "lpnIds": {
+            "minItems": 1,
+            "maxItems": 1000,
+            "uniqueItems": true,
+            "description": "The LPNs to print (distinct ids of this goods receipt). Send this, or `grnLineId`, or neither.",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "grnLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Print the non-voided LPNs of one line of this receipt. Send this, or `lpnIds`, or neither."
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "zpl",
+              "pdf"
+            ],
+            "description": "`zpl` (Zebra thermal, 203 dpi) or `pdf`"
+          },
+          "layout": {
+            "type": "string",
+            "enum": [
+              "label",
+              "a4"
+            ],
+            "default": "label",
+            "description": "`label` — one label per page or per ^XA…^XZ (default); `a4` — a 3 × 8 sheet of 70 × 36 mm cells (PDF only)"
+          },
+          "size": {
+            "type": "string",
+            "enum": [
+              "4x2",
+              "2x1"
+            ],
+            "default": "4x2",
+            "description": "The label size in inches (`label` layout only; sending it with `a4` is a 400)"
+          }
+        },
+        "required": [
+          "format"
+        ]
+      },
+      "VoidLpnRequestDto": {
+        "type": "object",
+        "properties": {
+          "reasonCode": {
+            "type": "string",
+            "enum": [
+              "misprint",
+              "wrong-quantity",
+              "label-damaged",
+              "other"
+            ],
+            "description": "Why the label is voided (`other` needs the note)"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200,
+            "description": "A note (trimmed, 1–200 characters; required with `other`)"
+          }
+        },
+        "required": [
+          "reasonCode"
+        ]
+      },
+      "LpnResponse": {
+        "type": "object",
+        "properties": {
+          "lpn": {
+            "$ref": "#/components/schemas/LpnDto"
+          }
+        },
+        "required": [
+          "lpn"
         ]
       },
       "OverReceiptDto": {
@@ -56602,6 +57389,12 @@
             "items": {
               "type": "string"
             }
+          },
+          "lpnCode": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 32,
+            "description": "Story 2-10b — the LPN (licence plate) the operator scanned for this placement: it must be an ACTIVE LPN of this GRN line holding at least `qty`, and the placement consumes it (`placed`). Absent, null or blank = no LPN (the payload hashes exactly as before)"
           }
         },
         "required": [
@@ -63020,6 +63813,7 @@
               "licence",
               "licence_policy",
               "ledger_event",
+              "lpn",
               "manifest",
               "order",
               "order_import",
@@ -63125,6 +63919,7 @@
               "licence",
               "licence_policy",
               "ledger_event",
+              "lpn",
               "manifest",
               "order",
               "order_import",

@@ -9,6 +9,7 @@ import {
   bins,
   goodsReceiptLines,
   goodsReceiptNotes,
+  lpns,
   putawayPlacements,
   skus,
   stockOnHand,
@@ -96,6 +97,13 @@ export interface PutawayTask {
    * `min(remaining, their count)`; a task at 0 is dropped.
    */
   readonly serialNumbers?: readonly string[];
+  /**
+   * Story 2-10b (decision 8) — the line's ACTIVE LPNs (licence plates), in
+   * code order, each with its declared quantity in base units; empty when
+   * none. The handheld's putaway task step matches an LPN scan against it. A
+   * placed or voided LPN never rides (an LPN is consumed by its placement).
+   */
+  readonly lpns: readonly { readonly code: string; readonly qty: number }[];
 }
 
 /** One bin of the snapshot's bins payload (blocked/system bins INCLUDED — the device needs them to reject a scan against them). */
@@ -489,6 +497,28 @@ export class PutawayFacade {
       tenantId,
       picked.map((entry) => entry.fit).filter((fit): fit is PutawayBinCandidate => fit !== null),
     );
+    // Story 2-10b — the tasks' active LPNs, one read (inbound-owned, read-only
+    // here as `goods_receipt_lines` is), in code order.
+    const lpnRows =
+      picked.length === 0
+        ? []
+        : await tx
+            .select({ grnLineId: lpns.grnLineId, code: lpns.code, qty: lpns.qty })
+            .from(lpns)
+            .where(
+              and(
+                eq(lpns.tenantId, tenantId),
+                inArray(lpns.grnLineId, picked.map((entry) => entry.row.grnLineId)),
+                eq(lpns.status, 'active'),
+              ),
+            )
+            .orderBy(asc(lpns.seq));
+    const lpnsByLine = new Map<string, { code: string; qty: number }[]>();
+    for (const row of lpnRows) {
+      const list = lpnsByLine.get(row.grnLineId) ?? [];
+      list.push({ code: row.code, qty: fromMilli(row.qty) });
+      lpnsByLine.set(row.grnLineId, list);
+    }
     const tasks: PutawayTask[] = picked.map(({ row, sku, remaining, fit, serialNumbers }) => ({
       grnId: row.grnId,
       grnCode: row.grnCode,
@@ -503,6 +533,7 @@ export class PutawayFacade {
       rationale: fit === null ? 'No conforming storage bin has room for these units' : putawayRationale(fit, labels),
       // Story 2-6a — present only on a serial line that captured serials.
       ...(serialNumbers === null ? {} : { serialNumbers }),
+      lpns: lpnsByLine.get(row.grnLineId) ?? [],
     }));
     return tasks;
   }
