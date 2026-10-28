@@ -706,14 +706,17 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
     const skuId = skuIds.get('WAV-SHORT')!;
     // The stock is real (so acceptance reserves it) but its bin is blocked,
     // which is exactly what "not pickable" means (putaway's filter set).
+    // Story 3-3b: a blocked bin's stock is no longer PROMISED either, so the
+    // block lands AFTER acceptance reserved it — this stays a draw-side test
+    // (the 3-3a A6 re-establishment, for bins).
     await seedStock(skuId, binC, 7);
+    const orderId = await createOrder([{ skuId, quantity: 7 }]);
     await request(app.getHttpServer())
-      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binC}`)
+      .post(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binC}/block`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ blocked: true })
-      .expect(200);
-    const orderId = await createOrder([{ skuId, quantity: 7 }]);
+      .send({ reason: 'damaged' })
+      .expect(201);
     const policy = await policyId(`Short ${ulid().slice(0, 8)}`, 'single');
 
     const wave = (await generate({ policyId: policy, orderIds: [orderId] }).expect(201)).body
@@ -732,11 +735,11 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
     // Unblock for the rest of the suite and free the order again.
     await cancelWave(wave.id).expect(200);
     await request(app.getHttpServer())
-      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binC}`)
+      .post(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binC}/unblock`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ blocked: false })
-      .expect(200);
+      .send({ note: 'Rack repaired' })
+      .expect(201);
   });
 
   // ── Story 12-1 — storage conformance in allocation (FR-40/AD-18) ──────────
@@ -943,14 +946,15 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
       .expect(200);
     // The merge moved the 6 units into A-01-03 and retired the source; put
     // them somewhere unpickable again so ONLY unpickable stock remains.
+    // Story 3-3b: blocked-bin stock is unpromisable, so the order reserves
+    // first and the block lands after it (a draw-side test).
+    const orderId = await createOrder([{ skuId, quantity: 10 }]);
     await request(app.getHttpServer())
-      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binC}`)
+      .post(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binC}/block`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ blocked: true })
-      .expect(200);
-
-    const orderId = await createOrder([{ skuId, quantity: 10 }]);
+      .send({ reason: 'damaged' })
+      .expect(201);
     const policy = await policyId(`System bins ${ulid().slice(0, 8)}`, 'single');
     const wave = (await generate({ policyId: policy, orderIds: [orderId] }).expect(201)).body
       .wave as Wave;
@@ -965,11 +969,11 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
     expect(released.picklists[0]!.status).toBe('cancelled');
 
     await request(app.getHttpServer())
-      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binC}`)
+      .post(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binC}/unblock`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ blocked: false })
-      .expect(200);
+      .send({ note: 'Rack repaired' })
+      .expect(201);
   });
 
   // ── release ────────────────────────────────────────────────────────────────

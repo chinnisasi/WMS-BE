@@ -80,6 +80,13 @@ export type BinRow = {
   dedicatedClientId: string | null;
   type: string;
   blocked: boolean;
+  /** Story 3-3b — why, when (ISO) and by whom the bin was blocked; all null while active. */
+  blockedReason: string | null;
+  blockedNote: string | null;
+  blockedAt: string | null;
+  blockedBy: string | null;
+  /** The blocker's display name (`memberDisplayNamesInTx`), null when `blockedBy` is. */
+  blockedByName: string | null;
   /** Story 3.6 — the retirement pair (null while the bin is live). */
   retiredAt: string | null;
   retiredBy: string | null;
@@ -996,6 +1003,15 @@ export class TenancyService {
   }
 
   /**
+   * Story 3-3b — the display names of these blockers (a bin command's
+   * response names who blocked the bin, `BinResponse.blockedByName`).
+   */
+  async memberDisplayNames(tenantId: string, userIds: readonly string[]): Promise<Map<string, string>> {
+    if (userIds.length === 0) return new Map();
+    return withTenantTransaction(this.db, tenantId, (tx) => memberDisplayNamesInTx(tx, tenantId, userIds));
+  }
+
+  /**
    * Bins of one zone (Story 1.3): the zone must belong to the warehouse
    * (404 otherwise), keyset cursor pagination on (created_at, id). Created
    * bins are immediately listed — no dormant state.
@@ -1009,14 +1025,14 @@ export class TenancyService {
   ): Promise<Page<BinRow>> {
     const pageSize = clampPageSize(limit);
     const before = cursor === undefined ? undefined : decodeCursorSafe(cursor);
-    const rows = await withTenantTransaction(this.db, tenantId, async (tx) => {
+    const rows = await withTenantTransaction(this.db, tenantId, async (tx): Promise<BinRow[]> => {
       await assertWarehouseInTenant(tx, tenantId, warehouseId);
       const scope = and(
         eq(bins.tenantId, tenantId),
         eq(bins.warehouseId, warehouseId),
         eq(bins.zoneId, zoneId),
       );
-      return tx
+      const found = await tx
         .select({
           id: bins.id,
           tenantId: bins.tenantId,
@@ -1036,6 +1052,11 @@ export class TenancyService {
           dedicatedClientId: bins.dedicatedClientId,
           type: bins.type,
           blocked: bins.blocked,
+          // Story 3-3b: the block's reason, note, time and blocker.
+          blockedReason: bins.blockedReason,
+          blockedNote: bins.blockedNote,
+          blockedAt: bins.blockedAt,
+          blockedBy: bins.blockedBy,
           // Story 3.6: retired bins STAY listed (the zone bin list is the
           // master-data view — the FE flags them with `retiredAt`; the
           // device snapshot is the surface that excludes them).
@@ -1055,6 +1076,14 @@ export class TenancyService {
         )
         .orderBy(desc(bins.createdAt), desc(bins.id))
         .limit(pageSize + 1);
+      // Story 3-3b: the blockers' display names, in the same transaction.
+      const blockers = found.flatMap((row) => (row.blockedBy === null ? [] : [row.blockedBy]));
+      const names = blockers.length === 0 ? new Map<string, string>() : await memberDisplayNamesInTx(tx, tenantId, blockers);
+      return found.map((row) => ({
+        ...row,
+        blockedAt: row.blockedAt === null ? null : new Date(row.blockedAt).toISOString(),
+        blockedByName: row.blockedBy === null ? null : (names.get(row.blockedBy) ?? null),
+      }));
     });
     // Story 10.1: a read model hands out BASE units; the column holds milli.
     const page = buildPage(

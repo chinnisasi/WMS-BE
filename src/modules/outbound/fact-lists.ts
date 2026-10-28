@@ -232,7 +232,7 @@ export async function listPicklistLinesInTx(
   tx: TenantTx,
   tenantId: string,
   warehouseId: string,
-  filter: WindowFilter & { readonly status?: PicklistLineStatus | undefined },
+  filter: WindowFilter & { readonly status?: PicklistLineStatus | undefined; readonly skippedBlockedBin?: boolean | undefined },
 ): Promise<Page<PicklistLineEntry>> {
   const l = picklistLines;
   const rows = await tx
@@ -247,6 +247,12 @@ export async function listPicklistLinesInTx(
         eq(l.tenantId, tenantId),
         eq(picklists.warehouseId, warehouseId),
         filter.status === undefined ? undefined : eq(l.status, filter.status),
+        // Story 3-3b: the Skip of a stop in a blocked bin, in or out.
+        filter.skippedBlockedBin === undefined
+          ? undefined
+          : filter.skippedBlockedBin
+            ? sql`${l.reasonCode} = 'skipped-blocked-bin'`
+            : sql`${l.reasonCode} is distinct from 'skipped-blocked-bin'`,
         // Story 1-5a: through the line's own order.
         filter.clientId === undefined ? undefined : orderOfClient(l.orderId, tenantId, filter.clientId),
         filter.from === undefined ? undefined : sql`${l.updatedAt} >= ${filter.from}::timestamptz`,

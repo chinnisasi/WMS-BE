@@ -46,6 +46,8 @@ import {
   type PlannedRecallBinTask,
 } from './recall-trace';
 export type { OrderTraceFacts, PlannedRecallBinTask } from './recall-trace';
+// Story 3-3b — the block impact preview's planned-lines read.
+import { plannedPickLinesInBinInTx } from './replan';
 import {
   listBackorderRefusalsInTx,
   listPackFailuresInTx,
@@ -624,6 +626,19 @@ export class OutboundFacade {
     return plannedTasksInBinsInTxImpl(tx, tenantId, orderIds, binSkuPairs);
   }
 
+  /**
+   * Story 3-3b (A13) — the planned pick lines in one bin, per SKU (lines and
+   * milli-units): the block impact preview's outbound term. A read on the
+   * caller's transaction.
+   */
+  async plannedPickLinesInBinInTx(
+    tx: TenantTx,
+    tenantId: string,
+    binId: string,
+  ): Promise<ReadonlyArray<{ skuId: string; lines: number; units: number }>> {
+    return plannedPickLinesInBinInTx(tx, tenantId, binId);
+  }
+
   /** `POST .../outbound/orders/{orderId}/label` — the 4.6c label command. */
   async createShipmentLabel(
     command: CreateShipmentLabelCommand,
@@ -1161,9 +1176,9 @@ export class OutboundFacade {
   async listPicklistLines(
     tenantId: string,
     warehouseId: string,
-    query: ListWindowQuery & { readonly status?: PicklistLineStatus | undefined } = {},
+    query: ListWindowQuery & { readonly status?: PicklistLineStatus | undefined; readonly skippedBlockedBin?: boolean | undefined } = {},
   ): Promise<Page<PicklistLineEntry>> {
-    const filter = { ...this.windowFilter(query), status: query.status };
+    const filter = { ...this.windowFilter(query), status: query.status, skippedBlockedBin: query.skippedBlockedBin };
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       await assertWarehouseInTenant(tx, tenantId, warehouseId);
       return listPicklistLinesInTx(tx, tenantId, warehouseId, filter);

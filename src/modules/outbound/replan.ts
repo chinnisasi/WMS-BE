@@ -389,3 +389,29 @@ async function openClaimsInTx(
     rows.flatMap((row) => (row.binId === null ? [] : [[row.binId, Number(row.claimed)] as const])),
   );
 }
+
+/**
+ * Story 3-3b (decision 11, A13) — the planned pick lines in ONE bin, per SKU:
+ * how many lines a block would leave needing a Skip and a re-plan, and the
+ * units (milli) they plan to draw. The `openClaimsInTx` shape — `planned` is
+ * the only status that claims anything — keyed by the bin instead of a SKU.
+ * Advisory (the block impact preview); never a lock.
+ */
+export async function plannedPickLinesInBinInTx(
+  tx: TenantTx,
+  tenantId: string,
+  binId: string,
+): Promise<ReadonlyArray<{ skuId: string; lines: number; units: number }>> {
+  const rows = await tx
+    .select({
+      skuId: picklistLines.skuId,
+      lines: sql<string>`count(*)::bigint`,
+      // Story 10.1: `::bigint` (milli-units overflow int4 at ~2.1M base units).
+      units: sql<string>`coalesce(sum(${picklistLines.qty}), 0)::bigint`,
+    })
+    .from(picklistLines)
+    .where(and(eq(picklistLines.tenantId, tenantId), eq(picklistLines.binId, binId), eq(picklistLines.status, 'planned')))
+    .groupBy(picklistLines.skuId)
+    .orderBy(picklistLines.skuId);
+  return rows.map((row) => ({ skuId: row.skuId, lines: Number(row.lines), units: Number(row.units) }));
+}

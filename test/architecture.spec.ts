@@ -497,7 +497,16 @@ describe('architecture: catalog identity is catalog-module-owned (story 10.3)', 
     const columns = new Set([...allowed.matchAll(/\bbatches\.(\w+)/g)].map((match) => match[1]!));
     expect([...columns].sort()).toEqual(['expiryDate', 'id', 'status', 'tenantId']);
     expect(drizzleWriteOn('batches').test(allowed)).toBe(false);
-    expect(allowed).toContain('export async function unpromisableBatchUnits(');
+    // Story 3-3b (decision 7) — the hook was EXTENDED, not forked: one
+    // exported `unpromisableUnits` returning `{ batch, blockedBin }`; the
+    // 3-3a batch term is its module-private half. Tenancy's `bins` is read
+    // there for `blocked` / `system_owned` only (locate only, as the
+    // system-bin hooks read it), never written.
+    expect(allowed).toContain('export async function unpromisableUnits(');
+    expect(allowed).not.toContain('export async function unpromisableBatchUnits(');
+    const hook = allowed.slice(allowed.indexOf('export async function unpromisableUnits('), allowed.indexOf('async function unpromisableBatchUnits('));
+    expect([...new Set([...hook.matchAll(/\bbins\.(\w+)/g)].map((match) => match[1]!))].sort()).toEqual(['blocked', 'id', 'systemOwned', 'tenantId']);
+    expect(drizzleWriteOn('bins').test(allowed)).toBe(false);
     // Story 4-3a (A12) — the allocation panel's undated-batch count rides the same allowance (same columns).
     expect(allowed).toContain('export async function undatedBatchesOnHandOfClientInTx(');
     // The writer of the lifecycle columns is catalog's block write — story

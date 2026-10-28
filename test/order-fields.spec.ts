@@ -694,11 +694,11 @@ describe('order fields (e2e, story 4-2a)', () => {
       const urgent = await createOrder('A-4', { priority: 'urgent' }, wh.warehouseId, 3);
       // The second bin goes unpickable after both orders reserved.
       await http()
-        .patch(`${API}/${tenantId}/warehouses/${wh.warehouseId}/bins/${wh.bins[1]!}`)
+        .post(`${API}/${tenantId}/warehouses/${wh.warehouseId}/bins/${wh.bins[1]!}/block`)
         .set('Authorization', `Bearer ${ownerToken}`)
         .set(KEY_HEADER, ulid())
-        .send({ blocked: true })
-        .expect(200);
+        .send({ reason: 'damaged' })
+        .expect(201);
       const wave = (await generate({ warehouseId: wh.warehouseId, policyId: await policy(wh.warehouseId, 'batch'), orderIds: [normal, urgent] }).expect(201)).body.wave as Wave;
       const lines = wave.picklists[0]!.lines;
       const urgentLines = lines.filter((line) => line.orderId === urgent);

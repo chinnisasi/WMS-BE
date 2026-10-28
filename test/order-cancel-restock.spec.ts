@@ -617,7 +617,8 @@ describe('story 4-2b: cancel with restock (e2e)', () => {
     await seed('CR-BLK', binC, 5);
     const { orderId, picklist } = await fixtures.releasedWave([{ skuId: sku('CR-BLK'), quantity: 2 }]);
     await fixtures.pickAllLines(picklist);
-    await sql`update bins set blocked = true where id = ${binC}`;
+    // Story 3-3b: a blocked row carries its reason, time and blocker (bins_blocked_pairing).
+    await sql`update bins set blocked = true, blocked_reason = 'damaged', blocked_at = now(), blocked_by = ${opsUserId} where id = ${binC}`;
     try {
       const key = ulid();
       const res = await cancelRestock(orderId, {}, key).expect(409);
@@ -626,7 +627,7 @@ describe('story 4-2b: cancel with restock (e2e)', () => {
       await expectUntouched(orderId, key, 'accepted', ['committed']);
       await cancelRestock(orderId, { restockBinId: binR }).expect(200);
     } finally {
-      await sql`update bins set blocked = false where id = ${binC}`;
+      await sql`update bins set blocked = false, blocked_reason = null, blocked_note = null, blocked_at = null, blocked_by = null where id = ${binC}`;
     }
   });
 
@@ -734,7 +735,7 @@ describe('story 4-2b: cancel with restock (e2e)', () => {
     const retired = await createBin(wh, zoneId, 'T-01-01');
     const blocked = await createBin(wh, zoneId, 'T-01-02');
     await sql`update bins set retired_at = now(), retired_by = ${opsUserId} where id = ${retired}`;
-    await sql`update bins set blocked = true where id = ${blocked}`;
+    await sql`update bins set blocked = true, blocked_reason = 'damaged', blocked_at = now(), blocked_by = ${opsUserId} where id = ${blocked}`;
     await seed('CR-ARM', binA, 3);
     const orderId = await fixtures.createOrder([{ skuId: sku('CR-ARM'), quantity: 1 }]);
     expect((await cancelRestock(orderId, { restockBinId: retired }).expect(409)).body.code).toBe('bin-retired');

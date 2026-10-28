@@ -320,6 +320,28 @@ export class MovementsFacade {
     @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
   ) {}
 
+  /**
+   * Story 3-3b (decision 11, A13) — the open count lines in one bin: the lines
+   * of its `pending` count tasks. A blocked bin is still counted (counting
+   * damaged stock is the point), so these stay open; the block impact preview
+   * only reports them. A read on the caller's transaction.
+   */
+  async openCountLinesInBinInTx(tx: TenantTx, tenantId: string, warehouseId: string, binId: string): Promise<number> {
+    const rows = await tx
+      .select({ n: sql<string>`count(*)::bigint` })
+      .from(countTaskLines)
+      .innerJoin(countTasks, and(eq(countTasks.tenantId, countTaskLines.tenantId), eq(countTasks.id, countTaskLines.taskId)))
+      .where(
+        and(
+          eq(countTaskLines.tenantId, tenantId),
+          eq(countTasks.warehouseId, warehouseId),
+          eq(countTasks.binId, binId),
+          eq(countTasks.status, 'pending'),
+        ),
+      );
+    return Number(rows[0]?.n ?? 0);
+  }
+
   // ── command passthroughs (the api layer's only transfer mutations) ──────
 
   createTransfer(command: Parameters<TransferService['createTransfer']>[0], idempotencyKey: string) {

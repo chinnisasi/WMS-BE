@@ -285,7 +285,18 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
       .send(body);
   }
 
+  // Story 3-3b (A17): the block toggle is two verbs now — `true` blocks
+  // (`damaged`), `false` unblocks (with the required note).
   function blockBin(binId: string, blocked: boolean, token = ownerToken, key = ulid()): SupertestTest {
+    return request(app.getHttpServer())
+      .post(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binId}/${blocked ? 'block' : 'unblock'}`)
+      .set('Authorization', `Bearer ${token}`)
+      .set(KEY_HEADER, key)
+      .send(blocked ? { reason: 'damaged' } : { note: 'Rack repaired' });
+  }
+
+  /** The retired PATCH `{blocked}` arm (A6) — only a pre-3-3b key still replays through it. */
+  function legacyPatchBlocked(binId: string, blocked: boolean, token = ownerToken, key = ulid()): SupertestTest {
     return request(app.getHttpServer())
       .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binId}`)
       .set('Authorization', `Bearer ${token}`)
@@ -455,14 +466,14 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
 
   // ── the block/unblock re-home (matrix rows: the PATCH URL is unchanged) ─────
 
-  it('block toggle: 200 with the flag + audit row; replay re-serves; reuse 422; unknown bin 404; system bin 400 validation-failed', async () => {
+  it('block verb: 201 with the flag + audit row; replay re-serves; reuse 422; unknown bin 404; system bin 400 validation-failed', async () => {
     const key = ulid();
-    const blocked = await blockBin(binA04, true, ownerToken, key).expect(200);
+    const blocked = await blockBin(binA04, true, ownerToken, key).expect(201);
     // `capacity` rides the block response: story 10.1 converts it out of
     // milli-units here too, and nothing else in this suite observes it.
     expect(blocked.body).toMatchObject({ id: binA04, capacity: 100, blocked: true });
 
-    const replay = await blockBin(binA04, true, ownerToken, key).expect(200);
+    const replay = await blockBin(binA04, true, ownerToken, key).expect(201);
     expect(replay.body).toEqual(blocked.body);
 
     const reuse = await blockBin(binA04, false, ownerToken, key).expect(422);
@@ -871,7 +882,10 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
       await seed.end();
     }
 
-    const replay = await blockBin(binA03, false, ownerToken, key).expect(200);
+    // Story 3-3b (A6): the PATCH `blocked` arm is retired, but BEHIND the
+    // replay lookup — a key stored by a pre-3-3b PATCH re-serves its
+    // snapshot (the pre-3-3b fingerprint, byte for byte).
+    const replay = await legacyPatchBlocked(binA03, false, ownerToken, key).expect(200);
     expect(replay.body).toMatchObject({
       id: binA03,
       blocked: true,
@@ -880,7 +894,18 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
       retiredBy: null,
       // Story 1-5b: a pre-1.5b snapshot replays shared (`normalizeBin`).
       dedicatedClientId: null,
+      // Story 3-3b (A7): a pre-3-3b snapshot replays the block's five fields null.
+      blockedReason: null,
+      blockedNote: null,
+      blockedAt: null,
+      blockedBy: null,
+      blockedByName: null,
     });
+    // …and a NEW key on the retired arm is the 400 naming both verbs.
+    const fresh = await legacyPatchBlocked(binA03, false).expect(400);
+    expect(fresh.body.code).toBe('validation-failed');
+    expect(String(fresh.body.detail)).toContain('/block');
+    expect(String(fresh.body.detail)).toContain('/unblock');
   });
 
   it('authority: merge needs bin.retire (accountant 403, foreign session 403, bare 401); bin.retire stays out of the operator hand', async () => {

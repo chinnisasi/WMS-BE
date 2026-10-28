@@ -5,6 +5,7 @@ import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import type { PicklistLine } from '../../shared/db/schema';
 import {
+  SUSPECT_STOCK_BIN_BLOCK_REASONS,
   auditEvents,
   batches,
   bins,
@@ -83,8 +84,30 @@ export const SHORT_PICK_REASON_CODES = [
   'damaged-units',
   'stock-not-found',
   'other',
+  // Story 3-3b (A2) — the handheld's Skip of a planned stop in a BLOCKED bin:
+  // a zero-unit short that re-plans the stop onto other bins. Warehouse
+  // state, not a picking error — SM-3 and the shortPicks tile exclude it
+  // (`reporting/kpis.ts`), the client's `lines_short` keeps it. Never offered
+  // in the handheld's manual reason picker. Named apart from the `bin-blocked`
+  // PROBLEM type so the two can never be confused.
+  'skipped-blocked-bin',
 ] as const;
 export type ShortPickReasonCode = (typeof SHORT_PICK_REASON_CODES)[number];
+
+/** Story 3-3b (A2) — the Skip reason. */
+export const SKIPPED_BLOCKED_BIN_REASON = 'skipped-blocked-bin' satisfies ShortPickReasonCode;
+
+/**
+ * Story 3-3b (A4, guide §4 "replacing a vocabulary") — the five pre-3-3b
+ * reasons, frozen: the tuple only ever grows (the 0106 CHECK is re-added NOT
+ * VALID on exactly that promise), asserted at module load.
+ */
+const PRE_3_3B_SHORT_PICK_REASON_CODES = ['bin-empty', 'fewer-units-than-planned', 'damaged-units', 'stock-not-found', 'other'] as const;
+for (const code of PRE_3_3B_SHORT_PICK_REASON_CODES) {
+  if (!(SHORT_PICK_REASON_CODES as readonly string[]).includes(code)) {
+    throw new Error(`SHORT_PICK_REASON_CODES lost the pre-3-3b reason "${code}" — stored short lines would no longer be representable.`);
+  }
+}
 
 function isShortPickReason(value: string): value is ShortPickReasonCode {
   return (SHORT_PICK_REASON_CODES as readonly string[]).includes(value);
@@ -762,6 +785,10 @@ export class PickCommandService {
           id: bins.id,
           code: bins.code,
           blocked: bins.blocked,
+          // Story 3-3b — the block's facts the Skip and the offline exemption rule on.
+          blockedReason: bins.blockedReason,
+          blockedAt: bins.blockedAt,
+          blockedBy: bins.blockedBy,
           systemOwned: bins.systemOwned,
           retiredAt: bins.retiredAt,
           // Story 12-1 — the class the draw gate rules on (FR-40).
@@ -794,8 +821,51 @@ export class PickCommandService {
       if (drawBin.retiredAt !== null) {
         throw binRetiredAsSource(drawBin.code);
       }
-      if (drawBin.blocked) {
-        throw binBlocked(drawBin.code);
+      // ── story 3-3b (A1, A2): the blocked-bin arm ─────────────────────────
+      // After the structural arms (exists → system → retired), under the bin
+      // row lock — so a block and a pick of the same bin serialise.
+      //   * The Skip (`skipped-blocked-bin`): only qty 0 at the PLANNED bin
+      //     (else 400), only while the bin is blocked (else 409
+      //     `bin-not-blocked` — the handheld drops the op; nothing was drawn
+      //     and the stop is still planned). Admitted, it takes the ordinary
+      //     zero-unit short path and the re-plan moves the remainder; the
+      //     class and secure gates are skipped, because nothing is drawn.
+      //   * A pick made BEFORE the block (offline truth: `occurredAt` <
+      //     `blocked_at`) lands, unless the block is a backfilled one (no
+      //     blocker) or its reason marks the stock itself suspect
+      //     (contamination, temperature excursion).
+      //   * Anything else from a blocked bin: 400 `bin-blocked`, as before.
+      let skipBlockedBin = false;
+      let landedBeforeBlock: { binId: string; blockedAt: string; reason: string | null } | null = null;
+      if (reasonCode === SKIPPED_BLOCKED_BIN_REASON) {
+        if (scaled.qty !== 0 || line.binId === null || command.binId !== line.binId) {
+          throw pickValidation(
+            `reasonCode "${SKIPPED_BLOCKED_BIN_REASON}" skips a planned stop in a blocked bin: it is a pick of 0 unit(s) at the stop's own bin` +
+              (line.binId !== null && command.binId !== line.binId ? ` (this stop plans bin ${line.binId}, not ${command.binId})` : '') +
+              '.',
+          );
+        }
+        if (!drawBin.blocked) {
+          throw new ProblemException(
+            'bin-not-blocked',
+            409,
+            'Bin not blocked',
+            `Bin "${drawBin.code}" is not blocked (it was unblocked) — pick the stop normally instead of skipping it.`,
+            { binCode: drawBin.code },
+          );
+        }
+        skipBlockedBin = true;
+      } else if (drawBin.blocked) {
+        const blockedAt = drawBin.blockedAt === null ? null : new Date(drawBin.blockedAt).toISOString();
+        const exempt =
+          blockedAt !== null &&
+          drawBin.blockedBy !== null &&
+          !(SUSPECT_STOCK_BIN_BLOCK_REASONS as readonly string[]).includes(drawBin.blockedReason ?? '') &&
+          Date.parse(occurredAt) < Date.parse(blockedAt);
+        if (!exempt) {
+          throw binBlocked(drawBin.code, drawBin.blockedReason);
+        }
+        landedBeforeBlock = { binId: drawBin.id, blockedAt, reason: drawBin.blockedReason };
       }
       // ── story 12-1: the class gate (FR-40) — after the structural arms,
       // before anything is drawn: the refusal precedes the ledger append.
@@ -804,7 +874,7 @@ export class PickCommandService {
       // placement's gate (the SYNC HAZARD rule — a stock row reachable here
       // only through the recorded bypasses is never drawable by the planner,
       // whose pool filter runs the same predicate).
-      if (!storageClassSatisfies(sku.storageClass, drawBin.storageClass)) {
+      if (!skipBlockedBin && !storageClassSatisfies(sku.storageClass, drawBin.storageClass)) {
         throw binStorageMismatch(drawBin.code, sku.code, drawBin.storageClass, sku.storageClass);
       }
       // ── story 12-3: the secure-bin authority gate (FR-42) — immediately
@@ -816,7 +886,8 @@ export class PickCommandService {
       // this writer is the gate's LIVE arm (merge/hold/release are
       // non-denying today — the matrix invariant keeps the subset enforced);
       // non-secure bins are byte-identical to the pre-12.3 build.
-      assertSecureBinAuthority(role, [drawBin]);
+      // Story 3-3b (A2): a Skip draws nothing, so it needs no `secure.move`.
+      if (!skipBlockedBin) assertSecureBinAuthority(role, [drawBin]);
 
       // A SKU that is BOTH batch- and serial-tracked cannot be picked here.
       // The payload carries serial numbers but no batch, `serials` holds no
@@ -1510,6 +1581,12 @@ export class PickCommandService {
         targetType: pickId === null ? 'picklist_line' : 'pick',
         targetId: pickId ?? line.id,
         reference: idempotencyKey,
+        // Story 3-3b (A1): a pick that landed from a blocked bin because it
+        // was made before the block says so on its own row; (A2) a Skip
+        // names the blocked bin and the block's reason, so the short reads
+        // as warehouse state, never as the picker's miss.
+        ...(landedBeforeBlock === null ? {} : { changes: { landedBeforeBlock } }),
+        ...(skipBlockedBin ? { changes: { skippedBlockedBin: { binId: drawBin.id, reason: drawBin.blockedReason } } } : {}),
         occurredAt: pickedAt,
       });
 
@@ -2305,12 +2382,12 @@ function binCannotCover(
 }
 
 /** The blocked-bin rejection (FR-10): a blocked bin is unpickable. */
-export function binBlocked(binCode: string): ProblemException {
+export function binBlocked(binCode: string, reason: string | null = null): ProblemException {
   return new ProblemException(
     'bin-blocked',
     400,
     'Bin is blocked',
-    `Bin "${binCode}" is blocked — picks from it are refused until it is unblocked.`,
+    `Bin "${binCode}" is blocked${reason === null ? '' : ` (${reason})`} — picks from it are refused until it is unblocked.`,
   );
 }
 

@@ -310,11 +310,11 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
 
     // The blocked placement-gate arm.
     await request(app.getHttpServer())
-      .patch(`${API}/${tenantId}/warehouses/${destWarehouseId}/bins/${binBlocked}`)
+      .post(`${API}/${tenantId}/warehouses/${destWarehouseId}/bins/${binBlocked}/block`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ blocked: true })
-      .expect(200);
+      .send({ reason: 'damaged' })
+      .expect(201);
 
     // A second tenant for the cross-tenant arms.
     const otherEmail = `other-${ulid().toLowerCase()}@example.com`;

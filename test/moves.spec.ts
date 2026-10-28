@@ -277,17 +277,17 @@ describe('bin-to-bin moves (e2e, story 3-1)', () => {
     await seed(SERIAL_ONLY, 'Q-01', 2, { serials: ['T1', 'T2'] });
 
     await http()
-      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${bin('T-BLOCK')}`)
+      .post(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${bin('T-BLOCK')}/block`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ blocked: true })
-      .expect(200);
+      .send({ reason: 'damaged' })
+      .expect(201);
     await http()
-      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${bin('V-BLOCKORIGIN')}`)
+      .post(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${bin('V-BLOCKORIGIN')}/block`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ blocked: true })
-      .expect(200);
+      .send({ reason: 'damaged' })
+      .expect(201);
     await http()
       .post(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${bin('U-RETIRE')}/retire`)
       .set('Authorization', `Bearer ${ownerToken}`)

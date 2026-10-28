@@ -107,6 +107,13 @@ export interface PutawayBinSummary {
   readonly type: string;
   readonly capacity: number;
   readonly blocked: boolean;
+  /**
+   * Story 3-3b (decision 12, A7) — why the bin is blocked (null while
+   * active): the handheld names it on its pre-queue refusals ("A-01 is
+   * blocked (damaged) — pick another bin"). Additive; the device reads it
+   * `?? null` from a snapshot cached before 3-3b.
+   */
+  readonly blockedReason: string | null;
   readonly systemOwned: boolean;
   /**
    * Story 12.8 (UX-DR29): the bin's storage class — the other half of the
@@ -528,6 +535,8 @@ export class PutawayFacade {
         type: bins.type,
         capacity: bins.capacity,
         blocked: bins.blocked,
+        // Story 3-3b — the reason the handheld names on its refusals.
+        blockedReason: bins.blockedReason,
         systemOwned: bins.systemOwned,
         // Story 12.8 (UX-DR29): the class rides beside the type — the
         // device's offline conformance mirror reads both arms (bin here, SKU

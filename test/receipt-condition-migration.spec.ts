@@ -127,6 +127,19 @@ describe('migration 0087: pre-rule DAMAGED locations are re-coded', () => {
 
     // What a damaged receipt ensures before it books: the system DAMAGED
     // bin, now free of the collision in both warehouses (409 before 0087).
+    // The ensure is TODAY's code, whose drizzle insert names every `bins`
+    // column — so the scratch database is first brought to the head of the
+    // chain (story 3-3b's 0106 added the first `bins` columns after 0087).
+    const journal = JSON.parse(readFileSync(resolve(process.cwd(), 'drizzle/meta/_journal.json'), 'utf8')) as { entries: { idx: number; tag: string }[] };
+    await sql.begin(async (tx) => {
+      for (const entry of journal.entries.filter((e) => e.idx > 87).sort((a, b) => a.idx - b.idx)) {
+        const statements = readFileSync(resolve(process.cwd(), 'drizzle', `${entry.tag}.sql`), 'utf8')
+          .split('--> statement-breakpoint')
+          .map((statement) => statement.trim())
+          .filter((statement) => statement.length > 0);
+        for (const statement of statements) await tx.unsafe(statement);
+      }
+    });
     const db = createDatabase(preUrl);
     try {
       for (const warehouseId of [w1, w2]) {

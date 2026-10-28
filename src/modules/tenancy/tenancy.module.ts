@@ -13,6 +13,7 @@ import { AuditExportRunner } from './audit-export.runner';
 import { AUDIT_EXPORT_STORE, PostgresAuditExportStore } from './audit-export.store';
 import { BinCommand } from './bin.command';
 import { BinLabelsService } from './bin-labels';
+import { BinBlockImpactService } from './bin-block-impact';
 import { DeviceSessionGuard } from './device-session.guard';
 import { EnrollmentCommand } from './enrollment.command';
 import { RegistrationCommand } from './registration.command';
@@ -79,6 +80,8 @@ import { ZoneCommand } from './zone.command';
     BinCommand,
     // Story 2-10a — bin labels (a read: ZPL / PDF rendering).
     BinLabelsService,
+    // Story 3-3b — the block impact preview (composed from facade reads).
+    BinBlockImpactService,
     UsersCommand,
     EnrollmentCommand,
     SyncReportCommand,

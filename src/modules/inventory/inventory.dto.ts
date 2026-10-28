@@ -734,6 +734,9 @@ export class StockEntryDto {
     description: 'Whether the bin is a system bin (RECEIVING, QC-HOLD, RETURNS, IN-TRANSIT, DAMAGED) — present only under `order=location`',
   })
   binSystemOwned?: boolean;
+
+  @ApiProperty({ description: 'Story 3-3b — the bin is blocked: its stock stays on hand but is not promised (the "Blocked bin" chip)' })
+  binBlocked!: boolean;
 }
 
 /** GET …/warehouses/{warehouseId}/inventory/stock response. */

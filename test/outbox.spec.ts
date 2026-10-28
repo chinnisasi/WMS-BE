@@ -451,13 +451,20 @@ describe('transactional outbox substrate and relay (e2e, story outbox-relay)', (
         .expect(200)
     ).body.items[0].id as string;
 
-    // bin.blocked
+    // bin.blocked (story 3-3b: the block verb, carrying the reason) and
+    // bin.unblocked (the unblock verb).
     await request(app.getHttpServer())
-      .patch(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/bins/${binId}`)
+      .post(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/bins/${binId}/block`)
       .set(scheme, token)
       .set(KEY_HEADER, ulid())
-      .send({ blocked: true })
-      .expect(200);
+      .send({ reason: 'damaged' })
+      .expect(201);
+    await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/bins/${binId}/unblock`)
+      .set(scheme, token)
+      .set(KEY_HEADER, ulid())
+      .send({ note: 'Rack repaired' })
+      .expect(201);
 
     // --- catalog: catalog.imported, catalog.sku_edited ---
     const csv = Buffer.from(
@@ -530,6 +537,7 @@ describe('transactional outbox substrate and relay (e2e, story outbox-relay)', (
       'zone.created',
       'bins.generated',
       'bin.blocked',
+      'bin.unblocked',
       'catalog.imported',
       'catalog.sku_edited',
       'stock.adjusted',
@@ -556,10 +564,18 @@ describe('transactional outbox substrate and relay (e2e, story outbox-relay)', (
       firstCode: 'A-01-01',
       lastCode: 'A-01-01',
     });
-    expect(byType.get('bin.blocked')!.payload).toMatchObject({
+    // Story 3-3b (A8): exact payloads — the block adds `reason`; the unblock
+    // is its own type, `blocked: false`, no reason.
+    expect(byType.get('bin.blocked')!.payload).toEqual({
       binId,
       warehouseId,
       blocked: true,
+      reason: 'damaged',
+    });
+    expect(byType.get('bin.unblocked')!.payload).toEqual({
+      binId,
+      warehouseId,
+      blocked: false,
     });
     expect(byType.get('catalog.imported')!.payload).toMatchObject({
       importId: imported.body.importId,

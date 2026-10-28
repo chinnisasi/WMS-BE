@@ -308,6 +308,10 @@ export const AUDIT_NEW_ACTIONS = [
   // history survives the unblock clearing the row.
   { action: 'batch.blocked', targetType: 'batch' },
   { action: 'batch.unblocked', targetType: 'batch' },
+  // Story 3-3b — the bin unblock verb (putaway's `BinStateCommand.unblock`).
+  // The block keeps the pre-9-3a `bin.blocked` action (never renamed); both
+  // rows now carry `changes` (before/after blocked, reason, note).
+  { action: 'bin.unblocked', targetType: 'bin' },
   // Story 3-7a — the batch recall (`RecallCommand`). Open, add and close are
   // keyed; the report download is an UNKEYED read audit (`reference` = a
   // fresh uuidv7 — no key was sent), one row per download.

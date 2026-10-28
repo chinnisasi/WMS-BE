@@ -48,9 +48,12 @@ import {
   Length,
   Matches,
   Max,
+  MaxLength,
   Min,
+  ValidateIf,
   ValidateNested,
 } from 'class-validator';
+import { BIN_BLOCK_REASONS, type BinBlockReason } from '../../shared/db/schema';
 
 /**
  * Trim inputs at the validation boundary so the command layer's normalized
@@ -1044,10 +1047,18 @@ export class PatchBinDto {
   // one idempotency key per request); a body with neither is a 400.
   // `blocked` went from required to optional, but a blocked-only body is the
   // only body the route ever accepted pre-11.5, so no client broke.
+  // Story 3-3b (A6): RETIRED. A bin is blocked with `POST …/block` and
+  // unblocked with `POST …/unblock`, which record why, when and by whom. The
+  // field stays declared (deprecated) so the ValidationPipe does not answer a
+  // generic "should not exist": a `{blocked}` body still reaches the state
+  // command, which re-serves a key stored by a pre-3-3b PATCH and otherwise
+  // answers 400 `validation-failed` naming the two verbs.
   @ApiProperty({
     required: false,
+    deprecated: true,
     example: false,
-    description: 'true blocks the bin (broken); false unblocks. Mutually exclusive with the capacity attributes.',
+    description:
+      'RETIRED (story 3-3b): a body carrying `blocked` answers 400 validation-failed naming `POST …/bins/{binId}/block` and `…/unblock` (only a key stored by a pre-3-3b PATCH still replays). Mutually exclusive with the capacity attributes.',
   })
   @IsOptional()
   @IsBoolean()
@@ -1246,6 +1257,33 @@ export class BinResponse {
   @ApiProperty({ example: false })
   blocked!: boolean;
 
+  // Story 3-3b: why, when and by whom the bin was blocked — all null while
+  // the bin is active (and on a snapshot stored before 3-3b, through
+  // `normalizeBin`).
+  @ApiProperty({
+    enum: [...BIN_BLOCK_REASONS, null],
+    nullable: true,
+    description: 'Story 3-3b: why the bin is blocked (null while active). A bin blocked before 3-3b reads `other` with the backfill note.',
+  })
+  blockedReason!: BinBlockReason | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Story 3-3b: the block\'s note (null when none, or while active)' })
+  blockedNote!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Story 3-3b: when the bin was blocked (ISO-8601; null while active)' })
+  blockedAt!: string | null;
+
+  @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    description: 'Story 3-3b: who blocked the bin (null while active, and for a block backfilled from before 3-3b)',
+  })
+  blockedBy!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Story 3-3b: the blocker\'s display name (the email handle), null when blockedBy is' })
+  blockedByName!: string | null;
+
   @ApiProperty({
     example: null,
     nullable: true,
@@ -1278,6 +1316,90 @@ export class BinListResponse {
 
   @ApiProperty({ type: String, nullable: true, description: 'Opaque keyset cursor' })
   nextCursor!: string | null;
+}
+
+/** Story 3-3b — `POST …/bins/{binId}/block`. */
+export class BlockBinDto {
+  @ApiProperty({
+    enum: [...BIN_BLOCK_REASONS],
+    description: 'Why the bin is blocked — `other` requires a note',
+  })
+  @IsIn(BIN_BLOCK_REASONS)
+  reason!: BinBlockReason;
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    type: String,
+    maxLength: 500,
+    description: 'What happened — trimmed, 1–500 characters (blank = none); required when reason is `other`',
+  })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsString()
+  // The 500-code-point rule is the command's (trimmed); this edge cap only
+  // bounds the body (the 3-3a BlockBatchDto shape).
+  @MaxLength(2000)
+  note?: string | null;
+}
+
+/** Story 3-3b — `POST …/bins/{binId}/unblock`: lifting a block always says why (the 3-3a A8 rule). */
+export class UnblockBinDto {
+  @ApiProperty({
+    type: String,
+    minLength: 1,
+    maxLength: 500,
+    description: 'Why the block is lifted — required, trimmed, 1–500 characters',
+  })
+  @IsString()
+  @MaxLength(2000)
+  note!: string;
+}
+
+/** Story 3-3b (A13) — one client's share of a block's impact. */
+export class BinBlockImpactClientDto {
+  @ApiProperty({ format: 'uuid' })
+  clientId!: string;
+
+  @ApiProperty({ description: 'The client\'s display name ("<tenant> (your company)" for the tenant\'s own goods)' })
+  clientName!: string;
+
+  @ApiProperty({ description: 'Base-UoM units of the client\'s SKUs on hand in the bin' })
+  units!: number;
+
+  @ApiProperty({ description: 'Distinct SKUs of the client on hand in the bin' })
+  skuCount!: number;
+
+  @ApiProperty({ description: 'Planned (not yet picked) pick lines of the client\'s SKUs in the bin' })
+  plannedPickLines!: number;
+}
+
+/**
+ * Story 3-3b (decision 11, A13) — `GET …/bins/{binId}/block-impact`: what a
+ * block would take out of service. Advisory and read-only: a block is never
+ * refused for open work.
+ */
+export class BinBlockImpactResponse {
+  @ApiProperty({ format: 'uuid' })
+  binId!: string;
+
+  @ApiProperty({ description: 'Base-UoM units on hand in the bin (every SKU) — they stop being promised' })
+  onHandUnits!: number;
+
+  @ApiProperty({ description: 'Distinct SKUs on hand in the bin' })
+  skuCount!: number;
+
+  @ApiProperty({ description: 'Planned pick lines in the bin — each will need a Skip and a re-plan' })
+  plannedPickLines!: number;
+
+  @ApiProperty({ description: 'Base-UoM units those planned lines draw from the bin' })
+  plannedPickUnits!: number;
+
+  @ApiProperty({ description: 'Open cycle-count lines in the bin (they stay open — a blocked bin is still counted)' })
+  openCountLines!: number;
+
+  @ApiProperty({ type: [BinBlockImpactClientDto], description: 'Per client: whose stock and storefronts the block hits (ordered by units, then name)' })
+  byClient!: BinBlockImpactClientDto[];
 }
 
 export class MergeBinDto {

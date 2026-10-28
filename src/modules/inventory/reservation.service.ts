@@ -1,7 +1,7 @@
 import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common';
 import { fromMilli, MAX_QUANTITY_MILLI } from '../../shared/primitives/quantity';
 import { and, asc, eq, gt, gte, inArray, isNull, lt, not, notExists, or, sql } from 'drizzle-orm';
-import type { SQL } from 'drizzle-orm';
+import type { SQL, SQLWrapper } from 'drizzle-orm';
 import { AUTH_DATABASE, DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { batches, batchOnHand, bins, inventoryQuarantines, reservations, skus, stockOnHand } from '../../shared/db/schema';
@@ -225,6 +225,84 @@ export async function damagedUnits(
   return Number(rows[0]?.damaged ?? 0);
 }
 
+/** Story 3-3b — the unpromisable hook's two terms (milli-units), subtracted side by side. */
+export interface UnpromisableUnits {
+  /** 3-3a / 4-3a: blocked, expired or below-minimum batches in NON-blocked bins. */
+  readonly batch: number;
+  /** 3-3b: the whole on-hand of blocked storage bins (every batch in them). */
+  readonly blockedBin: number;
+}
+
+/**
+ * The unpromisable hook, extended by story 3-3b (decision 7) — one hook, two
+ * terms, never a double subtraction:
+ *   * `blockedBin` — Σ `stock_on_hand` of the SKU in bins where
+ *     `blocked AND NOT system_owned` (a system bin is never blockable; the
+ *     predicate is belt and braces), under the same open-quarantine
+ *     `notExists` predicate `committedOnHand` uses — stock no wave or re-plan
+ *     will plan (`replan.ts` skips blocked bins), so ATP does not promise it.
+ *     Every batch in a blocked bin is counted here, whatever its status.
+ *   * `batch` — 3-3a's term (`unpromisableBatchUnits`), restricted to bins
+ *     that are NOT blocked, so a blocked lot in a blocked bin is counted once,
+ *     under `blockedBin`.
+ * `bins` is read for `blocked` and `system_owned` only (locate only — the
+ * architecture allowance).
+ */
+export async function unpromisableUnits(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  skuId: string,
+): Promise<UnpromisableUnits> {
+  const quarantined = tx
+    .select({ one: sql<number>`1` })
+    .from(inventoryQuarantines)
+    .where(
+      and(
+        eq(inventoryQuarantines.tenantId, tenantId),
+        eq(inventoryQuarantines.warehouseId, warehouseId),
+        eq(inventoryQuarantines.skuId, skuId),
+        eq(inventoryQuarantines.binId, stockOnHand.binId),
+        eq(inventoryQuarantines.status, 'open'),
+      ),
+    );
+  // Built, NOT awaited: the sum rides the batch term's probe statement
+  // (`unpromisableBatchUnits`), so the hook costs the round trips it cost
+  // before 3-3b — every ATP read, grant ceiling and order-import line pays them.
+  const blockedSum = tx
+    .select({
+      // Story 10.1: `::bigint` (milli-units overflow int4 at ~2.1M base units).
+      units: sql<string>`coalesce(sum(${stockOnHand.quantity}), 0)::bigint`,
+    })
+    .from(stockOnHand)
+    .innerJoin(bins, eq(bins.id, stockOnHand.binId))
+    .where(
+      and(
+        eq(stockOnHand.tenantId, tenantId),
+        eq(stockOnHand.warehouseId, warehouseId),
+        eq(stockOnHand.skuId, skuId),
+        gt(stockOnHand.quantity, 0),
+        // Tenancy master data, read only to locate the scope.
+        eq(bins.tenantId, tenantId),
+        eq(bins.blocked, true),
+        eq(bins.systemOwned, false),
+        notExists(quarantined),
+      ),
+    );
+  return unpromisableBatchUnits(tx, tenantId, warehouseId, skuId, blockedSum);
+}
+
+/** The hook's pair under the snapshot field names (`unpromisableBatch`, `blockedBin`). */
+async function unpromisableTerms(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  skuId: string,
+): Promise<{ unpromisableBatch: number; blockedBin: number }> {
+  const { batch, blockedBin } = await unpromisableUnits(tx, tenantId, warehouseId, skuId);
+  return { unpromisableBatch: batch, blockedBin };
+}
+
 /**
  * The unpromisable-batch hook (story 3-3a, A1–A3): the on-hand of BLOCKED or
  * EXPIRED batches — stock that is physically here but that no wave, re-plan,
@@ -271,13 +349,20 @@ export async function damagedUnits(
  * where `cutoff` is the IST midnight `minDays` days after `at`'s IST date —
  * every row the JS predicate could refuse, and no more. The allocation RULE
  * never affects ATP.
+ *
+ * Story 3-3b: now the `batch` half of `unpromisableUnits`, module-private
+ * (every caller reads the pair), and it skips BLOCKED bins — their whole
+ * on-hand is the `blockedBin` term.
  */
-export async function unpromisableBatchUnits(
+async function unpromisableBatchUnits(
   tx: TenantTx,
   tenantId: string,
   warehouseId: string,
   skuId: string,
-): Promise<number> {
+  // Story 3-3b — the `blockedBin` sum (a built, un-awaited select), evaluated
+  // in the SAME statement as this term's dated-live probe below.
+  blockedSum: SQLWrapper,
+): Promise<UnpromisableUnits> {
   const quarantined = tx
     .select({ one: sql<number>`1` })
     .from(inventoryQuarantines)
@@ -301,13 +386,19 @@ export async function unpromisableBatchUnits(
   // dated, unexpired batch can have stock below it.
   let minDays: number | null = null;
   let cutoff = new Date(at).toISOString();
-  const datedLive = await tx
+  const datedLiveProbe = tx
     .select({ one: sql<number>`1` })
     .from(batchOnHand)
     .innerJoin(batches, and(eq(batches.tenantId, tenantId), eq(batches.id, batchOnHand.batchId)))
     .where(and(scopeRows, eq(batches.status, 'active'), gte(batches.expiryDate, cutoff)))
     .limit(1);
-  if (datedLive.length > 0) {
+  // ONE statement, always one row: the blocked-bin sum (scalar subquery,
+  // `coalesce(…)::bigint` — a string at this boundary) and the probe.
+  const probeRows = (await tx.execute(
+    sql`select (${blockedSum}) as blocked_bin, exists(${datedLiveProbe}) as dated_live`,
+  )) as unknown as { blocked_bin: string | null; dated_live: boolean }[];
+  const blockedBin = Number(probeRows[0]?.blocked_bin ?? 0);
+  if (probeRows[0]?.dated_live === true) {
     minDays = await minOutboundShelfLifeOfSkuInTx(tx, tenantId, skuId);
     if (minDays !== null) {
       const minimumBoundary = istMidnightOf(addIsoDays(istDateOf(cutoff), minDays));
@@ -347,6 +438,9 @@ export async function unpromisableBatchUnits(
           )!,
         ),
         notExists(quarantined),
+        // Story 3-3b: a blocked BIN's whole on-hand is the `blockedBin` term —
+        // its batches are never counted here too (no double subtraction).
+        eq(bins.blocked, false),
         // Only the unpromisable rows leave the database: blocked, or past
         // expiry at `at` — `expiry_date < $at` is `isBatchExpiredAt`'s own
         // boundary (drawable while expiry ≥ at; `at` is whole milliseconds,
@@ -371,7 +465,7 @@ export async function unpromisableBatchUnits(
   }
   let total = 0;
   for (const entry of byBin.values()) total += Math.min(entry.sum, entry.binOnHand);
-  return total;
+  return { batch: total, blockedBin };
 }
 
 /**
@@ -554,6 +648,12 @@ export interface AtpSnapshot {
    */
   readonly unpromisableBatch: number;
   /**
+   * Story 3-3b: the whole on-hand of BLOCKED storage bins
+   * (`unpromisableUnits.blockedBin`) — on hand, never promised; a blocked
+   * lot in a blocked bin is counted here, not in `unpromisableBatch`.
+   */
+  readonly blockedBin: number;
+  /**
    * Story 7.1 (AD-13): the scope's standing channel-buffer total (the journal
    * sum over `held` `owner_type: 'buffer'` rows) — transparency only. The
    * subtraction itself lives ONCE, in `reserved` (the mirror; RN-1): a
@@ -561,7 +661,7 @@ export interface AtpSnapshot {
    * separate term in the `atp` arithmetic would subtract it twice.
    */
   readonly buffer: number;
-  /** `max(0, onHand − reserved − qcHeld − inTransit − returnsAwaiting − damaged − unpromisableBatch)` — never oversells (the buffer IS part of `reserved`). */
+  /** `max(0, onHand − reserved − qcHeld − inTransit − returnsAwaiting − damaged − unpromisableBatch − blockedBin)` — never oversells (the buffer IS part of `reserved`). */
   readonly atp: number;
 }
 
@@ -629,6 +729,7 @@ function bufferOverCeiling(
       (probe.returnsAwaiting > 0 ? ` (of which ${fromMilli(probe.returnsAwaiting)} are returns awaiting disposition)` : '') +
       (probe.damaged > 0 ? ` (of which ${fromMilli(probe.damaged)} are damaged)` : '') +
       (probe.unpromisableBatch > 0 ? ` (of which ${fromMilli(probe.unpromisableBatch)} in blocked or expired batches, or below the client's minimum remaining shelf life)` : '') +
+          (probe.blockedBin > 0 ? ` (of which ${fromMilli(probe.blockedBin)} in blocked bins)` : '') +
       `, holding ${fromMilli(probe.reserved)} already — the buffer of ${fromMilli(command.targetMilli)} ` +
       `cannot be reserved.`,
   );
@@ -646,6 +747,8 @@ interface StandingBufferProbe {
   readonly damaged: number;
   /** Story 3-3a: blocked, expired or below-minimum (4-3a) batch units — named in the refusal. */
   readonly unpromisableBatch: number;
+  /** Story 3-3b: blocked-bin units — named in the refusal. */
+  readonly blockedBin: number;
 }
 
 /** A standing buffer command — one integer target per (integration, warehouse, sku). */
@@ -681,6 +784,8 @@ export interface ChannelVisibleSnapshot {
   readonly damaged: number;
   /** Story 3-3a: blocked, expired or below the client's minimum remaining shelf life (4-3a) — on hand, outside the pool. */
   readonly unpromisableBatch: number;
+  /** Story 3-3b: the on-hand of blocked storage bins — on hand, outside the pool. */
+  readonly blockedBin: number;
   /** The pool ATP (every holder included). */
   readonly poolAtp: number;
   /** THIS channel's own standing buffer (milli-units). */
@@ -882,8 +987,9 @@ export class ReservationService implements OnModuleInit {
       returnsAwaiting: await returnsAwaitingUnits(tx, tenantId, warehouseId, skuId),
       // Story 2-4a: and units received damaged.
       damaged: await damagedUnits(tx, tenantId, warehouseId, skuId),
-      // Story 3-3a: and units of blocked or expired batches.
-      unpromisableBatch: await unpromisableBatchUnits(tx, tenantId, warehouseId, skuId),
+      // Story 3-3a: and units of blocked or expired batches; story 3-3b: and
+      // units in blocked bins.
+      ...(await unpromisableTerms(tx, tenantId, warehouseId, skuId)),
     }));
     if (probe.existing !== undefined) {
       return this.idempotentHit(probe.existing, command);
@@ -907,6 +1013,7 @@ export class ReservationService implements OnModuleInit {
           (probe.returnsAwaiting > 0 ? ` (of which ${fromMilli(probe.returnsAwaiting)} are returns awaiting disposition)` : '') +
       (probe.damaged > 0 ? ` (of which ${fromMilli(probe.damaged)} are damaged)` : '') +
           (probe.unpromisableBatch > 0 ? ` (of which ${fromMilli(probe.unpromisableBatch)} in blocked or expired batches, or below the client's minimum remaining shelf life)` : '') +
+          (probe.blockedBin > 0 ? ` (of which ${fromMilli(probe.blockedBin)} in blocked bins)` : '') +
           ` — the request for ${fromMilli(command.quantity)} cannot be reserved.`,
       );
     }
@@ -1175,13 +1282,15 @@ export class ReservationService implements OnModuleInit {
         // committed-read tx).
         damaged: await damagedUnits(tx, tenantId, warehouseId, skuId),
         // Story 3-3a: the unpromisable-batch hook — blocked or expired
-        // batches' on-hand outside the subtracted system bins (same tx).
-        unpromisableBatch: await unpromisableBatchUnits(tx, tenantId, warehouseId, skuId),
+        // batches' on-hand outside the subtracted system bins (same tx);
+        // story 3-3b: and the whole on-hand of blocked bins (one hook, two
+        // terms, never counted twice).
+        ...(await unpromisableTerms(tx, tenantId, warehouseId, skuId)),
         // Story 7.1: the standing-buffer figure is a journal read (AD-13) —
         // transparency only, ALREADY inside `reserved` (see the formula note).
         buffer: await bufferUnits(tx, tenantId, warehouseId, skuId),
       }));
-    let { onHand, qcHeld, inTransit, returnsAwaiting, damaged, unpromisableBatch, buffer } = await readInputs();
+    let { onHand, qcHeld, inTransit, returnsAwaiting, damaged, unpromisableBatch, blockedBin, buffer } = await readInputs();
     const counterKey = reservationCounterKey(tenantId, warehouseId, skuId);
     const readyKey = reservationReadyKey(tenantId, warehouseId);
 
@@ -1208,7 +1317,7 @@ export class ReservationService implements OnModuleInit {
       // Re-read the Postgres inputs AFTER the repair, so on-hand and the
       // counter come from the same side of the rebuild (never pre-rebuild
       // on-hand against a post-rebuild reserved figure).
-      ({ onHand, qcHeld, inTransit, returnsAwaiting, damaged, unpromisableBatch, buffer } = await readInputs());
+      ({ onHand, qcHeld, inTransit, returnsAwaiting, damaged, unpromisableBatch, blockedBin, buffer } = await readInputs());
     }
     let reserved: number;
     try {
@@ -1247,11 +1356,14 @@ export class ReservationService implements OnModuleInit {
       // Story 3-3a — blocked or expired batch units (the subtraction is what
       // stops order create, channel publish and replenishment promising them).
       unpromisableBatch,
+      // Story 3-3b — blocked-bin units (the subtraction is what stops the
+      // promise side counting stock the wave will never plan).
+      blockedBin,
       // Story 7.1 — the standing-buffer total, transparency only: a buffer IS
       // a held reservation and is already inside `reserved`. Subtracting it
       // again here would double-carve it (RN-1).
       buffer,
-      atp: Math.max(0, onHand - reserved - qcHeld - inTransit - returnsAwaiting - damaged - unpromisableBatch),
+      atp: Math.max(0, onHand - reserved - qcHeld - inTransit - returnsAwaiting - damaged - unpromisableBatch - blockedBin),
     };
   }
 
@@ -1760,14 +1872,16 @@ export class ReservationService implements OnModuleInit {
     // Story 3-3a: the unpromisable-batch hook is a ceiling term too — the
     // units of a blocked or expired batch are on hand but no wave or pick
     // will ever draw them, so no grant may promise them.
-    const unpromisableBatch = await unpromisableBatchUnits(tx, tenantId, warehouseId, skuId);
+    // Story 3-3b: and so is the whole on-hand of a blocked bin — the wave
+    // never plans it (one hook, the two terms disjoint).
+    const { batch: unpromisableBatch, blockedBin } = await unpromisableUnits(tx, tenantId, warehouseId, skuId);
     // Story 7.1 (RN-1): NO standalone buffer term. A channel's Safety Buffer
     // is a `held` reservations row since 0050 — it reaches every ceiling and
     // ATP read inside `reserved` through the counter mirror (the journalling
     // grant paths subtract Postgres-side, the script arbitrates counter-
     // side); a second subtraction here would carve every buffer off the
     // pool twice.
-    return Math.max(0, onHand - qcHeld - inTransit - returnsAwaiting - damaged - unpromisableBatch);
+    return Math.max(0, onHand - qcHeld - inTransit - returnsAwaiting - damaged - unpromisableBatch - blockedBin);
   }
 
   /** Committed on-hand, excluding every open-quarantined (sku, bin) scope. */
@@ -2417,7 +2531,7 @@ export class ReservationService implements OnModuleInit {
       inTransit: await inTransitUnits(tx, tenantId, warehouseId, skuId),
       returnsAwaiting: await returnsAwaitingUnits(tx, tenantId, warehouseId, skuId),
       damaged: await damagedUnits(tx, tenantId, warehouseId, skuId),
-      unpromisableBatch: await unpromisableBatchUnits(tx, tenantId, warehouseId, skuId),
+      ...(await unpromisableTerms(tx, tenantId, warehouseId, skuId)),
     }));
     const previousMilli = probe.existing?.quantity ?? 0;
 
@@ -2484,6 +2598,7 @@ export class ReservationService implements OnModuleInit {
               (probe.returnsAwaiting > 0 ? ` (of which ${fromMilli(probe.returnsAwaiting)} are returns awaiting disposition)` : '') +
       (probe.damaged > 0 ? ` (of which ${fromMilli(probe.damaged)} are damaged)` : '') +
               (probe.unpromisableBatch > 0 ? ` (of which ${fromMilli(probe.unpromisableBatch)} in blocked or expired batches, or below the client's minimum remaining shelf life)` : '') +
+          (probe.blockedBin > 0 ? ` (of which ${fromMilli(probe.blockedBin)} in blocked bins)` : '') +
               `, holding ${fromMilli(lockedReserved)} already — the buffer of ${fromMilli(targetMilli)} ` +
               `cannot be reserved.`,
           );
@@ -2688,7 +2803,7 @@ export class ReservationService implements OnModuleInit {
    * The sync's per-channel visible quantity (story 7-1, RN-6): the POOL's
    * ATP read (fail-closed — a store-down ATP throws the 503 the sync
    * branches on) MINUS the channel's OWN standing buffer, clamped at zero —
-   * `V(c) = max(0, onHand − qcHeld − inTransit − returnsAwaiting − damaged − unpromisableBatch − Σheld − buffer(c))` = the
+   * `V(c) = max(0, onHand − qcHeld − inTransit − returnsAwaiting − damaged − unpromisableBatch − blockedBin − Σheld − buffer(c))` = the
    * channel's share of the shared pool minus its own staleness margin. The
    * pool's `atp` already includes `buffer(c)` inside `reserved` (RN-1's
    * single-subtraction layout), so the margin is subtracted once more for
@@ -2725,6 +2840,9 @@ export class ReservationService implements OnModuleInit {
       returnsAwaiting: pool.returnsAwaiting,
       damaged: pool.damaged,
       unpromisableBatch: pool.unpromisableBatch,
+      // Story 3-3b — read `?? 0` (A7): a pool snapshot is never stored, but
+      // the field is additive on the wire.
+      blockedBin: pool.blockedBin ?? 0,
       poolAtp: pool.atp,
       buffer: own,
       visibleMilli: Math.max(0, pool.atp - own),

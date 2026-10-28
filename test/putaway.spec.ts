@@ -511,11 +511,11 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     // fill A-06 to capacity, then a line of 11 has room only in A-01..A-04 —
     // and once A-02 is filled the winner moves on.
     await request(app.getHttpServer())
-      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binA05}`)
+      .post(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binA05}/block`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ blocked: true })
-      .expect(200);
+      .send({ reason: 'damaged' })
+      .expect(201);
     await adjust({ warehouseId, skuId: plainSkuId, binId: binA06, quantityDelta: 5, reasonCode: 'stock-count', note: 'fill A-06' }).expect(201);
 
     const second = await blindGrn([{ poLineId: null, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 12 }]);
