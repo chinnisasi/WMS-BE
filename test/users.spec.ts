@@ -561,10 +561,10 @@ describe('users, roles, and permission gating (e2e)', () => {
     }).expect(201);
 
     const deniedBlock = await request(app.getHttpServer())
-      .patch(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/bins/${ownerBin.body.id}`)
+      .post(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/bins/${ownerBin.body.id}/block`)
       .set('Authorization', `Bearer ${operator.token}`)
       .set('Idempotency-Key', ulid())
-      .send({ blocked: true })
+      .send({ reason: 'damaged' })
       .expect(403);
     expect(deniedBlock.body).toMatchObject({ code: 'role-denied' });
     expect(deniedBlock.body.detail).toContain('bin.block');

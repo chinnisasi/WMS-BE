@@ -743,6 +743,13 @@
       "when": 1793164987062,
       "tag": "0105_vendor_returns",
       "breakpoints": true
+    },
+    {
+      "idx": 106,
+      "version": "7",
+      "when": 1793174486750,
+      "tag": "0106_blocked_locations",
+      "breakpoints": true
     }
   ]
 }

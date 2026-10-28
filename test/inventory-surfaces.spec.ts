@@ -248,8 +248,9 @@ describe('inventory read surfaces (e2e, story 2.5)', () => {
     );
     for (const item of plainItems) {
       expect(item.skuId).toBe(skuIds.get('PLAIN-1'));
-      // The exact row shape — no batch fields on the stock list.
-      expect(Object.keys(item).sort()).toEqual(['binId', 'createdAt', 'id', 'quantity', 'skuId', 'warehouseId']);
+      // The exact row shape — no batch fields on the stock list. Story 3-3b
+      // ADDED `binBlocked` (the "Blocked bin" chip) on both orders.
+      expect(Object.keys(item).sort()).toEqual(['binBlocked', 'binId', 'createdAt', 'id', 'quantity', 'skuId', 'warehouseId']);
     }
 
     const inBinB = await get(`/warehouses/${warehouseId}/inventory/stock?binId=${binB}`).expect(200);
@@ -712,7 +713,8 @@ describe('inventory read surfaces (e2e, story 2.5)', () => {
       expect(receiving.quantity).toBe(4);
       expect(rows.slice(0, -1).every((row) => row.binSystemOwned === false)).toBe(true);
       expect(Object.keys(rows[0]!).sort()).toEqual(
-        ['binCode', 'binId', 'binSystemOwned', 'createdAt', 'id', 'quantity', 'skuId', 'warehouseId'],
+        // Story 3-3b added `binBlocked` on both orders.
+        ['binBlocked', 'binCode', 'binId', 'binSystemOwned', 'createdAt', 'id', 'quantity', 'skuId', 'warehouseId'],
       );
     });
 

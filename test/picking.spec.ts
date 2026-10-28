@@ -726,12 +726,15 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     expect((PICKLIST_LINE_STATUSES as readonly string[]).includes('picked')).toBe(true);
     expect((PICKLIST_LINE_STATUSES as readonly string[]).includes('short')).toBe(true);
     // The reason enum is fixed and command-validated (the putaway pattern).
+    // Story 3-3b WIDENED it by one (`skipped-blocked-bin`, the Skip of a stop
+    // in a blocked bin) — the five original reasons stay, in order.
     expect([...SHORT_PICK_REASON_CODES]).toEqual([
       'bin-empty',
       'fewer-units-than-planned',
       'damaged-units',
       'stock-not-found',
       'other',
+      'skipped-blocked-bin',
     ]);
 
     const definition = getLedgerEventType('pick.picked');
@@ -1278,12 +1281,15 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
 
     // Block the bin AFTER the wave planned (the floor state moved on).
     await request(app.getHttpServer())
-      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binBlockedId}`)
+      .post(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binBlockedId}/block`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ blocked: true })
-      .expect(200);
-    const blocked = await pick(bodyFor(line, { binId: binBlockedId })).expect(400);
+      .send({ reason: 'damaged' })
+      .expect(201);
+    // Story 3-3b (A1): a pick made BEFORE the block lands, so this one is
+    // stamped after it at millisecond precision (`bodyFor` truncates to the
+    // second, which can precede the block's own instant).
+    const blocked = await pick(bodyFor(line, { binId: binBlockedId, occurredAt: new Date().toISOString() })).expect(400);
     expect(blocked.body.code).toBe('bin-blocked');
     expect(blocked.body.detail).toContain('A-09-01');
 

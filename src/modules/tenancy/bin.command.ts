@@ -228,6 +228,15 @@ export interface BinSnapshot {
     readonly dedicatedClientId: string | null;
     readonly type: string;
     readonly blocked: boolean;
+    /**
+     * Story 3-3b — why, when and by whom the bin was blocked (all null while
+     * active). A snapshot stored before 3-3b lacks them; `normalizeBin`
+     * (tenancy.controller.ts) reads an absent field as null (A7).
+     */
+    readonly blockedReason?: string | null;
+    readonly blockedNote?: string | null;
+    readonly blockedAt?: string | null;
+    readonly blockedBy?: string | null;
     /** The Receiving/QC-hold system bins (never blockable/mergeable/retirable). */
     readonly systemOwned: boolean;
     /** Story 3.6 — the retirement pair (null while the bin is live). */
@@ -1995,7 +2004,15 @@ export function duplicateBinCode(code: string): ProblemException {
   );
 }
 
-/** The snapshot's bin body from a `bins` row (the Story 3.6 fields included). */
+/**
+ * The snapshot's bin body from a `bins` row (the Story 3.6 fields included) —
+ * exported for putaway's `BinStateCommand` (story 3-3b), so every bin command
+ * answers one shape.
+ */
+export function binSnapshotFromRow(row: typeof bins.$inferSelect): BinSnapshot['bin'] {
+  return binFromRow(row);
+}
+
 function binFromRow(row: typeof bins.$inferSelect): BinSnapshot['bin'] {
   return {
     id: row.id,
@@ -2018,6 +2035,11 @@ function binFromRow(row: typeof bins.$inferSelect): BinSnapshot['bin'] {
     dedicatedClientId: row.dedicatedClientId,
     type: row.type,
     blocked: row.blocked,
+    // Story 3-3b: the block's reason, note, time (ISO) and blocker.
+    blockedReason: row.blockedReason,
+    blockedNote: row.blockedNote,
+    blockedAt: row.blockedAt === null ? null : new Date(row.blockedAt).toISOString(),
+    blockedBy: row.blockedBy,
     systemOwned: row.systemOwned,
     retiredAt: row.retiredAt,
     retiredBy: row.retiredBy,

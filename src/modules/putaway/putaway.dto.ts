@@ -1,6 +1,7 @@
 import { Type } from 'class-transformer';
 import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../../shared/primitives/quantity';
 import { STORAGE_CLASSES } from '../../shared/primitives/storage-class';
+import { BIN_BLOCK_REASONS } from '../../shared/db/schema';
 import { ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, IsUUID, Length, Max, Min } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 import { PUTAWAY_MISMATCH_REASON_CODES as PUTAWAY_MISMATCH_REASON_ENUM } from './mismatch-reason';
@@ -279,6 +280,13 @@ export class PutawayBinDto {
 
   @ApiProperty({ description: 'Broken-bin flag — blocked bins reject placements' })
   blocked!: boolean;
+
+  @ApiProperty({
+    enum: [...BIN_BLOCK_REASONS, null],
+    nullable: true,
+    description: 'Story 3-3b — why the bin is blocked (null while active); the handheld names it on its refusals. A client reading a snapshot cached before 3-3b treats an absent field as null',
+  })
+  blockedReason!: string | null;
 
   @ApiProperty({ description: 'System bins (Receiving/QC-hold) are never placement targets' })
   systemOwned!: boolean;

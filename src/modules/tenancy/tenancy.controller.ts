@@ -27,6 +27,8 @@ import { DEFAULT_LABEL_SIZE } from '../../shared/labels/layout';
 // Value import: Nest DI needs the runtime class token (same bend as below).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { BinLabelsService } from './bin-labels';
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { BinBlockImpactService } from './bin-block-impact';
 import { IdempotencyKey, parseRequiredIdempotencyKey } from './idempotency-guard';
 import { clientIpOf } from './auth-attempts';
 import {
@@ -77,6 +79,9 @@ import {
   GenerateBinsDto,
   MergeBinDto,
   PatchBinDto,
+  BlockBinDto,
+  UnblockBinDto,
+  BinBlockImpactResponse,
   RegisterTenantDto,
   SignInDto,
   SignInResponse,
@@ -150,6 +155,7 @@ export class TenancyController {
     private readonly binStateCommand: BinStateCommand,
     private readonly tenancyService: TenancyService,
     private readonly binLabels: BinLabelsService,
+    private readonly binBlockImpactService: BinBlockImpactService,
   ) {}
 
   @Post()
@@ -559,7 +565,7 @@ export class TenancyController {
     // Story 12-1: through `normalizeBin` like every other bin response — a
     // stored pre-12.1 create snapshot lacks `storageClass`, which reads as
     // 'ambient' (the migration's DEFAULT).
-    return normalizeBin(snapshot.bin);
+    return this.binResponse(tenantId, snapshot.bin);
   }
 
   @Post(':tenantId/warehouses/:warehouseId/zones/:zoneId/bins/grid')
@@ -645,7 +651,7 @@ export class TenancyController {
       query.cursor,
       query.limit === undefined ? undefined : query.limit,
     );
-    return { items: [...page.items], nextCursor: page.nextCursor };
+    return { items: page.items.map((bin) => normalizeBin(bin)), nextCursor: page.nextCursor };
   }
 
   /**
@@ -746,12 +752,12 @@ export class TenancyController {
   @ApiBearerAuth()
   @ApiOperation({
     summary:
-      'Blocks or unblocks a bin (Story 3.6: never a system or retired bin), or edits its structure (Story 11-5: dimensions and max weight; 12-1: storage class; 1-5b: dedicated client — tenancy owns the structure)',
+      'Edits a bin\'s structure (Story 11-5: dimensions and max weight; 12-1: storage class; 1-5b: dedicated client — tenancy owns the structure). The `blocked` field is RETIRED (story 3-3b): block and unblock with POST …/block and …/unblock',
   })
   @ApiBody({ type: PatchBinDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiOkResponse({ type: BinResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, invalid body, a system bin on the blocked arm (validation-failed names the bin — the capacity arm deliberately permits system bins), a system bin given a dedicated client (validation-failed, story 1-5b), a body mixing blocked with capacity attributes or a dedicated client, a body carrying neither (validation-failed), or a non-boolean blocked (validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, invalid body, a body carrying `blocked` (validation-failed naming POST …/block and …/unblock — retired by story 3-3b; only a key stored by a pre-3-3b PATCH still replays), a system bin given a dedicated client (validation-failed, story 1-5b), a body mixing blocked with capacity attributes or a dedicated client, a body carrying neither (validation-failed), or a non-boolean blocked (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks bin.block (role-denied) or bin.create (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Bin does not exist in this warehouse, or the dedicated client does not exist (not-found)') })
@@ -839,7 +845,7 @@ export class TenancyController {
         },
         key,
       );
-      return normalizeBin(snapshot.bin);
+      return this.binResponse(tenantId, snapshot.bin);
     }
     if (!hasBlocked) {
       throw new ProblemException(
@@ -849,14 +855,130 @@ export class TenancyController {
         'Send `blocked` (the bin\'s operational state) or a structure attribute (lengthMm, widthMm, heightMm, maxWeightGrams, storageClass, dedicatedClientId) — the body carries neither.',
       );
     }
-    // Story 3.6: delegated to the re-homed command — the putaway module owns
-    // bin operational state; the URL and the response body are unchanged.
-    // (`blocked` is defined here — the other two arms returned above.)
-    const snapshot = await this.binStateCommand.setBlocked(
+    // Story 3-3b (A6): the `blocked` arm is RETIRED — a block records why,
+    // when and by whom through `POST …/block` / `…/unblock`. The body still
+    // reaches putaway's state command, which runs authority and the replay
+    // lookup (a key stored by a pre-3-3b PATCH re-serves its snapshot) and
+    // otherwise answers 400 naming the two verbs. (`blocked` is defined here
+    // — the other two arms returned above.)
+    const snapshot = await this.binStateCommand.legacyPatch(
       { tenantId, actorUserId: session.userId, warehouseId, binId, blocked: dto.blocked! },
       key,
     );
-    return normalizeBin(snapshot.bin);
+    return this.binResponse(tenantId, snapshot.bin);
+  }
+
+  @Post(':tenantId/warehouses/:warehouseId/bins/:binId/block')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Blocks a bin with a reason (story 3-3b): its stock stays on hand but stops being promised; putaway, move, transfer and merge into it are refused, and a planned pick stop in it is skipped and re-planned',
+    description:
+      'bin.block (owner, ops manager). `reason` is one of the fixed set; `other` requires a `note` (trimmed, 1–500 characters). Records the reason, note, time and blocker on the bin. ' +
+      'A block never moves stock and never cancels a reservation or a task. Never a system bin (400) or a retired bin (409 bin-retired).',
+  })
+  @ApiBody({ type: BlockBinDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: BinResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a reason outside the fixed set, `other` without a note, a note over 500 characters, or a system bin (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks bin.block (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse or bin does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The bin is already blocked (bin-already-blocked), the bin is retired (bin-retired), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  @ApiParam({ name: 'binId', format: 'uuid' })
+  async blockBin(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @Param('binId') binId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: BlockBinDto,
+  ): Promise<BinResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.binStateCommand.block(
+      { tenantId, actorUserId: session.userId, warehouseId, binId, reason: dto.reason, note: dto.note },
+      key,
+    );
+    return this.binResponse(tenantId, snapshot.bin);
+  }
+
+  @Post(':tenantId/warehouses/:warehouseId/bins/:binId/unblock')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Unblocks a bin (story 3-3b): the note saying why is required; the block\'s reason, note, time and blocker are cleared (the history is the audit trail)',
+    description: 'bin.block (owner, ops manager). `note` is required (trimmed, 1–500 characters): lifting a block is the riskier direction.',
+  })
+  @ApiBody({ type: UnblockBinDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: BinResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a missing or blank note, a note over 500 characters, or a system bin (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks bin.block (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse or bin does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The bin is not blocked (bin-not-blocked), the bin is retired (bin-retired), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  @ApiParam({ name: 'binId', format: 'uuid' })
+  async unblockBin(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @Param('binId') binId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: UnblockBinDto,
+  ): Promise<BinResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.binStateCommand.unblock(
+      { tenantId, actorUserId: session.userId, warehouseId, binId, note: dto.note },
+      key,
+    );
+    return this.binResponse(tenantId, snapshot.bin);
+  }
+
+  @Get(':tenantId/warehouses/:warehouseId/bins/:binId/block-impact')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'What blocking this bin would take out of service (story 3-3b): on-hand units and SKUs, planned pick lines, open count lines, per client',
+    description: 'bin.block (owner, ops manager). Advisory and read-only — a block is never refused for open work.',
+  })
+  @ApiOkResponse({ type: BinBlockImpactResponse })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks bin.block (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse or bin does not exist in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  @ApiParam({ name: 'binId', format: 'uuid' })
+  async binBlockImpact(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @Param('binId') binId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<BinBlockImpactResponse> {
+    assertOwnTenant(session, tenantId);
+    const impact = await this.binBlockImpactService.impact(tenantId, session.userId, warehouseId, binId);
+    return { ...impact, byClient: impact.byClient.map((row) => ({ ...row })) };
+  }
+
+  /**
+   * Every bin response passes here: `normalizeBin` (a stored snapshot's
+   * absent fields, §9) and, story 3-3b, the blocker's display name — read
+   * live, so a replayed snapshot names the blocker as the trail does now.
+   */
+  private async binResponse(tenantId: string, bin: Parameters<typeof normalizeBin>[0]): Promise<BinResponse> {
+    const response = normalizeBin(bin);
+    if (response.blockedBy === null) return response;
+    const names = await this.tenancyService.memberDisplayNames(tenantId, [response.blockedBy]);
+    return { ...response, blockedByName: names.get(response.blockedBy) ?? null };
   }
 
   @Post(':tenantId/warehouses/:warehouseId/bins/:binId/merge')
@@ -900,8 +1022,8 @@ export class TenancyController {
       key,
     );
     return {
-      source: normalizeBin(snapshot.source),
-      target: normalizeBin(snapshot.target),
+      source: await this.binResponse(tenantId, snapshot.source),
+      target: await this.binResponse(tenantId, snapshot.target),
       moved: snapshot.moved,
     };
   }
@@ -938,7 +1060,7 @@ export class TenancyController {
       { tenantId, actorUserId: session.userId, warehouseId, binId },
       key,
     );
-    return normalizeBin(snapshot.bin);
+    return this.binResponse(tenantId, snapshot.bin);
   }
 
   @Get(':tenantId/setup-checklist')
@@ -976,6 +1098,11 @@ function normalizeBin(bin: {
   maxWeightGrams?: number | null;
   storageClass?: string;
   dedicatedClientId?: string | null;
+  blockedReason?: string | null;
+  blockedNote?: string | null;
+  blockedAt?: string | null;
+  blockedBy?: string | null;
+  blockedByName?: string | null;
 }): BinResponse {
   return {
     ...bin,
@@ -996,6 +1123,16 @@ function normalizeBin(bin: {
     // Story 1-5b: stored pre-1.5b snapshots lack the dedicated client — an
     // absent field reads null (shared — what every pre-1.5b bin was).
     dedicatedClientId: bin.dedicatedClientId ?? null,
+    // Story 3-3b (decision 12, A7): stored pre-3-3b snapshots (a create, a
+    // retire, an edit, a merge or a legacy PATCH `{blocked}`) lack the
+    // block's fields — an absent field reads null (a pre-3-3b blocked bin's
+    // snapshot then says blocked with no reason: the reason was never
+    // recorded at that time; the live list carries the backfilled one).
+    blockedReason: bin.blockedReason ?? null,
+    blockedNote: bin.blockedNote ?? null,
+    blockedAt: bin.blockedAt ?? null,
+    blockedBy: bin.blockedBy ?? null,
+    blockedByName: bin.blockedByName ?? null,
   } as BinResponse;
 }
 

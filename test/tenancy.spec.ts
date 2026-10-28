@@ -975,7 +975,7 @@ describe('tenancy (e2e)', () => {
     expect(descending.body).toMatchObject({ code: 'validation-failed' });
   });
 
-  test('bin block toggle: 200 with the flag, replay re-serves, unknown bin 404, foreign session 403', async () => {
+  test('bin block verbs (story 3-3b): 201 with the reason, replay re-serves, reuse 422, unknown bin 404, foreign session 403; the PATCH `blocked` arm answers 400 naming the verbs', async () => {
     const { tenantId, token, warehouseId } = await setupTenantWithWarehouse();
     const zone = await createZone(token, tenantId, warehouseId, { code: 'A', name: 'Zone A' }).expect(201);
     const bin = await createBin(token, tenantId, warehouseId, zone.body.id as string, {
@@ -984,31 +984,47 @@ describe('tenancy (e2e)', () => {
       type: 'shelf',
     }).expect(201);
     const binId = bin.body.id as string;
-    const body = { blocked: true };
+    const verb = (path: 'block' | 'unblock', body: Record<string, unknown>, key = ulid(), as = token) =>
+      request(app.getHttpServer())
+        .post(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/bins/${binId}/${path}`)
+        .set('Authorization', `Bearer ${as}`)
+        .set('Idempotency-Key', key)
+        .send(body);
     const key = ulid();
 
-    const blocked = await patchBin(token, tenantId, warehouseId, binId, body, key).expect(200);
-    expect(blocked.body).toMatchObject({ id: binId, blocked: true });
+    // The retired PATCH arm (A6): a fresh key answers 400 naming both verbs.
+    const retired = await patchBin(token, tenantId, warehouseId, binId, { blocked: true }).expect(400);
+    expect(retired.body.code).toBe('validation-failed');
+    expect(retired.body.detail).toContain(`/bins/${binId}/block`);
+    expect(retired.body.detail).toContain(`/bins/${binId}/unblock`);
 
-    const replay = await patchBin(token, tenantId, warehouseId, binId, body, key).expect(200);
+    const blocked = await verb('block', { reason: 'maintenance' }, key).expect(201);
+    expect(blocked.body).toMatchObject({ id: binId, blocked: true, blockedReason: 'maintenance', blockedNote: null });
+
+    const replay = await verb('block', { reason: 'maintenance' }, key).expect(201);
     expect(replay.body).toEqual(blocked.body);
 
     // Same key, different payload → idempotency-key-reuse, not a replay.
-    const reuse = await patchBin(token, tenantId, warehouseId, binId, { blocked: false }, key).expect(422);
+    const reuse = await verb('unblock', { note: 'fixed' }, key).expect(422);
     expect(reuse.body).toMatchObject({ code: 'idempotency-key-reuse' });
 
-    const unblocked = await patchBin(token, tenantId, warehouseId, binId, { blocked: false }).expect(200);
-    expect(unblocked.body).toMatchObject({ id: binId, blocked: false });
+    const unblocked = await verb('unblock', { note: 'Shelf re-bolted' }).expect(201);
+    expect(unblocked.body).toMatchObject({ id: binId, blocked: false, blockedReason: null, blockedAt: null, blockedBy: null, blockedByName: null });
 
     // Unknown bin in a known warehouse → 404 not-found.
-    await patchBin(token, tenantId, warehouseId, uuidv7(), body).expect(404);
+    await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/bins/${uuidv7()}/block`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', ulid())
+      .send({ reason: 'damaged' })
+      .expect(404);
 
     // Foreign session → 403 permission-denied.
     const emailB = `owner-${ulid().toLowerCase()}@example.com`;
     const registeredB = await registerTenant(emailB).expect(201);
     createdTenantIds.push(registeredB.body.tenant.id);
     const tokenB = await signIn(emailB);
-    const cross = await patchBin(tokenB, tenantId, warehouseId, binId, body).expect(403);
+    const cross = await verb('block', { reason: 'damaged' }, ulid(), tokenB).expect(403);
     expect(cross.body).toMatchObject({ code: 'permission-denied' });
   });
 

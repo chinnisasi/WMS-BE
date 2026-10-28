@@ -250,6 +250,8 @@ export interface CatalogSnapshot {
     readonly type: string;
     readonly capacity: number;
     readonly blocked: boolean;
+    /** Story 3-3b: why the bin is blocked (null while active) — named on the handheld's refusals. */
+    readonly blockedReason: string | null;
     readonly systemOwned: boolean;
     /** Story 12.8 (UX-DR29): the bin's storage class — the device's offline conformance mirror. Never null on the wire (the column defaults to `ambient`). */
     readonly storageClass: string;

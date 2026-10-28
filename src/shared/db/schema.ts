@@ -768,6 +768,20 @@ export const bins = pgTable(
      */
     type: text('type').notNull(),
     blocked: boolean('blocked').notNull().default(false),
+    /**
+     * Story 3-3b — why, when and by whom the bin was blocked (a damaged rack,
+     * a spill, an audit hold …). Set together exactly while `blocked` and
+     * cleared together by the unblock — the `bins_blocked_pairing` CHECK
+     * (0106, migration-SQL-only). `blocked_reason` is one of
+     * `BIN_BLOCK_REASONS`; `other` requires the note. `blocked_by` is null
+     * only on a bin blocked before 3-3b (the backfill — reason `other`); the
+     * command always sets it. The history survives on the audit rows'
+     * `changes` (`bin.blocked` / `bin.unblocked`).
+     */
+    blockedReason: text('blocked_reason'),
+    blockedNote: text('blocked_note'),
+    blockedAt: timestamp('blocked_at', { withTimezone: true, mode: 'string' }),
+    blockedBy: uuid('blocked_by'),
     systemOwned: boolean('system_owned').notNull().default(false),
     retiredAt: timestamp('retired_at', { withTimezone: true, mode: 'string' }),
     retiredBy: uuid('retired_by'),
@@ -1213,6 +1227,33 @@ export const BATCH_BLOCK_REASONS = [
   'other',
 ] as const;
 export type BatchBlockReason = (typeof BATCH_BLOCK_REASONS)[number];
+
+/**
+ * Story 3-3b (decision 3) — why a BIN is blocked. A closed vocabulary, the
+ * three mirrored layers (guide §4): this tuple, the `bins_blocked_pairing`
+ * CHECK (0106) and the DTOs' `@IsIn` / enum over the same tuple; pinned TS ↔
+ * DB by test/bin-block.spec.ts. `other` requires a note (the command).
+ * `contamination` and `temperature-excursion` are the SUSPECT-STOCK reasons:
+ * a pick made offline just before such a block is refused, never exempted
+ * (design review A1).
+ */
+export const BIN_BLOCK_REASONS = [
+  'damaged',
+  'maintenance',
+  'contamination',
+  'temperature-excursion',
+  'safety-hazard',
+  'investigation',
+  'other',
+] as const;
+export type BinBlockReason = (typeof BIN_BLOCK_REASONS)[number];
+
+/**
+ * Story 3-3b (A1) — the reasons whose units picked just BEFORE the block are
+ * exactly the suspect stock: a pick that predates such a block is refused
+ * like any other (`pick.command.ts`), never exempted.
+ */
+export const SUSPECT_STOCK_BIN_BLOCK_REASONS: readonly BinBlockReason[] = ['contamination', 'temperature-excursion'];
 
 /**
  * Batch identity (Story 2.4 — catalog-owned, beside `skus`): one row per

@@ -1136,7 +1136,7 @@ export class RecordPickDto {
     nullable: true,
     enum: [...SHORT_PICK_REASON_CODES],
     description:
-      'Story 4.4: why this stop came up short. REQUIRED whenever qty is below the line’s planned quantity (including 0), refused outside the fixed set with a 400 naming the whole set, and ignored when qty equals the plan (that is an ordinary full pick). It is part of the idempotency payload hash — the reason is intent, not an observation.',
+      'Story 4.4: why this stop came up short. REQUIRED whenever qty is below the line’s planned quantity (including 0), refused outside the fixed set with a 400 naming the whole set, and ignored when qty equals the plan (that is an ordinary full pick). It is part of the idempotency payload hash — the reason is intent, not an observation. Story 3-3b: `skipped-blocked-bin` skips a planned stop whose bin is now blocked — only with qty 0 at the stop\'s own bin (else 400 validation-failed) and only while the bin is blocked (else 409 bin-not-blocked); it re-plans the stop onto other bins and needs no bin scan.',
   })
   @IsOptional()
   // `@IsIn` over the same tuple the `enum` above documents: a generated client
@@ -2377,6 +2377,18 @@ export class PicklistLineListQuery {
   @IsOptional()
   @IsIn(PICKLIST_LINE_STATUSES)
   status?: (typeof PICKLIST_LINE_STATUSES)[number];
+
+  @ApiProperty({
+    required: false,
+    type: String,
+    enum: ['true', 'false'],
+    description:
+      "Story 3-3b — `true`: only stops skipped because their bin was blocked (reasonCode `skipped-blocked-bin`); `false`: every other line (the short-picks tile's drill — a skip is warehouse state, not a picking error). Exactly 'true' or 'false'",
+  })
+  @IsOptional()
+  @BooleanFlag()
+  @IsBoolean()
+  skippedBlockedBin?: boolean;
 
   @ApiProperty({ required: false, format: 'date-time', description: FROM_DESCRIPTION('updated_at') })
   @IsOptional()

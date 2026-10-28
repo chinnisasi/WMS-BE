@@ -308,6 +308,9 @@ async function shortLineCounts(tx: TenantTx, ctx: TileContext): Promise<{ today:
         where pl.tenant_id = ${scope.tenantId}::uuid
           and p.warehouse_id = ${scope.warehouseId}::uuid
           and pl.status = 'short'
+          -- Story 3-3b (A11): a Skip of a stop in a blocked bin is warehouse
+          -- state, not a picking error — out of SM-3 and the shortPicks tile.
+          and pl.reason_code is distinct from 'skipped-blocked-bin'
           and pl.updated_at >= ${ts(window.d7From)}
           and pl.updated_at < ${ts(window.asOf)}`,
   );
@@ -315,7 +318,8 @@ async function shortLineCounts(tx: TenantTx, ctx: TileContext): Promise<{ today:
 }
 
 function shortLinesFigure(ctx: TileContext, values: { today: number; d7: number } | null): WindowedFigure {
-  return windowed(ctx, DRILL.picklistLines(ctx.scope), { status: 'short' }, true, values);
+  // Story 3-3b (A11): the drill excludes the blocked-bin Skips too, so it still reconciles.
+  return windowed(ctx, DRILL.picklistLines(ctx.scope), { status: 'short', skippedBlockedBin: 'false' }, true, values);
 }
 
 // ── 1. dock-to-stock ──────────────────────────────────────────────────────────

@@ -329,6 +329,8 @@ export interface StockOnHandEntry {
   readonly binCode?: string;
   /** Inventory-screen — present only under `order: 'location'`. */
   readonly binSystemOwned?: boolean;
+  /** Story 3-3b — the bin is blocked (both orders). */
+  readonly binBlocked: boolean;
 }
 
 /** Query of the Story 2.5 stock-list read (keyset cursor pagination). */
@@ -907,6 +909,20 @@ export class InventoryFacade {
         )
         .orderBy(desc(stockOnHand.createdAt), desc(stockOnHand.id))
         .limit(pageSize + 1);
+      // Story 3-3b (A12) — the "Blocked bin" chip: ONE keyed `bins` lookup
+      // over the page's bin ids (the location path's join, without changing
+      // this path's order or plan). Tenancy master data, read to locate only.
+      const pageBinIds = [...new Set(rows.map((row) => row.binId))];
+      const blockedBins = new Set(
+        pageBinIds.length === 0
+          ? []
+          : (
+              await tx
+                .select({ id: bins.id })
+                .from(bins)
+                .where(and(eq(bins.tenantId, tenantId), eq(bins.warehouseId, warehouseId), inArray(bins.id, pageBinIds), eq(bins.blocked, true)))
+            ).map((row) => row.id),
+      );
       const page = buildPage(
         rows.map(({ createdAtText, ...row }) => ({
           createdAt: fullPrecisionInstant(createdAtText),
@@ -916,6 +932,7 @@ export class InventoryFacade {
             // Read model — base units at the edge (see `listEvents`).
             quantity: fromMilli(row.quantity),
             createdAt: canonicalInstant(row.createdAt),
+            binBlocked: blockedBins.has(row.binId),
           },
         })),
         pageSize,
@@ -953,6 +970,8 @@ export class InventoryFacade {
           createdAt: stockOnHand.createdAt,
           binCode: bins.code,
           binSystemOwned: bins.systemOwned,
+          // Story 3-3b — the "Blocked bin" chip.
+          binBlocked: bins.blocked,
         })
         .from(stockOnHand)
         .innerJoin(
