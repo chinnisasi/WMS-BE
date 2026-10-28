@@ -665,7 +665,8 @@ export interface DeviceDockAppointmentView {
   readonly doorCode: string;
   readonly vehicleNo: string | null;
   readonly transporterName: string | null;
-  readonly documents: readonly { readonly kind: 'po' | 'asn'; readonly code: string | null }[];
+  /** A26 — `clientId` lets the device prefix the client's code when two documents' codes collide (an ASN code is unique per client only). */
+  readonly documents: readonly { readonly kind: 'po' | 'asn'; readonly code: string | null; readonly clientId: string | null }[];
 }
 
 /**
@@ -705,7 +706,7 @@ export async function todaysDockAppointmentsInTx(
     doorCode: view.doorCode,
     vehicleNo: view.vehicleNo,
     transporterName: view.transporterName,
-    documents: view.documents.map((doc) => ({ kind: doc.kind, code: doc.code })),
+    documents: view.documents.map((doc) => ({ kind: doc.kind, code: doc.code, clientId: doc.clientId })),
   }));
 }
 

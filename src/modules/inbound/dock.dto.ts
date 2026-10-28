@@ -487,6 +487,14 @@ export class CatalogDockAppointmentDocumentDto {
 
   @ApiProperty({ type: String, nullable: true, example: 'PO-1002' })
   code!: string | null;
+
+  @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    description: "A26 — the document's client (named in the snapshot's `clients`), so the device prefixes a colliding code with the client's code",
+  })
+  clientId!: string | null;
 }
 
 /** Story 2-3b (decision 12, A13) — one booked appointment of today on the device. */

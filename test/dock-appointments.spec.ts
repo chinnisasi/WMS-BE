@@ -926,8 +926,11 @@ describe('story 2-3b: dock appointments', () => {
         doorCode: 'D2',
         vehicleNo: null,
         transporterName: null,
-        documents: [{ kind: 'po', code: 'PO-1002' }],
+        documents: [{ kind: 'po', code: 'PO-1002', clientId: expect.any(String) }],
       });
+      // A26 — the document's client is in the snapshot's clients list (the device prefixes a colliding code with it).
+      const docClientId = (entry.documents as { clientId: string }[])[0]!.clientId;
+      expect(((snapshot as unknown as { clients: { id: string }[] }).clients ?? []).map((c) => c.id)).toContain(docClientId);
       const starts = snapshot.dockAppointments.map((a) => a.startsAt as string);
       expect([...starts].sort()).toEqual(starts);
       expect(starts.every((s) => s >= istMidnightOf(TODAY) && s < istMidnightOf(TOMORROW))).toBe(true);

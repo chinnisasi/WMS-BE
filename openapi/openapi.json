@@ -55491,11 +55491,18 @@
             "type": "string",
             "nullable": true,
             "example": "PO-1002"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "A26 — the document's client (named in the snapshot's `clients`), so the device prefixes a colliding code with the client's code"
           }
         },
         "required": [
           "kind",
-          "code"
+          "code",
+          "clientId"
         ]
       },
       "CatalogDockAppointmentDto": {

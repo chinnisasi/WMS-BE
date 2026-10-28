@@ -306,6 +306,9 @@ export class ReceivingController {
       // Story 1-5b: every bin's dedicated client, so the device can name the
       // client a dedicated bin belongs to when it refuses a scan against it.
       ...snapshot.bins.map((bin) => bin.dedicatedClientId).filter((id): id is string => id !== null),
+      // Story 2-3b (A26): every client an expected appointment's document names,
+      // so the device can prefix a colliding document code with its client's code.
+      ...snapshot.dockAppointments.flatMap((appointment) => appointment.documents.map((doc) => doc.clientId)).filter((id): id is string => id !== null),
     ]);
     return {
       ...snapshot,
