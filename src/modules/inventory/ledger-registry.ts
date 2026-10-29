@@ -301,6 +301,16 @@ export type LedgerReferenceDoc =
       readonly reasonCode?: string;
       readonly handlingUnitIds?: readonly string[];
     }
+  // Story 4-7b — the return-reversal arm: every `return.reversed` event names
+  // the blind return authorization whose booking a reviewer rejected, the
+  // receipt line it reverses and the reject reason. All three always present.
+  // NEW union arm — the earlier kinds are never reshaped.
+  | {
+      readonly kind: 'return-reversal';
+      readonly rmaId: string;
+      readonly returnReceiptLineId: string;
+      readonly reasonCode: string;
+    }
   // Story 4-2b — the restock arm: every `pick.restocked` event names the
   // cancel-with-restock it belongs to (`restockId` — one per command, shared
   // by all its events), the order and order line whose draw it reverses, the
@@ -766,6 +776,28 @@ registerLedgerEventType({
   type: 'return.scrapped',
   sinceVersion: 1,
   referenceKinds: ['return-disposition'],
+  allowsBatchArm: true,
+  allowsSerialArm: true,
+});
+
+/**
+ * Grammar v1, Story 4-7b — the reversal of a blind return's booking at
+ * review (decision 8): a reviewer rejected a parcel the handheld received
+ * with no RMA (mis-scanned, not the client's goods, a duplicate), so each of
+ * its receipt lines' `return.received` intakes is undone by a pure DRAW out
+ * of the system RETURNS bin (`fromBinId` RETURNS, `toBinId` null — the
+ * `return.scrapped` convention), never a negative `return.received` and never
+ * a `stock.adjusted` (adjustment analytics stay clean). Both identity arms
+ * are OPEN: a reversed serial leaves stock (its latest event names no bin),
+ * so a correct re-receipt of the same unit passes `serial-in-stock`. It
+ * meters `['from']` (storage accrued for exactly the hours the units were
+ * booked — A26). The recall trace nets it against `returned` (D5).
+ * Registers sinceVersion 1 — no new grammar version.
+ */
+registerLedgerEventType({
+  type: 'return.reversed',
+  sinceVersion: 1,
+  referenceKinds: ['return-reversal'],
   allowsBatchArm: true,
   allowsSerialArm: true,
 });

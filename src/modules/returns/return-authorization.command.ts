@@ -67,8 +67,44 @@ export const RETURN_REASON_CODES = [
   'not-as-described',
   'changed-mind',
   'other',
+  // Story 4-7b (decision 9) — a blind return's line: the parcel arrived with
+  // no authorization, so no customer reason is known. Written ONLY by the
+  // blind receipt; the create path refuses it (`AUTHORIZABLE_REASON_CODES`).
+  'unannounced',
 ] as const;
 export type ReturnReasonCode = (typeof RETURN_REASON_CODES)[number];
+
+/**
+ * Story 4-7b (decision 9, A5) — the reasons an operator may AUTHORIZE a
+ * return for: the six pre-4-7b codes, never `unannounced`. The create's
+ * shape check and its DTO (`@IsIn`, the openapi enum) use this list; the
+ * response DTOs keep the wide `RETURN_REASON_CODES`. Frozen beside the wide
+ * list and asserted at module load (guide §4 — a replaced list admits
+ * everything the old one did).
+ */
+export const AUTHORIZABLE_REASON_CODES = ['damaged', 'defective', 'wrong-item', 'not-as-described', 'changed-mind', 'other'] as const;
+export type AuthorizableReasonCode = (typeof AUTHORIZABLE_REASON_CODES)[number];
+for (const code of AUTHORIZABLE_REASON_CODES) {
+  if (!(RETURN_REASON_CODES as readonly string[]).includes(code)) {
+    throw new Error(`AUTHORIZABLE_REASON_CODES names "${code}", which RETURN_REASON_CODES does not hold.`);
+  }
+}
+
+/** Story 4-7b — where an RMA came from (0112's `return_authorizations_origin_check`). */
+export const RMA_ORIGINS = ['authorized', 'blind'] as const;
+export type RmaOrigin = (typeof RMA_ORIGINS)[number];
+
+/** Story 4-7b — a blind RMA's review (0112's `return_authorizations_review_status_check`). */
+export const RMA_REVIEW_STATUSES = ['pending', 'accepted', 'rejected'] as const;
+export type RmaReviewStatus = (typeof RMA_REVIEW_STATUSES)[number];
+
+/** Story 4-7b (decision 6) — how the parcel reference matched the suggested order. */
+export const BLIND_MATCH_KINDS = ['awb', 'order-reference'] as const;
+export type BlindMatchKind = (typeof BLIND_MATCH_KINDS)[number];
+
+/** Story 4-7b (decision 8) — why a blind return was rejected; `other` needs a note. */
+export const BLIND_REJECT_REASONS = ['mis-scanned', 'not-our-goods', 'duplicate', 'other'] as const;
+export type BlindRejectReason = (typeof BLIND_REJECT_REASONS)[number];
 
 /** The line limit, a purchase order's and an order's. */
 export const MAX_RMA_LINES = 200;
@@ -138,7 +174,8 @@ export interface RmaSerial {
 
 export interface RmaLineSnapshot {
   readonly id: string;
-  readonly orderLineId: string;
+  /** Story 4-7b — null on a blind line no accept has linked to an order line. */
+  readonly orderLineId: string | null;
   readonly skuId: string;
   /** Base units. */
   readonly authorizedQty: number;
@@ -154,12 +191,14 @@ export interface RmaDetail {
   readonly id: string;
   readonly code: string;
   readonly status: RmaStatus;
-  readonly orderId: string;
+  /** Story 4-7b — null on a blind RMA not (yet) linked to an order. */
+  readonly orderId: string | null;
   readonly orderReference: string | null;
   readonly warehouseId: string;
   readonly clientId: string;
   readonly externalReference: string | null;
-  readonly orderDispatchedAt: string;
+  /** Story 4-7b — null exactly when `orderId` is. */
+  readonly orderDispatchedAt: string | null;
   readonly createdAt: string;
   readonly createdBy: string;
   readonly cancelledAt: string | null;
@@ -173,6 +212,29 @@ export interface RmaDetail {
    * serves (IMPLEMENTATION-GUIDE §9).
    */
   readonly receipts?: readonly ReturnReceiptView[];
+  /**
+   * Story 4-7b — where the RMA came from, and a blind RMA's review. OPTIONAL
+   * on the type (a stored create / cancel snapshot never carried them and
+   * replays without them); the list and detail reads always emit them.
+   */
+  readonly origin?: RmaOrigin;
+  readonly reviewStatus?: RmaReviewStatus | null;
+  readonly parcelReference?: string | null;
+  readonly suggestedOrderId?: string | null;
+  readonly matchKind?: BlindMatchKind | null;
+  /** A24 — the operator chose the client at an ambiguous barcode (null on an authorized RMA). */
+  readonly clientPrompted?: boolean | null;
+  readonly reviewedAt?: string | null;
+  readonly reviewedBy?: string | null;
+  readonly reviewReasonCode?: BlindRejectReason | null;
+  readonly reviewNote?: string | null;
+  /**
+   * Story 4-7b — the detail read ONLY (never a list item, never a stored
+   * snapshot): receivable RMAs of the suggested order (the card's flag), and
+   * other blind RMAs received with the same parcel reference (A20).
+   */
+  readonly openRmasForSuggestedOrder?: readonly { readonly id: string; readonly code: string; readonly status: RmaStatus }[];
+  readonly sameParcelRmas?: readonly { readonly id: string; readonly code: string; readonly reviewStatus: RmaReviewStatus }[];
 }
 
 /** One order line of the returnable read. Quantities in base units. */
@@ -317,7 +379,7 @@ function codePoints(value: string): number {
 export interface NormalizedRmaLine {
   readonly orderLineId: string;
   readonly qty: number;
-  readonly reasonCode: ReturnReasonCode;
+  readonly reasonCode: AuthorizableReasonCode;
   readonly reasonNote: string | null;
   /** Null when the request named none; trimmed, distinct, in request order otherwise. */
   readonly serialNumbers: readonly string[] | null;
@@ -361,12 +423,14 @@ export function normalizeCreate(command: Pick<CreateRmaCommand, 'externalReferen
     if (typeof line.qty !== 'number' || !Number.isFinite(line.qty) || line.qty <= 0) {
       throw rmaValidation(`${at}: qty must be a number greater than 0 (got ${String(line.qty)}).`);
     }
-    if (!(RETURN_REASON_CODES as readonly string[]).includes(line.reasonCode)) {
+    // Story 4-7b (A5) — the authorizable codes only: `unannounced` belongs to
+    // the blind receipt and is refused here.
+    if (!(AUTHORIZABLE_REASON_CODES as readonly string[]).includes(line.reasonCode)) {
       throw rmaValidation(
-        `${at}: reasonCode must be one of ${JSON.stringify(RETURN_REASON_CODES)} (got "${String(line.reasonCode)}").`,
+        `${at}: reasonCode must be one of ${JSON.stringify(AUTHORIZABLE_REASON_CODES)} (got "${String(line.reasonCode)}").`,
       );
     }
-    const reasonCode = line.reasonCode as ReturnReasonCode;
+    const reasonCode = line.reasonCode as AuthorizableReasonCode;
     const reasonNote = trimmedOrNull(line.reasonNote);
     if (reasonNote !== null && codePoints(reasonNote) > MAX_RMA_NOTE) {
       throw rmaValidation(`${at}: reasonNote must be at most ${MAX_RMA_NOTE} characters (got ${codePoints(reasonNote)}).`);
@@ -550,6 +614,9 @@ export async function returnableFactsInTx(
   const authorizedMilli = new Map<string, number>();
   const authorizedSerials = new Map<string, Set<string>>();
   for (const row of authorizedRows) {
+    // Story 4-7b (A4) — an accepted blind RMA's UNLINKED line names no order
+    // line: it speaks for none of this order's units.
+    if (row.orderLineId === null) continue;
     authorizedMilli.set(row.orderLineId, (authorizedMilli.get(row.orderLineId) ?? 0) + Number(row.authorizedQty));
     const set = authorizedSerials.get(row.orderLineId) ?? new Set<string>();
     for (const id of row.serialIds) set.add(id);
@@ -643,6 +710,12 @@ export async function rmaDetailsInTx(
   catalog: CatalogFacade,
   tenantId: string,
   headers: readonly ReturnAuthorizationRow[],
+  /**
+   * Story 4-7b — emit the origin and review keys. The list and detail reads
+   * pass true; a stored create / cancel snapshot omits them, so its bytes
+   * stay exactly as before 4-7b.
+   */
+  opts: { readonly withReview?: boolean } = {},
 ): Promise<RmaDetail[]> {
   if (headers.length === 0) {
     return [];
@@ -689,7 +762,8 @@ export async function rmaDetailsInTx(
     warehouseId: header.warehouseId,
     clientId: header.clientId,
     externalReference: header.externalReference,
-    orderDispatchedAt: canonicalInstant(header.orderDispatchedAt),
+    // Story 4-7b (A4) — null on a blind RMA with no order.
+    orderDispatchedAt: header.orderDispatchedAt === null ? null : canonicalInstant(header.orderDispatchedAt),
     createdAt: canonicalInstant(header.createdAt),
     createdBy: header.createdBy,
     cancelledAt: header.cancelledAt === null ? null : canonicalInstant(header.cancelledAt),
@@ -705,7 +779,36 @@ export async function rmaDetailsInTx(
       reasonNote: line.reasonNote,
       serials: line.serialIds.map((id) => ({ id, serialNumber: serialNumberOf(numberById, id) })).sort(bySerialNumber),
     })),
+    ...(opts.withReview === true ? reviewFieldsOf(header) : {}),
   }));
+}
+
+/** Story 4-7b — the origin and review keys of one RMA row, as the reads emit them. */
+export function reviewFieldsOf(header: ReturnAuthorizationRow): Pick<
+  RmaDetail,
+  | 'origin'
+  | 'reviewStatus'
+  | 'parcelReference'
+  | 'suggestedOrderId'
+  | 'matchKind'
+  | 'clientPrompted'
+  | 'reviewedAt'
+  | 'reviewedBy'
+  | 'reviewReasonCode'
+  | 'reviewNote'
+> {
+  return {
+    origin: header.origin as RmaOrigin,
+    reviewStatus: header.reviewStatus as RmaReviewStatus | null,
+    parcelReference: header.parcelReference,
+    suggestedOrderId: header.suggestedOrderId,
+    matchKind: header.matchKind as BlindMatchKind | null,
+    clientPrompted: header.clientPrompted,
+    reviewedAt: header.reviewedAt === null ? null : canonicalInstant(header.reviewedAt),
+    reviewedBy: header.reviewedBy,
+    reviewReasonCode: header.reviewReasonCode as BlindRejectReason | null,
+    reviewNote: header.reviewNote,
+  };
 }
 
 /** A serial id the catalog cannot resolve is a data fault (the ledger and the RMA name only real serials) — never shown as its uuid. */
@@ -727,6 +830,7 @@ export async function rmaDetailInTx(
   catalog: CatalogFacade,
   tenantId: string,
   rmaId: string,
+  opts: { readonly withReview?: boolean } = {},
 ): Promise<RmaDetail | null> {
   const rows = await tx
     .select()
@@ -737,7 +841,7 @@ export async function rmaDetailInTx(
   if (header === undefined) {
     return null;
   }
-  return (await rmaDetailsInTx(tx, catalog, tenantId, [header]))[0]!;
+  return (await rmaDetailsInTx(tx, catalog, tenantId, [header], opts))[0]!;
 }
 
 // ── the commands ─────────────────────────────────────────────────────────────
@@ -949,7 +1053,7 @@ export class ReturnAuthorizationCommand {
       orderLineId: string;
       skuId: string;
       authorizedMilli: number;
-      reasonCode: ReturnReasonCode;
+      reasonCode: AuthorizableReasonCode;
       reasonNote: string | null;
       serialIds: string[];
     }[]
@@ -1037,12 +1141,7 @@ export class ReturnAuthorizationCommand {
    * backstop.
    */
   private async allocateCode(tx: TenantTx, tenantId: string): Promise<string> {
-    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${rmaSequenceLockKey(tenantId)}, 0))`);
-    const rows = await tx
-      .select({ n: sql<number>`coalesce(max(substring(${returnAuthorizations.code} from '^RMA-([0-9]{1,9})$')::int), 0)` })
-      .from(returnAuthorizations)
-      .where(eq(returnAuthorizations.tenantId, tenantId));
-    return rmaCode(Number(rows[0]?.n ?? 0) + 1);
+    return allocateRmaCodeInTx(tx, tenantId);
   }
 
   /** Lock + 404 only — never a status check (§1, the `loadOpenPo` lesson). */
@@ -1071,6 +1170,12 @@ export class ReturnAuthorizationCommand {
     payloadHash: string,
   ): Promise<RmaDetail> {
     const snapshot = (await rmaDetailInTx(tx, this.catalog, tenantId, rmaId))!;
+    if (snapshot.orderId === null) {
+      // Unreachable: create writes an order, and cancel refuses anything not
+      // `open` (a blind RMA is born `received`) — A4: these events never
+      // carry a null order.
+      throw new ProblemException('data-fault', 500, 'Return data is inconsistent', `Return authorization "${snapshot.code}" has no order.`);
+    }
     const at = nowIso();
     const payload: ReturnAuthorizationEventPayload = {
       rmaId,
@@ -1154,4 +1259,21 @@ export class ReturnAuthorizationCommand {
  */
 export function rmaOrderReference(facts: { readonly clientOrderRef: string | null; readonly externalEventId: string | null }): string | null {
   return facts.clientOrderRef ?? facts.externalEventId;
+}
+
+/**
+ * The next `RMA-<n>` under the tenant's sequence advisory lock — the
+ * `allocateGrnCode` copy: only codes matching `RMA-<1–9 digits>` take the
+ * max (a forged or oversized tail is ignored, never a cast 500), and a
+ * 5-digit code sorts numerically. The unique `(tenant, code)` index is the
+ * backstop. Story 4-7b extracted it so the blind receipt allocates from the
+ * same sequence (its lock order: `:rma-seq`, then `:rrn-seq`).
+ */
+export async function allocateRmaCodeInTx(tx: TenantTx, tenantId: string): Promise<string> {
+  await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${rmaSequenceLockKey(tenantId)}, 0))`);
+  const rows = await tx
+    .select({ n: sql<number>`coalesce(max(substring(${returnAuthorizations.code} from '^RMA-([0-9]{1,9})$')::int), 0)` })
+    .from(returnAuthorizations)
+    .where(eq(returnAuthorizations.tenantId, tenantId));
+  return rmaCode(Number(rows[0]?.n ?? 0) + 1);
 }

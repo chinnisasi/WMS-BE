@@ -1,5 +1,5 @@
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
-import { returnDispositions, returnHoldSettlements, returnReceiptLines } from '../../shared/db/schema';
+import { returnAuthorizations, returnDispositions, returnHoldSettlements, returnReceiptLines, returnReceipts } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 
@@ -106,24 +106,48 @@ export function dispositionDataFault(detail: string): ProblemException {
 /**
  * Story 4-7a (A20) — the conservation assertion, run inside the writing
  * transaction AFTER the writes: every touched line's stored `open_qty` must
- * equal `qty − restocked − scrapped − quarantined + returned` over its own
+ * equal `basis − restocked − scrapped − quarantined + returned` over its own
  * rows. A mismatch is a typed 500 `data-fault` and the transaction rolls back
  * — nothing half-booked commits.
+ *
+ * Story 4-7b (A1, D1) — the BASIS is the line's `qty` when its RMA's review
+ * is null (an authorized RMA) or `accepted`, and 0 while a blind RMA's
+ * review is `pending` or once it is `rejected` (`open_qty` stays 0: nothing
+ * can be dispositioned). The blind receipt, accept and reject assert it on
+ * their lines, so the equation holds in every review state.
  */
+export function dispositionBasis(qty: number, reviewStatus: string | null): number {
+  return reviewStatus === null || reviewStatus === 'accepted' ? qty : 0;
+}
+
 export async function assertLinesConservedInTx(tx: TenantTx, tenantId: string, lineIds: readonly string[]): Promise<void> {
   const ids = [...new Set(lineIds)];
   if (ids.length === 0) return;
   const lines = await tx
-    .select({ id: returnReceiptLines.id, qty: returnReceiptLines.qty, openQty: returnReceiptLines.openQty })
+    .select({
+      id: returnReceiptLines.id,
+      qty: returnReceiptLines.qty,
+      openQty: returnReceiptLines.openQty,
+      reviewStatus: returnAuthorizations.reviewStatus,
+    })
     .from(returnReceiptLines)
+    .innerJoin(
+      returnReceipts,
+      and(eq(returnReceipts.tenantId, returnReceiptLines.tenantId), eq(returnReceipts.id, returnReceiptLines.returnReceiptId)),
+    )
+    .innerJoin(
+      returnAuthorizations,
+      and(eq(returnAuthorizations.tenantId, returnReceipts.tenantId), eq(returnAuthorizations.id, returnReceipts.rmaId)),
+    )
     .where(and(eq(returnReceiptLines.tenantId, tenantId), inArray(returnReceiptLines.id, ids)));
   const splits = await lineSplitsInTx(tx, tenantId, ids);
   for (const line of lines) {
     const split = splits.get(line.id) ?? EMPTY_SPLIT;
-    const expected = Number(line.qty) - split.restocked - split.scrapped - split.quarantined + split.returned;
+    const basis = dispositionBasis(Number(line.qty), line.reviewStatus);
+    const expected = basis - split.restocked - split.scrapped - split.quarantined + split.returned;
     if (Number(line.openQty) !== expected || split.onHold < 0) {
       throw dispositionDataFault(
-        `Return receipt line "${line.id}" does not conserve: open ${Number(line.openQty)} milli-units, but received ${Number(line.qty)} − restocked ${split.restocked} − scrapped ${split.scrapped} − quarantined ${split.quarantined} + returned ${split.returned} = ${expected}.`,
+        `Return receipt line "${line.id}" does not conserve: open ${Number(line.openQty)} milli-units, but basis ${basis} (received ${Number(line.qty)}, review ${line.reviewStatus ?? 'none'}) − restocked ${split.restocked} − scrapped ${split.scrapped} − quarantined ${split.quarantined} + returned ${split.returned} = ${expected}.`,
       );
     }
   }

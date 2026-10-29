@@ -854,6 +854,102 @@ export class OutboundFacade {
   // (the invoicing facts read's methods follow — story 8-1)
 
   /**
+   * Story 4-7b (decision 6, A15, A23, D6, D7) — the DISPATCHED orders of one
+   * client in one warehouse that a blind return's scanned parcel reference
+   * names, in the caller's transaction. Arms, in order, each tried only when
+   * the earlier ones found no dispatched order:
+   *
+   * 1. `awb` — a carrier-labelled shipment's `tracking_number` (exact,
+   *    case-sensitive; a VOIDED label never counts — the
+   *    `outbound-register.ts` precedent). A manually dispatched order's AWB
+   *    lives only in its ledger reference doc and is not searched (A15).
+   * 2. `order-reference`, EXACT — the reference is the order's own label:
+   *    its client order number or its channel reference, plus `-BO{seq}` on a
+   *    backorder follow-on (D6). A root's bare number therefore names the
+   *    root alone, and a printed follow-on label names that follow-on.
+   * 3. `order-reference`, the chain — `orderReferenceMatch` (4-2c: a printed
+   *    `-BO{n}` label also finds its chain by the stripped number).
+   *
+   * The reference is trimmed by the caller (blank = no lookup). Every arm
+   * carries the explicit client and warehouse predicates. The caller turns
+   * exactly one order into a suggestion; several are no suggestion.
+   */
+  async ordersByParcelReferenceInTx(
+    tx: TenantTx,
+    tenantId: string,
+    clientId: string,
+    warehouseId: string,
+    reference: string,
+  ): Promise<{ readonly orderId: string; readonly matchKind: 'awb' | 'order-reference' }[]> {
+    const awb = await tx
+      .selectDistinct({ orderId: orders.id })
+      .from(shipments)
+      .innerJoin(orders, and(eq(orders.tenantId, shipments.tenantId), eq(orders.id, shipments.orderId)))
+      .where(
+        and(
+          eq(shipments.tenantId, tenantId),
+          eq(shipments.trackingNumber, reference),
+          sql`${shipments.status} <> 'voided'`,
+          eq(orders.clientId, clientId),
+          eq(orders.warehouseId, warehouseId),
+          eq(orders.status, 'dispatched'),
+        ),
+      )
+      .orderBy(orders.id);
+    if (awb.length > 0) return awb.map((row) => ({ orderId: row.orderId, matchKind: 'awb' as const }));
+    const candidates = await tx
+      .select({
+        orderId: orders.id,
+        clientOrderRef: orders.clientOrderRef,
+        externalEventId: orders.externalEventId,
+        followOnSeq: orders.followOnSeq,
+      })
+      .from(orders)
+      .where(
+        and(
+          eq(orders.tenantId, tenantId),
+          eq(orders.clientId, clientId),
+          eq(orders.warehouseId, warehouseId),
+          eq(orders.status, 'dispatched'),
+          orderReferenceMatch(orders.id, tenantId, reference, clientId),
+        ),
+      )
+      .orderBy(orders.id);
+    const suffix = (seq: number | null): string => (seq === null ? '' : `-BO${seq}`);
+    const exact = candidates.filter(
+      (row) =>
+        (row.clientOrderRef !== null && `${row.clientOrderRef}${suffix(row.followOnSeq)}` === reference) ||
+        (row.externalEventId !== null && `${row.externalEventId}${suffix(row.followOnSeq)}` === reference),
+    );
+    const chosen = exact.length > 0 ? exact : candidates;
+    return chosen.map((row) => ({ orderId: row.orderId, matchKind: 'order-reference' as const }));
+  }
+
+  /**
+   * Story 4-7b (A19, D7) — the carrier tracking numbers of each named order
+   * (every non-voided shipment), in the caller's transaction: the device
+   * snapshot's open returns carry them, so a scanned forward AWB of an
+   * order with an open RMA redirects to the RMA receipt. Orders with none
+   * are absent.
+   */
+  async trackingNumbersByOrderIdsInTx(tx: TenantTx, tenantId: string, orderIds: readonly string[]): Promise<Map<string, string[]>> {
+    const out = new Map<string, string[]>();
+    const ids = [...new Set(orderIds)];
+    if (ids.length === 0) return out;
+    const rows = await tx
+      .select({ orderId: shipments.orderId, trackingNumber: shipments.trackingNumber })
+      .from(shipments)
+      .where(and(eq(shipments.tenantId, tenantId), inArray(shipments.orderId, ids), sql`${shipments.status} <> 'voided'`))
+      .orderBy(asc(shipments.createdAt), asc(shipments.id));
+    for (const row of rows) {
+      const list = out.get(row.orderId) ?? [];
+      if (!list.includes(row.trackingNumber)) list.push(row.trackingNumber);
+      out.set(row.orderId, list);
+    }
+    return out;
+  }
+
+  /**
    * The dispatch facts invoicing's generator derives an invoice from (story
    * 8-1): the order header (status, consignee GSTIN, destination address) and
    * its lines with the SKU join and the per-line picks sum — the "picks

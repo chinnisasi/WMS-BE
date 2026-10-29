@@ -232,6 +232,12 @@ export const AUDIT_NEW_ACTIONS = [
   // Story 4-7a — the disposition commands (`ReturnDispositionCommand`, web
   // and handheld): one row per command, the first disposition its target.
   { action: 'return_disposition.recorded', targetType: 'return_disposition' },
+  // Story 4-7b — the blind returns (`BlindReturnCommand`): the handheld's
+  // unannounced parcel (its all-refused arm targets the `device`, pinned in
+  // the same suite) and its web review.
+  { action: 'return_receipt.blind_recorded', targetType: 'return_receipt' },
+  { action: 'return_authorization.blind_accepted', targetType: 'return_authorization' },
+  { action: 'return_authorization.blind_rejected', targetType: 'return_authorization' },
   // Story 2-8b — the return-to-vendor document's four transitions.
   { action: 'vendor_return.created', targetType: 'vendor_return' },
   { action: 'vendor_return.picked', targetType: 'vendor_return' },

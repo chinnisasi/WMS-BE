@@ -3,6 +3,7 @@ import {
   ArrayMaxSize,
   ArrayMinSize,
   IsArray,
+  IsBoolean,
   IsIn,
   IsInt,
   IsNumber,
@@ -21,11 +22,22 @@ import {
   MAX_RMA_LINES,
   MAX_RMA_NOTE,
   MAX_RMA_SERIALS_PER_LINE,
+  AUTHORIZABLE_REASON_CODES,
+  BLIND_MATCH_KINDS,
+  BLIND_REJECT_REASONS,
   RETURN_REASON_CODES,
+  RMA_ORIGINS,
+  RMA_REVIEW_STATUSES,
   RMA_STATUSES,
+  type AuthorizableReasonCode,
+  type BlindMatchKind,
+  type BlindRejectReason,
   type ReturnReasonCode,
+  type RmaOrigin,
+  type RmaReviewStatus,
   type RmaStatus,
 } from './return-authorization.command';
+import { BLIND_ENTRY_REFUSALS, MAX_BLIND_REVIEW_NOTE, MAX_PARCEL_REFERENCE, type BlindEntryRefusal } from './blind-return.command';
 import {
   MAX_RETURN_NOTE,
   MAX_RETURN_RECEIPT_ENTRIES,
@@ -84,9 +96,10 @@ export class ReturnAuthorizationLineInputDto {
   @Max(MAX_QUANTITY_BASE)
   qty!: number;
 
-  @ApiProperty({ enum: [...RETURN_REASON_CODES], description: 'Why the units come back; `other` requires a reasonNote' })
-  @IsIn([...RETURN_REASON_CODES])
-  reasonCode!: ReturnReasonCode;
+  // Story 4-7b (A5) — the authorizable codes only (`unannounced` is the blind receipt's).
+  @ApiProperty({ enum: [...AUTHORIZABLE_REASON_CODES], description: 'Why the units come back; `other` requires a reasonNote' })
+  @IsIn([...AUTHORIZABLE_REASON_CODES])
+  reasonCode!: AuthorizableReasonCode;
 
   @ApiProperty({
     required: false,
@@ -188,6 +201,16 @@ export class ReturnAuthorizationListQuery {
   @IsUUID()
   orderId?: string;
 
+  @ApiProperty({ required: false, enum: [...RMA_ORIGINS], description: 'Story 4-7b — only authorized, or only blind (unannounced), return authorizations' })
+  @IsOptional()
+  @IsIn([...RMA_ORIGINS])
+  origin?: RmaOrigin;
+
+  @ApiProperty({ required: false, enum: [...RMA_REVIEW_STATUSES], description: 'Story 4-7b — only unannounced returns in one review state (the Unannounced tab reads pending)' })
+  @IsOptional()
+  @IsIn([...RMA_REVIEW_STATUSES])
+  reviewStatus?: RmaReviewStatus;
+
   @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
   @IsOptional()
   @IsString()
@@ -216,8 +239,8 @@ export class ReturnAuthorizationLineDto {
   @ApiProperty({ format: 'uuid' })
   id!: string;
 
-  @ApiProperty({ format: 'uuid' })
-  orderLineId!: string;
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'The order line returned — story 4-7b: null on an unannounced line no accept has linked' })
+  orderLineId!: string | null;
 
   @ApiProperty({ format: 'uuid' })
   skuId!: string;
@@ -249,8 +272,8 @@ export class ReturnAuthorizationDto {
   @ApiProperty({ enum: [...RMA_STATUSES] })
   status!: RmaStatus;
 
-  @ApiProperty({ format: 'uuid' })
-  orderId!: string;
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'The order returned — story 4-7b: null on an unannounced return not linked to an order' })
+  orderId!: string | null;
 
   @ApiProperty({ type: String, nullable: true, description: "The order's reference at authorization — story 4-1b: its client order number, else its channel reference (external event id); null when it has neither. An RMA created before 4-1b holds the channel reference only" })
   orderReference!: string | null;
@@ -264,8 +287,8 @@ export class ReturnAuthorizationDto {
   @ApiProperty({ type: String, nullable: true, description: "A channel's or customer's RMA number; null when none was given" })
   externalReference!: string | null;
 
-  @ApiProperty({ description: 'When the order was dispatched (ISO-8601 UTC) — recorded at authorization' })
-  orderDispatchedAt!: string;
+  @ApiProperty({ type: String, nullable: true, description: 'When the order was dispatched (ISO-8601 UTC) — recorded at authorization; story 4-7b: null exactly when orderId is' })
+  orderDispatchedAt!: string | null;
 
   @ApiProperty({ description: 'ISO-8601 UTC creation time (the keyset field)' })
   createdAt!: string;
@@ -292,6 +315,74 @@ export class ReturnAuthorizationDto {
       'Story 13-2 — the receipts against this authorization, oldest first. Present ONLY on GET /returns/{rmaId}; absent on the list and on the create/cancel responses',
   })
   receipts?: readonly ReturnReceiptViewDto[];
+
+  @ApiProperty({ required: false, enum: [...RMA_ORIGINS], description: 'Story 4-7b — authorized (13-1) or blind (an unannounced parcel). Always present on the list and detail reads; absent on a pre-4-7b create/cancel response' })
+  origin?: RmaOrigin;
+
+  @ApiProperty({ required: false, type: String, nullable: true, enum: [...RMA_REVIEW_STATUSES, null], description: "Story 4-7b — a blind return's review; null on an authorized one" })
+  reviewStatus?: RmaReviewStatus | null;
+
+  @ApiProperty({ required: false, type: String, nullable: true, description: 'Story 4-7b — the scanned AWB or order number of a blind return' })
+  parcelReference?: string | null;
+
+  @ApiProperty({ required: false, type: String, nullable: true, format: 'uuid', description: 'Story 4-7b — the dispatched order the parcel reference matched (a suggestion only)' })
+  suggestedOrderId?: string | null;
+
+  @ApiProperty({ required: false, type: String, nullable: true, enum: [...BLIND_MATCH_KINDS, null], description: 'Story 4-7b — how the reference matched: the carrier AWB or the order reference' })
+  matchKind?: BlindMatchKind | null;
+
+  @ApiProperty({ required: false, type: Boolean, nullable: true, description: 'Story 4-7b — the operator chose the client at a barcode several clients share; null on an authorized return' })
+  clientPrompted?: boolean | null;
+
+  @ApiProperty({ required: false, type: String, nullable: true, description: 'Story 4-7b — when the review was decided (ISO-8601 UTC)' })
+  reviewedAt?: string | null;
+
+  @ApiProperty({ required: false, type: String, nullable: true, format: 'uuid', description: 'Story 4-7b — who decided the review' })
+  reviewedBy?: string | null;
+
+  @ApiProperty({ required: false, type: String, nullable: true, enum: [...BLIND_REJECT_REASONS, null], description: 'Story 4-7b — why a blind return was rejected' })
+  reviewReasonCode?: BlindRejectReason | null;
+
+  @ApiProperty({ required: false, type: String, nullable: true, description: "Story 4-7b — the reject's note" })
+  reviewNote?: string | null;
+
+  @ApiProperty({
+    required: false,
+    type: () => [RmaRefDto],
+    description: "Story 4-7b — detail only: the suggested order's open or partially received return authorizations (the card's flag)",
+  })
+  openRmasForSuggestedOrder?: readonly RmaRefDto[];
+
+  @ApiProperty({
+    required: false,
+    type: () => [SameParcelRmaDto],
+    description: 'Story 4-7b — detail only: other unannounced returns received with the same parcel reference, any review state',
+  })
+  sameParcelRmas?: readonly SameParcelRmaDto[];
+}
+
+/** Story 4-7b — another RMA named on a blind return's card. */
+export class RmaRefDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty()
+  code!: string;
+
+  @ApiProperty({ enum: [...RMA_STATUSES] })
+  status!: RmaStatus;
+}
+
+/** Story 4-7b (A20) — another blind RMA with the same parcel reference. */
+export class SameParcelRmaDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty()
+  code!: string;
+
+  @ApiProperty({ enum: [...RMA_REVIEW_STATUSES] })
+  reviewStatus!: RmaReviewStatus;
 }
 
 export class ReturnAuthorizationListResponse {
@@ -531,6 +622,12 @@ export class ReturnReceiptLineViewDto {
 
   @ApiProperty({ minimum: 0, description: 'Story 4-7a — units that failed a return hold\'s inspection (now in DAMAGED), base UoM' })
   failedInspectionQty!: number;
+
+  @ApiProperty({ required: false, minimum: 0, description: 'Story 4-7b — an unannounced return\'s line: units awaiting review (qty while pending, else 0); absent on an authorized return' })
+  pendingReviewQty?: number;
+
+  @ApiProperty({ required: false, minimum: 0, description: 'Story 4-7b — an unannounced return\'s line: units reversed at review (qty once rejected, else 0); absent on an authorized return' })
+  reversedQty?: number;
 }
 
 export class ReturnReceiptViewDto {
@@ -825,14 +922,20 @@ export class PortalReturnRowDto {
   @ApiProperty({ enum: [...RMA_STATUSES] })
   status!: RmaStatus;
 
-  @ApiProperty({ format: 'uuid' })
-  orderId!: string;
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'Story 4-7b — null on an accepted unannounced return linked to no order' })
+  orderId!: string | null;
 
   @ApiProperty({ type: String, nullable: true })
   orderReference!: string | null;
 
   @ApiProperty({ type: String, nullable: true })
   externalReference!: string | null;
+
+  @ApiProperty({ enum: [...RMA_ORIGINS], description: 'Story 4-7b — authorized, or blind (an unannounced parcel — listed once accepted)' })
+  origin!: RmaOrigin;
+
+  @ApiProperty({ type: String, nullable: true, description: "Story 4-7b — an unannounced return's scanned AWB or order number" })
+  parcelReference!: string | null;
 
   @ApiProperty({ description: 'ISO-8601 UTC' })
   createdAt!: string;
@@ -922,4 +1025,192 @@ export class PortalReturnDetailResponse extends PortalReturnRowDto {
 
   @ApiProperty({ type: [PortalReturnDispositionDto], description: 'Oldest first' })
   dispositions!: readonly PortalReturnDispositionDto[];
+}
+
+// ── story 4-7b: blind returns ───────────────────────────────────────────────
+
+/** One scanned unit, case or run of untracked units of an unannounced parcel. */
+export class BlindReceiptEntryDto {
+  @ApiProperty({ format: 'uuid', description: "The SKU scanned — the parcel's client's (sku-not-of-client otherwise)" })
+  @LowercaseUuid()
+  @IsUUID()
+  skuId!: string;
+
+  @ApiProperty({
+    description: `Units received, base UoM. ${QUANTITY_FIELD_DESCRIPTION} A serial entry is exactly 1 unit; a catch-weight entry is exactly 1 case.`,
+    minimum: 0.001,
+    maximum: MAX_QUANTITY_BASE,
+  })
+  @Type(() => Number)
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(0.001)
+  @Max(MAX_QUANTITY_BASE)
+  qty!: number;
+
+  @ApiProperty({ enum: [...RETURN_CONDITIONS], description: 'The inspection grade (13-2)' })
+  @IsIn([...RETURN_CONDITIONS])
+  condition!: ReturnCondition;
+
+  @ApiProperty({ required: false, type: String, nullable: true, description: `An inspection note — trimmed, blank means absent, at most ${MAX_RETURN_NOTE} characters`, maxLength: MAX_RETURN_NOTE * 2 })
+  @IsOptional()
+  @IsString()
+  @Length(0, MAX_RETURN_NOTE * 2)
+  note?: string | null;
+
+  @ApiProperty({ required: false, type: String, nullable: true, description: "Batch-tracked SKUs: an existing batch of the SKU (never created)", maxLength: 128 })
+  @IsOptional()
+  @IsString()
+  @Length(0, 128)
+  batchCode?: string | null;
+
+  @ApiProperty({ required: false, type: String, nullable: true, description: 'Serial-tracked SKUs: an existing serial of the SKU, out of stock (qty 1)', maxLength: 400 })
+  @IsOptional()
+  @IsString()
+  @Length(0, 400)
+  serialNumber?: string | null;
+
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    description: `Catch-weight SKUs: the case's weight in whole grams (qty 1), at most ${MAX_HANDLING_UNIT_WEIGHT_GRAMS}`,
+    minimum: 1,
+    maximum: MAX_HANDLING_UNIT_WEIGHT_GRAMS,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_HANDLING_UNIT_WEIGHT_GRAMS)
+  weightGrams?: number | null;
+}
+
+/** POST /tenants/{tenantId}/returns/blind-receipts body — the `return.receive_blind` op. */
+export class ReceiveBlindReturnDto {
+  @ApiProperty({ format: 'uuid', description: 'The warehouse receiving the parcel' })
+  @LowercaseUuid()
+  @IsUUID()
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid', description: "The parcel's client — fixed on the handheld by the first unit's SKU" })
+  @LowercaseUuid()
+  @IsUUID()
+  clientId!: string;
+
+  @ApiProperty({ description: 'The operator chose the client at a barcode several clients share (A24)' })
+  @IsBoolean()
+  clientPrompted!: boolean;
+
+  @ApiProperty({
+    required: false,
+    type: String,
+    nullable: true,
+    description: `The scanned AWB or order number — trimmed, blank means skipped, at most ${MAX_PARCEL_REFERENCE} characters`,
+    maxLength: MAX_PARCEL_REFERENCE * 2,
+  })
+  @IsOptional()
+  @IsString()
+  @Length(0, MAX_PARCEL_REFERENCE * 2)
+  parcelReference?: string | null;
+
+  @ApiProperty({ description: "Device time (ISO-8601 UTC, Z-suffixed) — the ledger events' business time" })
+  @IsString()
+  occurredAt!: string;
+
+  @ApiProperty({
+    type: [BlindReceiptEntryDto],
+    minItems: 1,
+    maxItems: MAX_RETURN_RECEIPT_ENTRIES,
+    description: `1–${MAX_RETURN_RECEIPT_ENTRIES} entries — one parcel is one op; the device receives the rest as another parcel`,
+  })
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(MAX_RETURN_RECEIPT_ENTRIES)
+  @ValidateNested({ each: true })
+  @Type(() => BlindReceiptEntryDto)
+  entries!: BlindReceiptEntryDto[];
+}
+
+export class BlindEntryAppliedDto {
+  @ApiProperty({ description: "The entry's place in the op (0-based)" })
+  entryIndex!: number;
+
+  @ApiProperty({ description: 'Units booked into RETURNS, base UoM' })
+  qty!: number;
+}
+
+export class BlindEntryRefusedDto {
+  @ApiProperty({ description: "The entry's place in the op (0-based)" })
+  entryIndex!: number;
+
+  @ApiProperty({ enum: [...BLIND_ENTRY_REFUSALS], description: 'Why it was not booked — the entry is in the review queue (Discard only)' })
+  reason!: BlindEntryRefusal;
+}
+
+/** The `return.receive_blind` 201 — and its idempotency snapshot. */
+export class BlindReceiptResultDto {
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'The blind return authorization created; null when every entry was refused' })
+  rmaId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'RMA-0001; null when every entry was refused' })
+  rmaCode!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'The receipt; null when every entry was refused' })
+  returnReceiptId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'RRN-0001; null when every entry was refused' })
+  code!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'The one dispatched order the parcel reference matched; null when none or several did' })
+  suggestedOrderId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, enum: [...BLIND_MATCH_KINDS, null] })
+  matchKind!: BlindMatchKind | null;
+
+  @ApiProperty({ type: [BlindEntryAppliedDto] })
+  applied!: readonly BlindEntryAppliedDto[];
+
+  @ApiProperty({ type: [BlindEntryRefusedDto], description: 'The refused entries — all of them sit in ONE review-queue row (Discard only)' })
+  refused!: readonly BlindEntryRefusedDto[];
+
+  @ApiProperty({ type: String, nullable: true, description: "The review row's op id when entries were refused (derived from the key); null otherwise" })
+  reviewOpId!: string | null;
+}
+
+/** POST /tenants/{tenantId}/returns/{rmaId}/accept body. */
+export class AcceptBlindReturnDto {
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    format: 'uuid',
+    description: "The dispatched order to link — the parcel's client and warehouse; null is the explicit \"No order\"",
+  })
+  @IsOptional()
+  @LowercaseUuid()
+  @IsUUID()
+  orderId!: string | null;
+}
+
+/** The accept's 200 — the return authorization plus the lines no order line could take. */
+export class BlindAcceptResultDto extends ReturnAuthorizationDto {
+  @ApiProperty({ type: [String], description: 'The RMA line ids left unlinked (every line under "No order")' })
+  unlinkedLines!: readonly string[];
+}
+
+/** POST /tenants/{tenantId}/returns/{rmaId}/reject body. */
+export class RejectBlindReturnDto {
+  @ApiProperty({ enum: [...BLIND_REJECT_REASONS], description: '`other` requires a note' })
+  @IsIn([...BLIND_REJECT_REASONS])
+  reasonCode!: BlindRejectReason;
+
+  @ApiProperty({
+    required: false,
+    type: String,
+    nullable: true,
+    description: `Required for "other"; trimmed, blank means absent, at most ${MAX_BLIND_REVIEW_NOTE} characters`,
+    maxLength: MAX_BLIND_REVIEW_NOTE * 2,
+  })
+  @IsOptional()
+  @IsString()
+  @Length(0, MAX_BLIND_REVIEW_NOTE * 2)
+  note?: string | null;
 }

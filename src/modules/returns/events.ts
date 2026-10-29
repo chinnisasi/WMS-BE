@@ -86,3 +86,43 @@ export interface ReturnScrapRecordedPayload {
   readonly reasonCode: string;
   readonly dispositionId: string;
 }
+
+/**
+ * Story 4-7b (A10) — a `return.receive_blind` op was recorded: an unannounced
+ * parcel's matching units were booked into RETURNS under an auto-created
+ * blind RMA awaiting review, and any others were sent to the review queue.
+ * Appended even when nothing applied (no RMA). Nothing subscribes (13-5 owns
+ * returns notification sources). The string doubles as the audit action.
+ */
+export const RETURN_BLIND_RECORDED_EVENT = 'return_receipt.blind_recorded';
+
+/** `return_receipt.blind_recorded`'s payload — flat ids and counts only. */
+export interface ReturnBlindRecordedPayload {
+  /** Null when every entry was refused (no RMA, no receipt). */
+  readonly rmaId: string | null;
+  readonly rmaCode: string | null;
+  readonly returnReceiptId: string | null;
+  readonly code: string | null;
+  readonly clientId: string;
+  readonly warehouseId: string;
+  readonly suggestedOrderId: string | null;
+  readonly appliedCount: number;
+  readonly refusedCount: number;
+}
+
+/** Story 4-7b (A10) — a blind RMA was accepted at review (optionally linked to an order). */
+export const RETURN_BLIND_ACCEPTED_EVENT = 'return_authorization.blind_accepted';
+
+/** Story 4-7b (A10) — a blind RMA was rejected at review; its booking was reversed. */
+export const RETURN_BLIND_REJECTED_EVENT = 'return_authorization.blind_rejected';
+
+/** Both review events' payload — flat ids and counts only. */
+export interface ReturnBlindReviewedPayload {
+  readonly rmaId: string;
+  readonly code: string;
+  readonly clientId: string;
+  readonly warehouseId: string;
+  /** Accept: the linked order, or null ("No order"); reject: always null. */
+  readonly orderId: string | null;
+  readonly lineCount: number;
+}

@@ -457,7 +457,24 @@ describe('return authorizations (e2e, story 13-1)', () => {
     // (detail-only; none yet). The create response — a stored snapshot —
     // carries no `receipts` key at all.
     expect(rma).not.toHaveProperty('receipts');
-    expect(got.body).toEqual({ ...rma, receipts: [] });
+    // Story 4-7b: the detail (and list) read also always emits the origin and
+    // review keys; the stored create snapshot above still carries none of
+    // them (pinned in test/blind-returns.spec.ts), so a replay is unchanged.
+    expect(rma).not.toHaveProperty('origin');
+    expect(got.body).toEqual({
+      ...rma,
+      receipts: [],
+      origin: 'authorized',
+      reviewStatus: null,
+      parcelReference: null,
+      suggestedOrderId: null,
+      matchKind: null,
+      clientPrompted: null,
+      reviewedAt: null,
+      reviewedBy: null,
+      reviewReasonCode: null,
+      reviewNote: null,
+    });
 
     // Over-authorize after the earlier RMA: 2 more of line A when 1 is left.
     const over = await createRma({ orderId, lines: [{ orderLineId: lineA.orderLineId, qty: 2, reasonCode: 'defective' }] }).expect(409);

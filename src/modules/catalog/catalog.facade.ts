@@ -206,6 +206,13 @@ export interface SkuFacts {
   readonly catchWeightTracked: boolean;
   readonly uom: string;
   readonly uomPrecision: number;
+  /**
+   * Story 4-7b — the SKU's client (`skus.client_id`, the source of truth since
+   * 1-1): a blind return refuses an entry of another client than the parcel's.
+   */
+  readonly clientId: string;
+  /** Story 4-7b — the SKU is a kit (has a composition): a kit never holds stock. */
+  readonly isKit: boolean;
 }
 
 /** One composition row as the explosion consumes it (Story 11.4) — milli-units in. */
@@ -1221,6 +1228,11 @@ export class CatalogFacade {
         batchTracked: skus.batchTracked,
         serialTracked: skus.serialTracked,
         catchWeightTracked: skus.catchWeightTracked,
+        clientId: skus.clientId,
+        // Story 4-7b — folded into this one statement (no extra round trip);
+        // the outer qualifier is written literally (a select-list fragment
+        // renders an interpolated column unqualified — guide §1, 4-2c).
+        isKit: sql<boolean>`exists (select 1 from kit_compositions k where k.tenant_id = "skus"."tenant_id" and k.kit_sku_id = "skus"."id")`,
       })
       .from(skus)
       .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, [...new Set(skuIds)])))
@@ -1240,6 +1252,8 @@ export class CatalogFacade {
           catchWeightTracked: row.catchWeightTracked,
           uom: row.uom,
           uomPrecision: uomPrecision(row.uom),
+          clientId: row.clientId,
+          isKit: row.isKit === true,
         },
       ]),
     );

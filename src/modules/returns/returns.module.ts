@@ -9,6 +9,7 @@ import { ReturnHoldSettlementHandler } from './hold-settlement.delivery';
 import { ReturnAuthorizationCommand } from './return-authorization.command';
 import { ReturnReceiptCommand } from './return-receipt.command';
 import { ReturnsFacade } from './returns.facade';
+import { BlindReturnCommand } from './blind-return.command';
 
 /**
  * Returns module (story 13-1, Epic 13 — the platform's first reverse flow).
@@ -36,13 +37,18 @@ import { ReturnsFacade } from './returns.facade';
  * return hold, its outcome) — `forwardRef(InboundModule)`, the compliance
  * excursion precedent.
  *
+ * Story 4-7b adds `BlindReturnCommand` (`return.receive_blind`, the device's
+ * unannounced parcel, and its web review — accept or reject); it writes only
+ * the module's own tables and reaches outbound (the parcel lookup, the
+ * returnable facts) through `OutboundFacade`.
+ *
  * Exports only its facade. Nothing imports this module back but the api shell
  * and the root composition, so there is no cycle. `forwardRef(catalog)`: the
  * catalog ↔ tenancy pattern every catalog importer follows.
  */
 @Module({
   imports: [SharedModule, OutboundModule, InventoryModule, forwardRef(() => CatalogModule), forwardRef(() => InboundModule)],
-  providers: [ReturnAuthorizationCommand, ReturnReceiptCommand, ReturnDispositionCommand, ReturnHoldSettlementHandler, ReturnsFacade],
+  providers: [ReturnAuthorizationCommand, ReturnReceiptCommand, ReturnDispositionCommand, ReturnHoldSettlementHandler, BlindReturnCommand, ReturnsFacade],
   exports: [ReturnsFacade],
 })
 export class ReturnsModule {}

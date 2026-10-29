@@ -175,6 +175,30 @@ function scopeQuarantined(skuCode: string, binCode: string): ProblemException {
   );
 }
 
+/**
+ * Story 4-7b (A1, D1) — 409 `review-pending` / `review-rejected`: the line
+ * belongs to a blind return whose review is not accepted. A pending one is
+ * accepted (or rejected) on the Unannounced tab first; a rejected one's
+ * booking was reversed, so there is nothing to disposition.
+ */
+function blindReviewBlocks(receiptCode: string, reviewStatus: 'pending' | 'rejected'): ProblemException {
+  return reviewStatus === 'pending'
+    ? new ProblemException(
+        'review-pending',
+        409,
+        'The unannounced return awaits review',
+        `Receipt "${receiptCode}" is an unannounced return still awaiting review — accept it on the Unannounced tab before dispositioning its units.`,
+        { reviewStatus },
+      )
+    : new ProblemException(
+        'review-rejected',
+        409,
+        'The unannounced return was rejected',
+        `Receipt "${receiptCode}" is an unannounced return that was rejected at review — its booking was reversed, so nothing awaits a disposition.`,
+        { reviewStatus },
+      );
+}
+
 function documentWarehouseMismatch(receiptCode: string): ProblemException {
   return new ProblemException(
     'document-warehouse-mismatch',
@@ -366,6 +390,8 @@ interface ReceiptHeader {
   readonly clientId: string;
   readonly warehouseId: string;
   readonly rmaId: string;
+  /** Story 4-7b (D1) — the RMA's review status (null on an authorized RMA). */
+  readonly reviewStatus: string | null;
 }
 
 /** One planned disposition (milli-units). */
@@ -490,6 +516,11 @@ export class ReturnDispositionCommand {
       const header = (await this.headersInTx(tx, tenantId, [line.returnReceiptId])).get(line.returnReceiptId);
       if (header === undefined) throw dispositionDataFault(`Return receipt line "${line.id}" names a receipt that does not exist.`);
       // ── guards, in the spec's order ─────────────────────────────────────
+      // Story 4-7b (A1, D1) — a blind return is dispositioned only once
+      // accepted: the first guard after the header read.
+      if (header.reviewStatus === 'pending' || header.reviewStatus === 'rejected') {
+        throw blindReviewBlocks(header.code, header.reviewStatus);
+      }
       if (header.warehouseId !== normalized.warehouseId) throw documentWarehouseMismatch(header.code);
       const checked = validateRecordableQuantity(normalized.qty, 'qty', sku.uom, sku.uomPrecision, 'non-negative');
       if (!checked.ok) throw invalid(checked.detail);
@@ -980,8 +1011,13 @@ export class ReturnDispositionCommand {
         clientId: returnReceipts.clientId,
         warehouseId: returnReceipts.warehouseId,
         rmaId: returnReceipts.rmaId,
+        reviewStatus: returnAuthorizations.reviewStatus,
       })
       .from(returnReceipts)
+      .innerJoin(
+        returnAuthorizations,
+        and(eq(returnAuthorizations.tenantId, returnReceipts.tenantId), eq(returnAuthorizations.id, returnReceipts.rmaId)),
+      )
       .where(and(eq(returnReceipts.tenantId, tenantId), inArray(returnReceipts.id, ids)));
     return new Map(rows.map((row) => [row.id, row]));
   }

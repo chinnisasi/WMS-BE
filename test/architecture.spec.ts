@@ -2468,6 +2468,26 @@ describe('architecture: return authorizations are returns-module-owned (story 13
     expect(receipt).toContain('this.catalog.createHandlingUnits(');
   });
 
+  it('story 4-7b: the blind-return command writes only the module\'s own tables, uses tenancy\'s helpers, reaches outbound through OutboundFacade and handling units through CatalogFacade', () => {
+    const blind = readFileSync(join(returnsRoot, 'blind-return.command.ts'), 'utf8');
+    expect(returnsFiles.some((file) => file.path === join(returnsRoot, 'blind-return.command.ts'))).toBe(true);
+    // It creates the blind RMA, its lines, the receipt and its lines.
+    for (const table of ['returnAuthorizations', 'returnAuthorizationLines', 'returnReceipts', 'returnReceiptLines'] as const) {
+      expect(drizzleWriteOn(table).test(blind)).toBe(true);
+    }
+    // Never a disposition or a settlement (4-7a's commands are not edited).
+    expect(drizzleWriteOn('returnDispositions').test(blind)).toBe(false);
+    expect(drizzleWriteOn('returnHoldSettlements').test(blind)).toBe(false);
+    for (const helper of ['assertDeviceOperatorInTx', 'ensureReturnsBinInTx', 'recordServerRejectedOpInTx', 'touchDeviceInTx']) {
+      expect(blind).toContain(helper);
+    }
+    expect(blind).toContain('this.outbound.ordersByParcelReferenceInTx(');
+    expect(blind).toContain('this.catalog.createHandlingUnits(');
+    expect(blind).toContain('this.catalog.settleReturnedHandlingUnitsInTx(');
+    expect(drizzleWriteOn('handlingUnits').test(blind)).toBe(false);
+    expect(blind).not.toMatch(/from '\.\.\/outbound\/(?!outbound\.facade')/);
+  });
+
   it('story 4-7a: returns reaches QC only through QcFacade (the return hold, its outcome); qc_holds is never written or named by returns; the settlement subscriber is the only writer of return_hold_settlements', () => {
     // The inbound files returns may import: the QC facade — and the module
     // file in returns.module.ts only (the forwardRef import, nothing else).
@@ -3439,6 +3459,8 @@ describe('architecture: AUDIT_TARGET_TYPES is the audit vocabulary (story 9-3a)'
     [join(SRC_ROOT, 'modules', 'invoicing', 'eway.command.ts')]: ['eway_bill', 'eway_state_threshold', 'eway_gstin_setting'],
     // Story 13-2 — the receipt targets the receipt, or (nothing applied) the RMA.
     [join(SRC_ROOT, 'modules', 'returns', 'return-receipt.command.ts')]: ['return_receipt', 'return_authorization'],
+    // Story 4-7b — the blind receipt targets the receipt, or (nothing applied, no RMA) the device.
+    [join(SRC_ROOT, 'modules', 'returns', 'blind-return.command.ts')]: ['return_receipt', 'device'],
     // Story 1-3 — the partner commands' one audit helper takes the target type.
     [join(SRC_ROOT, 'modules', 'partners', 'partners.command.ts')]: ['partner', 'partner_link'],
   };

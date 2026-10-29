@@ -418,6 +418,9 @@ export function referenceSummary(
     // Story 4-7a — a restock or scrap of a returned unit.
     case 'return-disposition':
       return `return ${doc.outcome} ${doc.rmaId}${doc.reasonCode === undefined ? '' : ` (${doc.reasonCode})`}`;
+    // Story 4-7b — a blind return's booking reversed at review.
+    case 'return-reversal':
+      return `return reversed ${doc.rmaId} (${doc.reasonCode})`;
     // Story 4-2b — a cancelled order's drawn units put back.
     case 'restock':
       return `restock order ${doc.orderId}`;

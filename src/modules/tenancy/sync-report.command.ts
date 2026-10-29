@@ -157,7 +157,14 @@ export type RejectedOpType =
   // to re-apply — the reviewer returns any staged units to DAMAGED, or picks
   // the RTV again. Excluded from `ApplicableOpType`, so tenancy never imports
   // the RTV command.
-  | 'rtv.pick';
+  | 'rtv.pick'
+  // Story 4-7b — an unannounced parcel's refused entries (server-raised: the
+  // catalog could not place them — an unknown SKU, serial or batch, another
+  // client's item) or a whole-op refusal (device-uploaded). Discard ONLY:
+  // re-applying the stored entries would be refused again; the remedy is to
+  // fix the catalog entry and receive the units again as a new parcel.
+  // Excluded from `ApplicableOpType`, so tenancy never imports returns.
+  | 'return.receive_blind';
 
 export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'grn.submit',
@@ -178,6 +185,7 @@ export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'receipt-photo.stage',
   'return.restock',
   'rtv.pick',
+  'return.receive_blind',
 ];
 
 /**
@@ -258,6 +266,8 @@ export const REJECTED_OP_DECISIONS_BY_TYPE: Readonly<Record<RejectedOpType, read
   'return.restock': ['discard'],
   // Story 2-8b — a refused RTV pick: Discard only (see the type's comment).
   'rtv.pick': ['discard'],
+  // Story 4-7b — an unannounced parcel's refused entries: Discard only.
+  'return.receive_blind': ['discard'],
 };
 
 /** Story 1-6d — the 403 an Apply on a `grn.licence-refused` row answers without `licences.manage`. */
@@ -269,7 +279,14 @@ export const RESOLVE_NOTE_MAX = 500;
 /** The op types the apply arm can re-execute (every type admitting `apply`). */
 type ApplicableOpType = Exclude<
   RejectedOpType,
-  'return.receive' | 'grn.lines-refused' | 'grn.inactive-sku-received' | 'gate-in.unload' | 'receipt-photo.stage' | 'return.restock' | 'rtv.pick'
+  | 'return.receive'
+  | 'grn.lines-refused'
+  | 'grn.inactive-sku-received'
+  | 'gate-in.unload'
+  | 'receipt-photo.stage'
+  | 'return.restock'
+  | 'rtv.pick'
+  | 'return.receive_blind'
 >;
 
 function isApplicableOpType(opType: RejectedOpType): opType is ApplicableOpType {
@@ -516,6 +533,16 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
   // Story 2-8b — the handheld's RTV pick as it enqueued it (the request body
   // plus the RTV id the path carries). `vendorReturnId` any string: a
   // malformed id must still reach the queue to be discarded.
+  // Story 4-7b — the unannounced parcel: a device-uploaded whole-op refusal
+  // carries the full op payload (no `refusals`); the server-raised row the
+  // refused entries beside `refusals` (the 13-2 shape).
+  'return.receive_blind': [
+    ['warehouseId', 'uuid-or-null'],
+    ['clientId', 'uuid-or-null'],
+    ['parcelReference', 'string-or-null'],
+    ['entries', 'array'],
+    ['refusals', 'array-or-absent'],
+  ],
   'rtv.pick': [
     ['vendorReturnId', 'string'],
     ['warehouseId', 'uuid-or-null'],
@@ -1241,6 +1268,8 @@ export class SyncReportCommand {
             `A ${row.opType} row admits only ${admitted.map((d) => `"${d}"`).join(' | ')} — "${command.decision}" is not available.` +
               (row.opType === 'return.receive'
                 ? ' Create a return authorization for these units, then receive them again.'
+                : row.opType === 'return.receive_blind'
+                  ? ' The units are on the dock and booked nowhere — fix the catalog entry, then receive them again as an unannounced parcel.'
                 : row.opType === 'grn.lines-refused'
                   ? " Receive these units again on a receipt for their own client."
                   : row.opType === 'grn.shelf-life-refused'

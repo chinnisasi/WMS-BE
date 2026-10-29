@@ -14,7 +14,7 @@ import { encodeCursor } from '../../shared/primitives/pagination';
 import { fromMilli } from '../../shared/primitives/quantity';
 import { canonicalInstant, fullPrecisionInstant } from '../../shared/primitives/time';
 import type { CatalogFacade } from '../catalog/catalog.facade';
-import type { RmaStatus, ReturnReasonCode } from './return-authorization.command';
+import type { RmaOrigin, RmaStatus, ReturnReasonCode } from './return-authorization.command';
 import type { ReturnCondition } from './return-receipt.command';
 import type { ReturnDispositionOutcome, ReturnDispositionReason } from './return-disposition.command';
 import { EMPTY_SPLIT, lineSplitsInTx } from './disposition-split';
@@ -200,9 +200,14 @@ export interface PortalReturnRow {
   readonly id: string;
   readonly code: string;
   readonly status: RmaStatus;
-  readonly orderId: string;
+  /** Story 4-7b (D2) — null on an accepted blind return the reviewer linked to no order. */
+  readonly orderId: string | null;
   readonly orderReference: string | null;
   readonly externalReference: string | null;
+  /** Story 4-7b (A25) — `authorized`, or `blind` (an unannounced parcel, shown only once accepted). */
+  readonly origin: RmaOrigin;
+  /** Story 4-7b (A25) — the scanned AWB or order number of a blind return; null otherwise. */
+  readonly parcelReference: string | null;
   readonly createdAt: string;
   readonly lineCount: number;
   readonly receivedTotal: number;
@@ -317,6 +322,15 @@ async function rmaLineTotalsInTx(tx: TenantTx, tenantId: string, clientId: strin
   return out;
 }
 
+/**
+ * Story 4-7b (decision 10, D2) — what the client may see: every authorized
+ * RMA, and a blind one only once ACCEPTED. A pending blind parcel may be
+ * mis-attributed, and a rejected one was never the client's.
+ */
+function portalVisiblePredicate() {
+  return sql`(${returnAuthorizations.origin} = 'authorized' or ${returnAuthorizations.reviewStatus} = 'accepted')`;
+}
+
 /** The `awaiting` predicate over `return_authorizations` (A30): an open line, or a quarantine with no settlement. */
 function awaitingPredicate(tenantId: string, clientId: string) {
   return sql`(
@@ -351,6 +365,8 @@ function toPortalRow(
     orderId: header.orderId,
     orderReference: header.orderReference,
     externalReference: header.externalReference,
+    origin: header.origin as RmaOrigin,
+    parcelReference: header.parcelReference,
     createdAt: canonicalInstant(header.createdAt),
     lineCount: lines.length,
     receivedTotal: fromMilli(lines.reduce((acc, line) => acc + Number(line.receivedQty), 0)),
@@ -401,6 +417,7 @@ export async function portalReturnsInTx(
       and(
         eq(returnAuthorizations.tenantId, tenantId),
         eq(returnAuthorizations.clientId, clientId),
+        portalVisiblePredicate(),
         state,
         query.before === null
           ? undefined
@@ -442,7 +459,15 @@ export async function portalReturnInTx(
   const headers = await tx
     .select()
     .from(returnAuthorizations)
-    .where(and(eq(returnAuthorizations.tenantId, tenantId), eq(returnAuthorizations.clientId, clientId), eq(returnAuthorizations.id, rmaId)))
+    .where(
+      and(
+        eq(returnAuthorizations.tenantId, tenantId),
+        eq(returnAuthorizations.clientId, clientId),
+        eq(returnAuthorizations.id, rmaId),
+        // Story 4-7b (D2) — a pending or rejected blind return is the same 404.
+        portalVisiblePredicate(),
+      ),
+    )
     .limit(1);
   const header = headers[0];
   if (header === undefined) return null;

@@ -4428,6 +4428,8 @@ export const shipments = pgTable(
     ),
     // The order's shipment read-back (GET .../orders/{orderId}/shipment).
     index('shipments_order_id_idx').on(table.orderId),
+    // Story 4-7b (0112) — a blind return's AWB lookup (the parcel reference).
+    index('shipments_tenant_tracking_number_idx').on(table.tenantId, table.trackingNumber),
     // One manifest's shipments, in labelled order (the detail read).
     index('shipments_manifest_id_idx').on(table.manifestId),
   ],
@@ -6888,20 +6890,51 @@ export const returnAuthorizations = pgTable(
     tenantId: uuid('tenant_id').notNull(),
     clientId: uuid('client_id').notNull(),
     warehouseId: uuid('warehouse_id').notNull(),
-    orderId: uuid('order_id').notNull(),
+    /** Story 4-7b (0112) — null on a BLIND RMA until it is accepted with an order (`origin_shape`). */
+    orderId: uuid('order_id'),
     orderReference: text('order_reference'),
     code: text('code').notNull(),
     externalReference: text('external_reference'),
     status: text('status').notNull().default('open'),
-    orderDispatchedAt: timestamp('order_dispatched_at', { withTimezone: true, mode: 'string' }).notNull(),
+    /** Story 4-7b (0112) — null exactly when `order_id` is null (a blind RMA with no order). */
+    orderDispatchedAt: timestamp('order_dispatched_at', { withTimezone: true, mode: 'string' }),
     createdBy: uuid('created_by').notNull(),
     cancelledBy: uuid('cancelled_by'),
     cancelledAt: timestamp('cancelled_at', { withTimezone: true, mode: 'string' }),
     cancelReason: text('cancel_reason'),
+    /**
+     * Story 4-7b (0112) — `authorized` (13-1's create) or `blind` (a parcel
+     * received on the handheld with no RMA; born `received`). The blind
+     * columns below are null on an authorized RMA (`origin_shape`).
+     */
+    origin: text('origin').notNull().default('authorized'),
+    /** `pending | accepted | rejected` on a blind RMA; null on an authorized one. */
+    reviewStatus: text('review_status'),
+    /** The scanned AWB or order number (1–64, trimmed); null when skipped. */
+    parcelReference: text('parcel_reference'),
+    /** The dispatched order the reference matched at receipt (a suggestion only). */
+    suggestedOrderId: uuid('suggested_order_id'),
+    /** `awb | order-reference` — set exactly when `suggested_order_id` is. */
+    matchKind: text('match_kind'),
+    /** A24 — the operator chose the client at an ambiguous barcode; NOT NULL on a blind RMA. */
+    clientPrompted: boolean('client_prompted'),
+    reviewedBy: uuid('reviewed_by'),
+    reviewedAt: timestamp('reviewed_at', { withTimezone: true, mode: 'string' }),
+    /** `mis-scanned | not-our-goods | duplicate | other` — set exactly when rejected. */
+    reviewReasonCode: text('review_reason_code'),
+    reviewNote: text('review_note'),
     ...tenantTimestamps,
   },
   (table) => [
     uniqueIndex('return_authorizations_tenant_code_unique').on(table.tenantId, table.code),
+    // Story 4-7b — the Unannounced tab's pending queue.
+    index('return_authorizations_tenant_pending_review_idx')
+      .on(table.tenantId, table.createdAt, table.id)
+      .where(sql`review_status = 'pending'`),
+    // Story 4-7b (A20) — "also received as": blind RMAs by parcel reference.
+    index('return_authorizations_tenant_parcel_reference_idx')
+      .on(table.tenantId, table.parcelReference)
+      .where(sql`origin = 'blind'`),
     // The per-order returnable read (Σ authorized over the order's open RMAs).
     index('return_authorizations_tenant_order_idx').on(table.tenantId, table.orderId),
     // The tenant-wide list's keyset (no warehouse filter).
@@ -6944,7 +6977,8 @@ export const returnAuthorizationLines = pgTable(
     rmaId: uuid('rma_id').notNull(),
     /** 1..n in REQUEST order — the read order (never inferred from uuidv7 ids). */
     lineNo: integer('line_no').notNull(),
-    orderLineId: uuid('order_line_id').notNull(),
+    /** Story 4-7b (0112) — null on a blind RMA line until an accept links it to an order line. */
+    orderLineId: uuid('order_line_id'),
     skuId: uuid('sku_id').notNull(),
     /** Milli-units — base UoM × 10³. */
     authorizedQty: bigint('authorized_qty', { mode: 'number' }).notNull(),
