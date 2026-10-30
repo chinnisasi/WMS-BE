@@ -639,6 +639,14 @@ describe('client consignment compliance (e2e, story 4-6a)', () => {
     expect((await versions(packed))[0]).toMatchObject({ status: 'withdrawn', end_reason: 'Order cancelled' });
   });
 
+  it('A38 — a cancel refused before its flip leaves the record live (a packed order is not cancelled by the plain cancel)', async () => {
+    const packed = await packedOrder();
+    await record(packed, body()).expect(201);
+    const refused = await http().post(`${API}/${tenantId}/outbound/orders/${packed}/cancel`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({});
+    expect(refused.status).toBeGreaterThanOrEqual(400);
+    expect(await versions(packed)).toEqual([{ seq: 1, status: 'live', dispatched_at: null, end_reason: null }]);
+  });
+
   // ── AC5: the handheld's stale snapshot ─────────────────────────────────────
 
   it('AC5 — a device handover of a parcel whose record was withdrawn settles it: dispatched, its shipment flagged, "Left without documents" lists it, a late record valid on the handover day clears it', async () => {
