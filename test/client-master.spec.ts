@@ -392,8 +392,9 @@ describe('story 1-2a: the client master record', () => {
       const def = await constraintDef('client_contacts_email_events_check');
       // The ARRAY[...] literal first (the subset), then one array_positions term per event.
       const listed = /ARRAY\[([^\]]+)\]/.exec(def)![1]!;
-      expect([...listed.matchAll(/'([a-z.]+)'::text/g)].map((match) => match[1]!)).toEqual([...CLIENT_EMAIL_EVENTS]);
-      const positions = [...def.matchAll(/array_positions\([^,]+, '([a-z.]+)'::text\)/g)].map((match) => match[1]!);
+      // Story 4-6a — an event name may carry a hyphen (`consignment.documents-needed`).
+      expect([...listed.matchAll(/'([a-z.-]+)'::text/g)].map((match) => match[1]!)).toEqual([...CLIENT_EMAIL_EVENTS]);
+      const positions = [...def.matchAll(/array_positions\([^,]+, '([a-z.-]+)'::text\)/g)].map((match) => match[1]!);
       expect(positions).toEqual([...CLIENT_EMAIL_EVENTS]);
     });
 

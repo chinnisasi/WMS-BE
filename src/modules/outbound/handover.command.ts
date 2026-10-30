@@ -636,10 +636,10 @@ export class HandoverCommand {
               status: 'handed_over',
               handoverId,
               handedOverAt,
-              // Story 4-6a (A14) — set only on a flagged device parcel.
-              ...(entry.complianceException === null ? {} : { complianceException: entry.complianceException }),
               packageCount: count,
               weightGrams: weightGrams ?? entry.shipment.weightGrams,
+              // Story 4-6a (A14) — set only on a flagged device parcel.
+              complianceException: entry.complianceException,
               ...(dims === null ? {} : { lengthMm: dims.lengthMm, widthMm: dims.widthMm, heightMm: dims.heightMm }),
               ...(verifyNow
                 ? { labelVerifiedAt: handedOverAt, labelVerifiedBy: actorUserId, labelVerifiedDeviceId: deviceId, labelVerifyMethod: 'handover-scan' }

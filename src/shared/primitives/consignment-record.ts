@@ -239,3 +239,53 @@ export function formatRupees(paise: number): string {
   const grouped = rest === '' ? last3 : `${rest.replace(/\B(?=(\d{2})+(?!\d))/g, ',')},${last3}`;
   return `${negative ? '-' : ''}₹${grouped}${fraction === 0 ? '' : `.${String(fraction).padStart(2, '0')}`}`;
 }
+
+/** `2026-10-30` → `30 Oct 2026` (an IST calendar date as the documents print it). */
+export function longIsoDate(date: string): string {
+  const [y, m, d] = date.split('-').map(Number) as [number, number, number];
+  const month = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][m - 1] ?? '';
+  return `${d} ${month} ${y}`;
+}
+
+/** The record facts the prints read (a live or stamped version). */
+export interface ConsignmentPrintFacts {
+  readonly brandDocumentType: string;
+  readonly brandDocumentNumber: string;
+  readonly brandDocumentDate: string;
+  readonly consignorGstin: string;
+  readonly consignorName: string | null;
+  readonly ewayStatus: string;
+  readonly ewayBillNumber: string | null;
+  readonly ewayBillDate: string | null;
+  readonly ewayValidUntil: string | null;
+  readonly ewayExemptionReason: string | null;
+}
+
+/**
+ * A19 — the carton label's one seam line from the LIVE version: `EWB 1234
+ * 5678 9012 / INV {number}`; `INV {number}` alone without a bill; `EWB
+ * EXEMPT / INV {number}` with an exemption. The document number is last, so
+ * the renderer's shrink-then-cut takes its tail, never the e-way number. ASCII
+ * only (a label prints 7-bit — the spec's middle dot would fold to `?`).
+ */
+export function cartonLabelConsignmentLine(facts: ConsignmentPrintFacts): string {
+  const doc = `${brandDocumentTag(facts.brandDocumentType)} ${facts.brandDocumentNumber}`;
+  if (facts.ewayBillNumber !== null) return `EWB ${formatEwayBillNumber(facts.ewayBillNumber)} / ${doc}`;
+  if (facts.ewayStatus === 'exempt') return `EWB EXEMPT / ${doc}`;
+  return doc;
+}
+
+/** A19 — the packing slip's annotations from the LIVE version (never the value — 4-5a decision 5). */
+export function packingSlipConsignmentLines(facts: ConsignmentPrintFacts): string[] {
+  const lines = [
+    `Tax document: ${brandDocumentWords(facts.brandDocumentType)} ${facts.brandDocumentNumber} dated ${longIsoDate(facts.brandDocumentDate)}, issued by ${facts.consignorName ?? 'the brand'} (GSTIN ${facts.consignorGstin})`,
+  ];
+  if (facts.ewayBillNumber !== null) {
+    lines.push(
+      `E-way bill ${formatEwayBillNumber(facts.ewayBillNumber)}${facts.ewayBillDate === null ? '' : ` dated ${longIsoDate(facts.ewayBillDate)}`}${facts.ewayValidUntil === null ? '' : `, valid until ${longIsoDate(facts.ewayValidUntil)}`}`,
+    );
+  } else if (facts.ewayStatus === 'exempt' && facts.ewayExemptionReason !== null) {
+    lines.push(`E-way bill: not required — ${ewayExemptionWords(facts.ewayExemptionReason)}`);
+  }
+  return lines;
+}

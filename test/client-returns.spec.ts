@@ -942,6 +942,28 @@ describe('story 4-7c: the return to client (e2e)', () => {
     expect((await cancel(rtc).expect(409)).body).toMatchObject({ code: 'rtc-closed', rtcStatus: 'dispatched' });
   });
 
+  it('story 4-6a (A22, A41) — the declared value is judged: above the threshold with no e-way bill is 409 eway-bill-required, an expired bill 409 eway-bill-expired, ₹10,000 dispatches; no value sent is unjudged', async () => {
+    await receiveDamaged('CG', 4);
+    const above = await createOk([damagedLine('CG', 1)]);
+    await pick(above).expect(200);
+    expect((await dispatch(above, captureBody({ declaredValuePaise: 20_000_000 })).expect(409)).body).toMatchObject({ code: 'eway-bill-required', thresholdPaise: 5_000_000 });
+    const expiredBody = captureBody({
+      declaredValuePaise: 20_000_000,
+      brandDocument: { type: 'challan', number: 'CH-E', date: istToday(-3) },
+      ewayBillNumber: '123456789012',
+      ewayBillDate: istToday(-3),
+      ewayValidUntil: istToday(-1),
+    });
+    expect((await dispatch(above, expiredBody).expect(409)).body.code).toBe('eway-bill-expired');
+    expect((await dispatch(above, captureBody({ declaredValuePaise: 20_000_000, ewayBillNumber: '123456789012', ewayBillDate: istToday(), ewayValidUntil: istToday(1) })).expect(200)).body.dispatch).toMatchObject({ declaredValuePaise: 20_000_000, ewayUnjudged: false });
+    const below = await createOk([damagedLine('CG', 1)]);
+    await pick(below).expect(200);
+    await dispatch(below, captureBody({ declaredValuePaise: 1_000_000 })).expect(200);
+    const unvalued = await createOk([damagedLine('CG', 1)]);
+    await pick(unvalued).expect(200);
+    expect((await dispatch(unvalued).expect(200)).body.dispatch).toMatchObject({ declaredValuePaise: null, ewayUnjudged: true });
+  });
+
   // ── a serial line and a fractional line, end to end ────────────────────────
 
   it('a serial line from RETURNS: create 1, pick it, dispatch writes one draw with its serial arm; a serial picked 0 returns to awaiting', async () => {

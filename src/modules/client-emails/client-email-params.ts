@@ -7,9 +7,12 @@ import {
 } from '../../shared/primitives/client-event-facts';
 import { orderLabelOf } from '../../shared/primitives/order-label';
 import { toMilli } from '../../shared/primitives/quantity';
+import { brandDocumentWords, formatRupees } from '../../shared/primitives/consignment-record';
 import {
   CLIENT_EMAIL_MAX_LINES,
   SHEET_PARCELS_SHOWN,
+  type ClientDocumentsNeededEmailParams,
+  type DocumentsNeededReason,
   type ClientShipmentDocumentEmailParams,
   type ShipmentDocumentKind,
   type ClientDispatchEmailParams,
@@ -144,6 +147,18 @@ export function dispatchOrderRefOf(fact: DispatchFact): string {
   });
 }
 
+/**
+ * Story 4-6a (A20) — the brand's document the goods left under, from the
+ * consignment version stamped at dispatch (immutable: the fact is frozen).
+ */
+export interface DispatchDocumentsFact {
+  readonly brandDocumentType: string;
+  readonly brandDocumentNumber: string;
+  readonly brandDocumentDate: string;
+  readonly ewayBillNumber: string | null;
+  readonly ewayValidUntil: string | null;
+}
+
 /** The `client-dispatch` params. Kit parent lines are dropped (their components remain). */
 export function buildDispatchEmailParams(
   fact: DispatchFact,
@@ -151,6 +166,7 @@ export function buildDispatchEmailParams(
     readonly skus: ReadonlyMap<string, SkuLabel>;
     readonly kitParentLineIds: ReadonlySet<string>;
   },
+  documents: DispatchDocumentsFact | null = null,
 ): ClientDispatchEmailParams {
   const kept = fact.lines.filter((line) => !names.kitParentLineIds.has(line.orderLineId));
   const lines: ClientDispatchLineParams[] = kept.map((line) => {
@@ -180,6 +196,51 @@ export function buildDispatchEmailParams(
     lines: lines.slice(0, CLIENT_EMAIL_MAX_LINES),
     moreLines: Math.max(0, lines.length - CLIENT_EMAIL_MAX_LINES),
     shortShipped: kept.some((line) => toMilli(line.shortfallQty) > 0),
+    // Story 4-6a (A20) — only when a version was stamped: a dispatch without
+    // the brand's documents stores 5-2b's keys exactly.
+    ...(documents === null
+      ? {}
+      : {
+          taxDocument: { label: brandDocumentWords(documents.brandDocumentType), number: documents.brandDocumentNumber, date: documents.brandDocumentDate },
+          ...(documents.ewayBillNumber === null ? {} : { ewayBill: { number: documents.ewayBillNumber, validUntil: documents.ewayValidUntil } }),
+        }),
+  };
+}
+
+/** Story 4-6a (A20) — the order an `order.packed` payload names, or null when malformed. */
+export function decodePackedOrderId(payload: unknown): string | null {
+  const pack = typeof payload === 'object' && payload !== null ? (payload as { pack?: unknown }).pack : undefined;
+  const orderId = typeof pack === 'object' && pack !== null ? (pack as { orderId?: unknown }).orderId : undefined;
+  return typeof orderId === 'string' && UUID.test(orderId) ? orderId.toLowerCase() : null;
+}
+
+/** Story 4-6a (A20) — the documents-needed reminder's params, key by key from the gate read at delivery. */
+export function buildDocumentsNeededEmailParams(
+  input: {
+    readonly orderId: string;
+    readonly orderRef: string;
+    readonly state: 'missing' | 'eway-required' | 'eway-expired';
+    readonly requiredBecause: 'policy-all' | 'policy-b2b' | 'value' | null;
+    readonly nationalThresholdPaise: number;
+    readonly recordThresholdPaise: number | null;
+    readonly ewayValidUntil: string | null;
+  },
+  names: ClientEmailNames,
+): ClientDocumentsNeededEmailParams {
+  const reason: DocumentsNeededReason =
+    input.state === 'eway-required' ? 'eway-pending' : input.state === 'eway-expired' ? 'eway-expired' : (input.requiredBecause ?? 'value');
+  const thresholdPaise = reason === 'value' ? input.nationalThresholdPaise : reason === 'eway-pending' ? input.recordThresholdPaise : null;
+  return {
+    tenantName: names.tenantName,
+    clientName: names.clientName,
+    warehouseName: names.warehouseName,
+    orderId: input.orderId,
+    orderRef: input.orderRef,
+    needs: input.state === 'missing' ? 'invoice' : 'eway-bill',
+    reason,
+    threshold: thresholdPaise === null ? null : formatRupees(thresholdPaise),
+    ewayValidUntil: input.state === 'eway-expired' ? input.ewayValidUntil : null,
+    replyTo: names.replyTo,
   };
 }
 

@@ -9,6 +9,9 @@ export const CLIENT_EMAIL_SOURCE_EVENTS = {
   'order.dispatched': 'order.dispatched',
   // Story 4-4a (D6) — a shared shipping document or signed-sheet page.
   'shipment.document-shared': 'shipment.documents',
+  // Story 4-6a (A20, A47) — a packed order still waiting for the brand's
+  // documents (queued only when the gate read AT DELIVERY is blocking).
+  'order.packed': 'consignment.documents-needed',
 } as const;
 export type ClientEmailSourceEvent = keyof typeof CLIENT_EMAIL_SOURCE_EVENTS;
 export const CLIENT_EMAIL_SOURCE_EVENT_TYPES = Object.keys(CLIENT_EMAIL_SOURCE_EVENTS) as ClientEmailSourceEvent[];

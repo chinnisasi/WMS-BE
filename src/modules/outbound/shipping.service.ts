@@ -24,6 +24,8 @@ import { livePackFactsOfOrdersInTx, packRecordOfOrderInTx, skuFactsByIdInTx, uom
 import { fromMilli } from '../../shared/primitives/quantity';
 import { AllocationCommandService } from './allocation.command';
 import { clientShipmentViewOf, type ClientShipmentView } from './shipping-views';
+import type { ConsignmentRecordRow } from '../invoicing/consignment-seam';
+import { consignmentTodayIst, parcelConsignmentsInTx } from './consignment.read';
 import { LABEL_OPEN_STATUSES, orderNotFound, orderNotOpen } from './shipping-support';
 import {
   candidateOf,
@@ -151,8 +153,41 @@ export interface HandoverDetailView extends HandoverView {
     readonly codAmountPaise: number | null;
     readonly destinationCity: string | null;
     readonly cartons: HandoverCartonsRead;
+    /** Story 4-6a (A19) — the brand's document the parcel LEFT under (the stamped version), or null. */
+    readonly taxDocument?: { readonly type: string; readonly number: string; readonly date: string } | null;
+    readonly ewayBillNumber?: string | null;
+    readonly ewayValidUntil?: string | null;
+    /** Story 4-6a (A14) — a device parcel that left without its documents. */
+    readonly complianceException?: string | null;
+    /** Story 4-6a (A39) — the live version recorded after the dispatch (clears an exception), or null. */
+    readonly lateRecord?: {
+      readonly seq: number;
+      readonly brandDocument: { readonly type: string; readonly number: string; readonly date: string };
+      readonly ewayBillNumber: string | null;
+      readonly recordedAt: string;
+    } | null;
   }[];
   readonly sheet: readonly FileView[];
+}
+
+/** Story 4-6a (A19, A39) — a handover parcel's consignment keys: the stamped version, the flag, a late record. */
+function consignmentOfParcel(stamped: ConsignmentRecordRow | null, live: ConsignmentRecordRow | null, complianceException: string | null) {
+  const late =
+    live !== null && live.recordedAfterDispatch && (stamped === null || live.id !== stamped.id)
+      ? {
+          seq: live.seq,
+          brandDocument: { type: live.brandDocumentType, number: live.brandDocumentNumber, date: live.brandDocumentDate },
+          ewayBillNumber: live.ewayBillNumber,
+          recordedAt: canonicalInstant(live.recordedAt),
+        }
+      : null;
+  return {
+    taxDocument: stamped === null ? null : { type: stamped.brandDocumentType, number: stamped.brandDocumentNumber, date: stamped.brandDocumentDate },
+    ewayBillNumber: stamped?.ewayBillNumber ?? null,
+    ewayValidUntil: stamped?.ewayValidUntil ?? null,
+    complianceException,
+    lateRecord: late,
+  };
 }
 
 @Injectable()
@@ -322,18 +357,22 @@ export class ShippingService {
       const packs = await this.inventory.packMeasurementsOfOrdersInTx(tx, tenantId, page.map((row) => row.order.id));
       // Story 4-5a (A21, A33, A39, D4) — the stored live pack's facts merge over the ledger's.
       const live = await livePackFactsOfOrdersInTx(tx, tenantId, page.map((row) => row.order.id));
+      // Story 4-6a (A16) — each candidate's consignment gate today.
+      const consignments = await parcelConsignmentsInTx(tx, tenantId, page.map((row) => row.order.id), consignmentTodayIst());
       const last = page.at(-1);
       return {
         items: page.map((row) => {
           const ledger = packs.get(row.order.id) ?? null;
           const facts = live.get(row.order.id) ?? null;
-          return candidateOf(
+          const candidate = candidateOf(
             row.order,
             row.shipment,
             ledger?.packedAt ?? null,
             facts === null ? null : { packSeq: facts.packSeq, cartonCount: facts.cartonCount },
             facts !== null ? facts.weightGrams : (ledger?.weightGrams ?? null),
           );
+          const consignment = consignments.get(row.order.id);
+          return consignment === undefined ? candidate : { ...candidate, consignment };
         }),
         nextCursor: rows.length > limit && last !== undefined ? encodeKeyset(last.cursorAt, last.order.id) : null,
       };
@@ -387,6 +426,7 @@ export class ShippingService {
         codAmountPaise: order.codAmountPaise,
         destinationCity: order.destinationCity,
         cartons: detail.cartons.get(order.id) ?? { cartonCount: 1, scanned: 0, legacy: true, codCartonScanned: null, staleCartonLabels: false },
+        ...consignmentOfParcel(detail.stamped.get(order.id) ?? null, detail.live.get(order.id) ?? null, shipment.complianceException),
       })),
       sheet,
     };

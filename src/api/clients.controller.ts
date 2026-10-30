@@ -38,7 +38,6 @@ import {
   UpdateClientStatusDto,
   UpdateClientTaxDetailsDto,
 } from './clients.dto';
-// eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { ConsignmentPolicyDto, ConsignmentPolicyResponse } from './consignment.dto';
 import type { ClientContactDto, ClientContactListItemDto, ClientDto } from './clients.dto';
 // Story 5-2b — bound to @Query(): a value import (the ValidationPipe reads the class).

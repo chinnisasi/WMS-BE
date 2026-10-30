@@ -564,3 +564,33 @@ export const consignmentReadClock = { now: (): number => Date.now() };
 export function consignmentTodayIst(): string {
   return istDateOf(new Date(consignmentReadClock.now()).toISOString());
 }
+
+/** A16 — one parcel's consignment as the 4-4a candidates and the device snapshot carry it. */
+export interface ParcelConsignment {
+  readonly state: ConsignmentGateState;
+  readonly blocking: boolean;
+  readonly ewayBillNumber: string | null;
+  readonly ewayValidUntil: string | null;
+}
+
+/** A16, D15 — the parcel consignments of a set of orders judged today (batches of 500; one threshold read). */
+export async function parcelConsignmentsInTx(tx: TenantTx, tenantId: string, orderIds: readonly string[], todayIst: string): Promise<Map<string, ParcelConsignment>> {
+  const out = new Map<string, ParcelConsignment>();
+  const ids = [...new Set(orderIds)];
+  if (ids.length === 0) return out;
+  const national = await nationalThresholdInForceInTx(tx, todayIst);
+  for (let i = 0; i < ids.length; i += FACT_CHUNK) {
+    const facts = await consignmentFactsOfOrdersInTx(tx, tenantId, ids.slice(i, i + FACT_CHUNK));
+    for (const [orderId, fact] of facts) {
+      const gate = judgeConsignment(fact, national, todayIst);
+      out.set(orderId, { state: gate.state, blocking: gate.blocking, ewayBillNumber: fact.live?.ewayBillNumber ?? null, ewayValidUntil: fact.live?.ewayValidUntil ?? null });
+    }
+  }
+  return out;
+}
+
+/** A16 — the gate state of each order (the order list rows). */
+export async function consignmentStatesOfOrdersInTx(tx: TenantTx, tenantId: string, orderIds: readonly string[]): Promise<Map<string, ConsignmentGateState>> {
+  const parcels = await parcelConsignmentsInTx(tx, tenantId, orderIds, consignmentTodayIst());
+  return new Map([...parcels].map(([id, p]) => [id, p.state]));
+}

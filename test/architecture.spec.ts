@@ -1853,8 +1853,10 @@ describe('architecture: invoices are invoicing-module-owned (story 8-1)', () => 
     'ewayStateThresholds',
     'ewayGstinSettings',
     'ewayNationalThresholds',
+    // Story 4-6a (A28) — the order consignment record (its seam writes inside invoicing/).
+    'orderConsignmentRecords',
   ] as const;
-  const RAW_INVOICING_TABLES = 'invoices|invoice_lines|invoice_series|eway_bills|eway_state_thresholds|eway_gstin_settings|eway_national_thresholds';
+  const RAW_INVOICING_TABLES = 'invoices|invoice_lines|invoice_series|eway_bills|eway_state_thresholds|eway_gstin_settings|eway_national_thresholds|order_consignment_records';
   const invoicingRoot = join(SRC_ROOT, 'modules', 'invoicing');
 
   it('no invoice-table write happens outside the invoicing module', () => {
@@ -1893,6 +1895,33 @@ describe('architecture: invoices are invoicing-module-owned (story 8-1)', () => 
     const eway = readFileSync(join(invoicingRoot, 'eway.command.ts'), 'utf8') + readFileSync(join(invoicingRoot, 'eway.delivery.ts'), 'utf8');
     for (const table of ['ewayBills', 'ewayStateThresholds', 'ewayGstinSettings'] as const) {
       expect(drizzleWriteOn(table).test(eway)).toBe(true);
+    }
+    // Story 4-6a (A28) — the record command and its seam write the consignment table.
+    expect(drizzleWriteOn('orderConsignmentRecords').test(readFileSync(join(invoicingRoot, 'consignment.command.ts'), 'utf8'))).toBe(true);
+    expect(drizzleWriteOn('orderConsignmentRecords').test(readFileSync(join(invoicingRoot, 'consignment-seam.ts'), 'utf8'))).toBe(true);
+  });
+
+  it('story 4-6a (A12, A28): invoicing/consignment-seam.ts imports only drizzle-orm and shared/ — outbound and client-emails import it, never the invoicing module', () => {
+    const source = readFileSync(join(invoicingRoot, 'consignment-seam.ts'), 'utf8');
+    expect(source).toMatch(/export async function stampConsignmentDispatchedInTx\(/);
+    expect(source).toMatch(/export async function withdrawConsignmentOnCancelInTx\(/);
+    const offenders: string[] = [];
+    for (const match of source.matchAll(/from '([^']+)'/g)) {
+      const target = match[1]!;
+      if (target !== 'drizzle-orm' && !target.startsWith('../../shared/')) offenders.push(`imports ${target}`);
+    }
+    expect(offenders).toEqual([]);
+    for (const [module, file] of [
+      ['outbound', 'dispatch.command.ts'],
+      ['outbound', 'order.command.ts'],
+      ['outbound', 'cancel-restock.command.ts'],
+      ['outbound', 'consignment.read.ts'],
+      ['client-emails', 'client-emails.enqueue.ts'],
+    ] as const) {
+      const caller = readFileSync(join(SRC_ROOT, 'modules', module, file), 'utf8');
+      expect(caller).toContain(`from '../invoicing/consignment-seam'`);
+      expect(caller).not.toContain(`from '../invoicing/invoicing.module'`);
+      expect(caller).not.toContain(`from '../invoicing/consignment.command'`);
     }
   });
 });
@@ -2636,7 +2665,8 @@ describe('architecture: the client portal (story 21-7)', () => {
   const PORTAL_READS: readonly { file: string; methods: readonly string[] }[] = [
     { file: join(SRC_ROOT, 'modules', 'inventory', 'inventory.facade.ts'), methods: ['portalStock'] },
     // Story 4-4a — the order's Shipping section.
-    { file: join(SRC_ROOT, 'modules', 'outbound', 'outbound.facade.ts'), methods: ['portalOrders', 'portalOrder', 'portalOrderShipping', 'portalPackingSlip'] },
+    // Story 4-6a (A18) — the order's Tax documents and the needed list.
+    { file: join(SRC_ROOT, 'modules', 'outbound', 'outbound.facade.ts'), methods: ['portalOrders', 'portalOrder', 'portalOrderShipping', 'portalPackingSlip', 'portalOrderConsignment', 'portalConsignmentsNeeded'] },
     { file: join(SRC_ROOT, 'modules', 'inbound', 'inbound.facade.ts'), methods: ['portalAsns', 'portalAsn', 'portalPurchaseOrders', 'portalPurchaseOrder', 'portalGoodsReceipts', 'portalGoodsReceipt', 'portalGoodsReceiptFile'] },
     { file: join(SRC_ROOT, 'modules', 'billing', 'billing.facade.ts'), methods: ['portalInvoices', 'portalInvoice', 'portalInvoiceNotes', 'portalInvoiceNote'] },
     { file: join(SRC_ROOT, 'modules', 'clients', 'clients.facade.ts'), methods: ['portalMeIn'] },
@@ -2695,6 +2725,9 @@ describe('architecture: the client portal (story 21-7)', () => {
         'portalOrderShipping',
         // Story 4-5a — the order's packing slip.
         'portalPackingSlip',
+        // Story 4-6a (A18) — the order's Tax documents and the needed list.
+        'portalOrderConsignment',
+        'portalConsignmentsNeeded',
         'portalAsns',
         'portalAsn',
         'portalPurchaseOrders',
@@ -2750,6 +2783,9 @@ describe('architecture: the client portal (story 21-7)', () => {
     // each entry opens its transactions through ONE stamped opener (pinned below).
     { file: join(SRC_ROOT, 'modules', 'outbound', 'client-label.command.ts'), methods: ['portalRecordClientLabel', 'portalRecordAwbAdvice'] },
     { file: join(SRC_ROOT, 'modules', 'outbound', 'shipping-files.command.ts'), methods: ['portalUploadOrderDocument'] },
+    // Story 4-6a (A51) — the brand records its consignment documents: an
+    // invoicing command the controller injects directly (one opener).
+    { file: join(SRC_ROOT, 'modules', 'invoicing', 'consignment.command.ts'), methods: ['recordPortalConsignment'] },
   ];
 
   /**
@@ -2969,6 +3005,8 @@ describe('architecture: the client portal (story 21-7)', () => {
     returns: 'ReturnsFacade',
     // Story 3-7a — the recall report download's audit row only.
     recalls: 'RecallsFacade',
+    // Story 4-6a (A51) — the portal consignment record (invoicing's command).
+    consignment: 'ConsignmentCommand',
   };
 
   /** Each PORTAL_READS file's class — the one the controller injects. */
@@ -2983,6 +3021,8 @@ describe('architecture: the client portal (story 21-7)', () => {
     [join(SRC_ROOT, 'modules', 'reporting', 'reporting.facade.ts'), 'ReportingFacade'],
     [join(SRC_ROOT, 'modules', 'returns', 'returns.facade.ts'), 'ReturnsFacade'],
     [join(SRC_ROOT, 'modules', 'recalls', 'recalls.facade.ts'), 'RecallsFacade'],
+    // Story 4-6a (A51) — a PORTAL_WRITES file the controller injects directly.
+    [join(SRC_ROOT, 'modules', 'invoicing', 'consignment.command.ts'), 'ConsignmentCommand'],
   ]);
 
   /**
@@ -3187,6 +3227,14 @@ describe('architecture: the client portal (story 21-7)', () => {
       if (cls === undefined) throw new Error(`PORTAL_READS file ${file} has no entry in PORTAL_READ_CLASS_BY_FILE`);
       const field = fieldOfClass.get(cls);
       if (field === undefined) throw new Error(`${cls} (from ${file}) is not an injected portal controller field`);
+      for (const method of methods) allowed.add(`${field}.${method}`);
+    }
+    // Story 4-6a (A51) — a portal write whose command the controller injects
+    // itself (its file mapped to its class above) is called directly.
+    for (const { file, methods } of PORTAL_WRITES) {
+      const cls = PORTAL_READ_CLASS_BY_FILE.get(file);
+      const field = cls === undefined ? undefined : fieldOfClass.get(cls);
+      if (field === undefined) continue;
       for (const method of methods) allowed.add(`${field}.${method}`);
     }
     for (const { field, method } of PORTAL_DELEGATIONS) allowed.add(`${field}.${method}`);
@@ -3929,6 +3977,8 @@ describe('architecture: the client-emails module (story 5-2b)', () => {
       // Story 4-4a (D8) — the stored-file renderer reads the bytes through the attachments facade.
       '../attachments/attachments.facade',
       '../attachments/attachments.module',
+      // Story 4-6a (A12, A47) — the consignment record's free-function seam (the stamped version the dispatch email names).
+      '../invoicing/consignment-seam',
     ]);
     const offenders: string[] = [];
     for (const file of moduleFiles) {

@@ -1,6 +1,7 @@
 import { Type } from 'class-transformer';
 import { ArrayMaxSize, ArrayMinSize, IsArray, IsBoolean, IsIn, IsInt, IsOptional, IsString, IsUUID, MaxLength, ValidateNested } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
+import { ConsignmentDocumentViewDto, ParcelConsignmentDto } from './consignment.dto';
 import {
   HANDOVER_PARCEL_REFUSALS,
   LABEL_VERIFY_METHODS,
@@ -361,6 +362,12 @@ export class HandoverParcelResultDto {
   @ApiProperty() awb!: string;
   @ApiProperty({ enum: [true] }) dispatched!: boolean;
   @ApiProperty({ type: String, nullable: true, format: 'uuid' }) followOnOrderId!: string | null;
+  @ApiProperty({
+    required: false,
+    enum: ['consignment-documents-missing', 'eway-bill-required', 'eway-bill-expired'],
+    description: "Story 4-6a (A14) — a handheld parcel that left without the brand's documents (a stale snapshot): handed over and flagged, never refused. Absent otherwise",
+  })
+  complianceException?: string;
 }
 
 export class HandoverRefusedParcelDto {
@@ -437,6 +444,7 @@ export class HandoverCandidateDto {
   @ApiProperty({ required: false, description: 'Story 4-5a (A21) — the live pack’s number; absent for an order packed before cartons were recorded (one carton, pack 1)' }) packSeq?: number;
   @ApiProperty({ required: false, description: 'Story 4-5a (A21) — the live pack’s carton count; absent as packSeq' }) cartonCount?: number;
   @ApiProperty({ required: false, type: Number, nullable: true, description: 'Story 4-5a (A33) — the handover’s weight default: the live pack’s gross when ≤ 1,000,000 g (null above it), else the last pack measurement' }) defaultWeightGrams?: number | null;
+  @ApiProperty({ required: false, type: ParcelConsignmentDto, description: "Story 4-6a (A16) — the brand's documents gate today; a blocking candidate cannot be ticked" }) consignment?: ParcelConsignmentDto;
 }
 
 export class HandoverCandidatesResponse {
@@ -470,6 +478,13 @@ export class HandoverDetailCartonsDto {
   @ApiProperty({ description: 'A37 — the handheld scanned a superseded pack’s label (accepted, not recorded): reprint the labels' }) staleCartonLabels!: boolean;
 }
 
+export class HandoverLateRecordDto {
+  @ApiProperty() seq!: number;
+  @ApiProperty({ type: ConsignmentDocumentViewDto }) brandDocument!: ConsignmentDocumentViewDto;
+  @ApiProperty({ type: String, nullable: true }) ewayBillNumber!: string | null;
+  @ApiProperty() recordedAt!: string;
+}
+
 export class HandoverDetailParcelDto {
   @ApiProperty({ format: 'uuid' }) orderId!: string;
   @ApiProperty() orderLabel!: string;
@@ -481,6 +496,11 @@ export class HandoverDetailParcelDto {
   @ApiProperty({ type: Number, nullable: true }) codAmountPaise!: number | null;
   @ApiProperty({ type: String, nullable: true }) destinationCity!: string | null;
   @ApiProperty({ type: HandoverDetailCartonsDto, description: 'Story 4-5a (A21, A34, A37, A44) — the order’s cartons at this handover' }) cartons!: HandoverDetailCartonsDto;
+  @ApiProperty({ required: false, type: ConsignmentDocumentViewDto, nullable: true, description: 'Story 4-6a (A19) — the brand’s document the parcel LEFT under (the stamped version); null when none was recorded' }) taxDocument?: ConsignmentDocumentViewDto | null;
+  @ApiProperty({ required: false, type: String, nullable: true, description: 'Story 4-6a — the stamped version’s e-way bill number' }) ewayBillNumber?: string | null;
+  @ApiProperty({ required: false, type: String, nullable: true, description: 'Story 4-6a — the stamped version’s e-way validity (YYYY-MM-DD)' }) ewayValidUntil?: string | null;
+  @ApiProperty({ required: false, type: String, nullable: true, enum: ['consignment-documents-missing', 'eway-bill-required', 'eway-bill-expired', null], description: 'Story 4-6a (A14) — a handheld parcel that left without its documents' }) complianceException?: string | null;
+  @ApiProperty({ required: false, type: HandoverLateRecordDto, nullable: true, description: 'Story 4-6a (A39) — the live version recorded after the dispatch (it clears an exception)' }) lateRecord?: HandoverLateRecordDto | null;
 }
 
 export class HandoverDetailDto extends HandoverViewDto {

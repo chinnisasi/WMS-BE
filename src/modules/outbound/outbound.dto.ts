@@ -679,6 +679,13 @@ export class OrderEntryDto {
 
   @ApiProperty({ description: 'ISO-8601 UTC last update' })
   updatedAt!: string;
+
+  @ApiProperty({
+    required: false,
+    enum: ['not-applicable', 'dispatched', 'eway-required', 'eway-expired', 'ready', 'missing', 'not-required'],
+    description: "Story 4-6a — the consignment gate today (the brand's tax document and e-way bill): the Docs cell. Optional",
+  })
+  consignmentState?: string;
 }
 
 export class OrderListResponse {

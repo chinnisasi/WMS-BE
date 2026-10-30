@@ -764,6 +764,26 @@ describe('story 2-8b: the return to vendor (e2e)', () => {
       );
     });
 
+    it('story 4-6a (A22, A41) — a declared ₹75,000 above the threshold with no e-way bill is 409 eway-bill-required (the figures named); an exemption satisfies it; the value is stored; no value sent is unjudged', async () => {
+      await receiveDamagedBlind('RU', 0, 3);
+      const rtv = await createOk([line('RU', 1)]);
+      await pick(rtv).expect(200);
+      const refused = await dispatch(rtv, captureBody({ declaredValuePaise: 7_500_000 })).expect(409);
+      expect(refused.body).toMatchObject({ code: 'eway-bill-required', declaredValuePaise: 7_500_000, thresholdPaise: 5_000_000, thresholdRule: 'national' });
+      expect((await dispatch(rtv, captureBody({ declaredValuePaise: 7_500_000, ewayExemption: { reason: 'other' } })).expect(400)).body.detail).toMatch(/note is required/);
+      const key = ulid();
+      const shipped = (await dispatch(rtv, captureBody({ declaredValuePaise: 7_500_000, ewayExemption: { reason: 'exempt-goods' } }), key).expect(200)).body as Rtv;
+      expect(shipped.dispatch).toMatchObject({ declaredValuePaise: 7_500_000, ewayUnjudged: false });
+      const audit = (await sql`select changes from audit_events where tenant_id = ${tenantId} and reference = ${key}`)[0]!.changes as Record<string, unknown>;
+      expect(audit).toEqual({ declaredValuePaise: 7_500_000, ewayExemption: { reason: 'exempt-goods', note: null } });
+      const old = await createOk([line('RU', 1)]);
+      await pick(old).expect(200);
+      expect(((await dispatch(old).expect(200)).body as Rtv).dispatch).toMatchObject({ declaredValuePaise: null, ewayUnjudged: true });
+      const below = await createOk([line('RU', 1)]);
+      await pick(below).expect(200);
+      await dispatch(below, captureBody({ declaredValuePaise: 1_000_000 })).expect(200);
+    });
+
     it('A7 — the vendor is not re-checked at dispatch: a picked RTV of a vendor deactivated meanwhile dispatches and prints the frozen vendor', async () => {
       const temp = await newPartner({ code: 'V-TMP', name: 'Temp Vendor', roles: ['vendor'], registeredAddress: { line1: '5 Temp', city: 'Pune', stateCode: '27', pincode: '411001' } });
       await linkVendor(app, tenantId, ownerToken, temp, brand);

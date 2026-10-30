@@ -650,7 +650,7 @@ describe('receipt and dispatch emails (e2e, story 5-2b)', () => {
       await seedClientRows(edge, 'client-dispatch', 2, midnight, 'cancelled');
       await seedClientRows(edge, 'client-receipt', 1, midnight, 'failed');
       const counts = await withTenantTransaction(db, tenantId, (tx: TenantTx) => clientEmailCountsTodayInTx(tx, tenantId, edge));
-      expect(counts).toEqual({ 'client-dispatch': 2, 'client-receipt': 1, 'client-shipment-document': 0 });
+      expect(counts).toEqual({ 'client-dispatch': 2, 'client-receipt': 1, 'client-shipment-document': 0, 'client-documents-needed': 0 });
     });
 
     it('AC: 500 ACME dispatch rows today → another ACME order dispatches, no row is written; the log answers capReachedToday.dispatch', async () => {
@@ -706,7 +706,9 @@ describe('receipt and dispatch emails (e2e, story 5-2b)', () => {
         const orderId = await dispatchOrder([{ skuId: sku.get('A-TEE')!, quantity: 1 }]);
         invoiceSpy.mockClear();
         await drain();
-        expect(failing).toHaveBeenCalledTimes(2);
+        // Two attempts for the DISPATCH event (story 4-6a: the pack's
+        // `order.packed` now reaches this handler too, with its own two).
+        expect(failing.mock.calls.filter(([, event]) => (event as { type: string }).type === 'order.dispatched')).toHaveLength(2);
         expect(invoiceSpy).toHaveBeenCalledTimes(1);
         expect((await sql`select count(*)::int as n from outbox_messages where type = 'order.dispatched' and payload->'dispatch'->>'orderId' = ${orderId}`)[0]!.n).toBe(0);
         expect(await mailRows(acme)).toHaveLength(0);

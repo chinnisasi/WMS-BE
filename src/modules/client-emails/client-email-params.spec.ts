@@ -188,6 +188,8 @@ describe('client email params (story 5-2b)', () => {
       'grn.recorded': 'receipt.recorded',
       'order.dispatched': 'order.dispatched',
       'shipment.document-shared': 'shipment.documents',
+      // Story 4-6a (A47) — a packed order still waiting for the brand's documents.
+      'order.packed': 'consignment.documents-needed',
     });
     expect(CLIENT_EMAIL_DAILY_CAP).toBe(500);
     expect(CLIENT_EMAIL_STALE_EVENT_MS).toBe(24 * 60 * 60 * 1000);

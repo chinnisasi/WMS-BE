@@ -4,7 +4,11 @@ import {
   ORDER_BRAND_DOCUMENT_TYPES,
   assertConsignmentRecordShape,
   brandDocumentTag,
+  cartonLabelConsignmentLine,
   formatEwayBillNumber,
+  formatRupees,
+  packingSlipConsignmentLines,
+  type ConsignmentPrintFacts,
   normalizeConsignmentRecordInput,
   type ConsignmentRecordInput,
 } from './consignment-record';
@@ -97,5 +101,36 @@ describe('story 4-6a — the order consignment record shape (A8, A33, A34)', () 
     expect(formatEwayBillNumber('123456789012')).toBe('1234 5678 9012');
     expect(formatEwayBillNumber('12345')).toBe('12345');
     expect([brandDocumentTag('invoice'), brandDocumentTag('challan'), brandDocumentTag('bill-of-supply')]).toEqual(['INV', 'DC', 'BOS']);
+  });
+
+  it('A19 — the carton label line (ASCII, the document number last) and the packing slip lines (never the value)', () => {
+    const facts: ConsignmentPrintFacts = {
+      brandDocumentType: 'invoice',
+      brandDocumentNumber: 'INV/26-27/0042',
+      brandDocumentDate: '2026-10-30',
+      consignorGstin: '29ABCDE1234F1Z5',
+      consignorName: 'Acme Brand Private Limited',
+      ewayStatus: 'recorded',
+      ewayBillNumber: '123456789012',
+      ewayBillDate: '2026-10-30',
+      ewayValidUntil: '2026-11-01',
+      ewayExemptionReason: null,
+    };
+    expect(cartonLabelConsignmentLine(facts)).toBe('EWB 1234 5678 9012 / INV INV/26-27/0042');
+    expect(cartonLabelConsignmentLine({ ...facts, brandDocumentType: 'challan', ewayStatus: 'pending', ewayBillNumber: null })).toBe('DC INV/26-27/0042');
+    expect(cartonLabelConsignmentLine({ ...facts, brandDocumentType: 'bill-of-supply', ewayStatus: 'exempt', ewayBillNumber: null, ewayExemptionReason: 'customs' })).toBe('EWB EXEMPT / BOS INV/26-27/0042');
+    expect(packingSlipConsignmentLines(facts)).toEqual([
+      'Tax document: Invoice INV/26-27/0042 dated 30 Oct 2026, issued by Acme Brand Private Limited (GSTIN 29ABCDE1234F1Z5)',
+      'E-way bill 1234 5678 9012 dated 30 Oct 2026, valid until 1 Nov 2026',
+    ]);
+    expect(packingSlipConsignmentLines({ ...facts, ewayStatus: 'exempt', ewayBillNumber: null, ewayBillDate: null, ewayValidUntil: null, ewayExemptionReason: 'exempt-goods' })[1]).toBe('E-way bill: not required — exempt goods');
+    expect(packingSlipConsignmentLines({ ...facts, ewayStatus: 'not-required', ewayBillNumber: null })).toHaveLength(1);
+    expect(packingSlipConsignmentLines(facts).join(' ')).not.toMatch(/₹|Rs|value/i);
+  });
+
+  it('formats rupees with Indian grouping, paise only when present', () => {
+    expect(formatRupees(11_800_000)).toBe('₹1,18,000');
+    expect(formatRupees(5_000_050)).toBe('₹50,000.50');
+    expect(formatRupees(0)).toBe('₹0');
   });
 });

@@ -21,7 +21,6 @@ import { SheetUploadFilter } from '../shared/import/upload-filter';
 import { ATTACHMENT_UPLOAD_LIMITS, AttachmentUploadFilter, CLIENT_LABEL_UPLOAD_LIMITS } from '../shared/import/attachment-upload-filter';
 import { parseCountField, parseReplaceField } from './shipping.controller';
 import { ConsignmentCommand } from '../modules/invoicing/consignment.command';
-// eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { PortalConsignmentRecordResponse, PortalConsignmentsNeededResponse, PortalOrderConsignmentResponse, RecordConsignmentDto } from './consignment.dto';
 // Story 4-4a — the portal Shipping section's bodies and responses.
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports

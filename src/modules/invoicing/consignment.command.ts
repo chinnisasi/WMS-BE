@@ -2,7 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, eq, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { auditEvents, orderConsignmentRecords } from '../../shared/db/schema';
+import { auditEvents, idempotencyKeys, orderConsignmentRecords } from '../../shared/db/schema';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK, type OutboxSink } from '../../shared/events/outbox.seam';
 import { uuidv7 } from '../../shared/primitives/ids';
@@ -20,6 +20,7 @@ import {
   type ValidConsignmentRecord,
 } from '../../shared/primitives/consignment-record';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
+import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { ROLE_CAPABILITIES, assertPermission } from '../tenancy/permissions';
 import { getMemberPortalFactsIn, getMemberRoleIn, invoicePartyFactsInTx } from '../tenancy/tenancy.service';
 import { clientPartySnapshotOf, getClientInTx, shareLockClientInTx } from '../clients/clients.facade';
@@ -36,7 +37,6 @@ import {
   type ConsignmentView,
   type PortalConsignmentView,
 } from './consignment-seam';
-import { replayKeyInTx, writeKeyInTx } from './consignment-keys';
 
 /**
  * Story 4-6a (A9, A10, A46, A51) — the order consignment record's commands:
@@ -519,6 +519,37 @@ export class ConsignmentCommand {
         : { consignment: toConsignmentView(inserted, { ratedValuePaise: order.ratedValuePaise }) };
     await writeKeyInTx(tx, tenantId, key, payloadHash, snapshot);
     return { record: inserted, ratedValuePaise: order.ratedValuePaise };
+  }
+}
+
+/** The 4.1 replay and key writes (the commands' own — the audit rule's static scan reads this file). */
+const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
+
+export async function replayKeyInTx(tx: TenantTx, tenantId: string, key: string, payloadHash: string): Promise<unknown> {
+  const rows = await tx
+    .select({ payloadHash: idempotencyKeys.payloadHash, responseSnapshot: idempotencyKeys.responseSnapshot })
+    .from(idempotencyKeys)
+    .where(and(eq(idempotencyKeys.tenantId, tenantId), eq(idempotencyKeys.key, key)))
+    .limit(1);
+  const row = rows[0];
+  if (row === undefined) return null;
+  if (row.payloadHash !== payloadHash) throw idempotencyKeyReuse();
+  return row.responseSnapshot;
+}
+
+export async function writeKeyInTx(tx: TenantTx, tenantId: string, key: string, payloadHash: string, snapshot: unknown): Promise<void> {
+  try {
+    await tx.insert(idempotencyKeys).values({ id: uuidv7(), tenantId, key, payloadHash, responseSnapshot: snapshot });
+  } catch (err) {
+    if (isUniqueViolationOn(err, IDEMPOTENCY_TENANT_KEY)) {
+      throw new ProblemException(
+        'conflict',
+        409,
+        'Concurrent idempotent request',
+        'The same Idempotency-Key is being processed concurrently; retry to read the settled result.',
+      );
+    }
+    throw err;
   }
 }
 

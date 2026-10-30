@@ -16182,6 +16182,393 @@
         ]
       }
     },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/consignment/withdraw": {
+      "post": {
+        "operationId": "ConsignmentController_withdraw",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WithdrawConsignmentDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsignmentWithdrawResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A reason outside 1–200 characters (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing orders.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown order (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No live record (consignment-not-found); the order is dispatched — amend instead (order-dispatched)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The key reused with another body (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-6a — orders.manage: withdraws the order’s live consignment record (the gate refuses again); refused once the order has left",
+        "tags": [
+          "consignment"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/consignment": {
+      "post": {
+        "operationId": "ConsignmentController_record",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordConsignmentDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsignmentRecordResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed field, a date outside its window, a missing consignor GSTIN, or an amendment after dispatch without a reason (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing dispatch.execute, or orders.manage for an exemption or an amendment after dispatch (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown order (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The order is cancelled (order-not-open); the tenant’s own goods (own-goods-invoiced); the e-way number is live on another of the client’s orders (eway-bill-in-use, extensions.orderId/orderLabel); 99 versions (consignment-version-limit); no national e-way threshold in force (eway-threshold-missing)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The declared value is below the COD amount (declared-value-below-order-value); the key reused (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-6a — dispatch.execute: records (or amends — a new version) the brand’s tax document, declared value and e-way bill for a client order; the WMS judges the e-way threshold in force on the document date. An exemption, an amendment after dispatch, or a value that drops a required bill need orders.manage (A46). The same body again is a no-op that stores the key.",
+        "tags": [
+          "consignment"
+        ]
+      },
+      "get": {
+        "operationId": "ConsignmentController_read",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderConsignmentResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown order (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No national e-way threshold in force (eway-threshold-missing)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-6a — the order’s consignment (any staff role): the gate today, the live version and its history, the version the goods left under, the warnings and the scans",
+        "tags": [
+          "consignment"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/outbound/consignments": {
+      "get": {
+        "operationId": "ConsignmentController_worklist",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "One client's orders (the shell's client switcher)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "view",
+            "required": false,
+            "in": "query",
+            "description": "needed (default): open orders waiting for documents; exceptions: device handovers that left without them",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "needed",
+                "exceptions"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsignmentWorklistResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed clientId or view (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown warehouse (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-6a — the documents worklist (any staff role): needed — open orders whose brand documents block them or whose e-way bill expires today, packed first (at most 5,000 scanned, truncated); exceptions — device handovers that left without them, until a late record clears them",
+        "tags": [
+          "consignment"
+        ]
+      }
+    },
     "/tenants/{tenantId}/receiving/goods-receipts": {
       "post": {
         "operationId": "ReceivingController_submitGoodsReceipt",
@@ -32203,6 +32590,220 @@
         ]
       }
     },
+    "/tenants/{tenantId}/clients/{clientId}/consignment-policy": {
+      "get": {
+        "operationId": "ClientsController_getConsignmentPolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsignmentPolicyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed clientId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-6a — reads a client's consignment documents rule (b2b | all | high-value) — when its orders need the brand's tax document and e-way bill recorded before they leave (any staff session; never the portal)",
+        "tags": [
+          "clients"
+        ]
+      },
+      "put": {
+        "operationId": "ClientsController_updateConsignmentPolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConsignmentPolicyDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed clientId, an unknown rule, or the self client (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks clients.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-6a — sets a client's consignment documents rule (clients.manage): b2b (the default), all, or high-value. Any order whose own value is above the e-way threshold always needs the brand's documents. Refused for the self client (its goods are invoiced by the WMS). An unchanged rule is a no-op (nothing written or audited; the key is stored)",
+        "tags": [
+          "clients"
+        ]
+      }
+    },
     "/tenants/{tenantId}/clients/{clientId}/contacts": {
       "get": {
         "operationId": "ClientsController_listContacts",
@@ -40026,6 +40627,278 @@
         ]
       }
     },
+    "/tenants/{tenantId}/portal/consignments/needed": {
+      "get": {
+        "operationId": "PortalController_consignmentsNeeded",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalConsignmentsNeededResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-6a — your open orders waiting for your tax invoice or e-way bill (packed first, at most 500), with what each needs",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/orders/{orderId}/consignment": {
+      "get": {
+        "operationId": "PortalController_orderConsignment",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalOrderConsignmentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed orderId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such order of this client — unknown, or another client's (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-6a — this order’s Tax documents: whether we need your invoice or e-way bill before it can leave, the live record and its history",
+        "tags": [
+          "portal"
+        ]
+      },
+      "post": {
+        "operationId": "PortalController_recordConsignment",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordConsignmentDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalConsignmentRecordResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed field or a date outside its window (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such order of this client (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "order-not-open, client-departed, eway-bill-in-use (one of your own orders), consignment-version-limit, eway-threshold-missing",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The declared value is below the COD amount (declared-value-below-order-value); the key reused (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-6a — orders.place: record (or amend — a new version) your tax invoice, delivery challan or bill of supply for this order, its declared value and its e-way bill (or an exemption). The WMS judges the e-way threshold from the declared value; the GSTIN defaults to yours.",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
     "/tenants/{tenantId}/portal/orders/{orderId}/packing-slip": {
       "get": {
         "operationId": "PortalController_orderPackingSlip",
@@ -46209,7 +47082,7 @@
             }
           },
           "409": {
-            "description": "The return to vendor is not picked — member status (rtv-not-picked); the partner is not a transporter or is inactive (partner-not-transporter, transporter-inactive); a reconcile quarantine on DAMAGED (disposition-scope-quarantined); DAMAGED no longer holds the picked units — members onHandQty, pickedQty (rtv-damaged-short); a user location occupies the DAMAGED code (damaged-bin-conflict); or a concurrent idempotent request (conflict)",
+            "description": "The return to vendor is not picked — member status (rtv-not-picked); the partner is not a transporter or is inactive (partner-not-transporter, transporter-inactive); a reconcile quarantine on DAMAGED (disposition-scope-quarantined); DAMAGED no longer holds the picked units — members onHandQty, pickedQty (rtv-damaged-short); a user location occupies the DAMAGED code (damaged-bin-conflict); story 4-6a — a declared value above the e-way threshold without an e-way bill or exemption (eway-bill-required, extensions declaredValuePaise/thresholdPaise/thresholdRule), an expired bill (eway-bill-expired), no threshold in force (eway-threshold-missing); or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -47196,7 +48069,7 @@
             }
           },
           "409": {
-            "description": "The return to client is not picked — member rtcStatus (rtc-not-picked); the partner is not a transporter or is inactive (partner-not-transporter, transporter-inactive); a reconcile quarantine on RETURNS or DAMAGED (disposition-scope-quarantined); DAMAGED no longer holds the picked units — members onHandQty, pickedQty (rtc-damaged-short); a user location occupies the RETURNS or DAMAGED code (returns-bin-conflict, damaged-bin-conflict); or a concurrent idempotent request (conflict)",
+            "description": "The return to client is not picked — member rtcStatus (rtc-not-picked); the partner is not a transporter or is inactive (partner-not-transporter, transporter-inactive); a reconcile quarantine on RETURNS or DAMAGED (disposition-scope-quarantined); DAMAGED no longer holds the picked units — members onHandQty, pickedQty (rtc-damaged-short); a user location occupies the RETURNS or DAMAGED code (returns-bin-conflict, damaged-bin-conflict); story 4-6a — a declared value above the e-way threshold without an e-way bill or exemption (eway-bill-required, extensions declaredValuePaise/thresholdPaise/thresholdRule), an expired bill (eway-bill-expired), no threshold in force (eway-threshold-missing); or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -57642,6 +58515,19 @@
           "updatedAt": {
             "type": "string",
             "description": "ISO-8601 UTC last update"
+          },
+          "consignmentState": {
+            "type": "string",
+            "enum": [
+              "not-applicable",
+              "dispatched",
+              "eway-required",
+              "eway-expired",
+              "ready",
+              "missing",
+              "not-required"
+            ],
+            "description": "Story 4-6a — the consignment gate today (the brand's tax document and e-way bill): the Docs cell. Optional"
           }
         },
         "required": [
@@ -59786,6 +60672,15 @@
             "type": "string",
             "nullable": true,
             "format": "uuid"
+          },
+          "complianceException": {
+            "type": "string",
+            "enum": [
+              "consignment-documents-missing",
+              "eway-bill-required",
+              "eway-bill-expired"
+            ],
+            "description": "Story 4-6a (A14) — a handheld parcel that left without the brand's documents (a stale snapshot): handed over and flagged, never refused. Absent otherwise"
           }
         },
         "required": [
@@ -59817,7 +60712,10 @@
               "awb-in-use",
               "order-holds-recalled-batch",
               "package-count-mismatch",
-              "carton-not-current"
+              "carton-not-current",
+              "consignment-documents-missing",
+              "eway-bill-required",
+              "eway-bill-expired"
             ]
           },
           "detail": {
@@ -59906,6 +60804,55 @@
           "staleCartonLabels"
         ]
       },
+      "ConsignmentDocumentViewDto": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "invoice",
+              "challan",
+              "bill-of-supply"
+            ]
+          },
+          "number": {
+            "type": "string"
+          },
+          "date": {
+            "type": "string",
+            "description": "YYYY-MM-DD"
+          }
+        },
+        "required": [
+          "type",
+          "number",
+          "date"
+        ]
+      },
+      "HandoverLateRecordDto": {
+        "type": "object",
+        "properties": {
+          "seq": {
+            "type": "number"
+          },
+          "brandDocument": {
+            "$ref": "#/components/schemas/ConsignmentDocumentViewDto"
+          },
+          "ewayBillNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "recordedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "seq",
+          "brandDocument",
+          "ewayBillNumber",
+          "recordedAt"
+        ]
+      },
       "HandoverDetailParcelDto": {
         "type": "object",
         "properties": {
@@ -59952,6 +60899,47 @@
             "allOf": [
               {
                 "$ref": "#/components/schemas/HandoverDetailCartonsDto"
+              }
+            ]
+          },
+          "taxDocument": {
+            "nullable": true,
+            "description": "Story 4-6a (A19) — the brand’s document the parcel LEFT under (the stamped version); null when none was recorded",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ConsignmentDocumentViewDto"
+              }
+            ]
+          },
+          "ewayBillNumber": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 4-6a — the stamped version’s e-way bill number"
+          },
+          "ewayValidUntil": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 4-6a — the stamped version’s e-way validity (YYYY-MM-DD)"
+          },
+          "complianceException": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "consignment-documents-missing",
+              "eway-bill-required",
+              "eway-bill-expired",
+              null
+            ],
+            "description": "Story 4-6a (A14) — a handheld parcel that left without its documents"
+          },
+          "lateRecord": {
+            "nullable": true,
+            "description": "Story 4-6a (A39) — the live version recorded after the dispatch (it clears an exception)",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/HandoverLateRecordDto"
               }
             ]
           }
@@ -60133,6 +61121,40 @@
           "labelVerified"
         ]
       },
+      "ParcelConsignmentDto": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "not-applicable",
+              "dispatched",
+              "eway-required",
+              "eway-expired",
+              "ready",
+              "missing",
+              "not-required"
+            ]
+          },
+          "blocking": {
+            "type": "boolean"
+          },
+          "ewayBillNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "ewayValidUntil": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "state",
+          "blocking",
+          "ewayBillNumber",
+          "ewayValidUntil"
+        ]
+      },
       "HandoverCandidateDto": {
         "type": "object",
         "properties": {
@@ -60191,6 +61213,14 @@
             "type": "number",
             "nullable": true,
             "description": "Story 4-5a (A33) — the handover’s weight default: the live pack’s gross when ≤ 1,000,000 g (null above it), else the last pack measurement"
+          },
+          "consignment": {
+            "description": "Story 4-6a (A16) — the brand's documents gate today; a blocking candidate cannot be ticked",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ParcelConsignmentDto"
+              }
+            ]
           }
         },
         "required": [
@@ -60296,6 +61326,812 @@
         "required": [
           "items",
           "nextCursor"
+        ]
+      },
+      "WithdrawConsignmentDto": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "description": "Why the record is withdrawn (1–200)"
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "ConsignorViewDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "legalName": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "name",
+          "legalName"
+        ]
+      },
+      "ConsignmentEwayViewDto": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "recorded",
+              "pending",
+              "not-required",
+              "exempt"
+            ]
+          },
+          "number": {
+            "type": "string",
+            "nullable": true
+          },
+          "date": {
+            "type": "string",
+            "nullable": true
+          },
+          "validUntil": {
+            "type": "string",
+            "nullable": true
+          },
+          "exemptionReason": {
+            "type": "string",
+            "enum": [
+              "exempt-goods",
+              "non-motorised",
+              "customs",
+              "other",
+              null
+            ],
+            "nullable": true
+          },
+          "exemptionNote": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "status",
+          "number",
+          "date",
+          "validUntil",
+          "exemptionReason",
+          "exemptionNote"
+        ]
+      },
+      "ConsignmentViewDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "seq": {
+            "type": "number",
+            "description": "1–99"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "live",
+              "superseded",
+              "withdrawn"
+            ]
+          },
+          "brandDocument": {
+            "$ref": "#/components/schemas/ConsignmentDocumentViewDto"
+          },
+          "consignorGstin": {
+            "type": "string"
+          },
+          "consignor": {
+            "description": "The brand as frozen when recorded",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ConsignorViewDto"
+              }
+            ]
+          },
+          "declaredValuePaise": {
+            "type": "number"
+          },
+          "destinationStateCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The ship-to state code; null when unknown"
+          },
+          "supplyType": {
+            "type": "string",
+            "enum": [
+              "intra",
+              "inter",
+              null
+            ],
+            "nullable": true
+          },
+          "thresholdPaise": {
+            "type": "number",
+            "nullable": true,
+            "description": "The threshold in force on the document date (null: no bill required)"
+          },
+          "thresholdRule": {
+            "type": "string",
+            "description": "national | state:NN"
+          },
+          "ewayRequired": {
+            "type": "boolean"
+          },
+          "eway": {
+            "$ref": "#/components/schemas/ConsignmentEwayViewDto"
+          },
+          "recordedAfterDispatch": {
+            "type": "boolean"
+          },
+          "dispatchedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "Set on the version the goods left under (immutable)"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "web",
+              "portal"
+            ]
+          },
+          "recordedBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "recordedAt": {
+            "type": "string"
+          },
+          "endedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "endedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "endReason": {
+            "type": "string",
+            "nullable": true
+          },
+          "declaredBelowRatedValue": {
+            "type": "boolean",
+            "description": "A40 — the declared value is below the order's own rated value (a warning)"
+          }
+        },
+        "required": [
+          "id",
+          "orderId",
+          "seq",
+          "status",
+          "brandDocument",
+          "consignorGstin",
+          "consignor",
+          "declaredValuePaise",
+          "destinationStateCode",
+          "supplyType",
+          "thresholdPaise",
+          "thresholdRule",
+          "ewayRequired",
+          "eway",
+          "recordedAfterDispatch",
+          "dispatchedAt",
+          "source",
+          "recordedBy",
+          "recordedAt",
+          "endedAt",
+          "endedBy",
+          "endReason"
+        ]
+      },
+      "ConsignmentWithdrawResponse": {
+        "type": "object",
+        "properties": {
+          "consignment": {
+            "type": "object",
+            "nullable": true,
+            "description": "Always null"
+          },
+          "history": {
+            "description": "Every version, newest first",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConsignmentViewDto"
+            }
+          }
+        },
+        "required": [
+          "consignment",
+          "history"
+        ]
+      },
+      "ConsignmentBrandDocumentDto": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "invoice",
+              "challan",
+              "bill-of-supply"
+            ],
+            "description": "The brand's tax invoice, delivery challan or bill of supply"
+          },
+          "number": {
+            "type": "string",
+            "description": "The document number (1–40 characters)",
+            "maxLength": 40
+          },
+          "date": {
+            "type": "string",
+            "description": "The document date (YYYY-MM-DD, IST) — no later than today and no earlier than 30 days before the order's creation day"
+          }
+        },
+        "required": [
+          "type",
+          "number",
+          "date"
+        ]
+      },
+      "ConsignmentEwayBillInputDto": {
+        "type": "object",
+        "properties": {
+          "number": {
+            "type": "string",
+            "description": "The brand's e-way bill number (12 digits) — recorded, never generated"
+          },
+          "date": {
+            "type": "string",
+            "description": "The e-way bill date (YYYY-MM-DD, IST): not before the document, not after today"
+          },
+          "validUntil": {
+            "type": "string",
+            "description": "Its last valid day (YYYY-MM-DD) — required: the goods move, so Part B is filled (A34)"
+          }
+        },
+        "required": [
+          "number",
+          "date",
+          "validUntil"
+        ]
+      },
+      "ConsignmentExemptionInputDto": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "enum": [
+              "exempt-goods",
+              "non-motorised",
+              "customs",
+              "other"
+            ],
+            "description": "Why no e-way bill is needed above the threshold (an office role on the staff surface — A46)"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "description": "Required for \"other\" (1–200)"
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "RecordConsignmentDto": {
+        "type": "object",
+        "properties": {
+          "brandDocument": {
+            "description": "Required — the brand's tax document the goods travel under",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ConsignmentBrandDocumentDto"
+              }
+            ]
+          },
+          "consignorGstin": {
+            "type": "string",
+            "nullable": true,
+            "description": "The brand registration the document names (defaults to the client's GSTIN)"
+          },
+          "declaredValuePaise": {
+            "type": "number",
+            "description": "Required — the consignment value on the brand's document, including tax, in paise (0–10^12); the e-way threshold is judged from it"
+          },
+          "ewayBill": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ConsignmentEwayBillInputDto"
+              }
+            ]
+          },
+          "ewayExemption": {
+            "nullable": true,
+            "description": "Instead of an e-way bill — never both",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ConsignmentExemptionInputDto"
+              }
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true,
+            "description": "Why it is amended (1–200) — required once the order is dispatched"
+          }
+        },
+        "required": [
+          "brandDocument",
+          "declaredValuePaise"
+        ]
+      },
+      "ConsignmentRecordResponse": {
+        "type": "object",
+        "properties": {
+          "consignment": {
+            "$ref": "#/components/schemas/ConsignmentViewDto"
+          }
+        },
+        "required": [
+          "consignment"
+        ]
+      },
+      "ConsignmentGateDto": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "not-applicable",
+              "dispatched",
+              "eway-required",
+              "eway-expired",
+              "ready",
+              "missing",
+              "not-required"
+            ]
+          },
+          "blocking": {
+            "type": "boolean"
+          },
+          "requiredBecause": {
+            "type": "string",
+            "enum": [
+              "policy-all",
+              "policy-b2b",
+              "value",
+              null
+            ],
+            "nullable": true
+          },
+          "valueFloorPaise": {
+            "type": "number",
+            "nullable": true,
+            "description": "max(the order's rated value, its COD amount) — null when it carries neither"
+          },
+          "nationalThresholdPaise": {
+            "type": "number"
+          },
+          "expiresToday": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "state",
+          "blocking",
+          "requiredBecause",
+          "valueFloorPaise",
+          "nationalThresholdPaise",
+          "expiresToday"
+        ]
+      },
+      "ConsignmentOrderRefDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLabel": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "orderId",
+          "orderLabel"
+        ]
+      },
+      "ConsignmentOtherClientDto": {
+        "type": "object",
+        "properties": {
+          "clientCode": {
+            "type": "string"
+          },
+          "orderLabel": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "clientCode",
+          "orderLabel"
+        ]
+      },
+      "ConsignmentScanDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "purpose": {
+            "type": "string"
+          },
+          "docKind": {
+            "type": "string",
+            "nullable": true
+          },
+          "fileName": {
+            "type": "string"
+          },
+          "contentType": {
+            "type": "string",
+            "nullable": true
+          },
+          "byteSize": {
+            "type": "number",
+            "nullable": true
+          },
+          "pageCount": {
+            "type": "number",
+            "nullable": true
+          },
+          "source": {
+            "type": "string"
+          },
+          "uploadedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "uploadedBy": {
+            "type": "string",
+            "nullable": true
+          },
+          "url": {
+            "type": "string",
+            "nullable": true
+          },
+          "urlExpiresAt": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "id",
+          "purpose",
+          "docKind",
+          "fileName",
+          "contentType",
+          "byteSize",
+          "pageCount",
+          "source",
+          "uploadedAt",
+          "uploadedBy",
+          "url",
+          "urlExpiresAt"
+        ]
+      },
+      "OrderConsignmentResponse": {
+        "type": "object",
+        "properties": {
+          "gate": {
+            "description": "The gate judged today (IST)",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ConsignmentGateDto"
+              }
+            ]
+          },
+          "live": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ConsignmentViewDto"
+              }
+            ]
+          },
+          "history": {
+            "description": "Superseded and withdrawn versions, newest first",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConsignmentViewDto"
+            }
+          },
+          "dispatchedRecordId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The version the goods left under"
+          },
+          "duplicates": {
+            "description": "Other live records of the client with the same document (a warning)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConsignmentOrderRefDto"
+            }
+          },
+          "consignorStateMismatch": {
+            "type": "boolean",
+            "description": "The consignor's state differs from the warehouse GSTIN's (a warning; false when the warehouse's state is unknown)"
+          },
+          "ewayUsedByOtherClient": {
+            "nullable": true,
+            "description": "The same e-way number is live under another client (staff only)",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ConsignmentOtherClientDto"
+              }
+            ]
+          },
+          "scans": {
+            "description": "4-4a's shipping documents of kinds invoice, challan and eway-bill",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConsignmentScanDto"
+            }
+          },
+          "complianceException": {
+            "type": "string",
+            "nullable": true,
+            "description": "A device handover that left without the documents"
+          }
+        },
+        "required": [
+          "gate",
+          "live",
+          "history",
+          "dispatchedRecordId",
+          "duplicates",
+          "consignorStateMismatch",
+          "ewayUsedByOtherClient",
+          "scans",
+          "complianceException"
+        ]
+      },
+      "ConsignmentWorklistEwayDto": {
+        "type": "object",
+        "properties": {
+          "number": {
+            "type": "string",
+            "nullable": true
+          },
+          "validUntil": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "number",
+          "validUntil"
+        ]
+      },
+      "ConsignmentWorklistRowDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLabel": {
+            "type": "string"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientCode": {
+            "type": "string"
+          },
+          "orderType": {
+            "type": "string",
+            "enum": [
+              "b2b",
+              "b2c",
+              null
+            ],
+            "nullable": true
+          },
+          "stage": {
+            "type": "string",
+            "enum": [
+              "accepted",
+              "packed"
+            ]
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "not-applicable",
+              "dispatched",
+              "eway-required",
+              "eway-expired",
+              "ready",
+              "missing",
+              "not-required"
+            ]
+          },
+          "requiredBecause": {
+            "type": "string",
+            "enum": [
+              "policy-all",
+              "policy-b2b",
+              "value",
+              null
+            ],
+            "nullable": true
+          },
+          "valueFloorPaise": {
+            "type": "number",
+            "nullable": true
+          },
+          "eway": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ConsignmentWorklistEwayDto"
+              }
+            ]
+          },
+          "declaredBelowRatedValue": {
+            "type": "boolean"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "packedAt": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "orderId",
+          "orderLabel",
+          "clientId",
+          "clientCode",
+          "orderType",
+          "stage",
+          "state",
+          "requiredBecause",
+          "valueFloorPaise",
+          "eway",
+          "declaredBelowRatedValue",
+          "createdAt",
+          "packedAt"
+        ]
+      },
+      "ConsignmentExceptionRowDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLabel": {
+            "type": "string"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientCode": {
+            "type": "string"
+          },
+          "shipmentId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "handoverId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "handoverCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "handedOverAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "consignment-documents-missing",
+              "eway-bill-required",
+              "eway-bill-expired"
+            ]
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "not-applicable",
+              "dispatched",
+              "eway-required",
+              "eway-expired",
+              "ready",
+              "missing",
+              "not-required"
+            ],
+            "description": "Re-judged on the handover day"
+          }
+        },
+        "required": [
+          "orderId",
+          "orderLabel",
+          "clientId",
+          "clientCode",
+          "shipmentId",
+          "handoverId",
+          "handoverCode",
+          "handedOverAt",
+          "code",
+          "state"
+        ]
+      },
+      "ConsignmentWorklistResponse": {
+        "type": "object",
+        "properties": {
+          "view": {
+            "type": "string",
+            "enum": [
+              "needed",
+              "exceptions"
+            ]
+          },
+          "needed": {
+            "description": "Packed orders first; at most 5,000 scanned",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConsignmentWorklistRowDto"
+            }
+          },
+          "exceptions": {
+            "description": "At most 500",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConsignmentExceptionRowDto"
+            }
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "view",
+          "needed",
+          "exceptions",
+          "truncated"
         ]
       },
       "GrnLineInputDto": {
@@ -63030,6 +64866,41 @@
           "labelVerified"
         ]
       },
+      "CatalogDispatchParcelConsignmentDto": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "not-applicable",
+              "dispatched",
+              "eway-required",
+              "eway-expired",
+              "ready",
+              "missing",
+              "not-required"
+            ]
+          },
+          "blocking": {
+            "type": "boolean"
+          },
+          "ewayBillNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "ewayValidUntil": {
+            "type": "string",
+            "nullable": true,
+            "description": "YYYY-MM-DD — the last valid day"
+          }
+        },
+        "required": [
+          "state",
+          "blocking",
+          "ewayBillNumber",
+          "ewayValidUntil"
+        ]
+      },
       "CatalogDispatchParcelDto": {
         "type": "object",
         "properties": {
@@ -63073,6 +64944,14 @@
             "allOf": [
               {
                 "$ref": "#/components/schemas/CatalogDispatchParcelShipmentDto"
+              }
+            ]
+          },
+          "consignment": {
+            "description": "Story 4-6a (A23, additive): the brand's documents gate today — a blocking parcel is refused at the handover scan; the device recomputes expiry from ewayValidUntil. Absent from an older server (read as unknown)",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CatalogDispatchParcelConsignmentDto"
               }
             ]
           }
@@ -74392,6 +76271,22 @@
           "minOutboundShelfLifeDays"
         ]
       },
+      "ClientConsignmentPolicyDto": {
+        "type": "object",
+        "properties": {
+          "documentRule": {
+            "type": "string",
+            "enum": [
+              "b2b",
+              "all",
+              "high-value"
+            ]
+          }
+        },
+        "required": [
+          "documentRule"
+        ]
+      },
       "ClientDto": {
         "type": "object",
         "properties": {
@@ -74474,6 +76369,14 @@
             "allOf": [
               {
                 "$ref": "#/components/schemas/ClientAllocationPolicyDto"
+              }
+            ]
+          },
+          "consignmentPolicy": {
+            "description": "Story 4-6a — the consignment documents rule. Optional: a mutation answer stored before 4-6a replays without it; every fresh read carries it",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ClientConsignmentPolicyDto"
               }
             ]
           },
@@ -74810,6 +76713,44 @@
           "undatedBatchesOnHand"
         ]
       },
+      "ConsignmentPolicyResponse": {
+        "type": "object",
+        "properties": {
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "documentRule": {
+            "type": "string",
+            "enum": [
+              "b2b",
+              "all",
+              "high-value"
+            ]
+          }
+        },
+        "required": [
+          "clientId",
+          "documentRule"
+        ]
+      },
+      "ConsignmentPolicyDto": {
+        "type": "object",
+        "properties": {
+          "documentRule": {
+            "type": "string",
+            "enum": [
+              "b2b",
+              "all",
+              "high-value"
+            ],
+            "description": "b2b: B2B orders (the default); all: every order; high-value: only the order’s own value above the e-way threshold"
+          }
+        },
+        "required": [
+          "documentRule"
+        ]
+      },
       "UpdateClientAllocationPolicyDto": {
         "type": "object",
         "properties": {
@@ -74918,7 +76859,8 @@
               "enum": [
                 "receipt.recorded",
                 "order.dispatched",
-                "shipment.documents"
+                "shipment.documents",
+                "consignment.documents-needed"
               ]
             }
           },
@@ -75004,7 +76946,8 @@
               "enum": [
                 "receipt.recorded",
                 "order.dispatched",
-                "shipment.documents"
+                "shipment.documents",
+                "consignment.documents-needed"
               ]
             }
           }
@@ -75068,7 +77011,8 @@
               "enum": [
                 "receipt.recorded",
                 "order.dispatched",
-                "shipment.documents"
+                "shipment.documents",
+                "consignment.documents-needed"
               ]
             }
           }
@@ -75139,7 +77083,8 @@
               "enum": [
                 "receipt.recorded",
                 "order.dispatched",
-                "shipment.documents"
+                "shipment.documents",
+                "consignment.documents-needed"
               ]
             }
           }
@@ -80293,6 +82238,231 @@
           "handoverSheet",
           "cartons",
           "packingSlipAvailable"
+        ]
+      },
+      "PortalConsignmentNeededRowDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLabel": {
+            "type": "string"
+          },
+          "clientOrderRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "stage": {
+            "type": "string",
+            "enum": [
+              "accepted",
+              "packed"
+            ]
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "not-applicable",
+              "dispatched",
+              "eway-required",
+              "eway-expired",
+              "ready",
+              "missing",
+              "not-required"
+            ]
+          },
+          "requiredBecause": {
+            "type": "string",
+            "enum": [
+              "policy-all",
+              "policy-b2b",
+              "value",
+              null
+            ],
+            "nullable": true
+          },
+          "ewayValidUntil": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "orderId",
+          "orderLabel",
+          "clientOrderRef",
+          "stage",
+          "state",
+          "requiredBecause",
+          "ewayValidUntil"
+        ]
+      },
+      "PortalConsignmentsNeededResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "description": "At most 500, packed first",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalConsignmentNeededRowDto"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "PortalConsignmentViewDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "seq": {
+            "type": "number"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "live",
+              "superseded",
+              "withdrawn"
+            ]
+          },
+          "brandDocument": {
+            "$ref": "#/components/schemas/ConsignmentDocumentViewDto"
+          },
+          "consignorGstin": {
+            "type": "string"
+          },
+          "consignor": {
+            "$ref": "#/components/schemas/ConsignorViewDto"
+          },
+          "declaredValuePaise": {
+            "type": "number"
+          },
+          "destinationStateCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "supplyType": {
+            "type": "string",
+            "enum": [
+              "intra",
+              "inter",
+              null
+            ],
+            "nullable": true
+          },
+          "thresholdPaise": {
+            "type": "number",
+            "nullable": true
+          },
+          "thresholdRule": {
+            "type": "string"
+          },
+          "ewayRequired": {
+            "type": "boolean"
+          },
+          "eway": {
+            "$ref": "#/components/schemas/ConsignmentEwayViewDto"
+          },
+          "recordedAfterDispatch": {
+            "type": "boolean"
+          },
+          "dispatchedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "web",
+              "portal"
+            ]
+          },
+          "recordedByYou": {
+            "type": "boolean"
+          },
+          "recordedAt": {
+            "type": "string"
+          },
+          "endedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "endReason": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "id",
+          "orderId",
+          "seq",
+          "status",
+          "brandDocument",
+          "consignorGstin",
+          "consignor",
+          "declaredValuePaise",
+          "destinationStateCode",
+          "supplyType",
+          "thresholdPaise",
+          "thresholdRule",
+          "ewayRequired",
+          "eway",
+          "recordedAfterDispatch",
+          "dispatchedAt",
+          "source",
+          "recordedByYou",
+          "recordedAt",
+          "endedAt",
+          "endReason"
+        ]
+      },
+      "PortalOrderConsignmentResponse": {
+        "type": "object",
+        "properties": {
+          "gate": {
+            "$ref": "#/components/schemas/ConsignmentGateDto"
+          },
+          "live": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PortalConsignmentViewDto"
+              }
+            ]
+          },
+          "history": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalConsignmentViewDto"
+            }
+          }
+        },
+        "required": [
+          "gate",
+          "live",
+          "history"
+        ]
+      },
+      "PortalConsignmentRecordResponse": {
+        "type": "object",
+        "properties": {
+          "consignment": {
+            "$ref": "#/components/schemas/PortalConsignmentViewDto"
+          }
+        },
+        "required": [
+          "consignment"
         ]
       },
       "PortalShipmentViewDto": {
@@ -87251,6 +89421,15 @@
             "type": "string",
             "description": "ISO-8601 UTC"
           },
+          "declaredValuePaise": {
+            "type": "number",
+            "nullable": true,
+            "description": "Story 4-6a — the declared consignment value in paise, judged against the e-way threshold; null when none was sent"
+          },
+          "ewayUnjudged": {
+            "type": "boolean",
+            "description": "Story 4-6a — true when no value was sent, so the e-way threshold was not judged (an older caller)"
+          },
           "brandDocument": {
             "$ref": "#/components/schemas/RtvBrandDocumentDto"
           },
@@ -87815,6 +89994,28 @@
           "date"
         ]
       },
+      "EwayExemptionDto": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "enum": [
+              "exempt-goods",
+              "non-motorised",
+              "customs",
+              "other"
+            ]
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "description": "Required for \"other\" (1–200)"
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
       "DispatchVendorReturnDto": {
         "type": "object",
         "properties": {
@@ -87877,6 +90078,23 @@
             "description": "Required — the number of packages (1–9999)",
             "minimum": 1,
             "maximum": 9999
+          },
+          "declaredValuePaise": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 0,
+            "maximum": 1000000000000,
+            "description": "Story 4-6a — the consignment value on the brand's document in paise, judged against the e-way threshold (above it an e-way bill number or an exemption is required). Optional on the API for older callers; the web always sends it"
+          },
+          "ewayExemption": {
+            "nullable": true,
+            "description": "Story 4-6a — instead of an e-way bill above the threshold",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EwayExemptionDto"
+              }
+            ]
           }
         },
         "required": [
@@ -88206,6 +90424,10 @@
             "type": "number",
             "nullable": true,
             "description": "The declared value in paise, as entered"
+          },
+          "ewayUnjudged": {
+            "type": "boolean",
+            "description": "Story 4-6a — true when no value was sent, so the e-way threshold was not judged (an older caller)"
           },
           "ewayBill": {
             "nullable": true,
@@ -88729,7 +90951,17 @@
             "nullable": true,
             "minimum": 0,
             "maximum": 1000000000000,
-            "description": "A9 — the consignor's declared value in paise, printed \"declared by the consignor\" and never judged"
+            "description": "A9 — the consignor's declared value in paise, printed \"declared by the consignor\" and judged against the e-way threshold (4-6a): above it an e-way bill number or an exemption is required. Optional on the API for older callers; the web always sends it"
+          },
+          "ewayExemption": {
+            "nullable": true,
+            "description": "Story 4-6a — instead of an e-way bill above the threshold",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EwayExemptionDto"
+              }
+            ]
           },
           "ewayBillNumber": {
             "type": "string",

@@ -1216,8 +1216,9 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // clause); shipments re-created with the client clause. 157 → 158.
       // Story 4-5a (0117) — order_packs, order_cartons, order_carton_lines, each
       // with the client clause on both arms. 158 → 161.
-      expect(policies).toHaveLength(161);
-      for (const table of ['shipments', 'courier_handovers', 'order_packs', 'order_cartons', 'order_carton_lines']) {
+      // Story 4-6a (0118) — order_consignment_records, the client clause on both arms. 161 → 162.
+      expect(policies).toHaveLength(162);
+      for (const table of ['shipments', 'courier_handovers', 'order_packs', 'order_cartons', 'order_carton_lines', 'order_consignment_records']) {
         const row = policies.find((candidate) => candidate.tablename === table)!;
         expect(row.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
         expect(row.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");

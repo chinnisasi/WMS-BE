@@ -121,6 +121,7 @@ import {
   consignmentExceptionsInTx,
   consignmentFactsOfOrdersInTx as consignmentFactsOfOrdersInTxImpl,
   consignmentNeededInTx,
+  consignmentStatesOfOrdersInTx,
   consignmentTodayIst,
   judgeConsignment,
   lockOrderForConsignmentInTx as lockOrderForConsignmentInTxImpl,
@@ -290,6 +291,8 @@ export interface OrderEntry {
   readonly followOnOrderId: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /** Story 4-6a (A16) — the consignment gate's state today (the list rows only; optional). */
+  readonly consignmentState?: string;
 }
 
 /** Story 4-2c — one order line as the channel writeback reads it: what SHIPPED (Σ picks), base units. */
@@ -1601,6 +1604,13 @@ export class OutboundFacade {
         createdAt: canonicalInstant(row.createdAt),
         updatedAt: canonicalInstant(row.updatedAt),
       }));
+      // Story 4-6a (A16) — each row's consignment gate today (one batch of
+      // facts per page; the Orders tab and Pack & Dispatch show a Docs cell).
+      const consignmentStates = await consignmentStatesOfOrdersInTx(tx, tenantId, rows.map((row) => row.id));
+      for (let i = 0; i < items.length; i += 1) {
+        const state = consignmentStates.get(items[i]!.id);
+        if (state !== undefined) (items[i] as { consignmentState?: string }).consignmentState = state;
+      }
       const page = buildPage(
         rows.map((row, index) => ({
           createdAt: fullPrecisionInstant(row.createdAtText),
