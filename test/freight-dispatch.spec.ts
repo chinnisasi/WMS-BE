@@ -82,7 +82,6 @@ describe('B2B freight dispatch (e2e, story 4-9a)', () => {
   let opsToken: string;
   let opsId: string;
   let floorWebToken: string;
-  let floorWebId: string;
   let operatorToken: string;
   let operatorId: string;
   let deviceToken: string;
@@ -115,7 +114,6 @@ describe('B2B freight dispatch (e2e, story 4-9a)', () => {
     opsId = ops.userId;
     const floor = await member('operator');
     floorWebToken = floor.token;
-    floorWebId = floor.userId;
     operatorId = floor.userId;
 
     warehouseId = (

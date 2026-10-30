@@ -263,7 +263,10 @@ describe('architecture: the order aggregate is outbound-module-owned (story 4.1)
     // the inventory twin).
     const outboundInternals = new RegExp(
       '(?:modules/outbound|\\.\\./outbound)/' +
-        '(?!(?:outbound\\.(facade|module|dto)|client-wind-down)[\'"])',
+        // Story 4-9a — `freight-carriage.read` is the declared free-function
+        // seam client-emails reads the frozen truck line through (drizzle and
+        // shared/ only — pinned below).
+        '(?!(?:outbound\\.(facade|module|dto)|client-wind-down|freight-carriage\\.read)[\'"])',
     );
     const siblingModules = files.filter(
       (file) =>
@@ -2728,6 +2731,8 @@ describe('architecture: the client portal (story 21-7)', () => {
         // Story 4-6a (A18) — the order's Tax documents and the needed list.
         'portalOrderConsignment',
         'portalConsignmentsNeeded',
+        // Story 4-9a (A22) — the order's freight note.
+        'portalFreightNote',
         'portalAsns',
         'portalAsn',
         'portalPurchaseOrders',
@@ -3630,7 +3635,16 @@ describe('architecture: the audit rule — every keyed command writes its audit 
       helper: join(SRC_ROOT, 'modules', 'outbound', 'shipping-support.ts'),
       specifier: './shipping-support',
       // Story 4-5a — the re-carton (`carton.command.ts`) writes its key through it too.
-      callers: ['client-label.command.ts', 'shipping-files.command.ts', 'handover.command.ts', 'carton.command.ts'].map((file) => join(SRC_ROOT, 'modules', 'outbound', file)),
+      // Story 4-9a — the freight commands write theirs through it as well.
+      callers: [
+        'client-label.command.ts',
+        'shipping-files.command.ts',
+        'handover.command.ts',
+        'carton.command.ts',
+        'freight-load.command.ts',
+        'freight-dispatch.command.ts',
+        'freight-consignment.command.ts',
+      ].map((file) => join(SRC_ROOT, 'modules', 'outbound', file)),
     },
   ];
 
@@ -4225,6 +4239,8 @@ describe('architecture: batch recalls are recalls-module-owned (story 3-7a)', ()
     ['outbound', 'cancel-restock.command.ts'],
     // Story 4-4a — the courier handover classifies each order's recalled lots.
     ['outbound', 'handover.command.ts'],
+    // Story 4-9a — the freight departure classifies each order's recalled lots.
+    ['outbound', 'freight-dispatch.command.ts'],
     ['catalog', 'batch-block.command.ts'],
     ['inbound', 'receiving.command.ts'],
     ['inbound', 'receiving.facade.ts'],
