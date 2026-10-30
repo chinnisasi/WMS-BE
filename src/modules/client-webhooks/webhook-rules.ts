@@ -10,7 +10,12 @@ import { isIP } from 'node:net';
  */
 
 /** The public, subscribable event vocabulary (decision 3). */
-export const WEBHOOK_EVENT_TYPES = ['receipt.recorded', 'order.dispatched'] as const;
+export const WEBHOOK_EVENT_TYPES = [
+  'receipt.recorded',
+  'order.dispatched',
+  // Story 4-9a (A28) — a freight consignment's proof of delivery (the highest `deliverySeq` wins).
+  'order.delivered',
+] as const;
 export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];
 
 /** The synchronous test send's envelope type — never stored, never subscribable (A4). */
@@ -20,6 +25,8 @@ export const WEBHOOK_TEST_EVENT_TYPE = 'webhook.test';
 export const WEBHOOK_SOURCE_EVENTS = {
   'grn.recorded': 'receipt.recorded',
   'order.dispatched': 'order.dispatched',
+  // Story 4-9a (A28) — the client is the payload's `clientId` (the receipt arm's shape).
+  'freight_consignment.delivered': 'order.delivered',
 } as const satisfies Record<string, WebhookEventType>;
 export type WebhookSourceEvent = keyof typeof WEBHOOK_SOURCE_EVENTS;
 export const WEBHOOK_SOURCE_EVENT_TYPES = Object.keys(WEBHOOK_SOURCE_EVENTS) as WebhookSourceEvent[];

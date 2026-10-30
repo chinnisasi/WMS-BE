@@ -834,6 +834,13 @@
       "when": 1793363055141,
       "tag": "0118_consignment_compliance",
       "breakpoints": true
+    },
+    {
+      "idx": 119,
+      "version": "7",
+      "when": 1793371371404,
+      "tag": "0119_freight_dispatch",
+      "breakpoints": true
     }
   ]
 }

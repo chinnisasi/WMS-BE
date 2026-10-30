@@ -30,11 +30,26 @@ import { ProblemException } from '../../shared/problem-details/problem.exception
  * other scan, with a `doc_kind`) and `handover-sheet` (a signed handover
  * sheet page, owner the courier handover). Mirrored by 0116's CHECKs.
  */
-export const ATTACHMENT_PURPOSES = ['receipt-damage', 'shipping-label', 'shipping-document', 'handover-sheet'] as const;
+export const ATTACHMENT_PURPOSES = [
+  'receipt-damage',
+  'shipping-label',
+  'shipping-document',
+  'handover-sheet',
+  // Story 4-9a (A5) — a signed loading-sheet page, owner the freight load (a multi-client document, never shared).
+  'loading-sheet',
+] as const;
 export type AttachmentPurpose = (typeof ATTACHMENT_PURPOSES)[number];
 
 /** Story 4-4a — a shipping document's kind (`attachments_doc_kind_check`). */
-export const SHIPPING_DOC_KINDS = ['invoice', 'challan', 'eway-bill', 'pod', 'other'] as const;
+export const SHIPPING_DOC_KINDS = [
+  'invoice',
+  'challan',
+  'eway-bill',
+  'pod',
+  'other',
+  // Story 4-9a (A5) — a scanned lorry receipt.
+  'lr',
+] as const;
 export type ShippingDocKind = (typeof SHIPPING_DOC_KINDS)[number];
 
 /** Story 4-4a — the stored content types (`attachments_content_type_check`): the three sanitized rasters and a re-serialised PDF. */
@@ -56,7 +71,13 @@ export const ATTACHMENT_SOURCES = ['handheld', 'web', 'portal'] as const;
 export type AttachmentSource = (typeof ATTACHMENT_SOURCES)[number];
 
 /** Story 4-4a — `order` (owner = parent = the order) and `courier_handover` (owner = parent = the handover). */
-export const ATTACHMENT_OWNER_TYPES = ['goods_receipt_line', 'order', 'courier_handover'] as const;
+export const ATTACHMENT_OWNER_TYPES = [
+  'goods_receipt_line',
+  'order',
+  'courier_handover',
+  // Story 4-9a (A5) — owner = the freight load (no parent).
+  'freight_load',
+] as const;
 export type AttachmentOwnerType = (typeof ATTACHMENT_OWNER_TYPES)[number];
 
 /** The statuses that count toward a line's and a receipt's photo cap (K21: a staged row has no line yet). */
