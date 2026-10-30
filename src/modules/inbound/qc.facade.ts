@@ -31,6 +31,7 @@ import type {
   ReleaseReceiptHoldsCommand,
   ReleaseReceiptHoldsSnapshot,
   ReturnHoldOutcome,
+  ReceiptLineQcOutcome,
 } from './qc.command';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 
@@ -219,6 +220,20 @@ export class QcFacade {
    */
   async returnHoldOutcomeInTx(tx: TenantTx, tenantId: string, holdId: string): Promise<ReturnHoldOutcome | null> {
     return this.qc.returnHoldOutcomeInTx(tx, tenantId, holdId);
+  }
+
+  /**
+   * Story 2-9a (decision 9) — the receipt-hold outcome of each of the given
+   * lines of one GRN, from QC's own record, inside the caller's transaction
+   * (the GRN document read).
+   */
+  async receiptQcOutcomesByGrnInTx(
+    tx: TenantTx,
+    tenantId: string,
+    grnId: string,
+    grnLineIds: readonly string[],
+  ): Promise<Map<string, ReceiptLineQcOutcome>> {
+    return this.qc.receiptQcOutcomesByGrnInTx(tx, tenantId, grnId, grnLineIds);
   }
 
   /**

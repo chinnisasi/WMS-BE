@@ -73,6 +73,8 @@ describe('client email params (story 5-2b)', () => {
       moreLines: 0,
       totals: { received: '12.500 kg, 4 pcs', damaged: '0.000 kg, 1 pcs', short: '0.000 kg, 2 pcs' },
       qcHeldLines: 2,
+      // Story 2-9a — the portal deep link's receipt.
+      grnId: GRN,
     });
     // No payload key leaks into the params (an allowlist, never a spread).
     expect(JSON.stringify(params)).not.toMatch(/deviceId|recordedBy|appliedQty|excessQty/);

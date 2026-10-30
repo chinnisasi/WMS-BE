@@ -734,8 +734,9 @@ describe('client portal (e2e, story 21-7)', () => {
       // 21-8's service report, plus 4-1a's order, plus 2-5a's two goods-receipt reads,
       // plus 4-7a's two returns reads, plus 5-6a's two credit/debit note reads,
       // plus 3-7a's three recall reads (the list, one recall, its report),
-      // plus 4-1c's order import, plus 4-7c's two return-to-client reads.
-      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(27);
+      // plus 4-1c's order import, plus 4-7c's two return-to-client reads,
+      // plus 2-9a's GRN document file.
+      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(28);
     });
 
     it('a portal token is refused on EVERY operator route — reads and writes — with the exact fence detail', async () => {
@@ -1210,6 +1211,7 @@ describe('client portal (e2e, story 21-7)', () => {
           // Story 2-5a — the client's goods receipts.
           '/tenants/{tenantId}/portal/inbound/goods-receipts',
           '/tenants/{tenantId}/portal/inbound/goods-receipts/{grnId}',
+          '/tenants/{tenantId}/portal/inbound/goods-receipts/{grnId}/document/file',
           '/tenants/{tenantId}/portal/inbound/purchase-orders',
           '/tenants/{tenantId}/portal/inbound/purchase-orders/{poId}',
           // Story 5-6a — an invoice's credit and debit notes, and one note.

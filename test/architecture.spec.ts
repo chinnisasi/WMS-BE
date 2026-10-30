@@ -2624,7 +2624,7 @@ describe('architecture: the client portal (story 21-7)', () => {
   const PORTAL_READS: readonly { file: string; methods: readonly string[] }[] = [
     { file: join(SRC_ROOT, 'modules', 'inventory', 'inventory.facade.ts'), methods: ['portalStock'] },
     { file: join(SRC_ROOT, 'modules', 'outbound', 'outbound.facade.ts'), methods: ['portalOrders', 'portalOrder'] },
-    { file: join(SRC_ROOT, 'modules', 'inbound', 'inbound.facade.ts'), methods: ['portalAsns', 'portalAsn', 'portalPurchaseOrders', 'portalPurchaseOrder', 'portalGoodsReceipts', 'portalGoodsReceipt'] },
+    { file: join(SRC_ROOT, 'modules', 'inbound', 'inbound.facade.ts'), methods: ['portalAsns', 'portalAsn', 'portalPurchaseOrders', 'portalPurchaseOrder', 'portalGoodsReceipts', 'portalGoodsReceipt', 'portalGoodsReceiptFile'] },
     { file: join(SRC_ROOT, 'modules', 'billing', 'billing.facade.ts'), methods: ['portalInvoices', 'portalInvoice', 'portalInvoiceNotes', 'portalInvoiceNote'] },
     { file: join(SRC_ROOT, 'modules', 'clients', 'clients.facade.ts'), methods: ['portalMeIn'] },
     // Story 21-7b — the announce form's two reads.
@@ -2685,6 +2685,8 @@ describe('architecture: the client portal (story 21-7)', () => {
         // Story 2-5a — the client's goods receipts and their damage photos.
         'portalGoodsReceipts',
         'portalGoodsReceipt',
+        // Story 2-9a — the GRN document file.
+        'portalGoodsReceiptFile',
         'portalInvoices',
         'portalInvoice',
         // Story 5-6a — an invoice's credit and debit notes, and one note.
@@ -3711,6 +3713,8 @@ describe('architecture: the mail module (story 5-1a)', () => {
         const shell =
           file.path === join(SRC_ROOT, 'app.module.ts') || file.path === join(SRC_ROOT, 'jobs', 'jobs.module.ts');
         if (shell && /\/mail\/mail\.module$/.test(target)) continue;
+        // Story 2-9a (D13) — client-emails wires MailModule for its attachment registry.
+        if (file.path === join(SRC_ROOT, 'modules', 'client-emails', 'client-emails.module.ts') && /\/mail\/mail\.module$/.test(target)) continue;
         if (file.path === join(SRC_ROOT, 'main.ts') && /\/mail\/mail\.config$/.test(target)) continue;
         offenders.push(`${file.path}: ${target}`);
       }
@@ -3718,6 +3722,21 @@ describe('architecture: the mail module (story 5-1a)', () => {
     expect(offenders).toEqual([]);
     // Meaningful: tenancy's users command and the DTOs do import the facade.
     expect(facadeImporters).toBeGreaterThanOrEqual(3);
+  });
+
+  it('story 2-9a: the mail module imports nothing from inbound or client-emails — the attachment registry is the port', () => {
+    const offenders = mailFiles
+      .filter((file) => /from\s+['"][^'"]*(?:modules\/(?:inbound|client-emails)|\.\.\/(?:inbound|client-emails))\//.test(file.source))
+      .map((file) => file.path);
+    expect(offenders).toEqual([]);
+  });
+
+  it('story 2-9a (A13): the attachment render opens a READ ONLY transaction stamped with the row client', () => {
+    const source = readFileSync(join(mailRoot, 'mail-attachments.ts'), 'utf8');
+    const render = source.slice(source.indexOf('async render('));
+    expect(render).toMatch(/withTenantTransaction\(/);
+    expect(render).toMatch(/\{\s*accessMode:\s*'read only',\s*clientId\s*\}/);
+    expect(render).toMatch(/statement_timeout/);
   });
 
   it('the mail module imports nothing from tenancy', () => {
@@ -3793,6 +3812,8 @@ describe('architecture: the client-emails module (story 5-2b)', () => {
       '../outbound/outbound.module',
       '../catalog/catalog.module',
       '../inbound/inbound.module',
+      // Story 2-9a (D13) — the attachment registry's module.
+      '../mail/mail.module',
     ]);
     const offenders: string[] = [];
     for (const file of moduleFiles) {

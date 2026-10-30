@@ -220,7 +220,17 @@ export class ClientEmailsEnqueueHandler implements OnModuleInit {
       const dedupeKey = clientEmailDedupeKey(template, subjectId, recipient.email);
       const row =
         template === 'client-receipt'
-          ? await queueClientEmailInTx(tx, { tenantId, clientId, template, to: recipient.email, dedupeKey, params: params as ClientReceiptEmailParams })
+          ? await queueClientEmailInTx(tx, {
+              tenantId,
+              clientId,
+              template,
+              to: recipient.email,
+              dedupeKey,
+              params: params as ClientReceiptEmailParams,
+              // Story 2-9a (decision 17) — every receipt email carries its GRN,
+              // rendered at send time (no per-client switch).
+              attachment: { kind: 'grn-pdf', ref: subjectId },
+            })
           : await queueClientEmailInTx(tx, { tenantId, clientId, template, to: recipient.email, dedupeKey, params: params as ClientDispatchEmailParams });
       if (row === null) {
         deduped += 1;

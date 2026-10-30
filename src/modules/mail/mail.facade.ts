@@ -12,6 +12,7 @@ import {
   EMAIL_LIVE_STATUSES,
   EMAIL_TEMPLATE_PRIORITY,
   type ClientEmailTemplate,
+  type EmailAttachmentKind,
   type EmailStatus,
   type EmailTemplate,
 } from './mail-rules';
@@ -22,6 +23,13 @@ import type {
   PasswordChangedEmailParams,
   PasswordResetEmailParams,
 } from './templates';
+
+// Story 2-9a — the send-time attachment port: a domain module registers its
+// renderer on the registry (`client-emails` → the GRN PDF). Re-exported here,
+// the only seam other modules import.
+export { MailAttachmentRegistry } from './mail-attachments';
+export type { EmailAttachment, EmailAttachmentRenderer } from './mail-attachments';
+export { EMAIL_ATTACHMENT_KINDS, type EmailAttachmentKind } from './mail-rules';
 
 /**
  * Story 5-1a — the mail module's ONLY seam (`test/architecture.spec.ts`:
@@ -125,7 +133,16 @@ export type QueueClientEmailInput = {
   /** `{template}:{subjectId}:{email}` — unique per tenant: a re-delivered event queues nothing new. */
   readonly dedupeKey: string;
 } & (
-  | { readonly template: 'client-receipt'; readonly params: ClientReceiptEmailParams }
+  | {
+      readonly template: 'client-receipt';
+      readonly params: ClientReceiptEmailParams;
+      /**
+       * Story 2-9a (decision 17) — a file the sender renders at SEND time
+       * (`grn-pdf` with the GRN id). Omitted, the row's attachment columns
+       * are NULL — every 5-2b caller and row unchanged.
+       */
+      readonly attachment?: { readonly kind: EmailAttachmentKind; readonly ref: string };
+    }
   | { readonly template: 'client-dispatch'; readonly params: ClientDispatchEmailParams }
 );
 
@@ -159,6 +176,8 @@ export async function queueClientEmailInTx(tx: TenantTx, input: QueueClientEmail
       status,
       nextAttemptAt: sql`now()`,
       errorCode: skipCode,
+      attachmentKind: input.template === 'client-receipt' ? (input.attachment?.kind ?? null) : null,
+      attachmentRef: input.template === 'client-receipt' ? (input.attachment?.ref ?? null) : null,
     })
     .onConflictDoNothing({ target: [emailMessages.tenantId, emailMessages.dedupeKey], where: sql`dedupe_key IS NOT NULL` })
     .returning({ id: emailMessages.id });

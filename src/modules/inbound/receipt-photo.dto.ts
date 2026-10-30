@@ -2,6 +2,7 @@ import { ApiProperty } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import { IsOptional, IsString, Length } from 'class-validator';
 import { ATTACHMENT_IMAGE_TYPES } from '../attachments/attachments.facade';
+import { GrnArrivalDto, GrnDocumentRefDto, GrnExcessDto, GrnLineQcDto, GrnPartiesDto, GrnTotalsDto } from './receiving.dto';
 
 /**
  * Story 2-5a — the damage-photo shapes. A stored idempotency snapshot never
@@ -215,11 +216,61 @@ export class PortalGoodsReceiptLineDto {
 
   @ApiProperty({ type: [PortalReceiptPhotoDto] })
   photos!: PortalReceiptPhotoDto[];
+
+  // ── story 2-9a (additive) ──
+  @ApiProperty({ type: String, nullable: true })
+  damageReasonLabel!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  shortReasonLabel!: string | null;
+
+  @ApiProperty()
+  uom!: string;
+
+  @ApiProperty({ description: 'Decimal places of the UoM' })
+  uomPrecision!: number;
+
+  @ApiProperty({ type: String, nullable: true })
+  batchCode!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'IST calendar date' })
+  mfgDate!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'IST calendar date' })
+  expiryDate!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, enum: ['typed', 'derived', null] })
+  expirySource!: 'typed' | 'derived' | null;
+
+  @ApiProperty({ type: GrnExcessDto, description: 'Over-receipt units awaiting approval, approved and rejected' })
+  excess!: GrnExcessDto;
+
+  @ApiProperty({ type: GrnLineQcDto, description: 'The quality-check outcome of the line' })
+  qc!: GrnLineQcDto;
+
+  @ApiProperty()
+  serialCount!: number;
+
+  @ApiProperty()
+  unreadableSerialCount!: number;
 }
 
 export class PortalGoodsReceiptDetailDto extends PortalGoodsReceiptRowDto {
   @ApiProperty({ type: [PortalGoodsReceiptLineDto] })
   lines!: PortalGoodsReceiptLineDto[];
+
+  // ── story 2-9a (additive): the GRN document's header ──
+  @ApiProperty({ type: GrnPartiesDto })
+  parties!: GrnPartiesDto;
+
+  @ApiProperty({ type: GrnDocumentRefDto })
+  document!: GrnDocumentRefDto;
+
+  @ApiProperty({ type: GrnArrivalDto, nullable: true })
+  arrival!: GrnArrivalDto | null;
+
+  @ApiProperty({ type: GrnTotalsDto })
+  totals!: GrnTotalsDto;
 }
 
 /** The text part of the handheld's multipart upload (the `file` part carries the bytes). */

@@ -1,0 +1,25 @@
+// Jest Snapshot v1, https://jestjs.io/docs/snapshot-testing
+
+exports[`the GRN document (e2e, story 2-9a) the freeze in grn.submit (device path) decision 13: the stored snapshot and the grn.recorded payload carry no parties — the snapshot is exactly {goodsReceipt, …} as before 1`] = `
+[
+  "blindReasonCode",
+  "clientId",
+  "code",
+  "deviceId",
+  "id",
+  "lines",
+  "occurredAt",
+  "poId",
+  "recordedAt",
+  "recordedBy",
+  "status",
+  "tenantId",
+  "warehouseId",
+]
+`;
+
+exports[`the GRN document (e2e, story 2-9a) the freeze in grn.submit (device path) decision 13: the stored snapshot and the grn.recorded payload carry no parties — the snapshot is exactly {goodsReceipt, …} as before 2`] = `
+[
+  "goodsReceipt",
+]
+`;

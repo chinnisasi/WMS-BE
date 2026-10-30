@@ -119,6 +119,8 @@ export function buildReceiptEmailParams(
       short: totalsByUom(fact.lines.map((line) => ({ ...unitOf(names.skus, line.skuId), qty: line.shortQty ?? 0 }))),
     },
     qcHeldLines: names.qcHeldLines,
+    // Story 2-9a — the GRN's id: the portal link opens that receipt (decision 18).
+    grnId: fact.grnId,
   };
 }
 

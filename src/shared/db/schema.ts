@@ -2624,6 +2624,14 @@ export const goodsReceiptNotes = pgTable(
      * No FK (IMPLEMENTATION-GUIDE §3).
      */
     gateInId: uuid('gate_in_id'),
+    /**
+     * Story 2-9a — the parties the GRN document prints (`GrnPartiesSnapshotV1`:
+     * the warehouse, the client, the vendor as on the PO), frozen by
+     * `grn.submit` and never rewritten. NULL on a GRN recorded before 2-9a —
+     * its document prints the live parties with a note (no backfill).
+     * `goods_receipt_notes_document_parties_shape` (0115) checks the shape.
+     */
+    documentParties: jsonb('document_parties'),
     status: text('status').notNull().default('recorded'),
     deviceId: uuid('device_id').notNull(),
     recordedBy: uuid('recorded_by').notNull(),
@@ -3068,6 +3076,8 @@ export const overReceipts = pgTable(
     // Story 21-6 — the close guard's pending probe per document.
     index('over_receipts_tenant_po_idx').on(table.tenantId, table.poId),
     index('over_receipts_tenant_asn_idx').on(table.tenantId, table.asnId),
+    // Story 2-9a (D8) — the GRN document's over-receipt sums by line.
+    index('over_receipts_tenant_grn_line_idx').on(table.tenantId, table.grnLineId),
   ],
 );
 
@@ -6887,6 +6897,14 @@ export const emailMessages = pgTable(
      * reset, password changed), 1 for client mail (`EMAIL_TEMPLATE_PRIORITY`).
      */
     priority: smallint('priority').notNull().default(0),
+    /**
+     * Story 2-9a — a file the sender renders and attaches at send time:
+     * `grn-pdf` (the GRN document) with `attachment_ref` = the GRN id. Both or
+     * neither (`email_messages_attachment_pairing`), only on `client-receipt`
+     * (`email_messages_attachment_template_check`). Null on every other row.
+     */
+    attachmentKind: text('attachment_kind'),
+    attachmentRef: uuid('attachment_ref'),
     ...tenantTimestamps,
   },
   (table) => [

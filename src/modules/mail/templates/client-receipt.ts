@@ -53,7 +53,32 @@ export interface ClientReceiptEmailParams {
   readonly totals: { readonly received: string; readonly damaged: string; readonly short: string };
   /** How many lines were placed on a QC hold (the snapshot's `qcHeldLines`; 0 when absent). */
   readonly qcHeldLines: number;
+  /**
+   * Story 2-9a — the GRN's id: the portal link opens that receipt
+   * (`/portal/inbound?grn={id}`, decision 18). Absent on a row queued before
+   * 2-9a (the list link, 5-2b's bytes).
+   */
+  readonly grnId?: string;
 }
+
+/**
+ * Story 2-9a (D5) — what the sender attached: `none` (a row with no
+ * attachment — 5-2b's bytes exactly), `attached`, or sent WITHOUT the file
+ * because it was `too-large` or its render `failed` (A14, A16).
+ */
+export type ClientReceiptAttachmentState = 'none' | 'attached' | 'too-large' | 'failed';
+
+const UUID_LIKE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The attachment's file name in the body — the SAME rule as inbound's `grnDocumentFilename(code, 'pdf')` (mail imports nothing from inbound; `test/grn-document.spec.ts` pins the two equal). */
+export function attachedFileName(grnCode: string): string {
+  return `${grnCode.replace(/[^A-Za-z0-9._-]/g, '_') || 'GRN'}.pdf`;
+}
+
+export const RECEIPT_ATTACHMENT_TOO_LARGE =
+  'The GRN is too large to attach — download it from the client portal, or reply to this email to ask for it.';
+export const RECEIPT_ATTACHMENT_FAILED =
+  'The GRN could not be attached — download it from the client portal, or reply to this email to ask for it.';
 
 const WHAT = 'client-receipt params';
 
@@ -85,7 +110,15 @@ export function decodeClientReceiptParams(raw: unknown): ClientReceiptEmailParam
       short: textField(totals, 'short', WHAT),
     },
     qcHeldLines: countField(value, 'qcHeldLines', WHAT),
+    ...grnIdOf(value),
   };
+}
+
+/** Story 2-9a — optional: absent on a pre-2-9a row; present, it must be a uuid. */
+function grnIdOf(value: Record<string, unknown>): { grnId?: string } {
+  if (value.grnId === undefined) return {};
+  if (typeof value.grnId !== 'string' || !UUID_LIKE.test(value.grnId)) throw new Error(`${WHAT}: grnId is not a uuid`);
+  return { grnId: value.grnId };
 }
 
 export const RECEIPT_DISCREPANCY_NOTE =
@@ -96,7 +129,12 @@ export const RECEIPT_DISCREPANCY_NOTE =
  * `fallbackReplyTo` is the deployment's `EMAIL_REPLY_TO` (the footer reads
  * "reply to this email" only when SOME Reply-To exists — A10).
  */
-export function renderClientReceiptEmail(params: ClientReceiptEmailParams, portalUrl: string, fallbackReplyTo: string | null): RenderedEmail {
+export function renderClientReceiptEmail(
+  params: ClientReceiptEmailParams,
+  portalUrl: string,
+  fallbackReplyTo: string | null,
+  attachment: ClientReceiptAttachmentState = 'none',
+): RenderedEmail {
   const tenant = plainText(params.tenantName);
   const client = plainText(params.clientName);
   const warehouse = plainText(params.warehouseName);
@@ -129,6 +167,15 @@ export function renderClientReceiptEmail(params: ClientReceiptEmailParams, porta
       : `${params.qcHeldLines} ${params.qcHeldLines === 1 ? 'line is' : 'lines are'} held for quality check.`;
   const opening = `${tenant} received goods for ${client} at ${warehouse}.`;
   const portal = `If you have portal access, your receipts are at ${portalUrl}`;
+  // Story 2-9a — one sentence about the file; none at all on a pre-2-9a row.
+  const fileNote =
+    attachment === 'attached'
+      ? `The goods receipt note is attached (${plainText(attachedFileName(params.grnCode))}).`
+      : attachment === 'too-large'
+        ? RECEIPT_ATTACHMENT_TOO_LARGE
+        : attachment === 'failed'
+          ? RECEIPT_ATTACHMENT_FAILED
+          : null;
 
   const text = [
     opening,
@@ -147,6 +194,7 @@ export function renderClientReceiptEmail(params: ClientReceiptEmailParams, porta
     '',
     RECEIPT_DISCREPANCY_NOTE,
     '',
+    ...(fileNote === null ? [] : [fileNote, '']),
     portal,
     '',
     footer,
@@ -162,6 +210,7 @@ export function renderClientReceiptEmail(params: ClientReceiptEmailParams, porta
       ...(more === null ? [] : [`<p>${html(more)}</p>`]),
       `<p>${html(totals)}${qc === null ? '' : `<br>${html(qc)}`}</p>`,
       `<p>${html(RECEIPT_DISCREPANCY_NOTE)}</p>`,
+      ...(fileNote === null ? [] : [`<p>${html(fileNote)}</p>`]),
       `<p>If you have portal access, <a href="${html(portalUrl)}">see your receipts in the portal</a>.</p>`,
     ],
     footer,

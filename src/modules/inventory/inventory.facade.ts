@@ -499,6 +499,34 @@ function invalidCursor(): ProblemException {
 }
 
 /**
+ * Story 1-2b (exported by 2-9a, A12) — the grouped `qc.held` read behind
+ * `InventoryFacade.qcHeldTotalsInTx`: per hold and batch ref, the quantity
+ * its own events moved. Exported so `test/grn-document.spec.ts` EXPLAINs the
+ * REAL statement (it must ride `ledger_events_hold_ref_idx`).
+ */
+export function qcHeldTotalsQuery(tx: TenantTx, tenantId: string, warehouseIds: readonly string[], holdIds: readonly string[]) {
+  return tx
+    .select({
+      holdId: sql<string>`${ledgerEvents.referenceDoc}->>'holdId'`,
+      batchRef: ledgerEvents.batchRef,
+      quantity: sql<string>`sum(abs(${ledgerEvents.quantityDelta}))::bigint`,
+    })
+    .from(ledgerEvents)
+    .where(
+      and(
+        eq(ledgerEvents.tenantId, tenantId),
+        // The hold's own warehouse(s) and the `?` predicate: the partial
+        // `ledger_events_hold_ref_idx` (tenant, warehouse, holdId) applies.
+        inArray(ledgerEvents.warehouseId, [...warehouseIds]),
+        eq(ledgerEvents.type, 'qc.held'),
+        sql`${ledgerEvents.referenceDoc} ? 'holdId'`,
+        inArray(sql`${ledgerEvents.referenceDoc}->>'holdId'`, [...holdIds]),
+      ),
+    )
+    .groupBy(sql`${ledgerEvents.referenceDoc}->>'holdId'`, ledgerEvents.batchRef);
+}
+
+/**
  * The inventory module's public surface (Story 2.1): the ONLY way any other
  * module — or the api shell — consumes stock state. The stock/ledger tables
  * are module-exclusive; the architecture test fails any write from outside
@@ -2613,25 +2641,7 @@ export class InventoryFacade {
     if (holdIds.length === 0 || warehouseIds.length === 0) {
       return new Map();
     }
-    const rows = await tx
-      .select({
-        holdId: sql<string>`${ledgerEvents.referenceDoc}->>'holdId'`,
-        batchRef: ledgerEvents.batchRef,
-        quantity: sql<string>`sum(abs(${ledgerEvents.quantityDelta}))::bigint`,
-      })
-      .from(ledgerEvents)
-      .where(
-        and(
-          eq(ledgerEvents.tenantId, tenantId),
-          // The hold's own warehouse(s) and the `?` predicate: the partial
-          // `ledger_events_hold_ref_idx` (tenant, warehouse, holdId) applies.
-          inArray(ledgerEvents.warehouseId, [...warehouseIds]),
-          eq(ledgerEvents.type, 'qc.held'),
-          sql`${ledgerEvents.referenceDoc} ? 'holdId'`,
-          inArray(sql`${ledgerEvents.referenceDoc}->>'holdId'`, [...holdIds]),
-        ),
-      )
-      .groupBy(sql`${ledgerEvents.referenceDoc}->>'holdId'`, ledgerEvents.batchRef);
+    const rows = await qcHeldTotalsQuery(tx, tenantId, warehouseIds, holdIds);
     const totals = new Map<string, { quantity: number; batchRefs: (string | null)[] }>();
     for (const row of rows) {
       const entry = totals.get(row.holdId) ?? { quantity: 0, batchRefs: [] };

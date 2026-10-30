@@ -16,7 +16,7 @@ import {
   type LogEmailGateway,
   type OutgoingEmail,
 } from '../src/modules/mail/email.gateway';
-import { EMAIL_STATUSES, EMAIL_TEMPLATES } from '../src/modules/mail/mail-rules';
+import { EMAIL_ATTACHMENT_KINDS, EMAIL_STATUSES, EMAIL_TEMPLATES } from '../src/modules/mail/mail-rules';
 import { assertMailConfigured } from '../src/modules/mail/mail.config';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow, noOpIdempotencyKey } from './support/audit-guard';
@@ -764,6 +764,29 @@ describe('email service and invite emails (e2e, story 5-1a)', () => {
       expect(listed('email_messages_status_check')).toEqual([...EMAIL_STATUSES]);
       expect(listed('email_messages_template_check')).toEqual([...EMAIL_TEMPLATES]);
       expect(listed('email_messages_secret_wipe_check')).toEqual(['pending', 'sending']);
+      // Story 2-9a — the attachment kinds (0115), and the attachment allowed only on the receipt notice.
+      expect(listed('email_messages_attachment_kind_check')).toEqual([...EMAIL_ATTACHMENT_KINDS]);
+      expect(listed('email_messages_attachment_template_check')).toEqual(['client-receipt']);
+      expect(defs.find((d) => d.conname === 'email_messages_attachment_pairing')).toBeDefined();
+    });
+
+    it('story 2-9a: the 0115 probe ran — an attachment kind without a ref, and a grn-pdf on an invite, are refused by name', async () => {
+      const t = uuidv7();
+      const refusedBy = async (attachmentKind: string | null, attachmentRef: string | null, template: string, clientId: string | null, dedupe: string | null) => {
+        try {
+          await sql`
+            insert into email_messages (id, tenant_id, template, to_email, params, status, next_attempt_at, client_id, dedupe_key, priority, attachment_kind, attachment_ref)
+            values (${uuidv7()}, ${t}, ${template}, 'a@x.in', '{}'::jsonb, 'pending', now(), ${clientId}, ${dedupe}, ${template === 'user-invite' ? 0 : 1}, ${attachmentKind}, ${attachmentRef})`;
+          return null;
+        } catch (err) {
+          return (err as { constraint_name?: string }).constraint_name ?? 'unknown';
+        }
+      };
+      expect(await refusedBy('grn-pdf', null, 'client-receipt', uuidv7(), `k:${ulid()}`)).toBe('email_messages_attachment_pairing');
+      expect(await refusedBy('invoice-pdf', uuidv7(), 'client-receipt', uuidv7(), `k:${ulid()}`)).toBe('email_messages_attachment_kind_check');
+      expect(await refusedBy('grn-pdf', uuidv7(), 'user-invite', null, null)).toBe('email_messages_attachment_template_check');
+      expect(await refusedBy('grn-pdf', uuidv7(), 'client-receipt', uuidv7(), `k:${ulid()}`)).toBeNull();
+      await sql`delete from email_messages where tenant_id = ${t}`;
     });
 
     it('RLS: email_messages is invisible across tenants and unscoped (wms_rls_probe)', async () => {

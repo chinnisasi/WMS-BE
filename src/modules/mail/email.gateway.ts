@@ -2,6 +2,7 @@ import { Logger } from '@nestjs/common';
 import { GetSuppressedDestinationCommand, SendEmailCommand, SESv2Client } from '@aws-sdk/client-sesv2';
 import { assertMailConfigured } from './mail.config';
 import { boundedEmailCode, EMAIL_ERROR_CLASS, type EmailProvider, type EmailTemplate } from './mail-rules';
+import type { EmailAttachment } from './mail-attachments';
 
 /**
  * Story 5-1a — the `EmailGateway` port (the `PushGateway` model): the only
@@ -37,6 +38,8 @@ export interface OutgoingEmail {
   readonly subject: string;
   readonly text: string;
   readonly html: string;
+  /** Story 2-9a — files rendered at send time (the receipt notice's GRN PDF); absent on every other mail. */
+  readonly attachments?: readonly EmailAttachment[];
 }
 
 export type EmailSendResult =
@@ -182,6 +185,17 @@ export class SesEmailGateway implements EmailGateway {
                 Text: { Data: email.text, Charset: 'UTF-8' },
                 Html: { Data: email.html, Charset: 'UTF-8' },
               },
+              // Story 2-9a — SES v2 `Message.Attachments` (simple content).
+              ...(email.attachments === undefined || email.attachments.length === 0
+                ? {}
+                : {
+                    Attachments: email.attachments.map((file) => ({
+                      FileName: file.filename,
+                      ContentType: file.contentType,
+                      RawContent: file.content,
+                      ContentDisposition: 'ATTACHMENT' as const,
+                    })),
+                  }),
             },
           },
         }),

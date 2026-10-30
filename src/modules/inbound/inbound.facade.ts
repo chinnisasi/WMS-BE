@@ -9,11 +9,23 @@ import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { KeysetWindow, Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
-import { fullPrecisionInstant } from '../../shared/primitives/time';
+import { fullPrecisionInstant, nowIso } from '../../shared/primitives/time';
 import { fromMilli } from '../../shared/primitives/quantity';
 import { PORTAL_PAGE_DEFAULT_LIMIT } from '../../shared/primitives/portal-page';
 import { AttachmentsFacade } from '../attachments/attachments.facade';
 import { receiptPhotoFileNames } from './receipt-photo.command';
+import { GrnDocumentReader } from './grn-document.read';
+import {
+  grnDocumentFile,
+  grnDocumentView,
+  type GrnArrivalView,
+  type GrnDocumentFile,
+  type GrnDocumentFormat,
+  type GrnDocumentLineView,
+  type GrnDocumentRefView,
+  type GrnPartiesView,
+  type GrnTotalsView,
+} from './grn-document.view';
 import {
   portalAsnInTx,
   portalGoodsReceiptInTx,
@@ -142,8 +154,18 @@ function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
   }
 }
 
-/** Story 2-5a — the portal receipt detail (an exact key allowlist; `PortalGoodsReceiptDetailDto`). */
+/**
+ * Story 2-5a — the portal receipt detail (an exact key allowlist;
+ * `PortalGoodsReceiptDetailDto`). Story 2-9a adds the GRN document's header
+ * (`parties`, `document`, `arrival`, `totals`) and, per line, the batch, the
+ * dates, the UoM, the over-receipt and the QC outcome — every 2-5a key
+ * unchanged.
+ */
 export interface PortalGoodsReceiptDetail extends PortalGoodsReceiptRow {
+  readonly parties: GrnPartiesView;
+  readonly document: GrnDocumentRefView;
+  readonly arrival: GrnArrivalView | null;
+  readonly totals: GrnTotalsView;
   readonly lines: readonly {
     readonly lineNo: number;
     readonly skuCode: string;
@@ -153,6 +175,18 @@ export interface PortalGoodsReceiptDetail extends PortalGoodsReceiptRow {
     readonly damageReasonCode: string | null;
     readonly shortQty: number;
     readonly shortReasonCode: string | null;
+    readonly damageReasonLabel: string | null;
+    readonly shortReasonLabel: string | null;
+    readonly uom: string;
+    readonly uomPrecision: number;
+    readonly batchCode: string | null;
+    readonly mfgDate: string | null;
+    readonly expiryDate: string | null;
+    readonly expirySource: 'typed' | 'derived' | null;
+    readonly excess: GrnDocumentLineView['excess'];
+    readonly qc: GrnDocumentLineView['qc'];
+    readonly serialCount: number;
+    readonly unreadableSerialCount: number;
     readonly photos: readonly {
       readonly id: string;
       readonly status: 'attached' | 'removed';
@@ -182,6 +216,8 @@ export class InboundFacade {
     @Inject(AsnImportCommand) private readonly asnImportCommand: AsnImportCommand,
     // Story 2-5a — the portal receipt detail presigns its photos.
     @Inject(AttachmentsFacade) private readonly attachments: AttachmentsFacade,
+    // Story 2-9a — the GRN document's one read.
+    @Inject(GrnDocumentReader) private readonly grnDocuments: GrnDocumentReader,
   ) {}
 
   // ── story 21-7: the client portal's inbound reads ─────────────────────────
@@ -252,10 +288,24 @@ export class InboundFacade {
    * URL, no reason, no remover. The response is rebuilt key by key.
    */
   async portalGoodsReceipt(tenantId: string, clientId: string, grnId: string): Promise<PortalGoodsReceiptDetail | null> {
-    const read = await withTenantTransaction(this.db, tenantId, (tx) => portalGoodsReceiptInTx(tx, tenantId, clientId, grnId), {
-      clientId,
-    });
-    if (read === null) return null;
+    const printedAt = nowIso();
+    const both = await withTenantTransaction(
+      this.db,
+      tenantId,
+      async (tx) => {
+        const minimal = await portalGoodsReceiptInTx(tx, tenantId, clientId, grnId);
+        if (minimal === null) return null;
+        // Story 2-9a — the GRN document's model, under the same stamp and scope.
+        const doc = await this.grnDocuments.readInTx(tx, tenantId, grnId, { clientId }, printedAt);
+        return doc === null ? null : { minimal, view: grnDocumentView(doc) };
+      },
+      { accessMode: 'read only', clientId },
+    );
+    if (both === null) return null;
+    const read = both.minimal;
+    const view = both.view;
+    // The new line keys merge onto 2-5a's lines BY LINE ID, never by position (A8).
+    const docLines = new Map(view.lines.map((line) => [line.id, line]));
     const lineNos = new Map(read.lines.map((line) => [line.id, line.lineNo]));
     const fileNames = receiptPhotoFileNames(
       read.code,
@@ -300,18 +350,79 @@ export class InboundFacade {
       photoCount: read.photoCount,
       receivedAt: read.receivedAt,
       createdAt: read.createdAt,
-      lines: read.lines.map((line) => ({
-        lineNo: line.lineNo,
-        skuCode: line.skuCode,
-        skuName: line.skuName,
-        qty: line.qty,
-        damagedQty: line.damagedQty,
-        damageReasonCode: line.damageReasonCode,
-        shortQty: line.shortQty,
-        shortReasonCode: line.shortReasonCode,
-        photos: photosByLine.get(line.id) ?? [],
-      })),
+      parties: view.parties,
+      document: view.document,
+      arrival: view.arrival,
+      totals: view.totals,
+      lines: read.lines.map((line) => {
+        const doc = docLines.get(line.id);
+        return {
+          lineNo: line.lineNo,
+          skuCode: line.skuCode,
+          skuName: line.skuName,
+          qty: line.qty,
+          damagedQty: line.damagedQty,
+          damageReasonCode: line.damageReasonCode,
+          shortQty: line.shortQty,
+          shortReasonCode: line.shortReasonCode,
+          photos: photosByLine.get(line.id) ?? [],
+          damageReasonLabel: doc?.damageReasonLabel ?? null,
+          shortReasonLabel: doc?.shortReasonLabel ?? null,
+          uom: doc?.uom ?? '',
+          uomPrecision: doc?.uomPrecision ?? 3,
+          batchCode: doc?.batchCode ?? null,
+          mfgDate: doc?.mfgDate ?? null,
+          expiryDate: doc?.expiryDate ?? null,
+          expirySource: doc?.expirySource ?? null,
+          excess: {
+            pendingQty: doc?.excess.pendingQty ?? 0,
+            approvedQty: doc?.excess.approvedQty ?? 0,
+            rejectedQty: doc?.excess.rejectedQty ?? 0,
+          },
+          qc: {
+            status: doc?.qc.status ?? null,
+            heldQty: doc?.qc.heldQty ?? 0,
+            releasedQty: doc?.qc.releasedQty ?? 0,
+            passedQty: doc?.qc.passedQty ?? 0,
+            failedQty: doc?.qc.failedQty ?? 0,
+          },
+          serialCount: doc?.serialCount ?? 0,
+          unreadableSerialCount: doc?.unreadableSerialCount ?? 0,
+        };
+      }),
     };
+  }
+
+  /**
+   * Story 2-9a — `GET …/portal/inbound/goods-receipts/{grnId}/document/file`:
+   * the client's own GRN as a file, from the SAME read (`scope {clientId}`,
+   * a stamped read-only transaction) and the SAME renderer as the staff
+   * copy. Null for unknown, another client's or a null-client GRN (one 404).
+   */
+  async portalGoodsReceiptFile(tenantId: string, clientId: string, grnId: string, format: GrnDocumentFormat): Promise<GrnDocumentFile | null> {
+    const doc = await withTenantTransaction(this.db, tenantId, (tx) => this.grnDocuments.readInTx(tx, tenantId, grnId, { clientId }, nowIso()), {
+      accessMode: 'read only',
+      clientId,
+    });
+    return doc === null ? null : grnDocumentFile(doc, format);
+  }
+
+  /**
+   * Story 2-9a (decision 17) — the receipt email's attachment renderer, in
+   * the CALLER'S transaction (the mail registry opens it read-only and
+   * stamped with the row's client). Null when the read is — the GRN is not
+   * that client's, or is gone.
+   */
+  async grnDocumentPdfInTx(
+    tx: TenantTx,
+    tenantId: string,
+    clientId: string,
+    grnId: string,
+  ): Promise<{ filename: string; contentType: string; content: Uint8Array } | null> {
+    const doc = await this.grnDocuments.readInTx(tx, tenantId, grnId, { clientId }, nowIso());
+    if (doc === null) return null;
+    const file = await grnDocumentFile(doc, 'pdf');
+    return { filename: file.filename, contentType: file.contentType, content: new Uint8Array(file.body) };
   }
 
   // ── story 21-6: advance shipment notices ──────────────────────────────────
