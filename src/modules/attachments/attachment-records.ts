@@ -508,11 +508,17 @@ export async function listByParentInTx(
   return [...live, ...history.reverse()];
 }
 
-/** Per-line live and awaited counts for a set of receipts (the lines read and the GRN list rows). */
+/**
+ * Per-line live and awaited counts for a set of receipts (the lines read and
+ * the GRN list rows). Story 2-9a (A13) — an optional `clientId` adds
+ * `attachments.client_id = $client` (the portal and mail copies of the GRN
+ * document pass it); omitted, the read is unchanged.
+ */
 export async function photoCountsByParentInTx(
   tx: TenantTx,
   tenantId: string,
   grnIds: readonly string[],
+  clientId?: string,
 ): Promise<Map<string, { photoCount: number; pendingPhotoCount: number; byLine: Map<string, { photoCount: number; pendingPhotoCount: number }> }>> {
   const out = new Map<string, { photoCount: number; pendingPhotoCount: number; byLine: Map<string, { photoCount: number; pendingPhotoCount: number }> }>();
   if (grnIds.length === 0) return out;
@@ -529,6 +535,7 @@ export async function photoCountsByParentInTx(
         eq(attachments.tenantId, tenantId),
         inArray(attachments.ownerParentId, [...grnIds]),
         inArray(attachments.status, [...LIVE_ATTACHMENT_STATUSES]),
+        ...(clientId === undefined ? [] : [eq(attachments.clientId, clientId)]),
       ),
     )
     .groupBy(attachments.ownerParentId, attachments.ownerId);

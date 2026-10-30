@@ -37,7 +37,9 @@ import { InventoryFacade } from '../modules/inventory/inventory.facade';
 import {
   CatalogSnapshotQuery,
   CatalogSnapshotResponse,
+  GoodsReceiptDocumentDto,
   GoodsReceiptLinesResponse,
+  GrnDocumentFileQueryDto,
   GoodsReceiptListQuery,
   GoodsReceiptListResponse,
   GoodsReceiptResponse,
@@ -412,6 +414,72 @@ export class ReceivingController {
       limit: query.limit,
     });
     return { items: page.items, nextCursor: page.nextCursor };
+  }
+
+  @Get(':tenantId/receiving/goods-receipts/:grnId/document')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Story 2-9a — one goods receipt as its GRN document (the web's details drawer): the parties (frozen at receipt), the document, the gate-in arrival, every line with its batch, dates, condition, over-receipt and QC outcome, and the totals — open to any member; no audit row (a read)",
+  })
+  @ApiOkResponse({ type: GoodsReceiptDocumentDto })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed grnId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No such goods receipt in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'grnId', format: 'uuid', description: 'The goods receipt' })
+  async goodsReceiptDocument(
+    @Param('tenantId') tenantId: string,
+    @Param('grnId') grnId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<GoodsReceiptDocumentDto> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(grnId, 'grnId');
+    return this.receiving.goodsReceiptDocument(tenantId, grnId) as unknown as Promise<GoodsReceiptDocumentDto>;
+  }
+
+  @Get(':tenantId/receiving/goods-receipts/:grnId/document/file')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Story 2-9a — the GRN document as a file: the A4 PDF (`format=pdf`) or its lines as CSV (`format=csv`, UTF-8 with BOM). `Content-Disposition` names `{GRN code}.pdf` / `{GRN code}-lines.csv` (CORS hides it — the web builds the same name). Any member; no audit row',
+  })
+  @ApiProduces('application/pdf', 'text/csv')
+  @ApiResponse({
+    status: 200,
+    description: 'The file',
+    content: {
+      'application/pdf': { schema: { type: 'string', format: 'binary' } },
+      'text/csv': { schema: { type: 'string', format: 'binary' } },
+    },
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('format absent or not pdf|csv, or a malformed grnId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No such goods receipt in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'grnId', format: 'uuid', description: 'The goods receipt' })
+  async goodsReceiptDocumentFile(
+    @Param('tenantId') tenantId: string,
+    @Param('grnId') grnId: string,
+    @Query() query: GrnDocumentFileQueryDto,
+    @CurrentSession() session: TenantSession,
+    @Res() res: Response,
+  ): Promise<void> {
+    // A17 — the query DTO's shape check ran first (the ValidationPipe), then
+    // the guard; every refusal is thrown before the first header.
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(grnId, 'grnId');
+    const file = await this.receiving.goodsReceiptDocumentFile(tenantId, grnId, query.format);
+    res.status(200);
+    res.setHeader('Content-Type', file.contentType);
+    res.setHeader('Content-Length', String(file.body.length));
+    res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(file.body);
   }
 
   @Get(':tenantId/receiving/goods-receipts/:grnId/lines')

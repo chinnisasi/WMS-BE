@@ -77,6 +77,9 @@ import {
   PortalWarehouseListResponse,
 } from './portal.dto';
 import { PortalGoodsReceiptDetailDto, PortalGoodsReceiptListResponse } from '../modules/inbound/receipt-photo.dto';
+// Bound to @Query() — a value import (the ValidationPipe reads the class).
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { GrnDocumentFileQueryDto } from '../modules/inbound/receiving.dto';
 
 const PORTAL_401 = 'Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)';
 const PORTAL_403 =
@@ -561,6 +564,47 @@ export class PortalController {
     const grn = await this.inbound.portalGoodsReceipt(tenantId, session.clientId, grnId);
     if (grn === null) throw notFound('Goods receipt', grnId);
     return { ...grn, lines: grn.lines.map((line) => ({ ...line, photos: line.photos.map((photo) => ({ ...photo })) })) };
+  }
+
+  @Get(':tenantId/portal/inbound/goods-receipts/:grnId/document/file')
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Story 2-9a — one of this client's goods receipts as its GRN document: the A4 PDF (`format=pdf`, the same document the warehouse holds) or its lines as CSV (`format=csv`). Names `{GRN code}.pdf` / `{GRN code}-lines.csv`",
+  })
+  @ApiProduces('application/pdf', 'text/csv')
+  @ApiResponse({
+    status: 200,
+    description: 'The file',
+    content: {
+      'application/pdf': { schema: { type: 'string', format: 'binary' } },
+      'text/csv': { schema: { type: 'string', format: 'binary' } },
+    },
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('format absent or not pdf|csv, or a malformed grnId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("No such goods receipt of this client — unknown, another client's, or unattributed (not-found)") })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'grnId', format: 'uuid' })
+  async goodsReceiptFile(
+    @Param('tenantId') tenantId: string,
+    @Param('grnId') grnId: string,
+    @Query() query: GrnDocumentFileQueryDto,
+    @CurrentPortalSession() session: PortalSession,
+    @Res() res: Response,
+  ): Promise<void> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(grnId, 'grnId');
+    const file = await this.inbound.portalGoodsReceiptFile(tenantId, session.clientId, grnId, query.format);
+    if (file === null) throw notFound('Goods receipt', grnId);
+    res.status(200);
+    res.setHeader('Content-Type', file.contentType);
+    res.setHeader('Content-Length', String(file.body.length));
+    res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(file.body);
   }
 
   @Get(':tenantId/portal/inbound/purchase-orders')

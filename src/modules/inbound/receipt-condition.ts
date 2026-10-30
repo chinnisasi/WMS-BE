@@ -13,11 +13,56 @@
  * CHECKs in `drizzle/0087_receipt_line_condition.sql`, and `@IsIn` on the
  * DTO. `test/receipt-condition.spec.ts` pins the tuples against the CHECKs.
  */
+import type { BlindReasonCode } from './receiving.command';
+
 export const DAMAGE_REASON_CODES = ['crushed', 'wet', 'torn-packaging', 'broken', 'leaking', 'pest', 'other'] as const;
 export type DamageReasonCode = (typeof DAMAGE_REASON_CODES)[number];
 
 export const SHORT_REASON_CODES = ['not-shipped', 'short-packed', 'lost-in-transit', 'other'] as const;
 export type ShortReasonCode = (typeof SHORT_REASON_CODES)[number];
+
+/**
+ * Story 2-9a (A8, D9) — the reason codes in words, as the GRN document and
+ * its DTOs print them. `Record`s over the code tuples, so a new code fails
+ * typecheck until it has a label. The wording is copied verbatim from wms-fe
+ * `src/lib/grn-lines.ts` (damage, short) and `src/lib/asns.ts` (blind) —
+ * PENDING records unifying the two copies.
+ */
+export const DAMAGE_REASON_LABELS: Readonly<Record<DamageReasonCode, string>> = {
+  crushed: 'Crushed',
+  wet: 'Wet',
+  'torn-packaging': 'Torn packaging',
+  broken: 'Broken',
+  leaking: 'Leaking',
+  pest: 'Pest',
+  other: 'Other',
+};
+
+export const SHORT_REASON_LABELS: Readonly<Record<ShortReasonCode, string>> = {
+  'not-shipped': 'Not shipped',
+  'short-packed': 'Short-packed',
+  'lost-in-transit': 'Lost in transit',
+  other: 'Other',
+};
+
+export const BLIND_REASON_LABELS: Readonly<Record<BlindReasonCode, string>> = {
+  'unannounced-delivery': 'Unannounced delivery',
+  'po-not-found': 'PO not found',
+  other: 'Other',
+};
+
+/** A stored reason code in words — the code itself when this build does not know it; null for null. */
+export function damageReasonLabelOf(code: string | null): string | null {
+  return code === null ? null : (DAMAGE_REASON_LABELS[code as DamageReasonCode] ?? code);
+}
+
+export function shortReasonLabelOf(code: string | null): string | null {
+  return code === null ? null : (SHORT_REASON_LABELS[code as ShortReasonCode] ?? code);
+}
+
+export function blindReasonLabelOf(code: string | null): string | null {
+  return code === null ? null : (BLIND_REASON_LABELS[code as BlindReasonCode] ?? code);
+}
 
 export function isDamageReasonCode(value: unknown): value is DamageReasonCode {
   return typeof value === 'string' && (DAMAGE_REASON_CODES as readonly string[]).includes(value);

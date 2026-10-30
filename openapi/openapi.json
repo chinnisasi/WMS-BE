@@ -14508,6 +14508,202 @@
         ]
       }
     },
+    "/tenants/{tenantId}/receiving/goods-receipts/{grnId}/document": {
+      "get": {
+        "operationId": "ReceivingController_goodsReceiptDocument",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "grnId",
+            "required": true,
+            "in": "path",
+            "description": "The goods receipt",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GoodsReceiptDocumentDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed grnId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such goods receipt in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 2-9a — one goods receipt as its GRN document (the web's details drawer): the parties (frozen at receipt), the document, the gate-in arrival, every line with its batch, dates, condition, over-receipt and QC outcome, and the totals — open to any member; no audit row (a read)",
+        "tags": [
+          "receiving"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/goods-receipts/{grnId}/document/file": {
+      "get": {
+        "operationId": "ReceivingController_goodsReceiptDocumentFile",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "grnId",
+            "required": true,
+            "in": "path",
+            "description": "The goods receipt",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "format",
+            "required": true,
+            "in": "query",
+            "description": "The file: the A4 PDF, or the lines as CSV (UTF-8 with BOM)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pdf",
+                "csv"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The file",
+            "content": {
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "format absent or not pdf|csv, or a malformed grnId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such goods receipt in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 2-9a — the GRN document as a file: the A4 PDF (`format=pdf`) or its lines as CSV (`format=csv`, UTF-8 with BOM). `Content-Disposition` names `{GRN code}.pdf` / `{GRN code}-lines.csv` (CORS hides it — the web builds the same name). Any member; no audit row",
+        "tags": [
+          "receiving"
+        ]
+      }
+    },
     "/tenants/{tenantId}/receiving/goods-receipts/{grnId}/lines": {
       "get": {
         "operationId": "ReceivingController_listGoodsReceiptLines",
@@ -38188,6 +38384,113 @@
         ]
       }
     },
+    "/tenants/{tenantId}/portal/inbound/goods-receipts/{grnId}/document/file": {
+      "get": {
+        "operationId": "PortalController_goodsReceiptFile",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "grnId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "format",
+            "required": true,
+            "in": "query",
+            "description": "The file: the A4 PDF, or the lines as CSV (UTF-8 with BOM)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pdf",
+                "csv"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The file",
+            "content": {
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "format absent or not pdf|csv, or a malformed grnId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such goods receipt of this client — unknown, another client's, or unattributed (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 2-9a — one of this client's goods receipts as its GRN document: the A4 PDF (`format=pdf`, the same document the warehouse holds) or its lines as CSV (`format=csv`). Names `{GRN code}.pdf` / `{GRN code}-lines.csv`",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
     "/tenants/{tenantId}/portal/inbound/purchase-orders": {
       "get": {
         "operationId": "PortalController_purchaseOrders",
@@ -58260,6 +58563,595 @@
           "items"
         ]
       },
+      "GrnAddressDto": {
+        "type": "object",
+        "properties": {
+          "line1": {
+            "type": "string"
+          },
+          "line2": {
+            "type": "string",
+            "nullable": true
+          },
+          "city": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "description": "The warehouse's state name, or a client/vendor address's `State code {nn}`"
+          },
+          "pincode": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "line1",
+          "line2",
+          "city",
+          "state",
+          "pincode"
+        ]
+      },
+      "GrnWarehousePartyDto": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "legalName": {
+            "type": "string",
+            "nullable": true
+          },
+          "gstin": {
+            "type": "string",
+            "nullable": true
+          },
+          "address": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GrnAddressDto"
+              }
+            ]
+          },
+          "operatorName": {
+            "type": "string",
+            "description": "The warehouse operator (the tenant)"
+          }
+        },
+        "required": [
+          "code",
+          "name",
+          "legalName",
+          "gstin",
+          "address",
+          "operatorName"
+        ]
+      },
+      "GrnPartyDto": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "legalName": {
+            "type": "string",
+            "nullable": true
+          },
+          "gstin": {
+            "type": "string",
+            "nullable": true
+          },
+          "address": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GrnAddressDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "code",
+          "name",
+          "legalName",
+          "gstin",
+          "address"
+        ]
+      },
+      "GrnPartiesDto": {
+        "type": "object",
+        "properties": {
+          "frozen": {
+            "type": "boolean",
+            "description": "True when the parties were frozen at receipt; false on a GRN recorded before frozen documents (the parties are the current ones)"
+          },
+          "warehouse": {
+            "description": "Received at — no contact name or phone",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GrnWarehousePartyDto"
+              }
+            ]
+          },
+          "client": {
+            "nullable": true,
+            "description": "The owner of the goods; null on an older mixed-client receipt",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GrnPartyDto"
+              }
+            ]
+          },
+          "vendor": {
+            "nullable": true,
+            "description": "The supplier as on the PO (frozen at PO creation); null on an ASN or blind receipt",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GrnPartyDto"
+              }
+            ]
+          },
+          "supplierNote": {
+            "type": "string",
+            "nullable": true,
+            "description": "The supplier block in words when there is no vendor (an ASN, a blind receipt, a PO without one)"
+          }
+        },
+        "required": [
+          "frozen",
+          "warehouse",
+          "client",
+          "vendor",
+          "supplierNote"
+        ]
+      },
+      "GrnDocumentRefDto": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "po",
+              "asn",
+              "blind"
+            ]
+          },
+          "code": {
+            "type": "string",
+            "nullable": true
+          },
+          "blindReasonCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "blindReasonLabel": {
+            "type": "string",
+            "nullable": true
+          },
+          "label": {
+            "type": "string",
+            "description": "\"PO P-1\", \"ASN A-77\" or \"Blind receipt (Unannounced delivery)\""
+          }
+        },
+        "required": [
+          "kind",
+          "code",
+          "blindReasonCode",
+          "blindReasonLabel",
+          "label"
+        ]
+      },
+      "GrnArrivalDocumentDto": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "invoice",
+              "challan",
+              "bill_of_entry"
+            ]
+          },
+          "number": {
+            "type": "string"
+          },
+          "date": {
+            "type": "string",
+            "description": "YYYY-MM-DD"
+          },
+          "ewayBillNo": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "kind",
+          "number",
+          "date",
+          "ewayBillNo"
+        ]
+      },
+      "GrnArrivalDto": {
+        "type": "object",
+        "properties": {
+          "gateInCode": {
+            "type": "string"
+          },
+          "vehicleNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "containerNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "transporterName": {
+            "type": "string",
+            "nullable": true
+          },
+          "lrNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "sealStatus": {
+            "type": "string",
+            "enum": [
+              "intact",
+              "broken",
+              "none"
+            ]
+          },
+          "sealNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "dockDoor": {
+            "type": "string",
+            "nullable": true
+          },
+          "gatedInAt": {
+            "type": "string"
+          },
+          "unloadStartedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "unloadEndedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "documents": {
+            "description": "Only this GRN's own documents (a shared truck's other paperwork is omitted)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GrnArrivalDocumentDto"
+            }
+          },
+          "documentsOmitted": {
+            "type": "boolean",
+            "description": "True when the gate-in carried documents this GRN does not show"
+          }
+        },
+        "required": [
+          "gateInCode",
+          "vehicleNo",
+          "containerNo",
+          "transporterName",
+          "lrNumber",
+          "sealStatus",
+          "sealNumber",
+          "dockDoor",
+          "gatedInAt",
+          "unloadStartedAt",
+          "unloadEndedAt",
+          "documents",
+          "documentsOmitted"
+        ]
+      },
+      "GrnExcessDto": {
+        "type": "object",
+        "properties": {
+          "pendingQty": {
+            "type": "number"
+          },
+          "approvedQty": {
+            "type": "number"
+          },
+          "rejectedQty": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "pendingQty",
+          "approvedQty",
+          "rejectedQty"
+        ]
+      },
+      "GrnLineQcDto": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "on-hold",
+              "released",
+              "inspected",
+              null
+            ]
+          },
+          "heldQty": {
+            "type": "number",
+            "description": "Released + passed + failed + still on hold"
+          },
+          "releasedQty": {
+            "type": "number"
+          },
+          "passedQty": {
+            "type": "number"
+          },
+          "failedQty": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "status",
+          "heldQty",
+          "releasedQty",
+          "passedQty",
+          "failedQty"
+        ]
+      },
+      "GrnDocumentLineDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "lineNo": {
+            "type": "number",
+            "minimum": 1
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string",
+            "description": "The current SKU name (item descriptions are not frozen)"
+          },
+          "clientCode": {
+            "type": "string",
+            "description": "The line SKU's client"
+          },
+          "uom": {
+            "type": "string"
+          },
+          "uomPrecision": {
+            "type": "number",
+            "description": "Decimal places of the UoM"
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "mfgDate": {
+            "type": "string",
+            "nullable": true,
+            "description": "IST calendar date"
+          },
+          "expiryDate": {
+            "type": "string",
+            "nullable": true,
+            "description": "IST calendar date"
+          },
+          "expirySource": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "typed",
+              "derived",
+              null
+            ]
+          },
+          "expectedQty": {
+            "type": "number",
+            "nullable": true,
+            "description": "The PO line's ordered or the ASN line's announced quantity, as at print"
+          },
+          "goodQty": {
+            "type": "number",
+            "description": "Good units (an excess included)"
+          },
+          "damagedQty": {
+            "type": "number"
+          },
+          "damageReasonCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "damageReasonLabel": {
+            "type": "string",
+            "nullable": true
+          },
+          "shortQty": {
+            "type": "number"
+          },
+          "shortReasonCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "shortReasonLabel": {
+            "type": "string",
+            "nullable": true
+          },
+          "toleranceQty": {
+            "type": "number",
+            "description": "Units booked within the over-receipt tolerance"
+          },
+          "excess": {
+            "$ref": "#/components/schemas/GrnExcessDto"
+          },
+          "qc": {
+            "$ref": "#/components/schemas/GrnLineQcDto"
+          },
+          "serialCount": {
+            "type": "number",
+            "description": "Serials captured (applied + awaiting approval)"
+          },
+          "unreadableSerialCount": {
+            "type": "number"
+          },
+          "rejectedSerialCount": {
+            "type": "number"
+          },
+          "photoCount": {
+            "type": "number",
+            "description": "Attached damage photos"
+          }
+        },
+        "required": [
+          "id",
+          "lineNo",
+          "skuCode",
+          "skuName",
+          "clientCode",
+          "uom",
+          "uomPrecision",
+          "batchCode",
+          "mfgDate",
+          "expiryDate",
+          "expirySource",
+          "expectedQty",
+          "goodQty",
+          "damagedQty",
+          "damageReasonCode",
+          "damageReasonLabel",
+          "shortQty",
+          "shortReasonCode",
+          "shortReasonLabel",
+          "toleranceQty",
+          "excess",
+          "qc",
+          "serialCount",
+          "unreadableSerialCount",
+          "rejectedSerialCount",
+          "photoCount"
+        ]
+      },
+      "GrnUomTotalsDto": {
+        "type": "object",
+        "properties": {
+          "uom": {
+            "type": "string"
+          },
+          "goodQty": {
+            "type": "number"
+          },
+          "damagedQty": {
+            "type": "number"
+          },
+          "shortQty": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "uom",
+          "goodQty",
+          "damagedQty",
+          "shortQty"
+        ]
+      },
+      "GrnTotalsDto": {
+        "type": "object",
+        "properties": {
+          "lineCount": {
+            "type": "number"
+          },
+          "byUom": {
+            "description": "Per UoM, in first-appearance order",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GrnUomTotalsDto"
+            }
+          }
+        },
+        "required": [
+          "lineCount",
+          "byUom"
+        ]
+      },
+      "GoodsReceiptDocumentDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "receivedAt": {
+            "type": "string",
+            "description": "When the goods were received (the device time)"
+          },
+          "recordedAt": {
+            "type": "string"
+          },
+          "printedAt": {
+            "type": "string",
+            "description": "The read instant (over-receipt and QC are as at this time)"
+          },
+          "parties": {
+            "$ref": "#/components/schemas/GrnPartiesDto"
+          },
+          "document": {
+            "$ref": "#/components/schemas/GrnDocumentRefDto"
+          },
+          "arrival": {
+            "nullable": true,
+            "description": "Only when a gate-in is linked; as recorded on the gate-in",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GrnArrivalDto"
+              }
+            ]
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GrnDocumentLineDto"
+            }
+          },
+          "totals": {
+            "$ref": "#/components/schemas/GrnTotalsDto"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "receivedAt",
+          "recordedAt",
+          "printedAt",
+          "parties",
+          "document",
+          "arrival",
+          "lines",
+          "totals"
+        ]
+      },
       "GrnLineSerialEntryDto": {
         "type": "object",
         "properties": {
@@ -74667,6 +75559,66 @@
             "items": {
               "$ref": "#/components/schemas/PortalReceiptPhotoDto"
             }
+          },
+          "damageReasonLabel": {
+            "type": "string",
+            "nullable": true
+          },
+          "shortReasonLabel": {
+            "type": "string",
+            "nullable": true
+          },
+          "uom": {
+            "type": "string"
+          },
+          "uomPrecision": {
+            "type": "number",
+            "description": "Decimal places of the UoM"
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "mfgDate": {
+            "type": "string",
+            "nullable": true,
+            "description": "IST calendar date"
+          },
+          "expiryDate": {
+            "type": "string",
+            "nullable": true,
+            "description": "IST calendar date"
+          },
+          "expirySource": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "typed",
+              "derived",
+              null
+            ]
+          },
+          "excess": {
+            "description": "Over-receipt units awaiting approval, approved and rejected",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GrnExcessDto"
+              }
+            ]
+          },
+          "qc": {
+            "description": "The quality-check outcome of the line",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GrnLineQcDto"
+              }
+            ]
+          },
+          "serialCount": {
+            "type": "number"
+          },
+          "unreadableSerialCount": {
+            "type": "number"
           }
         },
         "required": [
@@ -74678,7 +75630,19 @@
           "damageReasonCode",
           "shortQty",
           "shortReasonCode",
-          "photos"
+          "photos",
+          "damageReasonLabel",
+          "shortReasonLabel",
+          "uom",
+          "uomPrecision",
+          "batchCode",
+          "mfgDate",
+          "expiryDate",
+          "expirySource",
+          "excess",
+          "qc",
+          "serialCount",
+          "unreadableSerialCount"
         ]
       },
       "PortalGoodsReceiptDetailDto": {
@@ -74735,6 +75699,24 @@
             "items": {
               "$ref": "#/components/schemas/PortalGoodsReceiptLineDto"
             }
+          },
+          "parties": {
+            "$ref": "#/components/schemas/GrnPartiesDto"
+          },
+          "document": {
+            "$ref": "#/components/schemas/GrnDocumentRefDto"
+          },
+          "arrival": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GrnArrivalDto"
+              }
+            ]
+          },
+          "totals": {
+            "$ref": "#/components/schemas/GrnTotalsDto"
           }
         },
         "required": [
@@ -74750,7 +75732,11 @@
           "photoCount",
           "receivedAt",
           "createdAt",
-          "lines"
+          "lines",
+          "parties",
+          "document",
+          "arrival",
+          "totals"
         ]
       },
       "PortalPurchaseOrderRowDto": {

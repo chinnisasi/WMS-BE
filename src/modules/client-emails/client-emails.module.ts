@@ -1,8 +1,11 @@
-import { Module } from '@nestjs/common';
+import { Inject, Module, type OnModuleInit } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
 import { OutboundModule } from '../outbound/outbound.module';
 import { CatalogModule } from '../catalog/catalog.module';
 import { InboundModule } from '../inbound/inbound.module';
+import { InboundFacade } from '../inbound/inbound.facade';
+import { MailModule } from '../mail/mail.module';
+import { MailAttachmentRegistry } from '../mail/mail.facade';
 import { ClientEmailsEnqueueHandler } from './client-emails.enqueue';
 import { ClientEmailsFacade } from './client-emails.facade';
 
@@ -23,8 +26,25 @@ import { ClientEmailsFacade } from './client-emails.facade';
  * `…InTx` functions.
  */
 @Module({
-  imports: [SharedModule, OutboundModule, CatalogModule, InboundModule],
+  // Story 2-9a (D13) — MailModule for its attachment registry (the singleton
+  // the sender holds).
+  imports: [SharedModule, OutboundModule, CatalogModule, InboundModule, MailModule],
   providers: [ClientEmailsEnqueueHandler, ClientEmailsFacade],
   exports: [ClientEmailsFacade],
 })
-export class ClientEmailsModule {}
+export class ClientEmailsModule implements OnModuleInit {
+  constructor(
+    @Inject(MailAttachmentRegistry) private readonly attachments: MailAttachmentRegistry,
+    @Inject(InboundFacade) private readonly inbound: InboundFacade,
+  ) {}
+
+  /**
+   * Story 2-9a (decision 17) — the receipt email's GRN PDF: mail renders it at
+   * send time through this renderer, in a read-only transaction stamped with
+   * the row's client (the portal's scope). Both process roles build the full
+   * `AppModule`, so the worker has it too.
+   */
+  onModuleInit(): void {
+    this.attachments.register('grn-pdf', (tx, tenantId, clientId, grnId) => this.inbound.grnDocumentPdfInTx(tx, tenantId, clientId, grnId));
+  }
+}

@@ -1950,3 +1950,305 @@ export class CatalogSnapshotResponse {
   })
   adjustReasons!: readonly CatalogAdjustReasonDto[];
 }
+
+// ── story 2-9a: the GRN document ────────────────────────────────────────────
+
+const GRN_QC_STATUS_ENUM = ['on-hold', 'released', 'inspected'] as const;
+
+/** Story 2-9a (A17) — `?format=pdf|csv` on the document file routes: required, a 400 when absent or anything else. */
+export class GrnDocumentFileQueryDto {
+  @ApiProperty({ enum: ['pdf', 'csv'], description: 'The file: the A4 PDF, or the lines as CSV (UTF-8 with BOM)' })
+  @IsIn(['pdf', 'csv'])
+  format!: 'pdf' | 'csv';
+}
+
+export class GrnAddressDto {
+  @ApiProperty()
+  line1!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  line2!: string | null;
+
+  @ApiProperty()
+  city!: string;
+
+  @ApiProperty({ description: "The warehouse's state name, or a client/vendor address's `State code {nn}`" })
+  state!: string;
+
+  @ApiProperty()
+  pincode!: string;
+}
+
+export class GrnPartyDto {
+  @ApiProperty()
+  code!: string;
+
+  @ApiProperty()
+  name!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  legalName!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  gstin!: string | null;
+
+  @ApiProperty({ type: GrnAddressDto, nullable: true })
+  address!: GrnAddressDto | null;
+}
+
+export class GrnWarehousePartyDto extends GrnPartyDto {
+  @ApiProperty({ description: 'The warehouse operator (the tenant)' })
+  operatorName!: string;
+}
+
+export class GrnPartiesDto {
+  @ApiProperty({ description: 'True when the parties were frozen at receipt; false on a GRN recorded before frozen documents (the parties are the current ones)' })
+  frozen!: boolean;
+
+  @ApiProperty({ type: GrnWarehousePartyDto, description: 'Received at — no contact name or phone' })
+  warehouse!: GrnWarehousePartyDto;
+
+  @ApiProperty({ type: GrnPartyDto, nullable: true, description: 'The owner of the goods; null on an older mixed-client receipt' })
+  client!: GrnPartyDto | null;
+
+  @ApiProperty({ type: GrnPartyDto, nullable: true, description: 'The supplier as on the PO (frozen at PO creation); null on an ASN or blind receipt' })
+  vendor!: GrnPartyDto | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The supplier block in words when there is no vendor (an ASN, a blind receipt, a PO without one)' })
+  supplierNote!: string | null;
+}
+
+export class GrnDocumentRefDto {
+  @ApiProperty({ enum: ['po', 'asn', 'blind'] })
+  kind!: 'po' | 'asn' | 'blind';
+
+  @ApiProperty({ type: String, nullable: true })
+  code!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  blindReasonCode!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  blindReasonLabel!: string | null;
+
+  @ApiProperty({ description: '"PO P-1", "ASN A-77" or "Blind receipt (Unannounced delivery)"' })
+  label!: string;
+}
+
+export class GrnArrivalDocumentDto {
+  @ApiProperty({ enum: ['invoice', 'challan', 'bill_of_entry'] })
+  kind!: string;
+
+  @ApiProperty()
+  number!: string;
+
+  @ApiProperty({ description: 'YYYY-MM-DD' })
+  date!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  ewayBillNo!: string | null;
+}
+
+export class GrnArrivalDto {
+  @ApiProperty()
+  gateInCode!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  vehicleNo!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  containerNo!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  transporterName!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  lrNumber!: string | null;
+
+  @ApiProperty({ enum: ['intact', 'broken', 'none'] })
+  sealStatus!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  sealNumber!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  dockDoor!: string | null;
+
+  @ApiProperty()
+  gatedInAt!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  unloadStartedAt!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  unloadEndedAt!: string | null;
+
+  @ApiProperty({ type: [GrnArrivalDocumentDto], description: "Only this GRN's own documents (a shared truck's other paperwork is omitted)" })
+  documents!: readonly GrnArrivalDocumentDto[];
+
+  @ApiProperty({ description: 'True when the gate-in carried documents this GRN does not show' })
+  documentsOmitted!: boolean;
+}
+
+export class GrnExcessDto {
+  @ApiProperty()
+  pendingQty!: number;
+
+  @ApiProperty()
+  approvedQty!: number;
+
+  @ApiProperty()
+  rejectedQty!: number;
+}
+
+export class GrnLineQcDto {
+  @ApiProperty({ type: String, nullable: true, enum: [...GRN_QC_STATUS_ENUM, null] })
+  status!: (typeof GRN_QC_STATUS_ENUM)[number] | null;
+
+  @ApiProperty({ description: 'Released + passed + failed + still on hold' })
+  heldQty!: number;
+
+  @ApiProperty()
+  releasedQty!: number;
+
+  @ApiProperty()
+  passedQty!: number;
+
+  @ApiProperty()
+  failedQty!: number;
+}
+
+export class GrnDocumentLineDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ minimum: 1 })
+  lineNo!: number;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty({ description: 'The current SKU name (item descriptions are not frozen)' })
+  skuName!: string;
+
+  @ApiProperty({ description: "The line SKU's client" })
+  clientCode!: string;
+
+  @ApiProperty()
+  uom!: string;
+
+  @ApiProperty({ description: 'Decimal places of the UoM' })
+  uomPrecision!: number;
+
+  @ApiProperty({ type: String, nullable: true })
+  batchCode!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'IST calendar date' })
+  mfgDate!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'IST calendar date' })
+  expiryDate!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, enum: ['typed', 'derived', null] })
+  expirySource!: 'typed' | 'derived' | null;
+
+  @ApiProperty({ type: Number, nullable: true, description: "The PO line's ordered or the ASN line's announced quantity, as at print" })
+  expectedQty!: number | null;
+
+  @ApiProperty({ description: 'Good units (an excess included)' })
+  goodQty!: number;
+
+  @ApiProperty()
+  damagedQty!: number;
+
+  @ApiProperty({ type: String, nullable: true })
+  damageReasonCode!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  damageReasonLabel!: string | null;
+
+  @ApiProperty()
+  shortQty!: number;
+
+  @ApiProperty({ type: String, nullable: true })
+  shortReasonCode!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  shortReasonLabel!: string | null;
+
+  @ApiProperty({ description: 'Units booked within the over-receipt tolerance' })
+  toleranceQty!: number;
+
+  @ApiProperty({ type: GrnExcessDto })
+  excess!: GrnExcessDto;
+
+  @ApiProperty({ type: GrnLineQcDto })
+  qc!: GrnLineQcDto;
+
+  @ApiProperty({ description: 'Serials captured (applied + awaiting approval)' })
+  serialCount!: number;
+
+  @ApiProperty()
+  unreadableSerialCount!: number;
+
+  @ApiProperty()
+  rejectedSerialCount!: number;
+
+  @ApiProperty({ description: 'Attached damage photos' })
+  photoCount!: number;
+}
+
+export class GrnUomTotalsDto {
+  @ApiProperty()
+  uom!: string;
+
+  @ApiProperty()
+  goodQty!: number;
+
+  @ApiProperty()
+  damagedQty!: number;
+
+  @ApiProperty()
+  shortQty!: number;
+}
+
+export class GrnTotalsDto {
+  @ApiProperty()
+  lineCount!: number;
+
+  @ApiProperty({ type: [GrnUomTotalsDto], description: 'Per UoM, in first-appearance order' })
+  byUom!: readonly GrnUomTotalsDto[];
+}
+
+/** Story 2-9a — `GET …/receiving/goods-receipts/{grnId}/document`. */
+export class GoodsReceiptDocumentDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty()
+  code!: string;
+
+  @ApiProperty({ description: 'When the goods were received (the device time)' })
+  receivedAt!: string;
+
+  @ApiProperty()
+  recordedAt!: string;
+
+  @ApiProperty({ description: 'The read instant (over-receipt and QC are as at this time)' })
+  printedAt!: string;
+
+  @ApiProperty({ type: GrnPartiesDto })
+  parties!: GrnPartiesDto;
+
+  @ApiProperty({ type: GrnDocumentRefDto })
+  document!: GrnDocumentRefDto;
+
+  @ApiProperty({ type: GrnArrivalDto, nullable: true, description: 'Only when a gate-in is linked; as recorded on the gate-in' })
+  arrival!: GrnArrivalDto | null;
+
+  @ApiProperty({ type: [GrnDocumentLineDto] })
+  lines!: readonly GrnDocumentLineDto[];
+
+  @ApiProperty({ type: GrnTotalsDto })
+  totals!: GrnTotalsDto;
+}

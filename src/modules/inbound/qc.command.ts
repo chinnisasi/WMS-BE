@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, eq, inArray, isNull } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
@@ -304,6 +304,39 @@ export interface ReturnHoldOutcome {
   readonly heldMilli: number;
   readonly returnedMilli: number;
   readonly failedMilli: number;
+}
+
+/** Story 2-9a — one GRN line's receipt-hold outcome, summed over its holds (milli-units). */
+export interface ReceiptLineQcOutcome {
+  readonly status: 'on-hold' | 'released' | 'inspected' | null;
+  /** = on hold + released + passed + failed. */
+  readonly heldMilli: number;
+  readonly onHoldMilli: number;
+  readonly releasedMilli: number;
+  readonly passedMilli: number;
+  readonly failedMilli: number;
+}
+
+interface InspectionTotals {
+  passedMilli: number;
+  failedMilli: number;
+}
+
+/**
+ * Stories 4-7a and 2-9a — the per-hold arithmetic, over facts already read:
+ * held = Σ the hold's `qc.held` events; returned = held on a release (a
+ * release is all-or-nothing), the passed rows on an inspection; failed = the
+ * failed rows. The map is a `Record` over `QcHoldStatus`, so a widened status
+ * vocabulary fails `typecheck` here (A2). The ONE implementation both
+ * `returnHoldOutcomeInTx` and `receiptQcOutcomesByGrnInTx` call.
+ */
+function holdOutcomeOf(status: QcHoldStatus, heldMilli: number, inspected: InspectionTotals | undefined): ReturnHoldOutcome {
+  const byStatus: Record<QcHoldStatus, () => { returnedMilli: number; failedMilli: number }> = {
+    open: () => ({ returnedMilli: 0, failedMilli: 0 }),
+    released: () => ({ returnedMilli: heldMilli, failedMilli: 0 }),
+    inspected: () => ({ returnedMilli: inspected?.passedMilli ?? 0, failedMilli: inspected?.failedMilli ?? 0 }),
+  };
+  return { status, heldMilli, ...byStatus[status]() };
 }
 
 /** Story 1-2b — `POST …/qc-holds/release-receipt`: every open receipt hold of one GRN. */
@@ -924,29 +957,104 @@ export class QcCommand {
     const arms = await this.inventory.qcHeldArmsInTx(tx, tenantId, hold.warehouseId, hold.id);
     const heldMilli = arms.reduce((sum, arm) => sum + arm.quantity, 0);
     const status = hold.status as QcHoldStatus;
-    const byStatus: Record<QcHoldStatus, () => Promise<{ returnedMilli: number; failedMilli: number }>> = {
-      open: async () => ({ returnedMilli: 0, failedMilli: 0 }),
-      released: async () => ({ returnedMilli: heldMilli, failedMilli: 0 }),
-      inspected: async () => {
-        const lines = await tx
-          .select({ outcome: qcInspectionLines.outcome, quantity: qcInspectionLines.quantity })
-          .from(qcInspectionLines)
-          .innerJoin(
-            qcInspections,
-            and(eq(qcInspections.tenantId, qcInspectionLines.tenantId), eq(qcInspections.id, qcInspectionLines.inspectionId)),
-          )
-          .where(and(eq(qcInspections.tenantId, tenantId), eq(qcInspections.holdId, hold.id)));
-        let passed = 0;
-        let failed = 0;
-        for (const line of lines) {
-          if (line.outcome === 'passed') passed += Number(line.quantity);
-          else failed += Number(line.quantity);
-        }
-        return { returnedMilli: passed, failedMilli: failed };
-      },
-    };
-    const outcome = await byStatus[status]();
-    return { status, heldMilli, ...outcome };
+    // The inspection rows are read only for an inspected hold (one-hold map).
+    const inspected = status === 'inspected' ? await this.inspectionTotalsInTx(tx, tenantId, [hold.id]) : new Map<string, InspectionTotals>();
+    return holdOutcomeOf(status, heldMilli, inspected.get(hold.id));
+  }
+
+  /**
+   * Story 2-9a (decision 9, A12) — the QC outcome of every RECEIPT hold on
+   * the given lines of one GRN, from QC's own record, summed per line (two
+   * holds may share a line — PENDING 1-2b). Three set-based reads, never one
+   * per hold: the holds; the grouped `qc.held` ledger totals
+   * (`InventoryFacade.qcHeldTotalsInTx`, the grouped form of
+   * `qcHeldArmsInTx`'s predicate); one inspection aggregate. Each hold goes
+   * through `holdOutcomeOf` — the SAME per-hold arithmetic
+   * `returnHoldOutcomeInTx` uses, so the two can never diverge. A line's
+   * status is `on-hold` if any hold is open, else `inspected` if any was
+   * inspected, else `released`, else absent from the map. A manual hold
+   * names no GRN line and is out of scope. `grnLineIds` are the caller's
+   * already-scoped lines (the portal read reached them through the client's
+   * SKUs), so the read never widens the scope.
+   */
+  async receiptQcOutcomesByGrnInTx(
+    tx: TenantTx,
+    tenantId: string,
+    grnId: string,
+    grnLineIds: readonly string[],
+  ): Promise<Map<string, ReceiptLineQcOutcome>> {
+    const out = new Map<string, ReceiptLineQcOutcome>();
+    if (grnLineIds.length === 0) return out;
+    const holds = await tx
+      .select({ id: qcHolds.id, status: qcHolds.status, warehouseId: qcHolds.warehouseId, grnLineId: qcHolds.grnLineId })
+      .from(qcHolds)
+      .innerJoin(goodsReceiptLines, and(eq(goodsReceiptLines.tenantId, qcHolds.tenantId), eq(goodsReceiptLines.id, qcHolds.grnLineId)))
+      .where(
+        and(
+          eq(qcHolds.tenantId, tenantId),
+          eq(qcHolds.kind, 'receipt'),
+          inArray(qcHolds.grnLineId, [...grnLineIds]),
+          eq(goodsReceiptLines.grnId, grnId),
+        ),
+      );
+    if (holds.length === 0) return out;
+    const held = await this.inventory.qcHeldTotalsInTx(
+      tx,
+      tenantId,
+      [...new Set(holds.map((hold) => hold.warehouseId))],
+      holds.map((hold) => hold.id),
+    );
+    const inspectedIds = holds.filter((hold) => hold.status === 'inspected').map((hold) => hold.id);
+    const inspected = inspectedIds.length === 0 ? new Map<string, InspectionTotals>() : await this.inspectionTotalsInTx(tx, tenantId, inspectedIds);
+    const acc = new Map<string, { held: number; onHold: number; released: number; passed: number; failed: number; statuses: Set<QcHoldStatus> }>();
+    for (const hold of holds) {
+      const status = hold.status as QcHoldStatus;
+      const outcome = holdOutcomeOf(status, held.get(hold.id)?.quantity ?? 0, inspected.get(hold.id));
+      const entry = acc.get(hold.grnLineId!) ?? { held: 0, onHold: 0, released: 0, passed: 0, failed: 0, statuses: new Set<QcHoldStatus>() };
+      entry.held += outcome.heldMilli;
+      if (status === 'open') entry.onHold += outcome.heldMilli;
+      if (status === 'released') entry.released += outcome.returnedMilli;
+      if (status === 'inspected') entry.passed += outcome.returnedMilli;
+      entry.failed += outcome.failedMilli;
+      entry.statuses.add(status);
+      acc.set(hold.grnLineId!, entry);
+    }
+    for (const [lineId, entry] of acc) {
+      out.set(lineId, {
+        status: entry.statuses.has('open') ? 'on-hold' : entry.statuses.has('inspected') ? 'inspected' : entry.statuses.has('released') ? 'released' : null,
+        heldMilli: entry.held,
+        onHoldMilli: entry.onHold,
+        releasedMilli: entry.released,
+        passedMilli: entry.passed,
+        failedMilli: entry.failed,
+      });
+    }
+    return out;
+  }
+
+  /** Passed and failed milli-units per hold, one grouped read over the inspection lines. */
+  private async inspectionTotalsInTx(tx: TenantTx, tenantId: string, holdIds: readonly string[]): Promise<Map<string, InspectionTotals>> {
+    const rows = await tx
+      .select({
+        holdId: qcInspections.holdId,
+        outcome: qcInspectionLines.outcome,
+        quantity: sql<string>`sum(${qcInspectionLines.quantity})::bigint`,
+      })
+      .from(qcInspectionLines)
+      .innerJoin(
+        qcInspections,
+        and(eq(qcInspections.tenantId, qcInspectionLines.tenantId), eq(qcInspections.id, qcInspectionLines.inspectionId)),
+      )
+      .where(and(eq(qcInspections.tenantId, tenantId), inArray(qcInspections.holdId, [...holdIds])))
+      .groupBy(qcInspections.holdId, qcInspectionLines.outcome);
+    const out = new Map<string, InspectionTotals>();
+    for (const row of rows) {
+      const entry = out.get(row.holdId) ?? { passedMilli: 0, failedMilli: 0 };
+      if (row.outcome === 'passed') entry.passedMilli += Number(row.quantity);
+      else entry.failedMilli += Number(row.quantity);
+      out.set(row.holdId, entry);
+    }
+    return out;
   }
 
   /**

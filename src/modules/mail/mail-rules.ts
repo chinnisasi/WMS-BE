@@ -104,6 +104,13 @@ export const EMAIL_LOCAL_CODES = [
   // Story 5-2b — a client email's contact was removed, changed its address or
   // dropped the event while the row was still queued.
   'unsubscribed',
+  // Story 2-9a — the send-time attachment: its render threw (transient — the
+  // last allowed attempt sends without the file, A14); no renderer is
+  // registered for its kind (config — a deployment fault); the call's render
+  // budget ran out before this row (released, no attempt spent — D7).
+  'attachment-failed',
+  'attachment-unavailable',
+  'attachment-deferred',
 ] as const;
 
 export type EmailErrorClass = 'transient' | 'config' | 'permanent' | 'unknown-outcome';
@@ -123,7 +130,11 @@ export const EMAIL_ERROR_CLASS: Readonly<Record<string, EmailErrorClass>> = {
   ThrottlingException: 'transient',
   ServiceUnavailable: 'transient',
   network: 'transient',
+  // Story 2-9a — the send-time render of an attachment threw.
+  'attachment-failed': 'transient',
   // config — the deployment is wrong: no attempt spent, logged once per tick, pending until expiry
+  // Story 2-9a — no renderer registered for the row's attachment kind.
+  'attachment-unavailable': 'config',
   // The daily sending quota: retrying with backoff would fail every queued
   // message within minutes — it waits (no attempt spent) until the quota resets or expiry.
   LimitExceededException: 'config',
@@ -162,3 +173,19 @@ export function boundedEmailCode(code: string): string {
   const cleaned = code.replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64);
   return cleaned === '' ? 'unknown-error' : cleaned;
 }
+
+/**
+ * Story 2-9a (decision 17) — the files a client notice may carry, rendered at
+ * SEND time by the renderer a domain module registered for the kind
+ * (`MailAttachmentRegistry`). Mirrored by 0115
+ * `email_messages_attachment_kind_check` (pinned by test/mail.spec.ts).
+ */
+export const EMAIL_ATTACHMENT_KINDS = ['grn-pdf'] as const;
+export type EmailAttachmentKind = (typeof EMAIL_ATTACHMENT_KINDS)[number];
+
+/** Above this an email is sent WITHOUT its file (the body says so — A16). The sender's default; a test lowers it. */
+export const EMAIL_ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024;
+/** One render's statement timeout (A15). */
+export const EMAIL_ATTACHMENT_STATEMENT_TIMEOUT = '15s';
+/** All renders of one `sendDue` call share this budget; past it the remaining rows are released (A15, D7). */
+export const EMAIL_ATTACHMENT_RENDER_BUDGET_MS = 60_000;

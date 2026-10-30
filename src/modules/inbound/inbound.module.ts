@@ -24,6 +24,7 @@ import { DockDoorCommand } from './dock-door.command';
 import { DockScheduleCommand } from './dock-schedule.command';
 import { DockAppointmentCommand } from './dock-appointment.command';
 import { DockFacade } from './dock.facade';
+import { GrnDocumentReader } from './grn-document.read';
 
 /**
  * Inbound module (Story 3.1): the purchase-order lifecycle — the upstream
@@ -91,6 +92,8 @@ import { DockFacade } from './dock.facade';
     DockScheduleCommand,
     DockAppointmentCommand,
     DockFacade,
+    // Story 2-9a — the GRN document's one read (staff, portal and mail copies).
+    GrnDocumentReader,
   ],
   exports: [InboundFacade, ReceivingFacade, QcFacade, GateInFacade, VendorReturnFacade, DockFacade],
 })

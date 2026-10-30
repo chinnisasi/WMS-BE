@@ -3,14 +3,14 @@ import { acceptInviteLinkFrom, resetPasswordLinkFrom, webLinkFrom } from '../lin
 import { decodeInviteParams, renderInviteEmail, type RenderedEmail } from './invite';
 import { decodePasswordResetParams, renderPasswordResetEmail } from './password-reset';
 import { decodePasswordChangedParams, renderPasswordChangedEmail } from './password-changed';
-import { decodeClientReceiptParams, renderClientReceiptEmail } from './client-receipt';
+import { decodeClientReceiptParams, renderClientReceiptEmail, type ClientReceiptAttachmentState } from './client-receipt';
 import { decodeClientDispatchParams, renderClientDispatchEmail } from './client-dispatch';
 
 export type { RenderedEmail } from './invite';
 export type { InviteEmailParams } from './invite';
 export type { PasswordResetEmailParams } from './password-reset';
 export type { PasswordChangedEmailParams } from './password-changed';
-export type { ClientReceiptEmailParams, ClientReceiptLineParams } from './client-receipt';
+export type { ClientReceiptAttachmentState, ClientReceiptEmailParams, ClientReceiptLineParams } from './client-receipt';
 export type { ClientDispatchEmailParams, ClientDispatchLineParams } from './client-dispatch';
 export { CLIENT_EMAIL_MAX_LINES } from './client-notice';
 
@@ -29,6 +29,11 @@ export interface RenderContext {
    * needs none.
    */
   readonly fallbackReplyTo?: string | null;
+  /**
+   * Story 2-9a (D5) — the receipt notice's file: what the sender attached
+   * (`client-receipt` only; absent = `none`, 5-2b's bytes).
+   */
+  readonly attachment?: ClientReceiptAttachmentState;
 }
 
 /**
@@ -57,12 +62,16 @@ export function renderEmail(template: EmailTemplate, params: unknown, context: R
     case 'password-changed':
       return renderPasswordChangedEmail(decodePasswordChangedParams(params), context.to);
     // Story 5-2b — the client notices: no secret; a link to the portal list.
-    case 'client-receipt':
+    case 'client-receipt': {
+      const receipt = decodeClientReceiptParams(params);
+      // Story 2-9a (decision 18) — the link opens THAT receipt when the params name it.
       return renderClientReceiptEmail(
-        decodeClientReceiptParams(params),
-        webLinkFrom(context.webBaseUrl, '/portal/inbound', {}),
+        receipt,
+        webLinkFrom(context.webBaseUrl, '/portal/inbound', receipt.grnId === undefined ? {} : { grn: receipt.grnId }),
         context.fallbackReplyTo ?? null,
+        context.attachment ?? 'none',
       );
+    }
     case 'client-dispatch':
       return renderClientDispatchEmail(
         decodeClientDispatchParams(params),

@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { and, asc, eq, lte, sql } from 'drizzle-orm';
 import type { PgUpdateSetSource } from 'drizzle-orm/pg-core';
 import { DATABASE } from '../../shared/shared.module';
@@ -8,7 +8,11 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { EMAIL_GATEWAY, type EmailGateway, type EmailSendResult, type OutgoingEmail } from './email.gateway';
 import { addressAllowed, mailConfigFromEnv } from './mail.config';
 import { openEmailSecret } from './mail-secrets';
+import { MailAttachmentRegistry, type EmailAttachment } from './mail-attachments';
+import type { ClientReceiptAttachmentState } from './templates';
 import {
+  EMAIL_ATTACHMENT_MAX_BYTES,
+  EMAIL_ATTACHMENT_RENDER_BUDGET_MS,
   EMAIL_CONFIG_FAULT_RETRY_MS,
   EMAIL_FINAL_STATUSES,
   EMAIL_MAX_ATTEMPTS,
@@ -23,6 +27,18 @@ import {
   type EmailTemplate,
 } from './mail-rules';
 import { renderEmail } from './templates';
+
+/**
+ * Story 2-9a (D6) — the sender's construction options (a test lowers the
+ * bounds; production uses the defaults — no env variable, A16).
+ */
+export const MAIL_SENDER_OPTIONS = 'MAIL_SENDER_OPTIONS' as const;
+export interface MailSenderOptions {
+  /** Above this an attachment is not attached (the body says so). Default `EMAIL_ATTACHMENT_MAX_BYTES`. */
+  readonly attachmentMaxBytes?: number;
+  /** The render budget of one `sendDue` call. Default `EMAIL_ATTACHMENT_RENDER_BUDGET_MS`. */
+  readonly renderBudgetMs?: number;
+}
 
 /** Story 5-2b (A7, D7) — the worker's per-call options. */
 export interface SendDueOptions {
@@ -124,10 +140,24 @@ const secs = (ms: number) => sql`make_interval(secs => ${ms / 1000}::double prec
 export class MailSender {
   private readonly logger = new Logger('MailSender');
 
+  private readonly attachmentMaxBytes: number;
+  private readonly renderBudgetMs: number;
+
   constructor(
     @Inject(DATABASE) private readonly db: Database,
     @Inject(EMAIL_GATEWAY) private readonly gateway: EmailGateway,
-  ) {}
+    /**
+     * Story 2-9a — the send-time attachment port (D6). Nest always injects
+     * the module's singleton; a sender constructed WITHOUT one (a suite's
+     * bare `new MailSender(db, gateway)`) sends every row as rendered at the
+     * claim, attaching nothing.
+     */
+    @Optional() @Inject(MailAttachmentRegistry) private readonly attachments?: MailAttachmentRegistry,
+    @Optional() @Inject(MAIL_SENDER_OPTIONS) options?: MailSenderOptions,
+  ) {
+    this.attachmentMaxBytes = options?.attachmentMaxBytes ?? EMAIL_ATTACHMENT_MAX_BYTES;
+    this.renderBudgetMs = options?.renderBudgetMs ?? EMAIL_ATTACHMENT_RENDER_BUDGET_MS;
+  }
 
   async sendDue(tenantId: string, limit?: number, options: SendDueOptions = {}): Promise<MailSendSummary> {
     const config = mailConfigFromEnv();
@@ -270,7 +300,27 @@ export class MailSender {
     let failed = claim.failed;
     let retried = 0;
     const configCodes = new Set<string>();
-    for (const claimed of claim.inFlight) {
+    // Story 2-9a (A15) — the attachment step's per-call state: the memo
+    // (successes only, keyed kind|client|ref — two recipients, one render) and
+    // the shared render budget.
+    const memo = new Map<string, EmailAttachment>();
+    const budget = { spentMs: 0 };
+    for (const inFlight of claim.inFlight) {
+      let claimed = inFlight;
+      // ── story 2-9a: 1. the attachment render, 2. a pure re-render ──────
+      if (inFlight.row.attachmentKind !== null && inFlight.row.attachmentRef !== null && this.attachments !== undefined) {
+        const step = await this.attachStep(tenantId, inFlight, memo, budget);
+        if (step.kind === 'released') continue; // pending again, no attempt spent
+        if (step.kind === 'outcome') {
+          if (step.outcome === null) continue;
+          if (step.outcome.kind === 'failed') failed += 1;
+          else retried += 1;
+          if (step.outcome.configCode !== null) configCodes.add(step.outcome.configCode);
+          continue;
+        }
+        claimed = step.claimed;
+      }
+      // ── 3. the live re-check and touch, 4. the send ─────────────────────
       const live = await withTenantTransaction(this.db, tenantId, (tx) =>
         tx
           .update(emailMessages)
@@ -307,6 +357,114 @@ export class MailSender {
       retried,
       configCodes: [...configCodes].sort(),
     };
+  }
+
+  /**
+   * Story 2-9a (decision 17, A14, A15, D7) — one claimed row's attachment,
+   * BEFORE its live re-check and send (so a slow render never outlives the
+   * check, and the body always matches what is attached):
+   *
+   *  - the call's render budget spent → the row is released to `pending`,
+   *    due now, `attachment-deferred`, NO attempt spent (written here, not as
+   *    a config fault — that would wait 60 s and log a deployment fault);
+   *  - no renderer registered for the kind → `attachment-unavailable`
+   *    (config: no attempt spent, pending + 60 s, the tick's config log);
+   *  - the render throws → `attachment-failed` (transient: an attempt,
+   *    backoff) — EXCEPT on the last allowed attempt, when the email is sent
+   *    without the file (A14: the attachment never costs the email);
+   *  - the renderer answers null (the GRN is not that client's, or is gone)
+   *    → sent without the file, logged at error level;
+   *  - larger than the bound → sent without the file;
+   *  - otherwise attached.
+   * The body is then re-rendered (pure) with the outcome. Logs carry ids only.
+   */
+  private async attachStep(
+    tenantId: string,
+    claimed: Claimed,
+    memo: Map<string, EmailAttachment>,
+    budget: { spentMs: number },
+  ): Promise<
+    | { kind: 'send'; claimed: Claimed }
+    | { kind: 'released' }
+    | { kind: 'outcome'; outcome: { kind: 'sent' | 'failed' | 'retried'; configCode: string | null } | null }
+  > {
+    const registry = this.attachments!;
+    const { row } = claimed;
+    const kind = row.attachmentKind!;
+    const ref = row.attachmentRef!;
+    const clientId = row.clientId;
+    if (!registry.has(kind) || clientId === null) {
+      const outcome = await withTenantTransaction(this.db, tenantId, (tx) =>
+        this.writeOutcome(tx, claimed, { ok: false, code: 'attachment-unavailable' }),
+      );
+      return { kind: 'outcome', outcome };
+    }
+    const key = `${kind}|${clientId}|${ref}`;
+    let file: EmailAttachment | null | undefined = memo.get(key);
+    let state: ClientReceiptAttachmentState = 'none';
+    if (file === undefined) {
+      if (budget.spentMs >= this.renderBudgetMs) {
+        await withTenantTransaction(this.db, tenantId, (tx) =>
+          tx
+            .update(emailMessages)
+            .set({ status: 'pending', errorCode: 'attachment-deferred', nextAttemptAt: sql`now()`, updatedAt: sql`now()` })
+            .where(and(eq(emailMessages.id, row.id), eq(emailMessages.status, 'sending'))),
+        );
+        return { kind: 'released' };
+      }
+      const started = Date.now();
+      try {
+        file = await registry.render(kind, tenantId, clientId, ref);
+      } catch (err) {
+        budget.spentMs += Date.now() - started;
+        if (row.attempts + 1 < EMAIL_MAX_ATTEMPTS) {
+          this.logger.warn(`client-email.attachment-failed message=${row.id} attempt=${row.attempts + 1} error=${(err as Error).name}`);
+          const outcome = await withTenantTransaction(this.db, tenantId, (tx) =>
+            this.writeOutcome(tx, claimed, { ok: false, code: 'attachment-failed' }),
+          );
+          return { kind: 'outcome', outcome };
+        }
+        this.logger.error(`client-email.attachment-failed message=${row.id} attempt=${row.attempts + 1} — the last attempt: sent without the file`);
+        file = null;
+        state = 'failed';
+      }
+      budget.spentMs += Date.now() - started;
+    }
+    if (file === null) {
+      if (state !== 'failed') this.logger.error(`client-email.attachment-missing message=${row.id} — sent without the file`);
+      state = 'failed';
+    } else if (file !== undefined && file.content.byteLength > this.attachmentMaxBytes) {
+      state = 'too-large';
+      this.logger.warn(`client-email.attachment-too-large message=${row.id} bytes=${file.content.byteLength} — sent without the file`);
+    } else {
+      state = 'attached';
+      memo.set(key, file!);
+    }
+    const config = mailConfigFromEnv();
+    let rendered;
+    try {
+      rendered = renderEmail(row.template as EmailTemplate, row.params, {
+        tenantId: row.tenantId,
+        to: row.toEmail,
+        webBaseUrl: config.webBaseUrl ?? '',
+        secret: null,
+        fallbackReplyTo: config.replyTo,
+        attachment: state,
+      });
+    } catch {
+      // The claim's render of the same params succeeded, so this cannot
+      // happen; if it ever does, the body rendered at the claim is sent
+      // without the file rather than lose the email.
+      return { kind: 'send', claimed };
+    }
+    const email: OutgoingEmail = {
+      ...claimed.email,
+      subject: rendered.subject,
+      text: rendered.text,
+      html: rendered.html,
+      ...(state === 'attached' ? { attachments: [file!] } : {}),
+    };
+    return { kind: 'send', claimed: { row, email } };
   }
 
   /**

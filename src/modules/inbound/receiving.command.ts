@@ -26,8 +26,14 @@ import {
   getClientsInTx,
   receivingPoliciesInTx,
   shareLockClientInTx,
+  getClientInTx,
+  clientPartySnapshotOf,
   type ClientReceivingPolicy,
 } from '../clients/clients.facade';
+// Story 2-9a — the GRN document's frozen parties.
+import type { VendorSnapshotV1 } from '../partners/partners.facade';
+import { grnWarehousePartyOf, type GrnPartiesSnapshotV1 } from './grn-document.types';
+import { liveWarehouseSnapshotInTx } from './vendor-return.read';
 import { QC_RECEIPT_PLACED_EVENT, QcCommand } from './qc.command';
 // Story 1-6d — licence enforcement: compliance's FREE functions (never its
 // Nest module — compliance forward-references inbound, so it would cycle).
@@ -1776,6 +1782,21 @@ export class ReceivingCommand {
         }
       }
 
+      // ── story 2-9a: freeze the parties the GRN document prints ─────────
+      // After every all-refused return (that arm writes no header) and
+      // BEFORE the tenant-wide GRN sequence lock (A4 — the extra reads never
+      // lengthen its hold). Plain reads, no locks: the lock order is
+      // unchanged. The warehouse carries no person (A3); the vendor is the
+      // PO's own frozen copy (A5 — no read: the locked PO row is in hand).
+      // Written only to the header: the snapshot, the hash and the
+      // `grn.recorded` payload are byte-identical (decision 13).
+      const documentParties: GrnPartiesSnapshotV1 = {
+        v: 1,
+        warehouse: grnWarehousePartyOf(await liveWarehouseSnapshotInTx(tx, command.tenantId, command.warehouseId)),
+        client: receiptClientId === null ? null : clientPartySnapshotOf(await getClientInTx(tx, command.tenantId, receiptClientId)),
+        vendor: po === null ? null : ((po.vendorSnapshot as VendorSnapshotV1 | null) ?? null),
+      };
+
       // ── the GRN header (server-assigned code under the tenant seq lock) ──
       const grnId = uuidv7();
       const code = await this.allocateGrnCode(tx, command.tenantId);
@@ -1792,6 +1813,8 @@ export class ReceivingCommand {
         blindReasonCode,
         // Story 2-3a — the linked gate-in, or null (unlinked or none named).
         gateInId: gateInLink?.linked?.id ?? null,
+        // Story 2-9a — the frozen parties (never in the snapshot or the payload).
+        documentParties,
         status: 'recorded',
         deviceId: command.deviceId,
         recordedBy: command.operatorUserId,

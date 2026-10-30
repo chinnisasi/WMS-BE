@@ -37,7 +37,7 @@ import { CatalogFacade, type BatchFacts } from '../catalog/catalog.facade';
 import type { PurchaseOrderLineSnapshot } from './po.command';
 import { lineSnapshot } from './po.command';
 import type { OverReceiptEntry } from './receiving.command';
-import { canonicalInstant, fullPrecisionInstant, istDateOf } from '../../shared/primitives/time';
+import { canonicalInstant, fullPrecisionInstant, istDateOf, nowIso } from '../../shared/primitives/time';
 import { fromMilli } from '../../shared/primitives/quantity';
 import { OPEN_ASN_STATUSES, asnLineSnapshot, type AsnLineSnapshot } from './asn.command';
 import { partnerNamesInTx, type VendorSnapshotV1 } from '../partners/partners.facade';
@@ -62,6 +62,9 @@ import {
 import { DAMAGE_REASON_CODES, SHORT_REASON_CODES } from './receipt-condition';
 import { LpnCommand, type LpnListSnapshot, type MintLpnsCommand, type MintLpnsSnapshot, type VoidLpnCommand, type VoidLpnSnapshot } from './lpn.command';
 import { LpnLabelsService, type LpnLabelsFile, type LpnLabelsRequest } from './lpn-labels';
+import { GrnDocumentReader } from './grn-document.read';
+import type { GrnDocument } from './grn-document.types';
+import { grnDocumentFile, grnDocumentView, type GrnDocumentFile, type GrnDocumentFormat, type GrnDocumentView } from './grn-document.view';
 
 /** One GRN header row of the GRN-list read (line counts + unit sums ride along). */
 export interface GoodsReceiptEntry {
@@ -372,7 +375,39 @@ export class ReceivingFacade {
     // Story 2-10b — LPNs at receiving (this module's own command and labels).
     @Inject(LpnCommand) private readonly lpns: LpnCommand,
     @Inject(LpnLabelsService) private readonly lpnLabels: LpnLabelsService,
+    // Story 2-9a — the GRN document's one read.
+    @Inject(GrnDocumentReader) private readonly grnDocuments: GrnDocumentReader,
   ) {}
+
+  // ── story 2-9a: the GRN document (staff copy, scope null) ────────────────
+
+  /**
+   * `GET …/goods-receipts/{grnId}/document` — the GRN document as JSON (the
+   * web's details drawer). Any member (a read — no capability, no audit row:
+   * decision 14). One read-only tenant transaction; unknown → 404.
+   */
+  async goodsReceiptDocument(tenantId: string, grnId: string): Promise<GrnDocumentView> {
+    return grnDocumentView(await this.readGrnDocument(tenantId, grnId));
+  }
+
+  /**
+   * `GET …/goods-receipts/{grnId}/document/file?format=pdf|csv` — the file,
+   * rendered AFTER the read transaction (`render(layout(read))`, the same
+   * function the portal and the receipt email use).
+   */
+  async goodsReceiptDocumentFile(tenantId: string, grnId: string, format: GrnDocumentFormat): Promise<GrnDocumentFile> {
+    return grnDocumentFile(await this.readGrnDocument(tenantId, grnId), format);
+  }
+
+  private async readGrnDocument(tenantId: string, grnId: string): Promise<GrnDocument> {
+    const doc = await withTenantTransaction(this.db, tenantId, (tx) => this.grnDocuments.readInTx(tx, tenantId, grnId, null, nowIso()), {
+      accessMode: 'read only',
+    });
+    if (doc === null) {
+      throw new ProblemException('not-found', 404, 'Goods receipt not found', `No goods receipt with id "${grnId}" exists in this tenant.`);
+    }
+    return doc;
+  }
 
   // ── story 2-10b: LPNs (licence plates) at receiving ──────────────────────
 
