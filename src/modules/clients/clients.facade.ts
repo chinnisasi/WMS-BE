@@ -6,6 +6,7 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import {
   CLIENT_EMAIL_EVENTS,
+  CONSIGNMENT_DOCUMENT_RULES,
   MAX_CLIENT_CONTACTS,
   MAX_CLIENT_LIST,
   clientContacts,
@@ -15,6 +16,7 @@ import {
   type ClientContactRole,
   type ClientEmailEvent,
   type ClientStatus,
+  type ConsignmentDocumentRuleValue,
 } from './clients.schema';
 import { latestClientEmailsByAddressInTx, type LatestClientEmail } from '../mail/mail.facade';
 import type { UserRole, UserStatus } from '../../shared/db/schema';
@@ -62,6 +64,12 @@ export interface ClientSnapshot {
    */
   readonly allocationPolicy?: ClientAllocationPolicy;
   /**
+   * Story 4-6a (A11, D8) — the client's consignment documents rule. OPTIONAL
+   * on the type: a `ClientMutationSnapshot` stored before 4-6a replays
+   * without it (every fresh read carries it).
+   */
+  readonly consignmentPolicy?: ClientConsignmentPolicy;
+  /**
    * Story 5-2b — the Reply-To of the client's receipt and dispatch emails
    * (null = the deployment's). OPTIONAL on the type: a
    * `ClientMutationSnapshot` stored before 5-2b replays without it (the
@@ -79,6 +87,38 @@ export interface ClientSnapshot {
 export interface ClientAllocationPolicy {
   readonly allocationRule: AllocationRule;
   readonly minOutboundShelfLifeDays: number | null;
+}
+
+/**
+ * Story 4-6a (A2, A11) — when the client's orders need the brand's documents
+ * recorded before they leave (`b2b` | `all` | `high-value`).
+ */
+export interface ClientConsignmentPolicy {
+  readonly documentRule: ConsignmentDocumentRuleValue;
+}
+
+/** Story 4-6a — the documents rule of a client row (an unknown stored rule reads `b2b`, fail-safe to the default). */
+export function consignmentPolicyOf(row: { readonly consignmentDocumentRule: string }): ClientConsignmentPolicy {
+  return {
+    documentRule: (CONSIGNMENT_DOCUMENT_RULES as readonly string[]).includes(row.consignmentDocumentRule)
+      ? (row.consignmentDocumentRule as ConsignmentDocumentRuleValue)
+      : 'b2b',
+  };
+}
+
+/** Story 4-6a (A13, A14) — the gate's client facts, for a set of clients in one query (unknown ids absent). */
+export async function consignmentPoliciesInTx(
+  tx: TenantTx,
+  tenantId: string,
+  clientIds: readonly string[],
+): Promise<Map<string, { readonly systemOwned: boolean; readonly code: string; readonly name: string; readonly documentRule: ConsignmentDocumentRuleValue }>> {
+  const ids = [...new Set(clientIds)];
+  if (ids.length === 0) return new Map();
+  const rows = await tx
+    .select({ id: clients.id, code: clients.code, name: clients.name, systemOwned: clients.systemOwned, consignmentDocumentRule: clients.consignmentDocumentRule })
+    .from(clients)
+    .where(and(eq(clients.tenantId, tenantId), inArray(clients.id, ids)));
+  return new Map(rows.map((row) => [row.id, { systemOwned: row.systemOwned, code: row.code, name: row.name, documentRule: consignmentPolicyOf(row).documentRule }]));
 }
 
 /** Story 4-3a — the policy every client starts with (and an unknown id reads). */
@@ -272,6 +312,7 @@ export function toClientSnapshot(row: typeof clients.$inferSelect): ClientSnapsh
     }),
     receivingPolicy: receivingPolicyOf(row),
     allocationPolicy: allocationPolicyOf(row),
+    consignmentPolicy: consignmentPolicyOf(row),
     emailReplyTo: row.emailReplyTo,
   };
 }
@@ -403,6 +444,26 @@ export class ClientsFacade {
         throw clientNotFound(clientId);
       }
       return allocationPolicyOf(row);
+    });
+  }
+
+  /**
+   * Story 4-6a (A11) — one client's consignment documents rule, 404 when the
+   * client is not this tenant's. A staff read (any operator session — never
+   * the portal).
+   */
+  async getConsignmentPolicy(tenantId: string, clientId: string): Promise<ClientConsignmentPolicy & { readonly systemOwned: boolean }> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select({ consignmentDocumentRule: clients.consignmentDocumentRule, systemOwned: clients.systemOwned })
+        .from(clients)
+        .where(and(eq(clients.tenantId, tenantId), eq(clients.id, clientId)))
+        .limit(1);
+      const row = rows[0];
+      if (row === undefined) {
+        throw clientNotFound(clientId);
+      }
+      return { ...consignmentPolicyOf(row), systemOwned: row.systemOwned };
     });
   }
 

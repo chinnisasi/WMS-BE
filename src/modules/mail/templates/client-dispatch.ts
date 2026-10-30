@@ -51,6 +51,14 @@ export interface ClientDispatchEmailParams {
   readonly moreLines: number;
   /** True when any line (shown or not) shipped short. */
   readonly shortShipped: boolean;
+  /**
+   * Story 4-6a (A20) — the brand's tax document the goods left under, from
+   * the consignment version stamped at dispatch (immutable, so the fact is
+   * frozen). Optional: a 5-2b / 4-5a row stored none and renders its bytes.
+   */
+  readonly taxDocument?: { readonly label: string; readonly number: string; readonly date: string } | null;
+  /** Story 4-6a (A20) — the e-way bill (number as recorded, its last valid day). */
+  readonly ewayBill?: { readonly number: string; readonly validUntil: string | null } | null;
 }
 
 const WHAT = 'client-dispatch params';
@@ -79,7 +87,31 @@ export function decodeClientDispatchParams(raw: unknown): ClientDispatchEmailPar
     })),
     moreLines: countField(value, 'moreLines', WHAT),
     shortShipped: value.shortShipped,
+    // Story 4-6a — optional keys, decoded only when present (an older row has none).
+    ...(value.taxDocument === undefined || value.taxDocument === null ? {} : { taxDocument: decodeTaxDocument(value.taxDocument) }),
+    ...(value.ewayBill === undefined || value.ewayBill === null ? {} : { ewayBill: decodeEwayBill(value.ewayBill) }),
   };
+}
+
+function decodeTaxDocument(raw: unknown): { label: string; number: string; date: string } {
+  const value = asRecord(raw, `${WHAT} taxDocument`);
+  return { label: textField(value, 'label', WHAT), number: textField(value, 'number', WHAT), date: textField(value, 'date', WHAT) };
+}
+
+function decodeEwayBill(raw: unknown): { number: string; validUntil: string | null } {
+  const value = asRecord(raw, `${WHAT} ewayBill`);
+  const number = textField(value, 'number', WHAT);
+  if (!/^[0-9]{12}$/.test(number)) throw new Error(`${WHAT}: ewayBill.number is not 12 digits`);
+  return { number, validUntil: nullableText(value, 'validUntil', WHAT) };
+}
+
+/** Story 4-6a (A20) — "Sent under Invoice INV-1 · E-way bill 1234 5678 9012", or null when no document was recorded. */
+export function dispatchDocumentsLine(params: Pick<ClientDispatchEmailParams, 'taxDocument' | 'ewayBill'>): string | null {
+  const doc = params.taxDocument ?? null;
+  if (doc === null) return null;
+  const eway = params.ewayBill ?? null;
+  const number = eway === null ? null : `${eway.number.slice(0, 4)} ${eway.number.slice(4, 8)} ${eway.number.slice(8)}`;
+  return `Sent under ${plainText(doc.label)} ${plainText(doc.number)}${number === null ? '' : ` · E-way bill ${number}`}`;
 }
 
 /** `{client}: order {ref} dispatched` plus ` — {carrier} {tracking}` when either is known. */
@@ -135,6 +167,8 @@ export function renderClientDispatchEmail(
   });
   const more = moreLinesNote(params.moreLines);
   const opening = `${tenant} dispatched order ${ref} for ${client} from ${warehouse}.`;
+  // Story 4-6a — one line when the brand's document was recorded; none on an older row.
+  const documents = dispatchDocumentsLine(params);
   // Story 4-5a — one sentence about the slip; none at all on a pre-4-5a row.
   const fileNote =
     attachment === 'attached'
@@ -149,6 +183,7 @@ export function renderClientDispatchEmail(
     opening,
     '',
     ...facts.map(([label, value]) => `${label}: ${value}`),
+    ...(documents === null ? [] : [documents]),
     '',
     ...rows.map(([code, name, ordered, dispatched, short]) => `- ${code} ${name}: ordered ${ordered}, dispatched ${dispatched}, short ${short}`),
     ...(more === null ? [] : [more]),
@@ -166,6 +201,7 @@ export function renderClientDispatchEmail(
     [
       `<p>${html(opening)}</p>`,
       `<p>${facts.map(([label, value]) => `${html(label)}: <strong>${html(value)}</strong>`).join('<br>')}</p>`,
+      ...(documents === null ? [] : [`<p>${html(documents)}</p>`]),
       htmlTable(['SKU', 'Name', 'Ordered', 'Dispatched', 'Short'], rows, new Set([2, 3, 4])),
       ...(more === null ? [] : [`<p>${html(more)}</p>`]),
       ...(params.shortShipped ? [`<p><strong>${html(DISPATCH_SHORT_NOTE)}</strong></p>`] : []),

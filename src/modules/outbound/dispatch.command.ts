@@ -26,6 +26,12 @@ import { followOnRemainder, orderLabelOf } from './follow-on';
 import type { OrderSource, OrderStatus } from './order.command';
 import type { Order } from '../../shared/db/schema';
 import { liveShipmentOfOrderInTx, shareOrderDocumentsInTx } from './client-arranged';
+import type { ConsignmentGateCode } from '../../shared/primitives/consignment-gate';
+import { istDateOf } from '../../shared/primitives/time';
+// Story 4-6a (A12) — the record's seam (a free-function file of invoicing,
+// guide §7h): outbound imports it, never the invoicing module.
+import { stampConsignmentDispatchedInTx } from '../invoicing/consignment-seam';
+import { consignmentFactsOfOrderRowsInTx, consignmentRefusal, judgeConsignment, NationalThresholds } from './consignment.read';
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
@@ -86,6 +92,16 @@ export interface DispatchOrderInTxInput {
   readonly idempotencyKey: string;
   /** Story 4-4a — the handover closing the order (named by the shared documents' payload). */
   readonly handoverId?: string | null;
+  /**
+   * Story 4-6a (A13, A32, D5) — the consignment gate's mode, REQUIRED of every
+   * caller (no default, so 4-9a's departure cannot forget it): `enforce` (the
+   * per-order dispatch, freight) judges the gate here and refuses 409 with the
+   * blocking code; `pre-checked` (the courier handover) already judged it once
+   * per parcel in its classification and passes the verdict.
+   */
+  readonly consignment: 'enforce' | 'pre-checked';
+  /** Story 4-6a (A14) — a pre-checked device parcel that left without its documents: the gate's code (else null). */
+  readonly complianceException: ConsignmentGateCode | null;
 }
 
 export interface DispatchOrderInTxResult {
@@ -93,6 +109,10 @@ export interface DispatchOrderInTxResult {
   /** The Valkey restores the caller applies AFTER its commit (`applyCounterRestores`). */
   readonly counterRestores: ReadonlyMap<string, number>;
   readonly followOnOrderId: string | null;
+  /** Story 4-6a — the pre-checked verdict carried through (null under `enforce`, which refuses instead). */
+  readonly complianceException: ConsignmentGateCode | null;
+  /** Story 4-6a (A13) — the consignment version stamped `dispatched_at`, or null when none was live. */
+  readonly consignmentRecordId: string | null;
 }
 
 // ── snapshots ────────────────────────────────────────────────────────────────
@@ -351,6 +371,8 @@ export class DispatchCommandService {
         recordedAt: now,
         batchesLocked: false,
         idempotencyKey,
+        consignment: 'enforce',
+        complianceException: null,
       });
 
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
@@ -425,6 +447,20 @@ export class DispatchCommandService {
           `Release the lot from the recall (close ${recallCodes.join(', ')} with it in releaseBatchIds), or cancel the order with restock (its units go back to stock; the lot stays blocked).`,
         { batchCodes: codes, recallCodes },
       );
+    }
+
+    // ── story 4-6a (A13, A31, D5): the consignment gate ─────────────────
+    // After the recall guard (a recalled lot is refused first on every
+    // path), before the flip. Read under the order lock: every writer of a
+    // consignment record holds it first (A21). Judged on the dispatch's own
+    // IST date (A32). `pre-checked` — a handover judged it in its
+    // classification, once per parcel; nothing is evaluated twice.
+    if (input.consignment === 'enforce') {
+      const facts = (await consignmentFactsOfOrderRowsInTx(tx, input.tenantId, [order])).get(order.id)!;
+      const day = istDateOf(input.occurredAt);
+      const threshold = await new NationalThresholds(tx).on(day);
+      const gate = judgeConsignment(facts, threshold, day);
+      if (gate.blocking) throw consignmentRefusal(facts, gate, threshold);
     }
 
     // ── Story 4.6c auto-stamp: the order's labelled shipment, if any ────
@@ -736,6 +772,11 @@ export class DispatchCommandService {
       },
     };
 
+    // ── story 4-6a (A13): the live consignment version is stamped ──────
+    // Immutable from here (the 0118 trigger): the sheet and the dispatch
+    // email print exactly this version.
+    const consignmentRecordId = await stampConsignmentDispatchedInTx(tx, input.tenantId, order.id, recordedAt);
+
     // ── in-transaction outbox append (AD-7) — before the idempotency key ─
     await this.outbox.append(tx, {
       messageId: uuidv7(),
@@ -767,7 +808,7 @@ export class DispatchCommandService {
       at: dispatchedAt,
     });
 
-    return { snapshot, counterRestores, followOnOrderId };
+    return { snapshot, counterRestores, followOnOrderId, complianceException: input.complianceException, consignmentRecordId };
   }
 
   /**

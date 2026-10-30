@@ -9,6 +9,7 @@ import { InvoiceGenerator } from './generator';
 import { EwayCommand } from './eway.command';
 import { EwayDeliveryHandler } from './eway.delivery';
 import { EWAY_GATEWAY, ewayGatewayFromEnv } from './eway-gateway';
+import { ConsignmentCommand } from './consignment.command';
 
 /**
  * The invoicing module (story 8-1): owns `invoices`, `invoice_lines`,
@@ -45,8 +46,10 @@ import { EWAY_GATEWAY, ewayGatewayFromEnv } from './eway-gateway';
     InvoicingFacade,
     EwayCommand,
     EwayDeliveryHandler,
+    // Story 4-6a — the order consignment record (staff and portal).
+    ConsignmentCommand,
     { provide: EWAY_GATEWAY, useFactory: () => ewayGatewayFromEnv() },
   ],
-  exports: [InvoicingFacade, InvoicingCommand, InvoiceGenerator, EwayCommand],
+  exports: [InvoicingFacade, InvoicingCommand, InvoiceGenerator, EwayCommand, ConsignmentCommand],
 })
 export class InvoicingModule {}

@@ -11,6 +11,7 @@ import { ProblemException, isUniqueViolationOn } from '../../shared/problem-deta
 import {
   assertBrandDocumentDateWindow,
   assertConsignmentCaptureShape,
+  CONSIGNMENT_CAPTURE_LIMITS,
   normalizeConsignmentCapture,
   type ConsignmentCaptureInput,
   type NormalizedConsignmentCapture,
@@ -65,8 +66,8 @@ export type { ClientReturnStatus, RtcAddressKind, RtcLineSource } from './client
 export const MAX_RTC_LINES = 200;
 /** The header note and the cancel reason, in code points (0113's CHECK). */
 export const MAX_RTC_NOTE = 500;
-/** A9 — the declared value's ceiling (paise; 0113's CHECK). */
-export const MAX_DECLARED_VALUE_PAISE = 1_000_000_000_000;
+/** A9 — the declared value's ceiling (paise; 0113's CHECK). Story 4-6a (A8): the shared capture limit, re-exported. */
+export const MAX_DECLARED_VALUE_PAISE = CONSIGNMENT_CAPTURE_LIMITS.declaredValueMaxPaise;
 /** A9 — a line's reason when none is given. */
 export const DEFAULT_RTC_REASON: ReturnDispositionReason = 'client-instruction';
 

@@ -20,6 +20,9 @@ import { MAX_SHEET_UPLOAD_BYTES } from '../shared/import/sheet-reader';
 import { SheetUploadFilter } from '../shared/import/upload-filter';
 import { ATTACHMENT_UPLOAD_LIMITS, AttachmentUploadFilter, CLIENT_LABEL_UPLOAD_LIMITS } from '../shared/import/attachment-upload-filter';
 import { parseCountField, parseReplaceField } from './shipping.controller';
+import { ConsignmentCommand } from '../modules/invoicing/consignment.command';
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { PortalConsignmentRecordResponse, PortalConsignmentsNeededResponse, PortalOrderConsignmentResponse, RecordConsignmentDto } from './consignment.dto';
 // Story 4-4a — the portal Shipping section's bodies and responses.
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import {
@@ -142,6 +145,9 @@ export class PortalController {
     @Inject(ReturnsFacade) private readonly returns: ReturnsFacade,
     // Story 3-7a — only the report download's audit row (stamped).
     @Inject(RecallsFacade) private readonly recalls: RecallsFacade,
+    // Story 4-6a (A51) — the portal consignment record (invoicing owns the
+    // table; the command opens its own client-stamped transaction).
+    @Inject(ConsignmentCommand) private readonly consignment: ConsignmentCommand,
   ) {}
 
   @Get(':tenantId/portal/me')
@@ -448,6 +454,78 @@ export class PortalController {
     const shipping = await this.outbound.portalOrderShipping(tenantId, session.clientId, orderId);
     if (shipping === null) throw notFound('Order', orderId);
     return JSON.parse(JSON.stringify(shipping)) as PortalOrderShippingResponse;
+  }
+
+  // ── story 4-6a: the order's Tax documents and the needed list ───────────
+
+  @Get(':tenantId/portal/consignments/needed')
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Story 4-6a — your open orders waiting for your tax invoice or e-way bill (packed first, at most 500), with what each needs' })
+  @ApiOkResponse({ type: PortalConsignmentsNeededResponse })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async consignmentsNeeded(@Param('tenantId') tenantId: string, @CurrentPortalSession() session: PortalSession): Promise<PortalConsignmentsNeededResponse> {
+    assertOwnTenant(session, tenantId);
+    const page = await this.outbound.portalConsignmentsNeeded(tenantId, session.clientId);
+    return JSON.parse(JSON.stringify(page)) as PortalConsignmentsNeededResponse;
+  }
+
+  @Get(':tenantId/portal/orders/:orderId/consignment')
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Story 4-6a — this order’s Tax documents: whether we need your invoice or e-way bill before it can leave, the live record and its history' })
+  @ApiOkResponse({ type: PortalOrderConsignmentResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed orderId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("No such order of this client — unknown, or another client's (not-found)") })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async orderConsignment(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @CurrentPortalSession() session: PortalSession,
+  ): Promise<PortalOrderConsignmentResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const view = await this.outbound.portalOrderConsignment(tenantId, session.clientId, orderId, session.userId);
+    if (view === null) throw notFound('Order', orderId);
+    return JSON.parse(JSON.stringify(view)) as PortalOrderConsignmentResponse;
+  }
+
+  @Post(':tenantId/portal/orders/:orderId/consignment')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Story 4-6a — orders.place: record (or amend — a new version) your tax invoice, delivery challan or bill of supply for this order, its declared value and its e-way bill (or an exemption). The WMS judges the e-way threshold from the declared value; the GSTIN defaults to yours.',
+  })
+  @ApiBody({ type: RecordConsignmentDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: PortalConsignmentRecordResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed field or a date outside its window (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("No such order of this client (not-found)") })
+  @ApiResponse({ status: 409, ...problemJsonResponse('order-not-open, client-departed, eway-bill-in-use (one of your own orders), consignment-version-limit, eway-threshold-missing') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('The declared value is below the COD amount (declared-value-below-order-value); the key reused (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async recordConsignment(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentPortalSession() session: PortalSession,
+    @Body() dto: RecordConsignmentDto,
+  ): Promise<PortalConsignmentRecordResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.consignment.recordPortalConsignment({ tenantId, clientId: session.clientId, actorUserId: session.userId, orderId, body: dto }, key);
+    return JSON.parse(JSON.stringify(snapshot)) as PortalConsignmentRecordResponse;
   }
 
   @Get(':tenantId/portal/orders/:orderId/packing-slip')

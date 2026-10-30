@@ -8,7 +8,16 @@
  * `email_messages_template_check` (0089; story 6-1c re-added it in 0103 with
  * the reset link and the password-changed notice).
  */
-export const EMAIL_TEMPLATES = ['user-invite', 'password-reset', 'password-changed', 'client-receipt', 'client-dispatch', 'client-shipment-document'] as const;
+export const EMAIL_TEMPLATES = [
+  'user-invite',
+  'password-reset',
+  'password-changed',
+  'client-receipt',
+  'client-dispatch',
+  'client-shipment-document',
+  // Story 4-6a (A20) — a packed order waits for the brand's documents (0118).
+  'client-documents-needed',
+] as const;
 export type EmailTemplate = (typeof EMAIL_TEMPLATES)[number];
 
 /**
@@ -17,7 +26,7 @@ export type EmailTemplate = (typeof EMAIL_TEMPLATES)[number];
  * through `queueClientEmailInTx` (each row carries `client_id` and a
  * `dedupe_key` — the 0114 `email_messages_client_shape_check`).
  */
-export const CLIENT_EMAIL_TEMPLATES = ['client-receipt', 'client-dispatch', 'client-shipment-document'] as const satisfies readonly EmailTemplate[];
+export const CLIENT_EMAIL_TEMPLATES = ['client-receipt', 'client-dispatch', 'client-shipment-document', 'client-documents-needed'] as const satisfies readonly EmailTemplate[];
 export type ClientEmailTemplate = (typeof CLIENT_EMAIL_TEMPLATES)[number];
 
 /**
@@ -35,6 +44,8 @@ export const EMAIL_TEMPLATE_PRIORITY = {
   'client-dispatch': 1,
   // Story 4-4a — a client notice: after account mail.
   'client-shipment-document': 1,
+  // Story 4-6a (A5) — a client notice: after account mail.
+  'client-documents-needed': 1,
 } as const satisfies Record<EmailTemplate, 0 | 1>;
 
 /**

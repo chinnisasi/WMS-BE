@@ -445,6 +445,16 @@ export const clients = pgTable(
      * `ClientsCommand.updateEmailSettings` (`clients.manage`).
      */
     emailReplyTo: text('email_reply_to'),
+    /**
+     * Story 4-6a (A2) — when the client's orders need the brand's tax document
+     * and e-way bill recorded before they leave: `b2b` (default), `all` or
+     * `high-value` (only the order's own value floor). The
+     * `clients_consignment_document_rule_check` CHECK lives ONLY in
+     * `drizzle/0118_consignment_compliance.sql`; mirrored by
+     * `CONSIGNMENT_DOCUMENT_RULES` (`clients.schema.ts`). Written only by
+     * `ClientsCommand.updateConsignmentPolicy` (`clients.manage`).
+     */
+    consignmentDocumentRule: text('consignment_document_rule').notNull().default('b2b'),
   },
   (table) => [
     uniqueIndex('clients_tenant_id_code_unique').on(table.tenantId, table.code),
@@ -3356,6 +3366,12 @@ export const vendorReturns = pgTable(
     vehicleNumber: text('vehicle_number'),
     packageCount: integer('package_count'),
     warehouseSnapshot: jsonb('warehouse_snapshot'),
+    /**
+     * Story 4-6a (A4, A22) — the consignment value the brand declares (paise,
+     * 0–10^12, `vendor_returns_declared_value_range`), judged against the
+     * e-way threshold at dispatch. NULL on an older caller's dispatch.
+     */
+    declaredValuePaise: bigint('declared_value_paise', { mode: 'number' }),
     // ── the cancel ───────────────────────────────────────────────────────
     cancelledBy: uuid('cancelled_by'),
     cancelledAt: timestamp('cancelled_at', { withTimezone: true, mode: 'string' }),
@@ -4474,6 +4490,14 @@ export const shipments = pgTable(
     voidReason: text('void_reason'),
     /** Story 4-4a — `web` | `portal` | `handheld`; null exactly on `carrier`. */
     recordedSurface: text('recorded_surface'),
+    /**
+     * Story 4-6a (A3, A14) — a device handover that dispatched this order
+     * without its brand documents (a stale snapshot): the gate's code. Only
+     * with a handover (`shipments_compliance_exception_check`, NOT VALID in
+     * 0118). Never rewritten — the worklist derives whether a late record
+     * cleared it.
+     */
+    complianceException: text('compliance_exception'),
     ...tenantTimestamps,
   },
   (table) => [
@@ -4510,6 +4534,10 @@ export const shipments = pgTable(
     index('shipments_tenant_tracking_number_idx').on(table.tenantId, table.trackingNumber),
     // One manifest's shipments, in labelled order (the detail read).
     index('shipments_manifest_id_idx').on(table.manifestId),
+    // Story 4-6a (0118, A3) — the "Left without documents" worklist.
+    index('shipments_compliance_exception_idx')
+      .on(table.tenantId, table.warehouseId, table.handedOverAt.desc(), table.id.desc())
+      .where(sql`compliance_exception IS NOT NULL`),
   ],
 );
 
@@ -6334,6 +6362,80 @@ export const ewayBills = pgTable(
 );
 
 export type EwayBill = typeof ewayBills.$inferSelect;
+
+/**
+ * Story 4-6a (A1) — one VERSION of a client order's consignment record: the
+ * brand's tax document (invoice, delivery challan or bill of supply), the
+ * consignor GSTIN with the brand frozen, the declared value with the e-way
+ * threshold verdict, and the e-way bill or its exemption. The WMS records,
+ * never issues (D4). One `live` version per order; a correction supersedes
+ * it; a withdrawal or a cancel ends it. A BEFORE UPDATE trigger
+ * (`order_consignment_records_immutable`) refuses any change but the ending
+ * columns and a one-way `dispatched_at` stamp. Owned by invoicing; reached
+ * from outbound through `invoicing/consignment-seam.ts`. Every CHECK and
+ * RLS (the 0041 client clause) live ONLY in
+ * `drizzle/0118_consignment_compliance.sql`. No FKs.
+ */
+export const orderConsignmentRecords = pgTable(
+  'order_consignment_records',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    orderId: uuid('order_id').notNull(),
+    seq: smallint('seq').notNull(),
+    /** `live` | `superseded` | `withdrawn` — `CONSIGNMENT_RECORD_STATUSES`. */
+    status: text('status').notNull(),
+    brandDocumentType: text('brand_document_type').notNull(),
+    brandDocumentNumber: text('brand_document_number').notNull(),
+    brandDocumentDate: date('brand_document_date', { mode: 'string' }).notNull(),
+    consignorGstin: text('consignor_gstin').notNull(),
+    /** `ClientPartySnapshotV1` with the resolved consignor GSTIN. */
+    consignorSnapshot: jsonb('consignor_snapshot').notNull(),
+    declaredValuePaise: bigint('declared_value_paise', { mode: 'number' }).notNull(),
+    destinationStateCode: text('destination_state_code'),
+    /** `intra` | `inter`, or NULL when the destination state is unknown. */
+    supplyType: text('supply_type'),
+    thresholdPaise: bigint('threshold_paise', { mode: 'number' }),
+    thresholdRule: text('threshold_rule').notNull(),
+    ewayRequired: boolean('eway_required').notNull(),
+    /** `recorded` | `pending` | `not-required` | `exempt`. */
+    ewayStatus: text('eway_status').notNull(),
+    ewayBillNumber: text('eway_bill_number'),
+    ewayBillDate: date('eway_bill_date', { mode: 'string' }),
+    ewayValidUntil: date('eway_valid_until', { mode: 'string' }),
+    ewayExemptionReason: text('eway_exemption_reason'),
+    ewayExemptionNote: text('eway_exemption_note'),
+    recordedAfterDispatch: boolean('recorded_after_dispatch').notNull(),
+    dispatchedAt: timestamp('dispatched_at', { withTimezone: true, mode: 'string' }),
+    /** `web` | `portal`. */
+    source: text('source').notNull(),
+    recordedBy: uuid('recorded_by').notNull(),
+    recordedAt: timestamp('recorded_at', { withTimezone: true, mode: 'string' }).notNull(),
+    endedAt: timestamp('ended_at', { withTimezone: true, mode: 'string' }),
+    endedBy: uuid('ended_by'),
+    endReason: text('end_reason'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('order_consignment_records_tenant_order_seq_unique').on(table.tenantId, table.orderId, table.seq),
+    uniqueIndex('order_consignment_records_live_unique')
+      .on(table.tenantId, table.orderId)
+      .where(sql`status = 'live'`),
+    // Per client, so no client can probe another's numbers (4-4a D6's reasoning).
+    uniqueIndex('order_consignment_records_client_eway_live_unique')
+      .on(table.tenantId, table.clientId, table.ewayBillNumber)
+      .where(sql`status = 'live' AND eway_bill_number IS NOT NULL`),
+    index('order_consignment_records_client_document_idx')
+      .on(table.tenantId, table.clientId, table.brandDocumentNumber)
+      .where(sql`status = 'live'`),
+  ],
+);
+
+export type OrderConsignmentRecord = typeof orderConsignmentRecords.$inferSelect;
 
 /**
  * Story 9-1 — the two facts the reporting read model needs that nothing

@@ -38,6 +38,8 @@ import {
   UpdateClientStatusDto,
   UpdateClientTaxDetailsDto,
 } from './clients.dto';
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { ConsignmentPolicyDto, ConsignmentPolicyResponse } from './consignment.dto';
 import type { ClientContactDto, ClientContactListItemDto, ClientDto } from './clients.dto';
 // Story 5-2b — bound to @Query(): a value import (the ValidationPipe reads the class).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
@@ -418,6 +420,64 @@ export class ClientsController {
     const untrackedSkuCount = await this.catalog.countUntrackedSkus(tenantId, clientId);
     const undatedBatchesOnHand = await this.inventory.undatedBatchesOnHandOfClient(tenantId, clientId);
     return { clientId, ...policy, untrackedSkuCount, undatedBatchesOnHand };
+  }
+
+  @Get(':tenantId/clients/:clientId/consignment-policy')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Story 4-6a — reads a client's consignment documents rule (b2b | all | high-value) — when its orders need the brand's tax document and e-way bill recorded before they leave (any staff session; never the portal)",
+  })
+  @ApiOkResponse({ type: ConsignmentPolicyResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed clientId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No client with this id exists in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'clientId', format: 'uuid' })
+  async getConsignmentPolicy(
+    @Param('tenantId') tenantId: string,
+    @Param('clientId') clientId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<ConsignmentPolicyResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam('clientId', clientId);
+    const policy = await this.facade.getConsignmentPolicy(tenantId, clientId);
+    return { clientId, documentRule: policy.documentRule };
+  }
+
+  @Put(':tenantId/clients/:clientId/consignment-policy')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Story 4-6a — sets a client's consignment documents rule (clients.manage): b2b (the default), all, or high-value. Any order whose own value is above the e-way threshold always needs the brand's documents. Refused for the self client (its goods are invoiced by the WMS). An unchanged rule is a no-op (nothing written or audited; the key is stored)",
+  })
+  @ApiBody({ type: ConsignmentPolicyDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: ClientResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed clientId, an unknown rule, or the self client (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks clients.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No client with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent request with the same Idempotency-Key (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'clientId', format: 'uuid' })
+  async updateConsignmentPolicy(
+    @Param('tenantId') tenantId: string,
+    @Param('clientId') clientId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: ConsignmentPolicyDto,
+  ): Promise<ClientResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam('clientId', clientId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.command.updateConsignmentPolicy({ tenantId, actorUserId: session.userId, clientId, documentRule: dto.documentRule }, key);
+    return { client: toClientDto(snapshot.client) };
   }
 
   @Put(':tenantId/clients/:clientId/allocation-policy')

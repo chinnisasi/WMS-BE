@@ -1,0 +1,528 @@
+{
+  "vectors": [
+    {
+      "name": "the self client is not applicable, whatever else holds",
+      "facts": {
+        "clientSystemOwned": true,
+        "documentRule": "all",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": "b2b",
+        "consigneeGstin": null,
+        "ratedValuePaise": null,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": null,
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "not-applicable",
+        "blocking": false,
+        "requiredBecause": null,
+        "valueFloorPaise": null,
+        "expiresToday": false,
+        "code": null
+      }
+    },
+    {
+      "name": "a cancelled order is not applicable",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "b2b",
+        "orderStatus": "cancelled",
+        "orderType": "b2b",
+        "consigneeGstin": null,
+        "ratedValuePaise": null,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": null,
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "not-applicable",
+        "blocking": false,
+        "requiredBecause": null,
+        "valueFloorPaise": null,
+        "expiresToday": false,
+        "code": null
+      }
+    },
+    {
+      "name": "a dispatched order reads dispatched, never blocking",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "b2b",
+        "orderStatus": "dispatched",
+        "orderType": "b2b",
+        "consigneeGstin": null,
+        "ratedValuePaise": null,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": null,
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "dispatched",
+        "blocking": false,
+        "requiredBecause": null,
+        "valueFloorPaise": null,
+        "expiresToday": false,
+        "code": null
+      }
+    },
+    {
+      "name": "a live record with its e-way bill owed blocks",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "high-value",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": "b2c",
+        "consigneeGstin": null,
+        "ratedValuePaise": null,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": {
+          "ewayStatus": "pending",
+          "ewayValidUntil": null
+        },
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "eway-required",
+        "blocking": true,
+        "requiredBecause": null,
+        "valueFloorPaise": null,
+        "expiresToday": false,
+        "code": "eway-bill-required"
+      }
+    },
+    {
+      "name": "a live bill valid until yesterday has expired",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "b2b",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": "b2b",
+        "consigneeGstin": null,
+        "ratedValuePaise": null,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": {
+          "ewayStatus": "recorded",
+          "ewayValidUntil": "2026-10-29"
+        },
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "eway-expired",
+        "blocking": true,
+        "requiredBecause": null,
+        "valueFloorPaise": null,
+        "expiresToday": false,
+        "code": "eway-bill-expired"
+      }
+    },
+    {
+      "name": "a live bill valid until today is ready and expires today",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "b2b",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": "b2b",
+        "consigneeGstin": null,
+        "ratedValuePaise": null,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": {
+          "ewayStatus": "recorded",
+          "ewayValidUntil": "2026-10-30"
+        },
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "ready",
+        "blocking": false,
+        "requiredBecause": null,
+        "valueFloorPaise": null,
+        "expiresToday": true,
+        "code": null
+      }
+    },
+    {
+      "name": "a live bill valid until tomorrow is ready",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "b2b",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": "b2b",
+        "consigneeGstin": null,
+        "ratedValuePaise": null,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": {
+          "ewayStatus": "recorded",
+          "ewayValidUntil": "2026-10-31"
+        },
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "ready",
+        "blocking": false,
+        "requiredBecause": null,
+        "valueFloorPaise": null,
+        "expiresToday": false,
+        "code": null
+      }
+    },
+    {
+      "name": "a live record below the threshold is ready",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "all",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": "b2c",
+        "consigneeGstin": null,
+        "ratedValuePaise": null,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": {
+          "ewayStatus": "not-required",
+          "ewayValidUntil": null
+        },
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "ready",
+        "blocking": false,
+        "requiredBecause": null,
+        "valueFloorPaise": null,
+        "expiresToday": false,
+        "code": null
+      }
+    },
+    {
+      "name": "a live exempt record is ready",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "b2b",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": "b2c",
+        "consigneeGstin": null,
+        "ratedValuePaise": 20000000,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": {
+          "ewayStatus": "exempt",
+          "ewayValidUntil": null
+        },
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "ready",
+        "blocking": false,
+        "requiredBecause": null,
+        "valueFloorPaise": 20000000,
+        "expiresToday": false,
+        "code": null
+      }
+    },
+    {
+      "name": "the rule all: a B2C order with no record is missing",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "all",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": "b2c",
+        "consigneeGstin": null,
+        "ratedValuePaise": null,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": null,
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "missing",
+        "blocking": true,
+        "requiredBecause": "policy-all",
+        "valueFloorPaise": null,
+        "expiresToday": false,
+        "code": "consignment-documents-missing"
+      }
+    },
+    {
+      "name": "the rule b2b: a B2B order with no record is missing",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "b2b",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": "b2b",
+        "consigneeGstin": null,
+        "ratedValuePaise": null,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": null,
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "missing",
+        "blocking": true,
+        "requiredBecause": "policy-b2b",
+        "valueFloorPaise": null,
+        "expiresToday": false,
+        "code": "consignment-documents-missing"
+      }
+    },
+    {
+      "name": "the rule b2b: a legacy order with a consignee GSTIN is B2B",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "b2b",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": null,
+        "consigneeGstin": "27ABCDE1234F1Z5",
+        "ratedValuePaise": null,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": null,
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "missing",
+        "blocking": true,
+        "requiredBecause": "policy-b2b",
+        "valueFloorPaise": null,
+        "expiresToday": false,
+        "code": "consignment-documents-missing"
+      }
+    },
+    {
+      "name": "the rule b2b: a legacy order without a GSTIN is not B2B",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "b2b",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": null,
+        "consigneeGstin": null,
+        "ratedValuePaise": null,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": null,
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "not-required",
+        "blocking": false,
+        "requiredBecause": null,
+        "valueFloorPaise": null,
+        "expiresToday": false,
+        "code": null
+      }
+    },
+    {
+      "name": "the rule b2b: a B2C order with no figures needs nothing",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "b2b",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": "b2c",
+        "consigneeGstin": null,
+        "ratedValuePaise": null,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": null,
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "not-required",
+        "blocking": false,
+        "requiredBecause": null,
+        "valueFloorPaise": null,
+        "expiresToday": false,
+        "code": null
+      }
+    },
+    {
+      "name": "the floor: two lines at Rs 30,000 exceed the threshold",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "b2b",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": "b2c",
+        "consigneeGstin": null,
+        "ratedValuePaise": 6000000,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": null,
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "missing",
+        "blocking": true,
+        "requiredBecause": "value",
+        "valueFloorPaise": 6000000,
+        "expiresToday": false,
+        "code": "consignment-documents-missing"
+      }
+    },
+    {
+      "name": "the floor equal to the threshold needs nothing (strictly above)",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "b2b",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": "b2c",
+        "consigneeGstin": null,
+        "ratedValuePaise": 5000000,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": null,
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "not-required",
+        "blocking": false,
+        "requiredBecause": null,
+        "valueFloorPaise": 5000000,
+        "expiresToday": false,
+        "code": null
+      }
+    },
+    {
+      "name": "the floor one paisa above the threshold is missing",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "b2b",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": "b2c",
+        "consigneeGstin": null,
+        "ratedValuePaise": 5000001,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": null,
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "missing",
+        "blocking": true,
+        "requiredBecause": "value",
+        "valueFloorPaise": 5000001,
+        "expiresToday": false,
+        "code": "consignment-documents-missing"
+      }
+    },
+    {
+      "name": "the COD amount alone sets the floor",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "b2b",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": "b2c",
+        "consigneeGstin": null,
+        "ratedValuePaise": 100000,
+        "codAmountPaise": 8000000,
+        "nationalThresholdPaise": 5000000,
+        "live": null,
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "missing",
+        "blocking": true,
+        "requiredBecause": "value",
+        "valueFloorPaise": 8000000,
+        "expiresToday": false,
+        "code": "consignment-documents-missing"
+      }
+    },
+    {
+      "name": "the floor applies under high-value",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "high-value",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": "b2c",
+        "consigneeGstin": null,
+        "ratedValuePaise": null,
+        "codAmountPaise": 5000001,
+        "nationalThresholdPaise": 5000000,
+        "live": null,
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "missing",
+        "blocking": true,
+        "requiredBecause": "value",
+        "valueFloorPaise": 5000001,
+        "expiresToday": false,
+        "code": "consignment-documents-missing"
+      }
+    },
+    {
+      "name": "high-value: a B2B order under the threshold needs nothing",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "high-value",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": "b2b",
+        "consigneeGstin": null,
+        "ratedValuePaise": 4999999,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": null,
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "not-required",
+        "blocking": false,
+        "requiredBecause": null,
+        "valueFloorPaise": 4999999,
+        "expiresToday": false,
+        "code": null
+      }
+    },
+    {
+      "name": "an accepted order is judged like a packed one",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "b2b",
+        "orderStatus": "accepted",
+        "orderType": "b2b",
+        "consigneeGstin": null,
+        "ratedValuePaise": null,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": null,
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "missing",
+        "blocking": true,
+        "requiredBecause": "policy-b2b",
+        "valueFloorPaise": null,
+        "expiresToday": false,
+        "code": "consignment-documents-missing"
+      }
+    },
+    {
+      "name": "the rule all wins over the floor reason",
+      "facts": {
+        "clientSystemOwned": false,
+        "documentRule": "all",
+        "orderStatus": "ready_to_dispatch",
+        "orderType": "b2c",
+        "consigneeGstin": null,
+        "ratedValuePaise": 9000000,
+        "codAmountPaise": null,
+        "nationalThresholdPaise": 5000000,
+        "live": null,
+        "istDate": "2026-10-30"
+      },
+      "expected": {
+        "state": "missing",
+        "blocking": true,
+        "requiredBecause": "policy-all",
+        "valueFloorPaise": 9000000,
+        "expiresToday": false,
+        "code": "consignment-documents-missing"
+      }
+    }
+  ]
+}

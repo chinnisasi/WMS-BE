@@ -24,6 +24,7 @@ import {
   CLIENT_EMAIL_EVENTS,
   CLIENT_EMAIL_EVENT_TEMPLATE,
   CLIENT_NAME_MAX,
+  CONSIGNMENT_DOCUMENT_RULES,
   MAX_CLIENT_CONTACTS,
   MIN_SHELF_LIFE_DAYS_MAX,
   MIN_SHELF_LIFE_DAYS_MIN,
@@ -244,6 +245,14 @@ export interface UpdateAllocationPolicyCommand {
   readonly clientId: string;
   readonly allocationRule: string;
   readonly minOutboundShelfLifeDays: number | null;
+}
+
+/** Story 4-6a (A11) — `PUT …/clients/{clientId}/consignment-policy`. */
+export interface UpdateConsignmentPolicyCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly clientId: string;
+  readonly documentRule: string;
 }
 
 export interface AddClientContactCommand {
@@ -908,6 +917,73 @@ export class ClientsCommand {
   }
 
   /**
+   * Story 4-6a (A11) — the client's consignment documents rule
+   * (`clients.manage`), the `updateAllocationPolicy` skeleton: hash (`arm:
+   * 'consignment-policy'`) → authority → replay → `lockClientForEdit` → replay
+   * again → guards (the `self` client → 400: its goods are invoiced by the
+   * WMS; an unknown rule → 400, behind the replay) → unchanged: a declared
+   * no-op that STORES the key (`clients.consignmentPolicy:unchanged`) → the
+   * update → audit `client.consignment_policy_updated` with before/after →
+   * key.
+   */
+  async updateConsignmentPolicy(command: UpdateConsignmentPolicyCommand, idempotencyKey: string): Promise<ClientMutationSnapshot> {
+    const documentRule = typeof command.documentRule === 'string' ? command.documentRule.trim() : command.documentRule;
+    const payloadHash = hashCommandPayload({
+      arm: 'consignment-policy',
+      tenantId: command.tenantId,
+      clientId: command.clientId,
+      documentRule,
+    });
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'clients.manage');
+      const replayed = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) {
+        return replayed;
+      }
+      const current = await this.lockClientForEdit(tx, command.tenantId, command.clientId);
+      const replayedUnderLock = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) {
+        return replayedUnderLock;
+      }
+      if (current.systemOwned) {
+        throw new ProblemException(
+          'validation-failed',
+          400,
+          'Invalid consignment policy',
+          "The tenant's own goods are invoiced by the WMS — the consignment documents rule applies to client brands only.",
+        );
+      }
+      if (typeof documentRule !== 'string' || !(CONSIGNMENT_DOCUMENT_RULES as readonly string[]).includes(documentRule)) {
+        throw new ProblemException(
+          'validation-failed',
+          400,
+          'Invalid consignment policy',
+          `documentRule must be one of ${JSON.stringify(CONSIGNMENT_DOCUMENT_RULES)} (got ${JSON.stringify(documentRule)}).`,
+        );
+      }
+      if (documentRule === current.consignmentDocumentRule) {
+        // A declared no-op (`clients.consignmentPolicy:unchanged`): nothing
+        // written or audited, the key stored.
+        const unchanged: ClientMutationSnapshot = { client: toClientSnapshot(current) };
+        await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, unchanged);
+        return unchanged;
+      }
+      const rows = await tx
+        .update(clients)
+        .set({ consignmentDocumentRule: documentRule, updatedAt: nowIso() })
+        .where(and(eq(clients.tenantId, command.tenantId), eq(clients.id, current.id)))
+        .returning();
+      const snapshot: ClientMutationSnapshot = { client: toClientSnapshot(rows[0]!) };
+      await this.audit(tx, command.tenantId, command.actorUserId, 'client.consignment_policy_updated', current.id, idempotencyKey, {
+        documentRule: { before: current.consignmentDocumentRule, after: documentRule },
+      });
+      await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+      return snapshot;
+    });
+  }
+
+  /**
    * Story 1-2a — add a contact to a client (`clients.manage`). The house
    * skeleton: normalize + hash (`arm: 'contact-add'`) → authority → replay →
    * lock the client `FOR NO KEY UPDATE` (404) → replay again → the shape
@@ -1282,7 +1358,8 @@ export class ClientsCommand {
       | 'client.contact_added'
       | 'client.contact_edited'
       | 'client.contact_removed'
-      | 'client.email_settings_updated',
+      | 'client.email_settings_updated'
+      | 'client.consignment_policy_updated',
     clientId: string,
     reference: string,
     /** Story 2-4b — `{field: {before, after}}`, written only when given (the receiving policy edit). */

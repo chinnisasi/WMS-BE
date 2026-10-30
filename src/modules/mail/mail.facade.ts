@@ -18,6 +18,7 @@ import {
 } from './mail-rules';
 import type {
   ClientDispatchEmailParams,
+  ClientDocumentsNeededEmailParams,
   ClientReceiptEmailParams,
   ClientShipmentDocumentEmailParams,
   InviteEmailParams,
@@ -60,6 +61,9 @@ export type { ClientEmailTemplate, EmailStatus, EmailTemplate } from './mail-rul
 export type {
   ClientDispatchEmailParams,
   ClientDispatchLineParams,
+  ClientDocumentsNeededEmailParams,
+  DocumentsNeededKind,
+  DocumentsNeededReason,
   ClientShipmentDocumentEmailParams,
   ClientShipmentDocumentParcelParams,
   ShipmentDocumentKind,
@@ -165,6 +169,12 @@ export type QueueClientEmailInput = {
        * attached at send time (`email_messages_shipment_document_attachment`).
        */
       readonly attachment: { readonly kind: 'stored-file'; readonly ref: string };
+    }
+  | {
+      /** Story 4-6a (A20) — the documents-needed reminder: no file. */
+      readonly template: 'client-documents-needed';
+      readonly params: ClientDocumentsNeededEmailParams;
+      readonly attachment?: undefined;
     }
 );
 
@@ -385,6 +395,7 @@ export async function clientEmailCountsTodayInTx(
     'client-receipt': count('client-receipt'),
     'client-dispatch': count('client-dispatch'),
     'client-shipment-document': count('client-shipment-document'),
+    'client-documents-needed': count('client-documents-needed'),
   };
 }
 
