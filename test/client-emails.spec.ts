@@ -551,6 +551,20 @@ describe('receipt and dispatch emails (e2e, story 5-2b)', () => {
   describe('events that queue nothing (no row ever)', () => {
     afterEach(() => wipeMail(acme));
 
+    it('story 4-4a — a shared document that is gone (unknown, removed, or not the client’s) queues nothing: document-gone', async () => {
+      const docs = await createClient('DOCS', 'Docs Brand');
+      await addContact(docs, { name: 'D', email: 'd@docs.example', emailEvents: ['shipment.documents'] }).expect(201);
+      const event: DomainEvent = {
+        eventId: uuidv7(),
+        type: 'shipment.document-shared',
+        tenantId,
+        occurredAt: new Date().toISOString(),
+        payload: { attachmentId: uuidv7(), clientId: docs, orderId: uuidv7(), handoverId: null, purpose: 'shipping-document', docKind: 'pod' },
+      };
+      expect(await handler.deliver(event)).toEqual({ kind: 'skipped', reason: 'document-gone' });
+      expect(await mailRows(docs)).toHaveLength(0);
+    });
+
     it('no subscriber: a client with contacts but none opted in', async () => {
       const quiet = await createClient('QUIET', 'Quiet Brand');
       await addContact(quiet, { name: 'Q', email: 'q@quiet.example' }).expect(201);

@@ -835,3 +835,37 @@ export async function removeAttachmentIfLiveInTx(
   if (row === null || (row.status !== 'attached' && row.status !== 'awaited')) return null;
   return markRemovedInTx(tx, { row, removedBy: input.removedBy, reason: input.reason });
 }
+
+/**
+ * Story 4-4a (E5, E6) — every shipping file's ordinal: its rank among ALL
+ * rows of the same owner and purpose (and document kind), ANY status, by
+ * `(created_at, id)`. One rule for the reads, the mail file name and the
+ * sheet's page number, so a file's name and page never change (a removed
+ * page 1 leaves page 3 page 3). Unbounded, on
+ * `attachments_tenant_owner_purpose_idx`.
+ */
+export async function fileOrdinalsInTx(
+  tx: TenantTx,
+  input: { readonly tenantId: string; readonly ownerType: AttachmentOwnerType; readonly ownerIds: readonly string[]; readonly purposes: readonly AttachmentPurpose[] },
+): Promise<Map<string, number>> {
+  if (input.ownerIds.length === 0) return new Map();
+  const rows = (await tx.execute(sql`
+    select id, row_number() over (partition by owner_id, purpose, coalesce(doc_kind, '') order by created_at, id)::int as n
+    from attachments
+    where tenant_id = ${input.tenantId}::uuid
+      and owner_type = ${input.ownerType}
+      and owner_id = any(${sql.param([...input.ownerIds])}::uuid[])
+      and purpose = any(${sql.param([...input.purposes])}::text[])
+  `)) as unknown as { id: string; n: number }[];
+  return new Map(rows.map((row) => [row.id, Number(row.n)]));
+}
+
+/** Story 4-4a (E4) — one attachment row by id (null when absent). */
+export async function attachmentByIdInTx(tx: TenantTx, tenantId: string, attachmentId: string): Promise<AttachmentRow | null> {
+  const rows = await tx
+    .select()
+    .from(attachments)
+    .where(and(eq(attachments.tenantId, tenantId), eq(attachments.id, attachmentId)))
+    .limit(1);
+  return rows[0] ?? null;
+}

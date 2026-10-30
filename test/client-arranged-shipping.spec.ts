@@ -473,6 +473,8 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
     expect(restock.status).toBeLessThan(300);
     const [restocked] = await shipmentsOf(packed);
     expect(restocked).toMatchObject({ status: 'voided', void_reason: 'Order cancelled' });
+    // V6 — its label file goes with it.
+    expect((await sql`select status, removed_reason from attachments where id = ${restocked!.label_attachment_id as string}`)[0]).toEqual({ status: 'removed', removed_reason: 'Order cancelled' });
     const event = (await sql`select payload from outbox_messages where tenant_id = ${tenantId} and type = 'shipment.voided' and payload->'shipment'->>'id' = ${restocked!.id as string}`)[0]!.payload as {
       shipment: Record<string, unknown>;
     };
@@ -497,11 +499,39 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
       {
         courier: { transporterId },
         pickupPersonPhone: '+91 98765 43210',
-        parcels: [{ orderId: verified }, { orderId: advised, awb: 'awbho00002', packageCount: 2 }, { orderId: bare, awb: '77001' }],
+        parcels: [{ orderId: verified }, { orderId: advised, awb: 'awbho00002', packageCount: 2 }, { orderId: bare, awb: '77001', weightGrams: 1234 }],
       },
       opsToken,
       key,
     ).expect(201);
+    // V13 — the weight: the last pack's measurement (900 g), or the parcel's own.
+    expect((await shipmentsOf(verified))[0]!.weight_grams).toBe(900);
+    expect((await shipmentsOf(bare))[0]!.weight_grams).toBe(1234);
+    // B6 — a courier-label row created from a scanned AWB is verified by that scan.
+    expect((await shipmentsOf(bare))[0]).toMatchObject({ label_verify_method: 'handover-scan', label_verified_by: opsId });
+    // V3 — the handover hash, key by key (handoverHashInput's key set), and the same key with another body is 422.
+    expect(await storedHash(key)).toBe(
+      hashCommandPayload({
+        arm: 'handover',
+        surface: 'web',
+        tenantId,
+        warehouseId,
+        clientId: acme,
+        courier: { transporterId, courierName: null },
+        pickupPersonName: 'Ravi',
+        pickupPersonPhone: '+919876543210',
+        vehicleNumber: 'KA01AB1234',
+        occurredAt: null,
+        note: null,
+        parcels: [
+          { orderId: verified, awb: null, packageCount: null, weightGrams: null },
+          { orderId: advised, awb: 'AWBHO00002', packageCount: 2, weightGrams: null },
+          { orderId: bare, awb: '77001', packageCount: null, weightGrams: 1234 },
+        ].sort((a, b) => (a.orderId < b.orderId ? -1 : 1)),
+        photoRefs: null,
+      }),
+    );
+    expect((await handOver({ courier: { transporterId }, parcels: [{ orderId: verified }] }, opsToken, key).expect(422)).body.code).toBe('idempotency-key-reuse');
     const handover = res.body.handover;
     expect(handover.code).toMatch(/^HO-\d{4}$/);
     expect(handover).toMatchObject({ courierName: 'Blue Dart Express', transporterId, shipmentCount: 3, packageCount: 4, codShipmentCount: 1, codTotalPaise: 49900, source: 'web' });
@@ -535,7 +565,7 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
     expect((await http().get(`${API}/${tenantId}/outbound/handovers/${handover.id}`).set('Authorization', `Bearer ${opsToken}`).expect(200)).body.handover.clientSnapshot.name).toBe('ACME Brand');
     await http().patch(`${API}/${tenantId}/clients/${acme}`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid()).send({ name: 'ACME Brand' });
     // Replay; a different body is 422.
-    expect((await handOver({ courier: { transporterId }, pickupPersonPhone: '+91 98765 43210', parcels: [{ orderId: verified }, { orderId: advised, awb: 'awbho00002', packageCount: 2 }, { orderId: bare, awb: '77001' }] }, opsToken, key).expect(201)).body).toEqual(res.body);
+    expect((await handOver({ courier: { transporterId }, pickupPersonPhone: '+91 98765 43210', parcels: [{ orderId: verified }, { orderId: advised, awb: 'awbho00002', packageCount: 2 }, { orderId: bare, awb: '77001', weightGrams: 1234 }] }, opsToken, key).expect(201)).body).toEqual(res.body);
     // The dispatch emails (5-2b) name the AWB; the portal reads "handed-over".
     await drain();
     const dispatchMail = (await sql`select params from email_messages where tenant_id = ${tenantId} and template = 'client-dispatch' and params->>'trackingNumber' = '123456789013'`) as unknown as { params: Record<string, unknown> }[];
@@ -607,9 +637,10 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
     await expectAuditRow({ tenantId, key: photo, action: 'handover_photo.uploaded', targetType: 'attachment', targetId: (await sql`select id from attachments where client_ref = ${photo}`)[0]!.id as string, actorUserId: operatorId });
     const late = ulid();
     const key = ulid();
+    const ac4OccurredAt = new Date(Date.now() - 5 * 60_000).toISOString();
     const res = await handOver(
       {
-        occurredAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+        occurredAt: ac4OccurredAt,
         photoRefs: [photo, late],
         parcels: [...orders.map((orderId, i) => ({ orderId, awb: `AWBDEVHO0${i}` })), { orderId: cancelled, awb: 'AWBDEVHO09' }],
       },
@@ -617,6 +648,19 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
       key,
     ).expect(201);
     expect(res.body.handover.source).toBe('handheld');
+    // V2 (A40) — the handover's time is min(occurredAt, now); each dispatch is
+    // max(handed_over_at, the order's pack time); recorded_at is the server's.
+    const handoverRow = (await sql`select handed_over_at from courier_handovers where id = ${res.body.handover.id as string}`)[0]!;
+    expect(new Date(handoverRow.handed_over_at as string).toISOString()).toBe(ac4OccurredAt);
+    for (const orderId of orders) {
+      const packedAt = (await sql`select max(occurred_at) as at from ledger_events where tenant_id = ${tenantId} and type = 'pack.packed' and reference_doc->>'orderId' = ${orderId}`)[0]!.at as string;
+      const events = (await sql`select occurred_at, recorded_at from ledger_events where tenant_id = ${tenantId} and type = 'dispatch.dispatched' and reference_doc->>'orderId' = ${orderId}`) as unknown as { occurred_at: string; recorded_at: string }[];
+      const expected = Math.max(Date.parse(new Date(handoverRow.handed_over_at as string).toISOString()), Date.parse(new Date(packedAt).toISOString()));
+      for (const event of events) {
+        expect(new Date(event.occurred_at).getTime()).toBe(expected);
+        expect(Math.abs(new Date(event.recorded_at).getTime() - Date.now())).toBeLessThan(60_000);
+      }
+    }
     expect(res.body.parcels).toHaveLength(3);
     expect(res.body.refused).toEqual([{ orderId: cancelled, code: 'order-not-ready', detail: expect.any(String) }]);
     expect(res.body.rejectedOpId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
@@ -698,6 +742,10 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
       if (wanted.every((subject) => subjects.includes(subject))) break;
     }
     const sent = captured.captured.slice(before).filter((email) => wanted.includes(email.subject));
+    // V8 — the email log names them.
+    const log = await http().get(`${API}/${tenantId}/clients/${acme}/emails?limit=100`).set('Authorization', `Bearer ${opsToken}`).expect(200);
+    const logged = (log.body.items as { kind: string; subjectLabel: string }[]).filter((item) => item.kind === 'shipment-document').map((item) => item.subjectLabel);
+    expect(logged).toEqual(expect.arrayContaining([orderRef, `${handed.body.handover.code} (page 1)`]));
     expect(sent.map((email) => email.subject).sort()).toEqual([...wanted].sort());
     const pod = sent.find((email) => email.subject.includes('Proof of delivery'))!;
     expect(Buffer.from(pod.attachments![0]!.content).subarray(0, 3)).toEqual(Buffer.from([0xff, 0xd8, 0xff]));
@@ -923,6 +971,178 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
     expect(results[2]!.body.code).toBe('handover-parcels-refused');
   });
 
+  // ── the review's verification gaps (V1–V13, E4–E6, E11) ────────────────────
+
+  it('V1 — after a web handover the reserved counter is restored, and a short-picked order’s follow-on is opened and allocated', async () => {
+    const ready = await fixtures.releasedWave([{ skuId: sku.get('A-TEE')!, quantity: 2 }], { clientOrderRef: `SO-${ulid().slice(18)}` });
+    const line = ready.picklist.lines[0]!;
+    await http().post(`${API}/${tenantId}/outbound/picks`).set('Authorization', `Bearer ${operatorToken}`).set(KEY_HEADER, ulid())
+      .send({ warehouseId, picklistId: line.picklistId, picklistLineId: line.id, skuId: line.skuId, binId: line.binId!, qty: 1, reasonCode: 'fewer-units-than-planned', occurredAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z') })
+      .expect(201);
+    await http().post(`${API}/${tenantId}/outbound/orders/${ready.orderId}/pack`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+      .send({ scanned: [{ skuId: line.skuId, qty: 1 }] }).expect(201);
+    // The counter restore: a fully picked order's committed hold retires on the handover.
+    const whole = await packedOrder();
+    const before = await app.get(InventoryFacade).atp(tenantId, warehouseId, sku.get('A-TEE')!);
+    await handOver({ parcels: [{ orderId: whole, awb: 'AWBWHOLE01' }] }).expect(201);
+    const after = await app.get(InventoryFacade).atp(tenantId, warehouseId, sku.get('A-TEE')!);
+    expect(after.reserved).toBe(before.reserved - 1000);
+    // The follow-on: the short-picked order's remainder opens and is allocated after the commit.
+    const res = await handOver({ parcels: [{ orderId: ready.orderId, awb: 'AWBSHORT01' }] }).expect(201);
+    const followOn = res.body.parcels[0].followOnOrderId as string;
+    expect(followOn).toMatch(/^[0-9a-f-]{36}$/);
+    const lines = (await sql`select reserved_qty::bigint::text as reserved from order_lines where order_id = ${followOn}`) as unknown as { reserved: string }[];
+    expect(lines.length).toBeGreaterThan(0);
+    expect(Number(lines[0]!.reserved)).toBeGreaterThan(0);
+  });
+
+  it('V3 — the verify, void and sheet-upload hashes, key by key', async () => {
+    const orderId = await packedOrder();
+    await staffLabel(orderId, { awb: 'AWBGOLD001', courierName: 'VRL' }, await labelPdf(1)).expect(201);
+    const verifyKey = ulid();
+    await verify(orderId, { scannedCode: 'awb-gold-001', method: 'scan' }, opsToken, verifyKey).expect(200);
+    expect(await storedHash(verifyKey)).toBe(hashCommandPayload({ arm: 'label-verify', surface: 'web', tenantId, orderId, scannedCode: 'AWBGOLD001', method: 'scan', occurredAt: null }));
+    const other = await acceptedOrder();
+    await awbAdvice(other, { awb: 'AWBGOLD002', courierName: 'VRL' }).expect(201);
+    const voidKey = ulid();
+    await http().post(`${API}/${tenantId}/outbound/orders/${other}/shipment/void`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, voidKey).send({ reason: ' Wrong AWB ' }).expect(200);
+    expect(await storedHash(voidKey)).toBe(hashCommandPayload({ arm: 'shipment-void', tenantId, orderId: other, reason: 'Wrong AWB' }));
+    const handed = await handOver({ parcels: [{ orderId, awb: 'AWBGOLD001' }] }).expect(201);
+    const sheetKey = ulid();
+    const pdf = await labelPdf(1);
+    await http().post(`${API}/${tenantId}/outbound/handovers/${handed.body.handover.id}/sheet`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, sheetKey)
+      .attach('file', pdf, { filename: 'sheet.pdf', contentType: 'application/pdf' }).expect(201);
+    expect(await storedHash(sheetKey)).toBe(
+      hashCommandPayload({ arm: 'handover-sheet', tenantId, handoverId: handed.body.handover.id, rawSha256: (await import('node:crypto')).createHash('sha256').update(pdf).digest('hex') }),
+    );
+  });
+
+  it('V4/V5/E2 — the caps (an 11th sheet page, an 11th portal document; portal documents do not count against the warehouse’s 20), no echo of a portal document, and a per-order dispatch’s courier in the portal', async () => {
+    const orderId = await packedOrder();
+    // Ten portal documents: the 11th is refused; a warehouse document still goes in.
+    for (let i = 0; i < 10; i += 1) {
+      await sql`insert into attachments (id, tenant_id, client_id, warehouse_id, purpose, doc_kind, status, source, owner_type, owner_id, owner_parent_id, object_key, content_type, byte_size, sha256, width, height, uploaded_at, created_by)
+        values (${uuidv7()}, ${tenantId}, ${acme}, ${warehouseId}, 'shipping-document', 'other', 'attached', 'portal', 'order', ${orderId}, ${orderId}, ${'seed/' + ulid()}, 'image/jpeg', 10, ${'a'.repeat(64)}, 1, 1, now(), ${opsId})`;
+    }
+    expect((await uploadDocument(orderId, 'invoice', JPEG, acmePortal, true).expect(409)).body.code).toBe('document-limit');
+    await uploadDocument(orderId, 'invoice', JPEG).expect(201);
+    // No echo: a portal document before and after a per-order dispatch is never shared.
+    const plain = await packedOrder();
+    const before = await uploadDocument(plain, 'challan', JPEG, acmePortal, true).expect(201);
+    await http().post(`${API}/${tenantId}/outbound/orders/${plain}/dispatch`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+      .send({ carrierName: 'Own fleet', trackingNumber: 'OF-0001' }).expect(201);
+    const after = await uploadDocument(plain, 'invoice', JPEG, acmePortal, true).expect(201);
+    expect((await sql`select count(*)::int as n from outbox_messages where type = 'shipment.document-shared' and payload->>'attachmentId' in ${sql([before.body.file.id as string, after.body.file.id as string])}`)[0]!.n).toBe(0);
+    // E2 — no shipment, but the dispatch record names the courier: 'shipped' with it.
+    const portal = await http().get(`${API}/${tenantId}/portal/orders/${plain}/shipping`).set('Authorization', `Bearer ${acmePortal}`).expect(200);
+    expect(portal.body).toMatchObject({ status: 'shipped', courierName: 'Own fleet', awb: 'OF-0001' });
+    // The sheet cap.
+    const sheetOrder = await packedOrder();
+    const handed = await handOver({ parcels: [{ orderId: sheetOrder, awb: 'AWBCAPS001' }] }).expect(201);
+    for (let i = 0; i < 10; i += 1) {
+      await sql`insert into attachments (id, tenant_id, client_id, warehouse_id, purpose, status, source, owner_type, owner_id, owner_parent_id, object_key, content_type, byte_size, sha256, width, height, uploaded_at, created_by)
+        values (${uuidv7()}, ${tenantId}, ${acme}, ${warehouseId}, 'handover-sheet', 'attached', 'web', 'courier_handover', ${handed.body.handover.id as string}, ${handed.body.handover.id as string}, ${'seed/' + ulid()}, 'image/jpeg', 10, ${'a'.repeat(64)}, 1, 1, now(), ${opsId})`;
+    }
+    const refused = await http().post(`${API}/${tenantId}/outbound/handovers/${handed.body.handover.id}/sheet`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+      .attach('file', JPEG, { filename: 'sheet.jpg', contentType: 'image/jpeg' }).expect(409);
+    expect(refused.body.code).toBe('handover-sheet-limit');
+  });
+
+  it('V7 — the staff void refuses a carrier label (the row stays labelled) and a handed-over shipment', async () => {
+    const carrierOrder = await packedOrder();
+    await http().post(`${API}/${tenantId}/outbound/orders/${carrierOrder}/label`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+      .send({ carrierConnectionId: sandboxConnectionId }).expect(201);
+    const voidOf = (orderId: string) =>
+      http().post(`${API}/${tenantId}/outbound/orders/${orderId}/shipment/void`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({ reason: 'x' });
+    expect((await voidOf(carrierOrder).expect(409)).body.code).toBe('shipment-not-client-arranged');
+    expect((await shipmentsOf(carrierOrder))[0]!.status).toBe('labelled');
+    const handedOrder = await packedOrder();
+    // E1 — upper-case ids are the same ids (normalised once at entry).
+    await handOver({ warehouseId: warehouseId.toUpperCase(), clientId: acme.toUpperCase(), parcels: [{ orderId: handedOrder.toUpperCase(), awb: 'AWBVOID001' }] }).expect(201);
+    expect((await voidOf(handedOrder).expect(409)).body.code).toBe('shipment-handed-over');
+  });
+
+  it('E4/E5/E6 — a sheet page’s number never shifts: remove page 1 of 3, page 3 stays page 3 in the read and the email; the removed page is not emailed', async () => {
+    const orderId = await packedOrder();
+    const handed = await handOver({ parcels: [{ orderId, awb: 'AWBPAGE001' }] }).expect(201);
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      const page = await http().post(`${API}/${tenantId}/outbound/handovers/${handed.body.handover.id}/sheet`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+        .attach('file', await labelPdf(i + 1), { filename: 'sheet.pdf', contentType: 'application/pdf' }).expect(201);
+      ids.push(page.body.file.id as string);
+    }
+    await http().post(`${API}/${tenantId}/outbound/shipping-files/${ids[0]}/remove`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({ reason: 'Blurred' }).expect(200);
+    const code = handed.body.handover.code as string;
+    const detail = await http().get(`${API}/${tenantId}/outbound/handovers/${handed.body.handover.id}`).set('Authorization', `Bearer ${opsToken}`).expect(200);
+    expect(detail.body.handover.sheet.map((file: { id: string; fileName: string }) => [file.id, file.fileName])).toEqual([
+      [ids[1], `${code}-sheet-2.pdf`],
+      [ids[2], `${code}-sheet-3.pdf`],
+    ]);
+    await drain();
+    const rows = (await sql`select attachment_ref, params->>'subjectLabel' as label from email_messages where tenant_id = ${tenantId} and attachment_ref in ${sql(ids)} order by attachment_ref`) as unknown as { attachment_ref: string; label: string }[];
+    expect(rows.map((row) => [row.attachment_ref, row.label]).sort()).toEqual([[ids[1], `${code} (page 2)`], [ids[2], `${code} (page 3)`]].sort());
+    // The log names them (V8).
+    const log = await http().get(`${API}/${tenantId}/clients/${acme}/emails?limit=100`).set('Authorization', `Bearer ${opsToken}`).expect(200);
+    const labels = (log.body.items as { kind: string; subjectLabel: string }[]).filter((item) => item.kind === 'shipment-document').map((item) => item.subjectLabel);
+    expect(labels).toEqual(expect.arrayContaining([`${code} (page 2)`, `${code} (page 3)`]));
+  });
+
+  it('E11 — a label for a carrier-labelled order is refused before any bytes are stored (no reservation, no object)', async () => {
+    const orderId = await packedOrder();
+    await http().post(`${API}/${tenantId}/outbound/orders/${orderId}/label`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+      .send({ carrierConnectionId: sandboxConnectionId }).expect(201);
+    const objects = store.objects.size;
+    expect((await staffLabel(orderId, { awb: 'AWBORPH001', courierName: 'X' }, await labelPdf(1)).expect(409)).body.code).toBe('shipment-exists');
+    expect(store.objects.size).toBe(objects);
+    expect((await sql`select count(*)::int as n from attachments where tenant_id = ${tenantId} and status = 'uploading'`)[0]!.n).toBe(0);
+  });
+
+  it('V10/V11 — the portal order row and detail carry the AWB after a portal label and not on a voided-only order; the device parcels list an accepted client label and never a carrier label', async () => {
+    const labelled = await acceptedOrder();
+    await portalLabel(labelled, { awb: 'AWBROW0001', courierName: 'Delhivery' }, await labelPdf(1)).expect(201);
+    const voided = await acceptedOrder();
+    await awbAdvice(voided, { awb: 'AWBROW0002', courierName: 'VRL' }).expect(201);
+    await http().post(`${API}/${tenantId}/outbound/orders/${voided}/shipment/void`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({ reason: 'gone' }).expect(200);
+    const detail = (orderId: string) => http().get(`${API}/${tenantId}/portal/orders/${orderId}`).set('Authorization', `Bearer ${acmePortal}`).expect(200);
+    expect((await detail(labelled)).body).toMatchObject({ awb: 'AWBROW0001', courierName: 'Delhivery' });
+    const bare = (await detail(voided)).body as Record<string, unknown>;
+    expect('awb' in bare || 'courierName' in bare).toBe(false);
+    const list = await http().get(`${API}/${tenantId}/portal/orders?limit=100`).set('Authorization', `Bearer ${acmePortal}`).expect(200);
+    expect((list.body.items as { id: string; awb?: string }[]).find((row) => row.id === labelled)!.awb).toBe('AWBROW0001');
+    // V11.
+    const carrier = await packedOrder();
+    await http().post(`${API}/${tenantId}/outbound/orders/${carrier}/label`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+      .send({ carrierConnectionId: sandboxConnectionId }).expect(201);
+    const snapshot = await http().get(`${API}/${tenantId}/devices/catalog-snapshot?warehouseId=${warehouseId}`).set('Authorization', `Bearer ${operatorToken}`).expect(200);
+    const parcels = snapshot.body.dispatchParcels as { orderId: string; status: string }[];
+    expect(parcels.find((p) => p.orderId === carrier)).toBeUndefined();
+    expect(parcels.find((p) => p.orderId === labelled)).toMatchObject({ status: 'accepted' });
+  });
+
+  it('V12 — a device upload of each new op type is accepted and makes a Discard-only review row', async () => {
+    const row = (opType: string, payload: Record<string, unknown>) => ({
+      opId: ulid(),
+      opType,
+      classification: 'rejected',
+      problemCode: 'label-mismatch',
+      problemDetail: 'refused',
+      payload,
+      attribution: { deviceLabel: 'Dock scanner', operatorEmail: 'op@example.com' },
+      opEnqueuedAt: new Date(Date.now() - 60_000).toISOString(),
+      opOccurredAt: null,
+    });
+    const rows = [
+      row('shipment.verify-label', { orderId: uuidv7(), scannedCode: 'AWB1234', method: 'scan', occurredAt: new Date().toISOString() }),
+      row('handover.create', { warehouseId, clientId: acme, courier: { courierName: 'VRL' }, pickupPersonName: 'Ravi', parcels: [{ orderId: uuidv7(), awb: 'AWB9999' }], photoRefs: [] }),
+      row('handover-photo.stage', { ref: ulid(), capturedAt: new Date().toISOString(), handoverOpId: ulid() }),
+    ];
+    await http().post(`${API}/${tenantId}/devices/sync-reports`).set('Authorization', `Bearer ${operatorToken}`).set(KEY_HEADER, ulid()).send({ rows }).expect(201);
+    const listed = (await http().get(`${API}/${tenantId}/rejected-ops?status=open`).set('Authorization', `Bearer ${ownerToken}`).expect(200)).body.items as { opId: string; opType: string; decisions: string[] }[];
+    for (const uploaded of rows) {
+      expect(listed.find((item) => item.opId === uploaded.opId)).toMatchObject({ opType: uploaded.opType, decisions: ['discard'] });
+    }
+  });
+
   it('A44 — the portal status derivation', () => {
     expect(portalShippingStatus('cancelled', null, false)).toBe('cancelled');
     expect(portalShippingStatus('accepted', null, false)).toBe('no-label-yet');
@@ -931,7 +1151,11 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
     expect(portalShippingStatus('accepted', { kind: 'courier-label', status: 'labelled', labelVerified: false }, false)).toBe('awb-received');
     expect(portalShippingStatus('dispatched', { kind: 'courier-label', status: 'handed_over', labelVerified: false }, true)).toBe('handed-over');
     expect(portalShippingStatus('dispatched', { kind: 'carrier', status: 'manifested', labelVerified: false }, true)).toBe('shipped');
-    expect(portalShippingStatus('dispatched', null, true)).toBe('shipped-no-courier-record');
+    // E2 — with no shipment: the dispatch record naming a courier or AWB is 'shipped', else no courier record.
+    expect(portalShippingStatus('dispatched', null, true)).toBe('shipped');
+    expect(portalShippingStatus('dispatched', null, false)).toBe('shipped-no-courier-record');
+    // E3 — an open order with a carrier label reads 'awb-received', never 'label-received'.
+    expect(portalShippingStatus('ready_to_dispatch', { kind: 'carrier', status: 'labelled', labelVerified: false }, false)).toBe('awb-received');
   });
 
   it('the OpenAPI document lists the 18 new routes', async () => {

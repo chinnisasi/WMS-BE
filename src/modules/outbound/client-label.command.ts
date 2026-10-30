@@ -24,6 +24,7 @@ import {
   CLIENT_REPLACED_VOID_REASON,
   STAFF_REPLACED_VOID_REASON,
   voidClientArrangedShipmentInTx,
+  liveShipmentOfOrderInTx,
 } from './client-arranged';
 import {
   authorizeWriterInTx,
@@ -192,6 +193,9 @@ export class ClientLabelCommand {
       },
       scope: async (tx) => {
         const order = await readOrderForWriterInTx(tx, command.tenantId, writer, command.orderId, null);
+        // E11 — the cheap refusals before any bytes are sanitised or put (Tx B
+        // re-checks them under its locks).
+        assertLabellable(order, await liveShipmentOfOrderInTx(tx, command.tenantId, order.id), input.replace, orderLabelOf(order));
         return { purpose: 'shipping-label', docKind: null, clientId: order.clientId, warehouseId: order.warehouseId };
       },
       sanitize: async () => {
@@ -259,41 +263,11 @@ export class ClientLabelCommand {
       input.transporterId === null ? null : await assertTransporterInTx(tx, tenantId, input.transporterId, 'a client label');
     const label = orderLabelOf(order);
 
-    // 1. the order is open — except that a parcel already handed over answers
-    // the more specific 409 `shipment-handed-over` (the matrix row "Replace …
-    // after handover"): its order reads `dispatched`, so the open check alone
-    // would make that answer unreachable.
-    if (live !== null && live.status === 'handed_over') {
-      throw new ProblemException('shipment-handed-over', 409, 'Shipment already handed over', `Order ${label}'s parcel was already handed to ${live.carrierName} (AWB ${live.trackingNumber}).`);
-    }
-    if (!(LABEL_OPEN_STATUSES as readonly string[]).includes(order.status)) {
-      throw orderNotOpen(order, label);
-    }
-    // 2. the live shipment.
+    // 1–2. the order is open, and the live shipment admits a new record.
+    assertLabellable(order, live, input.replace, label);
     const now = nowIso();
     let replaced: Shipment | null = null;
     if (live !== null) {
-      if (live.kind === 'carrier') {
-        throw new ProblemException(
-          'shipment-exists',
-          409,
-          'Order already has a shipment',
-          `Order ${label} already has a carrier label (${live.carrierName} ${live.trackingNumber}) — void it before recording the client's own courier.`,
-          { awb: live.trackingNumber, kind: live.kind },
-        );
-      }
-      if (live.status === 'handed_over') {
-        throw new ProblemException('shipment-handed-over', 409, 'Shipment already handed over', `Order ${label}'s parcel was already handed to ${live.carrierName} (AWB ${live.trackingNumber}).`);
-      }
-      if (!input.replace) {
-        throw new ProblemException(
-          'shipment-exists',
-          409,
-          'Order already has a shipment',
-          `Order ${label} already has ${live.kind === 'client-label' ? 'a client label' : 'an AWB'} (${live.carrierName} ${live.trackingNumber}) — replace it to record another.`,
-          { awb: live.trackingNumber, kind: live.kind },
-        );
-      }
       // The void is written FIRST (D7): a replace with the same AWB is not
       // refused by its own shipment.
       replaced = await voidClientArrangedShipmentInTx(tx, this.outbox, {
@@ -501,7 +475,9 @@ export class ClientLabelCommand {
       }
       if (live.labelVerifiedAt !== null) return noOp(live);
       const now = nowIso();
-      const verifiedAt = occurredAt === null ? now : new Date(Math.min(Date.parse(occurredAt), Date.parse(now))).toISOString();
+      // E8 — never before the label existed: max(labelled_at, min(occurredAt, now)).
+      const verifiedAt =
+        occurredAt === null ? now : new Date(Math.max(Date.parse(live.labelledAt), Math.min(Date.parse(occurredAt), Date.parse(now)))).toISOString();
       const [updated] = await tx
         .update(shipments)
         .set({
@@ -511,7 +487,7 @@ export class ClientLabelCommand {
           labelVerifyMethod: method,
           updatedAt: now,
         })
-        .where(and(eq(shipments.id, live.id), eq(shipments.status, 'labelled')))
+        .where(and(eq(shipments.tenantId, command.tenantId), eq(shipments.id, live.id), eq(shipments.status, 'labelled')))
         .returning();
       await tx.insert(auditEvents).values({
         id: uuidv7(),
@@ -534,6 +510,40 @@ export class ClientLabelCommand {
 }
 
 // ── shared pieces ─────────────────────────────────────────────────────────────
+
+/**
+ * A8 guards 1–2 (no writes): a handed-over parcel answers the specific 409
+ * `shipment-handed-over` before the open check (its order reads
+ * `dispatched`); then the order is open; then a carrier label, or a live
+ * client-arranged record without `replace`, is 409 `shipment-exists`.
+ */
+function assertLabellable(order: Order, live: Shipment | null, replace: boolean, label: string): void {
+  if (live !== null && live.status === 'handed_over') {
+    throw new ProblemException('shipment-handed-over', 409, 'Shipment already handed over', `Order ${label}'s parcel was already handed to ${live.carrierName} (AWB ${live.trackingNumber}).`);
+  }
+  if (!(LABEL_OPEN_STATUSES as readonly string[]).includes(order.status)) {
+    throw orderNotOpen(order, label);
+  }
+  if (live === null) return;
+  if (live.kind === 'carrier') {
+    throw new ProblemException(
+      'shipment-exists',
+      409,
+      'Order already has a shipment',
+      `Order ${label} already has a carrier label (${live.carrierName} ${live.trackingNumber}) — void it before recording the client's own courier.`,
+      { awb: live.trackingNumber, kind: live.kind },
+    );
+  }
+  if (!replace) {
+    throw new ProblemException(
+      'shipment-exists',
+      409,
+      'Order already has a shipment',
+      `Order ${label} already has ${live.kind === 'client-label' ? 'a client label' : 'an AWB'} (${live.carrierName} ${live.trackingNumber}) — replace it to record another.`,
+      { awb: live.trackingNumber, kind: live.kind },
+    );
+  }
+}
 
 function normalizeLabelInput(command: ClientLabelInput): NormalizedLabelInput {
   const awb = normalizeAwb(typeof command.awb === 'string' ? command.awb : '');
@@ -684,8 +694,9 @@ export async function insertClientArrangedInTx(
                     labelVerifyMethod: 'handover-scan',
                   }),
             }),
-        createdAt: input.labelledAt,
-        updatedAt: input.labelledAt,
+        // E10 — the row stamps are the server's; labelledAt keeps the business time.
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
       })
       .returning();
     return row!;

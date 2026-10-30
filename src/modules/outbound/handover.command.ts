@@ -208,12 +208,14 @@ export class HandoverCommand {
     @Inject(DispatchCommandService) private readonly dispatch: DispatchCommandService,
   ) {}
 
-  async handOver(command: HandOverCommand, key: string): Promise<HandoverOutcome> {
-    const surface = command.surface.kind;
-    if (!UUID_RE.test(command.warehouseId)) throw validation('warehouseId must be a uuid.');
-    if (!UUID_RE.test(command.clientId)) throw validation('clientId must be a uuid.');
+  async handOver(raw: HandOverCommand, key: string): Promise<HandoverOutcome> {
+    const surface = raw.surface.kind;
+    if (typeof raw.warehouseId !== 'string' || !UUID_RE.test(raw.warehouseId)) throw validation('warehouseId must be a uuid.');
+    if (typeof raw.clientId !== 'string' || !UUID_RE.test(raw.clientId)) throw validation('clientId must be a uuid.');
+    // E1 — the ids normalised ONCE: the hash, every compare and every insert read these.
+    const command: HandOverCommand = { ...raw, warehouseId: raw.warehouseId.toLowerCase(), clientId: raw.clientId.toLowerCase() };
     const input = normalizeHandover(command);
-    const payloadHash = hashCommandPayload(handoverHashInput(command.tenantId, surface, command.warehouseId.toLowerCase(), command.clientId.toLowerCase(), input));
+    const payloadHash = hashCommandPayload(handoverHashInput(command.tenantId, surface, command.warehouseId, command.clientId, input));
     const actorUserId = command.surface.kind === 'web' ? command.surface.actorUserId : command.surface.operatorUserId;
     const tenantId = command.tenantId;
 
@@ -505,7 +507,8 @@ export class HandoverCommand {
               surface: surface === 'web' ? 'web' : 'handheld',
               status: 'handed_over',
               label,
-              handover: { id: handoverId, at: handedOverAt, weightGrams, dims, verify: null },
+              // B6 — the AWB scanned here IS the verification (as on a pre-advised row).
+              handover: { id: handoverId, at: handedOverAt, weightGrams, dims, verify: { at: handedOverAt, by: actorUserId, deviceId } },
             });
           } catch (err) {
             // A33 — another command took this AWB meanwhile: a kept conflict.

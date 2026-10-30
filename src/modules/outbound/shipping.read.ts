@@ -9,7 +9,7 @@ import { maskPhone } from '../../shared/primitives/phone';
 import { addIsoDays, canonicalInstant, fullPrecisionInstant, isIsoDate, istMidnightOf } from '../../shared/primitives/time';
 import { decodeCursor, encodeCursor } from '../../shared/primitives/pagination';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
-import { listByOwnerInTx } from '../attachments/attachment-records';
+import { fileOrdinalsInTx, listByOwnerInTx } from '../attachments/attachment-records';
 import { extensionOf, fileNamePart } from './shipping-support';
 import type { ShipmentKind, ShipmentStatus } from './shipment.command';
 
@@ -42,16 +42,18 @@ export type PortalShippingStatus = (typeof PORTAL_SHIPPING_STATUSES)[number];
 export function portalShippingStatus(
   orderStatus: string,
   live: { readonly kind: string; readonly status: string; readonly labelVerified: boolean } | null,
+  /** E2 — the order's dispatch record names a carrier or a tracking number (its first `dispatch.dispatched` reference doc). */
   hasDispatchRecord: boolean,
 ): PortalShippingStatus {
   if (orderStatus === 'cancelled') return 'cancelled';
   if (orderStatus === 'dispatched') {
-    if (live === null) return hasDispatchRecord ? 'shipped-no-courier-record' : 'shipped-no-courier-record';
+    if (live === null) return hasDispatchRecord ? 'shipped' : 'shipped-no-courier-record';
     if (live.status === 'handed_over') return 'handed-over';
     return 'shipped';
   }
   if (live === null) return 'no-label-yet';
-  if (live.kind === 'courier-label') return 'awb-received';
+  // E3 — a carrier label (the warehouse's) is not a label the client sent: its AWB is known.
+  if (live.kind === 'courier-label' || live.kind === 'carrier') return 'awb-received';
   if (live.kind === 'client-label' && live.labelVerified && orderStatus === 'ready_to_dispatch') return 'ready-for-pickup';
   return 'label-received';
 }
@@ -72,21 +74,21 @@ export const DOC_KIND_FILE_WORD: Readonly<Record<string, string>> = {
   other: 'document',
 };
 
-/** `{order}-label.pdf`, `{order}-{kind}-{n}.{ext}`, `{HO}-sheet-{n}.{ext}` — n counts per kind in creation order. */
-export function shippingFileNames(ownerLabel: string, rows: readonly AttachmentRow[]): Map<string, string> {
+/**
+ * `{order}-label.pdf`, `{order}-{kind}-{n}.{ext}`, `{HO}-sheet-{n}.{ext}` —
+ * n is the file's ordinal (`fileOrdinalsInTx`: its rank among every row of
+ * its owner, purpose and kind, any status), so a name never changes.
+ */
+export function shippingFileNames(ownerLabel: string, rows: readonly AttachmentRow[], ordinals: ReadonlyMap<string, number>): Map<string, string> {
   const out = new Map<string, string>();
-  const counters = new Map<string, number>();
-  const sorted = [...rows].sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : 1));
   const base = fileNamePart(ownerLabel);
-  for (const row of sorted) {
+  for (const row of rows) {
     if (row.purpose === 'shipping-label') {
       out.set(row.id, `${base}-label.pdf`);
       continue;
     }
     const word = row.purpose === 'handover-sheet' ? 'sheet' : (DOC_KIND_FILE_WORD[row.docKind ?? 'other'] ?? 'document');
-    const n = (counters.get(word) ?? 0) + 1;
-    counters.set(word, n);
-    out.set(row.id, `${base}-${word}-${n}.${extensionOf(row.contentType)}`);
+    out.set(row.id, `${base}-${word}-${ordinals.get(row.id) ?? 1}.${extensionOf(row.contentType)}`);
   }
   return out;
 }
@@ -128,7 +130,7 @@ export async function orderShippingInTx(tx: TenantTx, tenantId: string, orderId:
     ...(clientId === undefined ? {} : { clientId }),
   });
   const label = orderLabelOf(order);
-  const names = shippingFileNames(label, files);
+  const names = shippingFileNames(label, files, await fileOrdinalsInTx(tx, { tenantId, ownerType: 'order', ownerIds: [order.id], purposes: ['shipping-label', 'shipping-document'] }));
   const labelRow = live?.labelAttachmentId == null ? null : (files.find((row) => row.id === live.labelAttachmentId) ?? null);
   const documents = files.filter((row) => row.purpose === 'shipping-document' && row.status === 'attached');
   let handover: CourierHandover | null = null;
@@ -150,7 +152,7 @@ export async function orderShippingInTx(tx: TenantTx, tenantId: string, orderId:
           ...(clientId === undefined ? {} : { clientId }),
         })
       ).filter((row) => row.status === 'attached');
-      const sheetNames = shippingFileNames(handover.code, pages);
+      const sheetNames = shippingFileNames(handover.code, pages, await fileOrdinalsInTx(tx, { tenantId, ownerType: 'courier_handover', ownerIds: [handover.id], purposes: ['handover-sheet'] }));
       sheet = pages.map((row) => ({ row, fileName: sheetNames.get(row.id)! }));
     }
   }
@@ -361,7 +363,7 @@ export async function handoverDetailInTx(tx: TenantTx, tenantId: string, handove
   const pages = (
     await listByOwnerInTx(tx, { tenantId, ownerType: 'courier_handover', ownerIds: [handover.id], purposes: ['handover-sheet'] })
   ).filter((row) => row.status === 'attached');
-  const names = shippingFileNames(handover.code, pages);
+  const names = shippingFileNames(handover.code, pages, await fileOrdinalsInTx(tx, { tenantId, ownerType: 'courier_handover', ownerIds: [handover.id], purposes: ['handover-sheet'] }));
   return { handover, parcels, sheet: pages.map((row) => ({ row, fileName: names.get(row.id)! })) };
 }
 

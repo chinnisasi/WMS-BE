@@ -3,9 +3,11 @@
  * hex digits, upper-cased (17 characters, Code 128 subset B, 222 modules —
  * it fits the 4×2 label at 2-dot bars; the full 32-hex id would not). The
  * code is a MATCH KEY against a list the server provided (the device's
- * snapshot, the web's candidates read) — never resolved server-side alone:
- * 64 random bits make a collision among one warehouse's packed orders
- * negligible, and a list holding two matches makes the client ask which.
+ * snapshot, the web's candidates read) — never resolved server-side alone.
+ * The last 16 hex digits of a uuidv7 carry 62 random bits (the variant fixes
+ * the top two bits of byte 8, so the first digit after `O` is 8–B): a
+ * collision among one warehouse's packed orders is still negligible, and a
+ * list holding two matches makes the client ask which.
  * Pure. Mirrored byte for byte in wms-fe and wms-mobile, pinned by
  * `parcel-tag.vectors.json`.
  */

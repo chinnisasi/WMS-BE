@@ -14,7 +14,7 @@ import { getClientsInTx } from '../clients/clients.facade';
 import { ROLE_CAPABILITIES } from '../tenancy/permissions';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
 import { AttachmentsFacade } from '../attachments/attachments.facade';
-import { listByOwnerInTx } from '../attachments/attachment-records';
+import { fileOrdinalsInTx } from '../attachments/attachment-records';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import { ClientLabelCommand } from './client-label.command';
 import { ShippingFilesCommand } from './shipping-files.command';
@@ -119,6 +119,7 @@ export interface PortalOrderShippingView {
 export interface PortalShippingRead {
   readonly shipping: NonNullable<Awaited<ReturnType<typeof orderShippingInTx>>>;
   readonly hasDispatchRecord: boolean;
+  readonly dispatchRecord: { readonly carrierName: string | null; readonly trackingNumber: string | null } | null;
 }
 
 export interface HandoverDetailView extends HandoverView {
@@ -217,7 +218,14 @@ export class ShippingService {
     const shipping = await orderShippingInTx(tx, tenantId, orderId, clientId);
     if (shipping === null) return null;
     const dispatched = shipping.order.status === 'dispatched' ? await this.inventory.firstDispatchByOrderInTx(tx, tenantId, [shipping.order.id]) : new Map();
-    return { shipping, hasDispatchRecord: dispatched.size > 0 };
+    const first = dispatched.get(shipping.order.id) ?? null;
+    const dispatchRecord = first === null ? null : { carrierName: first.carrierName ?? null, trackingNumber: first.trackingNumber ?? null };
+    return {
+      shipping,
+      // E2 — "the dispatch record names a carrier or a tracking number".
+      hasDispatchRecord: dispatchRecord !== null && (dispatchRecord.carrierName !== null || dispatchRecord.trackingNumber !== null),
+      dispatchRecord,
+    };
   }
 
   /** A17, A44, A45 — the portal's Shipping section: an exact key allowlist, presigned after the read. */
@@ -250,8 +258,9 @@ export class ShippingService {
         live === null ? null : { kind: live.kind, status: live.status, labelVerified: live.labelVerifiedAt !== null },
         read.hasDispatchRecord,
       ),
-      courierName: live?.carrierName ?? null,
-      awb: live?.trackingNumber ?? null,
+      // E2 — with no live shipment, the dispatch record's courier and AWB.
+      courierName: live?.carrierName ?? read.dispatchRecord?.carrierName ?? null,
+      awb: live?.trackingNumber ?? read.dispatchRecord?.trackingNumber ?? null,
       packageCount: live?.packageCount ?? null,
       handedOverAt: handover === null ? null : canonicalInstant(handover.handedOverAt),
       vehicleNumber: handover?.vehicleNumber ?? null,
@@ -379,14 +388,14 @@ export class ShippingService {
     if (row.ownerType === 'order') {
       const order = (await tx.select().from(orders).where(and(eq(orders.tenantId, tenantId), eq(orders.id, row.ownerId), eq(orders.clientId, clientId))).limit(1))[0];
       if (order === undefined) return null;
-      const siblings = await listByOwnerInTx(tx, { tenantId, ownerType: 'order', ownerIds: [order.id], purposes: ['shipping-label', 'shipping-document'], clientId, includeHistory: true });
-      return shippingFileNames(orderLabelOf(order), siblings).get(row.id) ?? null;
+      const ordinals = await fileOrdinalsInTx(tx, { tenantId, ownerType: 'order', ownerIds: [order.id], purposes: ['shipping-label', 'shipping-document'] });
+      return shippingFileNames(orderLabelOf(order), [row], ordinals).get(row.id) ?? null;
     }
     if (row.ownerType === 'courier_handover') {
       const detail = await handoverDetailInTx(tx, tenantId, row.ownerId);
       if (detail === null || detail.handover.clientId !== clientId) return null;
-      const pages = await listByOwnerInTx(tx, { tenantId, ownerType: 'courier_handover', ownerIds: [row.ownerId], purposes: ['handover-sheet'], clientId, includeHistory: true });
-      return shippingFileNames(detail.handover.code, pages).get(row.id) ?? null;
+      const ordinals = await fileOrdinalsInTx(tx, { tenantId, ownerType: 'courier_handover', ownerIds: [row.ownerId], purposes: ['handover-sheet'] });
+      return shippingFileNames(detail.handover.code, [row], ordinals).get(row.id) ?? null;
     }
     return null;
   }

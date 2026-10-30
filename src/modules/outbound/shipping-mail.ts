@@ -4,7 +4,7 @@ import type { TenantTx } from '../../shared/db/tenant-scope';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { orderLabelOf } from '../../shared/primitives/order-label';
 import { canonicalInstant } from '../../shared/primitives/time';
-import { listByOwnerInTx } from '../attachments/attachment-records';
+import { attachmentByIdInTx, fileOrdinalsInTx } from '../attachments/attachment-records';
 import { shippingFileNames } from './shipping.read';
 
 /**
@@ -43,22 +43,20 @@ export interface ShipmentDocumentEmailFacts {
 
 export async function shipmentDocumentEmailFactsInTx(tx: TenantTx, tenantId: string, fact: ShipmentDocumentFactInput): Promise<ShipmentDocumentEmailFacts | null> {
   if (!UUID_RE.test(fact.attachmentId) || !UUID_RE.test(fact.clientId)) return null;
+  // E4 — only a file still attached (and the event's client's) is emailed: a
+  // removed or expired one is `document-gone`.
+  const file = await attachmentByIdInTx(tx, tenantId, fact.attachmentId);
+  if (file === null || file.status !== 'attached' || file.clientId !== fact.clientId || file.purpose !== fact.purpose) return null;
   if (fact.purpose === 'shipping-document') {
     if (fact.orderId === null || !UUID_RE.test(fact.orderId)) return null;
     const order = (
       await tx.select().from(orders).where(and(eq(orders.tenantId, tenantId), eq(orders.id, fact.orderId), eq(orders.clientId, fact.clientId))).limit(1)
     )[0];
     if (order === undefined) return null;
-    const files = await listByOwnerInTx(tx, {
-      tenantId,
-      ownerType: 'order',
-      ownerIds: [order.id],
-      purposes: ['shipping-label', 'shipping-document'],
-      clientId: fact.clientId,
-      includeHistory: true,
-    });
+    if (file.ownerId !== order.id) return null;
     const label = orderLabelOf(order);
-    const fileName = shippingFileNames(label, files).get(fact.attachmentId);
+    const ordinals = await fileOrdinalsInTx(tx, { tenantId, ownerType: 'order', ownerIds: [order.id], purposes: ['shipping-label', 'shipping-document'] });
+    const fileName = shippingFileNames(label, [file], ordinals).get(fact.attachmentId);
     if (fileName === undefined) return null;
     const live = (
       await tx
@@ -94,18 +92,12 @@ export async function shipmentDocumentEmailFactsInTx(tx: TenantTx, tenantId: str
       .limit(1)
   )[0];
   if (handover === undefined) return null;
-  const pages = await listByOwnerInTx(tx, {
-    tenantId,
-    ownerType: 'courier_handover',
-    ownerIds: [handover.id],
-    purposes: ['handover-sheet'],
-    clientId: fact.clientId,
-    includeHistory: true,
-  });
-  const fileName = shippingFileNames(handover.code, pages).get(fact.attachmentId);
+  if (file.ownerId !== handover.id) return null;
+  // E6 — the page number IS the file's ordinal (the same rule as its name).
+  const ordinals = await fileOrdinalsInTx(tx, { tenantId, ownerType: 'courier_handover', ownerIds: [handover.id], purposes: ['handover-sheet'] });
+  const fileName = shippingFileNames(handover.code, [file], ordinals).get(fact.attachmentId);
   if (fileName === undefined) return null;
-  const ordered = [...pages].sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : 1));
-  const page = ordered.findIndex((row) => row.id === fact.attachmentId) + 1;
+  const page = ordinals.get(fact.attachmentId) ?? 1;
   const parcels = await tx
     .select({ shipment: shipments, order: orders })
     .from(shipments)

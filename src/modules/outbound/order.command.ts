@@ -1912,12 +1912,14 @@ export class OrderCommandService {
           )
           .for('update');
         for (const shipment of liveLabel) {
+          // B10 — one instant for the void, its outbox event and its audit row.
+          const voidedAt = nowIso();
           await voidClientArrangedShipmentInTx(tx, this.outbox, {
             tenantId: command.tenantId,
             shipment,
             actorUserId: command.actorUserId,
             reason: CANCELLED_VOID_REASON,
-            at: nowIso(),
+            at: voidedAt,
           });
           // The label precedent (4-2b A12): the shipment's audit rows target the order.
           await tx.insert(auditEvents).values({
@@ -1928,7 +1930,8 @@ export class OrderCommandService {
             targetType: 'order',
             targetId: order.id,
             reference: idempotencyKey,
-            occurredAt: nowIso(),
+            changes: { shipmentId: shipment.id, reason: CANCELLED_VOID_REASON },
+            occurredAt: voidedAt,
           });
         }
       }
