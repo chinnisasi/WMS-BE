@@ -181,11 +181,16 @@ function uniqueSorted(ids: readonly string[]): string[] {
 export async function liveConsignmentRecordsOfOrdersInTx(tx: TenantTx, tenantId: string, orderIds: readonly string[]): Promise<Map<string, ConsignmentRecordRow>> {
   const ids = uniqueSorted(orderIds);
   if (ids.length === 0) return new Map();
-  const rows = await tx
+  const rows = await liveConsignmentRecordsQuery(tx, tenantId, ids);
+  return new Map(rows.map((row) => [row.orderId, row]));
+}
+
+/** A50 — the live read itself (exported so the suite EXPLAINs the REAL query). */
+export function liveConsignmentRecordsQuery(tx: TenantTx, tenantId: string, orderIds: readonly string[]) {
+  return tx
     .select()
     .from(orderConsignmentRecords)
-    .where(and(eq(orderConsignmentRecords.tenantId, tenantId), inArray(orderConsignmentRecords.orderId, ids), eq(orderConsignmentRecords.status, 'live')));
-  return new Map(rows.map((row) => [row.orderId, row]));
+    .where(and(eq(orderConsignmentRecords.tenantId, tenantId), inArray(orderConsignmentRecords.orderId, [...orderIds]), eq(orderConsignmentRecords.status, 'live')));
 }
 
 /** Every version of one order, newest first (the history the reads print). */

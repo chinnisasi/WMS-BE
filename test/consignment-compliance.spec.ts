@@ -10,6 +10,12 @@ import { MailFacade } from '../src/modules/mail/mail.facade';
 import { EMAIL_GATEWAY, type LogEmailGateway } from '../src/modules/mail/email.gateway';
 import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
 import { HANDOVER_PARCEL_REFUSALS } from '../src/modules/outbound/handover.command';
+import { withTenantTransaction, type TenantTx } from '../src/shared/db/tenant-scope';
+import type { Database } from '../src/shared/db/db';
+import { ewayRequired, thresholdForMovement } from '../src/shared/eway/eway-threshold';
+import { liveConsignmentRecordsQuery } from '../src/modules/invoicing/consignment-seam';
+import { consignmentExceptionsQuery, consignmentNeededPassQuery, portalOpenOrdersQuery } from '../src/modules/outbound/consignment.read';
+import { uuidv7 } from '../src/shared/primitives/ids';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { pdfPagesText } from './support/pdf-text';
 import { expectAuditRow, noOpIdempotencyKey } from './support/audit-guard';
@@ -760,6 +766,107 @@ describe('client consignment compliance (e2e, story 4-6a)', () => {
     expect(results.map((r) => r.status).sort()).toEqual([201, 409]);
     expect(results.find((r) => r.status === 409)!.body.code).toBe('eway-bill-in-use');
     expect(await sql`select count(*)::int as n from order_consignment_records where tenant_id = ${tenantId} and eway_bill_number = ${number} and status = 'live'`).toEqual([{ n: 1 }]);
+  });
+
+  // ── A46 on the portal: the brand speaks for its own documents ──────────────
+
+  it('A46 — the PORTAL may record an exemption and amend after dispatch (the brand issues its documents), but an amendment after dispatch still needs a reason, and the audit row names the portal user', async () => {
+    const orderId = await packedOrder();
+    const exempt = body({ ewayBill: undefined, ewayExemption: { reason: 'non-motorised' } });
+    expect((await portalRecord(orderId, exempt).expect(201)).body.consignment.eway.status).toBe('exempt');
+    await dispatch(orderId).expect(201);
+    const amended = body();
+    expect((await portalRecord(orderId, amended).expect(400)).body.detail).toMatch(/reason is required/);
+    const key = ulid();
+    expect((await portalRecord(orderId, { ...amended, reason: 'Bill generated after all' }, acmePortal, key).expect(201)).body.consignment).toMatchObject({ seq: 2, recordedAfterDispatch: true, recordedByYou: true });
+    await expectAuditRow({ tenantId, key, action: 'consignment.recorded', targetType: 'order', targetId: orderId, actorUserId: acmePortalId });
+  });
+
+  // ── A50: the threshold branches, directly ──────────────────────────────────
+
+  it('A50 — thresholdForMovement: destination unknown takes the LOWER of national and the from-state override (an override below wins, above loses, NULL never wins); intra with a NULL override needs none; no from-state is national; value == threshold is not required', async () => {
+    const t = uuidv7();
+    const by = uuidv7();
+    await sql`insert into eway_state_thresholds (id, tenant_id, state_code, threshold_paise, effective_from, created_by) values
+      (${uuidv7()}, ${t}, '27', 3000000, '2020-01-01', ${by}),
+      (${uuidv7()}, ${t}, '29', 10000000, '2020-01-01', ${by}),
+      (${uuidv7()}, ${t}, '33', null, '2020-01-01', ${by})`;
+    const db = app.get<unknown>(DATABASE) as Database;
+    const judge = (fromState: string | null, toState: string | null) =>
+      withTenantTransaction(db, t, (tx: TenantTx) => thresholdForMovement(tx, t, { fromState, toState, istDate: istDay() }));
+    expect(await judge('27', null)).toEqual({ thresholdPaise: 3_000_000, rule: 'state:27', supplyType: null });
+    expect(await judge('29', null)).toEqual({ thresholdPaise: 5_000_000, rule: 'national', supplyType: null });
+    expect(await judge('33', null)).toEqual({ thresholdPaise: 5_000_000, rule: 'national', supplyType: null });
+    expect(await judge('07', null)).toEqual({ thresholdPaise: 5_000_000, rule: 'national', supplyType: null });
+    expect(await judge('33', '33')).toEqual({ thresholdPaise: null, rule: 'state:33', supplyType: 'intra' });
+    expect(await judge('27', '29')).toEqual({ thresholdPaise: 5_000_000, rule: 'national', supplyType: 'inter' });
+    expect(await judge(null, '29')).toEqual({ thresholdPaise: 5_000_000, rule: 'national', supplyType: null });
+    expect(ewayRequired(5_000_000, { thresholdPaise: 5_000_000, rule: 'national' })).toBe(false);
+    expect(ewayRequired(5_000_001, { thresholdPaise: 5_000_000, rule: 'national' })).toBe(true);
+    expect(ewayRequired(99_000_000, { thresholdPaise: null, rule: 'state:33' })).toBe(false);
+  });
+
+  it('A50 — a floor exactly at the national threshold needs no record (strictly above): a B2C order rated 1 × ₹50,000 ships', async () => {
+    const orderId = await packedOrder({ quantity: 1, ratePaise: 5_000_000, extra: { orderType: 'b2c' } });
+    await dispatch(orderId).expect(201);
+  });
+
+  // ── A50: the partial indexes, on the REAL queries (guide §5: ANALYZE first) ─
+
+  it('A50 — EXPLAIN: the live read uses order_consignment_records_live_unique; the worklist passes use orders_ready_to_dispatch_idx and orders_accepted_tenant_warehouse_idx (D3); the exceptions read shipments_compliance_exception_idx; the portal list orders_tenant_client_open_idx', async () => {
+    const wh = uuidv7();
+    const client = uuidv7();
+    const template = await acceptedOrder();
+    // 24,200 orders of a fake warehouse and client (the template row's columns, fresh ids): 2,200 packed and
+    // 2,200 accepted among a history of dispatched ones — a real warehouse's shape.
+    await sql`
+      insert into orders
+      select (jsonb_populate_record(null::orders, to_jsonb(o) || jsonb_build_object(
+        'id', gen_random_uuid(), 'warehouse_id', ${wh}::uuid, 'client_id', ${client}::uuid,
+        'status', case g % 11 when 0 then 'accepted' when 1 then 'ready_to_dispatch' else 'dispatched' end,
+        'client_order_ref', null, 'external_event_id', null, 'source_payload_hash', null,
+        'follow_on_of_order_id', null, 'follow_on_root_order_id', null, 'follow_on_seq', null,
+        'created_at', now() - (g || ' minutes')::interval, 'updated_at', now() - (g || ' minutes')::interval))).*
+      from orders o, generate_series(1, 24200) g where o.id = ${template}`;
+    // 3,000 handed-over shipments of that warehouse, 20 flagged.
+    await sql`
+      insert into shipments (id, tenant_id, warehouse_id, order_id, client_id, status, kind, carrier_name, tracking_number, label_attachment_id, package_count, labelled_by, labelled_at, recorded_surface,
+        handover_id, handed_over_at, label_verified_at, label_verified_by, label_verify_method, compliance_exception)
+      select gen_random_uuid(), ${tenantId}, ${wh}, gen_random_uuid(), ${client}, 'handed_over', 'client-label', 'Delhivery', 'AWBX' || g, gen_random_uuid(), 1, ${opsId}, now(), 'portal',
+        gen_random_uuid(), now() - (g || ' minutes')::interval, now(), ${opsId}, 'handover-scan', case when g % 150 = 0 then 'consignment-documents-missing' else null end
+      from generate_series(1, 3000) g`;
+    // 3,000 consignment versions of fake orders (live and superseded).
+    await sql`
+      insert into order_consignment_records (id, tenant_id, client_id, warehouse_id, order_id, seq, status, brand_document_type, brand_document_number, brand_document_date,
+        consignor_gstin, consignor_snapshot, declared_value_paise, threshold_rule, eway_required, eway_status, recorded_after_dispatch, source, recorded_by, recorded_at, ended_at, ended_by, end_reason)
+      select gen_random_uuid(), ${tenantId}, ${client}, ${wh}, gen_random_uuid(), 1, case when g % 3 = 0 then 'live' else 'superseded' end, 'invoice', 'INV-X' || g, current_date,
+        '29ABCDE1234F1Z5', '{"v":1}'::jsonb, 100, 'national', false, 'not-required', false, 'web', ${opsId}, now(),
+        case when g % 3 = 0 then null else now() end, case when g % 3 = 0 then null else ${opsId}::uuid end, case when g % 3 = 0 then null else 'x' end
+      from generate_series(1, 3000) g`;
+    await sql`analyze orders`;
+    await sql`analyze shipments`;
+    await sql`analyze order_consignment_records`;
+    const db = app.get<unknown>(DATABASE) as unknown as TenantTx;
+    const plan = async (query: { toSQL(): { sql: string; params: unknown[] } }) => {
+      const { sql: text, params } = query.toSQL();
+      return (await sql.unsafe(`explain ${text}`, params as never[])).map((row) => Object.values(row)[0]).join('\n');
+    };
+    const someOrders = ((await sql`select order_id from order_consignment_records where tenant_id = ${tenantId} and client_id = ${client} limit 5`) as unknown as { order_id: string }[]).map((r) => r.order_id);
+    expect(await plan(liveConsignmentRecordsQuery(db, tenantId, someOrders))).toContain('order_consignment_records_live_unique');
+    // D3 — each pass is bounded by an OPEN-orders partial index, never a scan of the dispatched history. The
+    // planner picks the pass's own index (0116 / 0104) or 0101's open-orders index (a skip scan on
+    // tenant + warehouse, then a top-N sort of at most 5,001 rows): either keeps the read to open orders.
+    const packedPlan = await plan(consignmentNeededPassQuery(db, tenantId, wh, null, 'ready_to_dispatch', 5001));
+    expect(packedPlan).toMatch(/orders_ready_to_dispatch_idx|orders_tenant_client_open_idx/);
+    expect(packedPlan).not.toMatch(/Seq Scan on orders/);
+    const acceptedPlan = await plan(consignmentNeededPassQuery(db, tenantId, wh, null, 'accepted', 5001));
+    expect(acceptedPlan).toMatch(/orders_accepted_tenant_warehouse_idx|orders_tenant_client_open_idx/);
+    expect(acceptedPlan).not.toMatch(/Seq Scan on orders/);
+    // A small page (the shape a later page cap would give) takes the pass's own ordered index.
+    expect(await plan(consignmentNeededPassQuery(db, tenantId, wh, null, 'ready_to_dispatch', 50))).toContain('orders_ready_to_dispatch_idx');
+    expect(await plan(consignmentNeededPassQuery(db, tenantId, wh, null, 'accepted', 50))).toContain('orders_accepted_tenant_warehouse_idx');
+    expect(await plan(consignmentExceptionsQuery(db, tenantId, wh, null))).toContain('shipments_compliance_exception_idx');
+    expect(await plan(portalOpenOrdersQuery(db, tenantId, client))).toContain('orders_tenant_client_open_idx');
   });
 
   it('the routes are in the OpenAPI document', async () => {

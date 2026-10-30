@@ -216,25 +216,14 @@ export async function consignmentNeededInTx(
   clientId: string | null,
   todayIst: string,
 ): Promise<{ rows: ConsignmentWorklistRow[]; truncated: boolean }> {
-  const scope = (status: 'ready_to_dispatch' | 'accepted') =>
-    and(eq(orders.tenantId, tenantId), eq(orders.warehouseId, warehouseId), eq(orders.status, status), ...(clientId === null ? [] : [eq(orders.clientId, clientId)]));
-  const packed = await tx
-    .select()
-    .from(orders)
-    .where(scope('ready_to_dispatch'))
-    .orderBy(asc(orders.updatedAt), asc(orders.id))
-    .limit(CONSIGNMENT_WORKLIST_SCAN + 1);
+  const scope = (status: 'ready_to_dispatch' | 'accepted') => consignmentNeededScope(tenantId, warehouseId, clientId, status);
+  const packed = await consignmentNeededPassQuery(tx, tenantId, warehouseId, clientId, 'ready_to_dispatch', CONSIGNMENT_WORKLIST_SCAN + 1);
   let truncated = packed.length > CONSIGNMENT_WORKLIST_SCAN;
   const packedRows = packed.slice(0, CONSIGNMENT_WORKLIST_SCAN);
   const room = CONSIGNMENT_WORKLIST_SCAN - packedRows.length;
   let acceptedRows: Order[] = [];
   if (room > 0) {
-    const accepted = await tx
-      .select()
-      .from(orders)
-      .where(scope('accepted'))
-      .orderBy(asc(orders.createdAt), asc(orders.id))
-      .limit(room + 1);
+    const accepted = await consignmentNeededPassQuery(tx, tenantId, warehouseId, clientId, 'accepted', room + 1);
     if (accepted.length > room) truncated = true;
     acceptedRows = accepted.slice(0, room);
   } else if (!truncated) {
@@ -257,6 +246,31 @@ export async function consignmentNeededInTx(
     return out;
   });
   return { rows, truncated };
+}
+
+function consignmentNeededScope(tenantId: string, warehouseId: string, clientId: string | null, status: 'ready_to_dispatch' | 'accepted') {
+  return and(eq(orders.tenantId, tenantId), eq(orders.warehouseId, warehouseId), eq(orders.status, status), ...(clientId === null ? [] : [eq(orders.clientId, clientId)]));
+}
+
+/**
+ * A43, D3 — one worklist pass (exported so the suite EXPLAINs the REAL query):
+ * packed orders by `(updated_at, id)` on 0116's `orders_ready_to_dispatch_idx`,
+ * accepted ones by `(created_at, id)` on 0104's `orders_accepted_tenant_warehouse_idx`.
+ */
+export function consignmentNeededPassQuery(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  clientId: string | null,
+  status: 'ready_to_dispatch' | 'accepted',
+  limit: number,
+) {
+  return tx
+    .select()
+    .from(orders)
+    .where(consignmentNeededScope(tenantId, warehouseId, clientId, status))
+    .orderBy(...(status === 'ready_to_dispatch' ? [asc(orders.updatedAt), asc(orders.id)] : [asc(orders.createdAt), asc(orders.id)]))
+    .limit(limit);
 }
 
 function worklistRowOf(fact: OrderConsignmentFacts, gate: ConsignmentGateResult, packedAt: string | null): ConsignmentWorklistRow {
@@ -300,20 +314,7 @@ export async function consignmentExceptionsInTx(
   warehouseId: string,
   clientId: string | null,
 ): Promise<ConsignmentExceptionRow[]> {
-  const rows = await tx
-    .select({ shipment: shipments, handoverCode: courierHandovers.code })
-    .from(shipments)
-    .leftJoin(courierHandovers, and(eq(courierHandovers.tenantId, shipments.tenantId), eq(courierHandovers.id, shipments.handoverId)))
-    .where(
-      and(
-        eq(shipments.tenantId, tenantId),
-        eq(shipments.warehouseId, warehouseId),
-        isNotNull(shipments.complianceException),
-        ...(clientId === null ? [] : [eq(shipments.clientId, clientId)]),
-      ),
-    )
-    .orderBy(desc(shipments.handedOverAt), desc(shipments.id))
-    .limit(CONSIGNMENT_EXCEPTIONS_MAX);
+  const rows = await consignmentExceptionsQuery(tx, tenantId, warehouseId, clientId);
   if (rows.length === 0) return [];
   const facts = await consignmentFactsOfOrdersInTx(tx, tenantId, rows.map((row) => row.shipment.orderId));
   const thresholds = new NationalThresholds(tx);
@@ -341,6 +342,32 @@ export async function consignmentExceptionsInTx(
   return out;
 }
 
+/** A50 — the exceptions read (exported so the suite EXPLAINs the REAL query; on `shipments_compliance_exception_idx`). */
+export function consignmentExceptionsQuery(tx: TenantTx, tenantId: string, warehouseId: string, clientId: string | null) {
+  return tx
+    .select({ shipment: shipments, handoverCode: courierHandovers.code })
+    .from(shipments)
+    .leftJoin(courierHandovers, and(eq(courierHandovers.tenantId, shipments.tenantId), eq(courierHandovers.id, shipments.handoverId)))
+    .where(
+      and(
+        eq(shipments.tenantId, tenantId),
+        eq(shipments.warehouseId, warehouseId),
+        isNotNull(shipments.complianceException),
+        ...(clientId === null ? [] : [eq(shipments.clientId, clientId)]),
+      ),
+    )
+    .orderBy(desc(shipments.handedOverAt), desc(shipments.id))
+    .limit(CONSIGNMENT_EXCEPTIONS_MAX);
+}
+
+/** A50 — the portal needed list's scan (exported so the suite EXPLAINs the REAL query; on 0101's `orders_tenant_client_open_idx`). */
+export function portalOpenOrdersQuery(tx: TenantTx, tenantId: string, clientId: string) {
+  return tx
+    .select()
+    .from(orders)
+    .where(and(eq(orders.tenantId, tenantId), eq(orders.clientId, clientId), sql`${orders.status} IN ('accepted','ready_to_dispatch')`));
+}
+
 /** A18 — one row of the portal's needed list (no warehouse flag, no staff fact). */
 export interface PortalConsignmentNeededRow {
   readonly orderId: string;
@@ -359,10 +386,7 @@ export interface PortalConsignmentNeededRow {
  * the explicit `client_id = $client` (the two layers).
  */
 export async function portalConsignmentsNeededInTx(tx: TenantTx, tenantId: string, clientId: string, todayIst: string): Promise<PortalConsignmentNeededRow[]> {
-  const open = await tx
-    .select()
-    .from(orders)
-    .where(and(eq(orders.tenantId, tenantId), eq(orders.clientId, clientId), sql`${orders.status} IN ('accepted','ready_to_dispatch')`));
+  const open = await portalOpenOrdersQuery(tx, tenantId, clientId);
   const national = await nationalThresholdInForceInTx(tx, todayIst);
   const kept = await inChunks(open, async (chunk) => {
     const facts = await consignmentFactsOfOrderRowsInTx(tx, tenantId, chunk);
