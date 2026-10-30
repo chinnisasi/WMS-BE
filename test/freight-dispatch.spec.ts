@@ -20,6 +20,8 @@ import { mintSignIn } from './support/sign-in';
 import { testAddress } from './support/shipment-address';
 import { dispatchedOrderFixtures, type Picklist } from './support/dispatched-order';
 import { pdfText } from './support/pdf-text';
+import { withTenantTransaction } from '../src/shared/db/tenant-scope';
+import { removeFromFreightOnCancelInTx } from '../src/modules/outbound/freight-support';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -496,6 +498,9 @@ describe('B2B freight dispatch (e2e, story 4-9a)', () => {
     expect(await storedHash(lrKey)).toBe(hashCommandPayload({ arm: 'freight-lr', tenantId, consignmentId: c1.id, lrNumber: '4411', lrDate: null, freightTerms: null, reason: 'Typo on the LR' }));
     const sameLr = noOpIdempotencyKey(tenantId, ulid(), 'freight.lr:unchanged');
     expect((await post(`freight-consignments/${c1.id as string}/lr`, { lrNumber: '4411', reason: 'again' }, sameLr).expect(200)).body.unchanged).toBe(true);
+    // A69 — the carriage snapshot is written once: the LR change and two deliveries left it as the departure wrote it.
+    expect((await consignmentOf(so1)).carriage_snapshot).toEqual(c1.carriage_snapshot);
+    expect((await consignmentOf(so1)).client_snapshot).toEqual(c1.client_snapshot);
   });
 
   // ── AC3: the web departure's refusals, acknowledgement and leave ──────────
@@ -750,5 +755,48 @@ describe('B2B freight dispatch (e2e, story 4-9a)', () => {
     const refused = await post(`freight-loads/${full.id}/orders`, { orderIds: [extra] }).expect(409);
     expect(refused.body).toMatchObject({ code: 'load-full', current: 100, adding: 1, max: 100 });
     await sql`update freight_consignments set status = 'removed', removed_at = now(), removed_by = ${opsId}, remove_reason = 'test' where load_id = ${full.id}`;
+  });
+
+  // ── 4-6a's gate at departure, the exceptions union, frozen parties, unstamped writes ──
+
+  it('4-6a at departure — the web refuses an order without the brand’s documents; the handheld dispatches it flagged and the documents worklist lists it with its load (A20); renaming the transporter after departure changes no print (AC6); a freight write refuses a client stamp (A64)', async () => {
+    await sql`update clients set consignment_document_rule = 'all' where id = ${beta}`;
+    try {
+      const order = await packedOrder('B-TEE', 1);
+      const load = (await createLoad({ orderIds: [order] }).expect(201)).body.load;
+      expect(load.consignments[0].gate).toMatchObject({ blocking: true });
+      await deviceScan(load.id, cartonCode(order, 1, 1)).expect(201);
+      const web = await depart(load.id, [{ orderId: order, decision: 'dispatch' }]).expect(409);
+      expect(web.body).toMatchObject({ code: 'freight-orders-refused', orders: [{ orderId: order, code: 'consignment-documents-missing' }] });
+      const device = await depart(load.id, [{ orderId: order, decision: 'dispatch' }], { occurredAt: new Date().toISOString(), warehouseId }, ulid(), operatorToken).expect(201);
+      expect(device.body.dispatched).toEqual([expect.objectContaining({ orderId: order, complianceException: 'consignment-documents-missing', loadException: null })]);
+      expect(await consignmentOf(order)).toMatchObject({ status: 'dispatched', compliance_exception: 'consignment-documents-missing' });
+      const worklist = await http().get(`${API}/${tenantId}/warehouses/${warehouseId}/outbound/consignments?view=exceptions`).set('Authorization', `Bearer ${opsToken}`).expect(200);
+      const row = (worklist.body.exceptions as { orderId: string; shipmentId: string | null; freight?: { loadCode: string } }[]).find((r) => r.orderId === order);
+      expect(row).toMatchObject({ shipmentId: null, code: 'consignment-documents-missing', freight: { loadId: load.id, loadCode: load.code } });
+
+      // AC6 — the partner renamed after departure: the frozen load prints the old name.
+      await sql`update business_partners set name = 'VRL Renamed Ltd' where id = ${transporterId}`;
+      const sheet = await http().get(`${API}/${tenantId}/outbound/freight-loads/${load.id}/loading-sheet`).set('Authorization', `Bearer ${opsToken}`).buffer(true)
+        .parse((res, cb) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (c: Buffer) => chunks.push(c));
+          res.on('end', () => cb(null, Buffer.concat(chunks)));
+        }).expect(200);
+      const text = await pdfText(sheet.body as Buffer);
+      expect(text).toContain('VRL Logistics');
+      expect(text).not.toContain('VRL Renamed');
+      await sql`update business_partners set name = 'VRL Logistics' where id = ${transporterId}`;
+
+      // A64 — the cancels' freight arm refuses a client-stamped transaction.
+      const planned = await acceptedOrder('A-TEE');
+      await createLoad({ orderIds: [planned] }).expect(201);
+      await expect(
+        withTenantTransaction(app.get(DATABASE), tenantId, (tx) => removeFromFreightOnCancelInTx(tx, { tenantId, orderId: planned, actorUserId: opsId, at: new Date().toISOString(), idempotencyKey: ulid() }), { clientId: acme }),
+      ).rejects.toThrow(/client-stamped/);
+      expect(await consignmentOf(planned)).toMatchObject({ status: 'planned' });
+    } finally {
+      await sql`update clients set consignment_document_rule = 'b2b' where id = ${beta}`;
+    }
   });
 });

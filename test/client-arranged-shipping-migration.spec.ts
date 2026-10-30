@@ -158,22 +158,23 @@ describe('migration 0116: client-arranged shipping', () => {
     const literals = (name: string) => [...def(name).def.matchAll(/'([^']+)'/g)].map((match) => match[1]!);
     expect(literals('shipments_kind_check')).toEqual([...SHIPMENT_KINDS]);
     expect(literals('shipments_status_check')).toEqual([...SHIPMENT_STATUSES]);
-    expect(literals('attachments_purpose_check')).toEqual([...ATTACHMENT_PURPOSES]);
+    // 0116's sets: 4-9a's 0119 appends `loading-sheet`, `freight_load` and `lr` (pinned by freight-dispatch-migration.spec.ts).
+    expect(literals('attachments_purpose_check')).toEqual(ATTACHMENT_PURPOSES.filter((purpose) => purpose !== 'loading-sheet'));
     expect(literals('attachments_source_check')).toEqual([...ATTACHMENT_SOURCES]);
-    expect(literals('attachments_owner_type_check')).toEqual([...ATTACHMENT_OWNER_TYPES]);
+    expect(literals('attachments_owner_type_check')).toEqual(ATTACHMENT_OWNER_TYPES.filter((type) => type !== 'freight_load'));
     expect(literals('attachments_content_type_check')).toEqual([...ATTACHMENT_CONTENT_TYPES]);
-    expect(literals('attachments_doc_kind_check').filter((value) => value !== 'shipping-document')).toEqual([...SHIPPING_DOC_KINDS]);
+    expect(literals('attachments_doc_kind_check').filter((value) => value !== 'shipping-document')).toEqual(SHIPPING_DOC_KINDS.filter((kind) => kind !== 'lr'));
     expect(literals('courier_handovers_source_check')).toEqual([...HANDOVER_SOURCES]);
     // 0116's set: the TS tuple as it stood at 0116 (4-6a's 0118 appends
     // `client-documents-needed`, pinned by consignment-compliance-migration.spec.ts).
-    expect(literals('email_messages_template_check')).toEqual(EMAIL_TEMPLATES.filter((template) => template !== 'client-documents-needed'));
+    expect(literals('email_messages_template_check')).toEqual(EMAIL_TEMPLATES.filter((template) => template !== 'client-documents-needed' && template !== 'client-delivery-update'));
     // 0116's set: the TS tuple as it stood at 0116 (4-5a's 0117 appends
     // `packing-slip-pdf`, pinned against the tuple by mail.spec.ts and
     // packing-documents-migration.spec.ts).
     expect(literals('email_messages_attachment_kind_check')).toEqual(EMAIL_ATTACHMENT_KINDS.filter((kind) => kind !== 'packing-slip-pdf'));
     // 0116's set (4-6a's 0118 appends `consignment.documents-needed`, pinned by client-master.spec.ts).
     expect(literals('client_contacts_email_events_check').filter((value, i, all) => all.indexOf(value) === i)).toEqual(
-      CLIENT_EMAIL_EVENTS.filter((event) => event !== 'consignment.documents-needed'),
+      CLIENT_EMAIL_EVENTS.filter((event) => event !== 'consignment.documents-needed' && event !== 'delivery.recorded'),
     );
     // The twelve shipments CHECKs are NOT VALID (their VALIDATE is PENDING); the rest validated.
     const shipmentChecks = checks.filter((check) => check.conname.startsWith('shipments_') && !check.convalidated).map((check) => check.conname).sort();
