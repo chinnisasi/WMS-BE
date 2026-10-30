@@ -686,6 +686,48 @@ describe('B2B freight dispatch (e2e, story 4-9a)', () => {
     expect(await sql`select count(*)::int as n from outbox_messages where tenant_id = ${tenantId} and type = 'shipment.document-shared' and payload->>'attachmentId' in (select id::text from attachments where owner_id = ${load.id})`).toEqual([{ n: 0 }]);
   });
 
+  // ── Part B, capacity, and the departure that dispatches nothing ──────────
+
+  it('A14 web — an e-way bill needs the Part B confirmation (naming the bills); an overloaded truck needs the acknowledgement (A66); both recorded on the load', async () => {
+    const order = await packedOrder('A-TEE', 2);
+    const today = new Date(Date.now() + 5.5 * 3_600_000).toISOString().slice(0, 10);
+    const until = new Date(Date.now() + 5 * 86_400_000).toISOString().slice(0, 10);
+    await sql`insert into order_consignment_records (id, tenant_id, client_id, warehouse_id, order_id, seq, status, brand_document_type, brand_document_number, brand_document_date,
+        consignor_gstin, consignor_snapshot, declared_value_paise, destination_state_code, supply_type, threshold_paise, threshold_rule, eway_required, eway_status,
+        eway_bill_number, eway_bill_date, eway_valid_until, recorded_after_dispatch, source, recorded_by, recorded_at)
+      values (${uuidv7()}, ${tenantId}, ${acme}, ${warehouseId}, ${order}, 1, 'live', 'invoice', 'INV-4409', ${today},
+        '29ABCDE1234F1Z5', '{"v":1,"code":"ACME","name":"ACME Brand"}'::jsonb, 11800000, '27', 'inter', 5000000, 'national', true, 'recorded',
+        '123456789012', ${today}, ${until}, false, 'web', ${opsId}, now())`;
+    const load = (await createLoad({ orderIds: [order], vehicleCapacityKg: 1 }).expect(201)).body.load;
+    expect(load.partB.required).toBe(true);
+    expect(load.consignments[0].eway).toEqual({ number: '123456789012', validUntil: until });
+    await scan(load.id, cartonCode(order, 1, 1)).expect(201);
+    await scan(load.id, cartonCode(order, 1, 2)).expect(201);
+    const consignments = [{ orderId: order, decision: 'dispatch' }];
+    const partB = await depart(load.id, consignments).expect(409);
+    expect(partB.body).toMatchObject({ code: 'eway-part-b-unconfirmed', orders: [{ orderId: order, ewayBillNumber: '123456789012' }], vehicleNumber: 'KA01AB1234' });
+    const heavy = await depart(load.id, consignments, { ewayPartBConfirmed: true }).expect(409);
+    expect(heavy.body).toMatchObject({ code: 'load-over-capacity', grossWeightGrams: 10_000, capacityKg: 1 });
+    const ok = await depart(load.id, consignments, { ewayPartBConfirmed: true, overCapacityAcknowledged: true }).expect(201);
+    expect(ok.body.load).toMatchObject({ capacityExceeded: true, partB: { required: true, confirmedBy: opsId } });
+    expect(ok.body.load.partB.confirmedAt).toEqual(expect.any(String));
+    // The stamped version is the one the truck left under.
+    expect((await sql`select dispatched_at is not null as stamped from order_consignment_records where order_id = ${order}`)[0]).toEqual({ stamped: true });
+  });
+
+  it('A50 — a handheld departure whose every order is refused closes the load (cancelled, the vehicle kept, one review row); later scans answer load-cancelled', async () => {
+    const order = await packedOrder('A-TEE', 1);
+    const load = (await createLoad({ orderIds: [order] }).expect(201)).body.load;
+    const ghost = uuidv7();
+    const res = await depart(load.id, [{ orderId: ghost, decision: 'dispatch' }], { occurredAt: new Date().toISOString(), warehouseId }, ulid(), operatorToken).expect(201);
+    expect(res.body).toMatchObject({ dispatched: [], refused: [{ orderId: ghost, code: 'consignment-removed' }], left: [{ orderId: order, reason: "Not on the device's dispatch list" }] });
+    expect(res.body.load.status).toBe('cancelled');
+    expect(res.body.load.cancel.reason).toMatch(/^Departed with no dispatchable order — see review /);
+    expect(res.body.load.vehicle.number).toBe('KA01AB1234');
+    expect(await orderStatus(order)).toBe('ready_to_dispatch');
+    expect((await deviceScan(load.id, cartonCode(order, 1, 1)).expect(409)).body.code).toBe('load-cancelled');
+  });
+
   // ── the device snapshot, the pallet package and load-full ─────────────────
 
   it('A23 — the device snapshot carries the open loads with their consignments and loaded codes; A10 — a full load refuses one more', async () => {
