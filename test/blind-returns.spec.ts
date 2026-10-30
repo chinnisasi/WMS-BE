@@ -337,6 +337,15 @@ describe('blind returns (e2e, story 4-7b)', () => {
       values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${orderId}, ${status}, ${uuidv7()}, 'sandbox', 'Sandbox', ${trackingNumber}, 'doc', ${opsUserId}, now(), ${manifestId}, ${voidedAt}, ${voidedBy})`;
   }
 
+  /** Story 4-9a (A61) — a dispatched freight consignment carrying an LR (staff data the suite seeds). */
+  async function addFreightLr(orderId: string, lrNumber: string): Promise<void> {
+    const clientId = (await sql`select client_id from orders where id = ${orderId}`)[0]!.client_id as string;
+    await sql`insert into freight_consignments (id, tenant_id, warehouse_id, load_id, order_id, client_id, status, stop_seq, lr_number, lr_recorded_at, lr_recorded_by,
+        dispatched_at, package_count, loaded_package_count, client_snapshot, carriage_snapshot, added_by)
+      values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${uuidv7()}, ${orderId}, ${clientId}, 'dispatched', 1, ${lrNumber}, now(), ${opsUserId},
+        now(), 1, 1, '{"v":1}'::jsonb, '{"v":1}'::jsonb, ${opsUserId})`;
+  }
+
   interface Entry {
     skuId: string;
     qty: number;
@@ -532,6 +541,19 @@ describe('blind returns (e2e, story 4-7b)', () => {
     expect(other.orderId).toBeDefined();
     const foreign = await receiveBlind({ parcelReference: 'OTHER-REF', entries: [{ skuId: sku('BA-1'), qty: 1 }] }).expect(201);
     expect(foreign.body.suggestedOrderId).toBeNull();
+  });
+
+  it('story 4-9a (A61): a dispatched freight consignment’s LR joins the AWB arm — matched normalised (a lower-case, hyphenated scan); an LR shared by two orders gives no suggestion', async () => {
+    const { orderId } = await dispatchedOrder([{ skuId: sku('BA-1'), quantity: 1 }]);
+    await addFreightLr(orderId, 'VRL4410');
+    const one = await receiveBlind({ parcelReference: 'vrl-44 10', entries: [{ skuId: sku('BA-1'), qty: 1 }] }).expect(201);
+    expect(one.body).toMatchObject({ suggestedOrderId: orderId, matchKind: 'awb' });
+    const a = await dispatchedOrder([{ skuId: sku('BA-1'), quantity: 1 }]);
+    const b = await dispatchedOrder([{ skuId: sku('BA-1'), quantity: 1 }]);
+    await addFreightLr(a.orderId, 'LR5500');
+    await addFreightLr(b.orderId, 'LR5500');
+    const none = await receiveBlind({ parcelReference: 'LR5500', entries: [{ skuId: sku('BA-1'), qty: 1 }] }).expect(201);
+    expect(none.body).toMatchObject({ suggestedOrderId: null, matchKind: null });
   });
 
   it('the order-reference arm after 4-2c (D6): the exact pass names a follow-on by its printed label and a root by its bare number; the chain alone would give no suggestion', async () => {
