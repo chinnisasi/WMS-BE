@@ -45814,6 +45814,174 @@
         ]
       }
     },
+    "/tenants/{tenantId}/vendor-returns/{vendorReturnId}/package-labels": {
+      "get": {
+        "description": "`format=zpl|pdf` (default zpl), `layout=label|a4` (default label; a4 is PDF only), `count` (required before dispatch; after it, defaults to the dispatched package count), `from`/`to` (a slice, default every package; at most 1,000 labels per print). `Content-Disposition: attachment` — `{code}-package-labels.{zpl|pdf}`.",
+        "operationId": "VendorReturnsController_packageLabels",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "vendorReturnId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "format",
+            "required": false,
+            "in": "query",
+            "description": "zpl (default; 4×6 at 203 dpi) or pdf",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "zpl",
+                "pdf"
+              ]
+            }
+          },
+          {
+            "name": "layout",
+            "required": false,
+            "in": "query",
+            "description": "label (default; one 4×6 per package) or a4 (two per landscape sheet — PDF only)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "label",
+                "a4"
+              ]
+            }
+          },
+          {
+            "name": "count",
+            "required": false,
+            "in": "query",
+            "description": "Packages, 1–9,999: required before dispatch; after it defaults to the dispatched count, and a different one is 409 package-count-mismatch",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "The first package to print (default 1)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "The last package to print (default count); one print is at most 1,000 labels",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The labels: ZPL as `text/plain; charset=us-ascii`, or a PDF",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed id, format, layout, count, from or to; zpl with the a4 layout; no count before dispatch (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks labels.execute (role-denied) — checked before anything it sent",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such return to vendor in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not picked or dispatched (rtv-not-picked); a count other than the dispatched one (package-count-mismatch); the vendor has no address of the consignee kind (consignee-address-missing)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "More than 1,000 labels in one print (too-many-labels — ask for a from/to range)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-5a — labels.execute: the 4×6 package labels of a picked or dispatched return to vendor, “PACKAGE n/N” — FROM the brand c/o the warehouse, TO the vendor’s frozen address of the RTV’s consignee kind, RETURN TO VENDOR {code}, the carrier and tracking ref once dispatched, and the barcode {code}.{n}. ZPL (203 dpi) first; PDF one 4×6 page per package, or two per landscape A4 sheet",
+        "tags": [
+          "vendor-returns"
+        ]
+      }
+    },
     "/tenants/{tenantId}/vendor-returns/{vendorReturnId}/pick": {
       "post": {
         "operationId": "VendorReturnsController_pick",
@@ -46628,6 +46796,174 @@
           }
         ],
         "summary": "One return to client — its frozen brand and address, lines, pick, dispatch capture and cancellation (the printable note reads it) — open to any member",
+        "tags": [
+          "client-returns"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-returns/{clientReturnId}/package-labels": {
+      "get": {
+        "description": "`format=zpl|pdf` (default zpl), `layout=label|a4` (default label; a4 is PDF only), `count` (required before dispatch; after it, defaults to the dispatched package count), `from`/`to` (a slice, default every package; at most 1,000 labels per print). `Content-Disposition: attachment` — `{code}-package-labels.{zpl|pdf}`.",
+        "operationId": "ClientReturnsController_packageLabels",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientReturnId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "format",
+            "required": false,
+            "in": "query",
+            "description": "zpl (default; 4×6 at 203 dpi) or pdf",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "zpl",
+                "pdf"
+              ]
+            }
+          },
+          {
+            "name": "layout",
+            "required": false,
+            "in": "query",
+            "description": "label (default; one 4×6 per package) or a4 (two per landscape sheet — PDF only)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "label",
+                "a4"
+              ]
+            }
+          },
+          {
+            "name": "count",
+            "required": false,
+            "in": "query",
+            "description": "Packages, 1–9,999: required before dispatch; after it defaults to the dispatched count, and a different one is 409 package-count-mismatch",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "The first package to print (default 1)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "The last package to print (default count); one print is at most 1,000 labels",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The labels: ZPL as `text/plain; charset=us-ascii`, or a PDF",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed id, format, layout, count, from or to; zpl with the a4 layout; no count before dispatch (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks labels.execute (role-denied) — checked before anything it sent",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such return to client in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not picked or dispatched (rtc-not-picked); a count other than the dispatched one (package-count-mismatch)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "More than 1,000 labels in one print (too-many-labels — ask for a from/to range)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-5a — labels.execute: the 4×6 package labels of a picked or dispatched return to client, “PACKAGE n/N” — FROM the brand c/o the warehouse, TO the RTC’s frozen consignee address, RETURN TO CLIENT {code}, the carrier and tracking ref once dispatched, and the barcode {code}.{n}. ZPL (203 dpi) first; PDF one 4×6 page per package, or two per landscape A4 sheet",
         "tags": [
           "client-returns"
         ]
@@ -59247,7 +59583,14 @@
           "weightGrams": {
             "type": "number",
             "nullable": true,
-            "description": "Weight in grams, 1–1,000,000 (default: the last pack measurement)"
+            "description": "Weight in grams, 1–1,000,000 (default: the live pack’s gross when ≤ 1,000,000 g, else the last pack measurement)"
+          },
+          "cartonCodes": {
+            "description": "Story 4-5a (A21) — the carton labels scanned onto the pickup (≤ 200; trimmed and upper-cased; an empty list is absent; unique by carton). A code that is not one of this order’s live cartons refuses the parcel (carton-not-current)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         },
         "required": [
@@ -59442,7 +59785,9 @@
               "awb-mismatch",
               "awb-required",
               "awb-in-use",
-              "order-holds-recalled-batch"
+              "order-holds-recalled-batch",
+              "package-count-mismatch",
+              "carton-not-current"
             ]
           },
           "detail": {
@@ -59498,6 +59843,39 @@
           "rejectedOpId"
         ]
       },
+      "HandoverDetailCartonsDto": {
+        "type": "object",
+        "properties": {
+          "cartonCount": {
+            "type": "number",
+            "description": "The live pack’s cartons (1 for an order packed before cartons were recorded)"
+          },
+          "scanned": {
+            "type": "number",
+            "description": "Cartons scanned onto this pickup (recorded on the carton)"
+          },
+          "legacy": {
+            "type": "boolean",
+            "description": "Packed before cartons were recorded: \"1 carton (packed before cartons were recorded)\""
+          },
+          "codCartonScanned": {
+            "type": "boolean",
+            "nullable": true,
+            "description": "A44 — a COD order whose cartons were scanned: false when carton 1 (the COD label) was not; null when not judged"
+          },
+          "staleCartonLabels": {
+            "type": "boolean",
+            "description": "A37 — the handheld scanned a superseded pack’s label (accepted, not recorded): reprint the labels"
+          }
+        },
+        "required": [
+          "cartonCount",
+          "scanned",
+          "legacy",
+          "codCartonScanned",
+          "staleCartonLabels"
+        ]
+      },
       "HandoverDetailParcelDto": {
         "type": "object",
         "properties": {
@@ -59538,6 +59916,14 @@
           "destinationCity": {
             "type": "string",
             "nullable": true
+          },
+          "cartons": {
+            "description": "Story 4-5a (A21, A34, A37, A44) — the order’s cartons at this handover",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/HandoverDetailCartonsDto"
+              }
+            ]
           }
         },
         "required": [
@@ -59549,7 +59935,8 @@
           "packageCount",
           "weightGrams",
           "codAmountPaise",
-          "destinationCity"
+          "destinationCity",
+          "cartons"
         ]
       },
       "HandoverDetailDto": {
@@ -59761,6 +60148,19 @@
                 "$ref": "#/components/schemas/HandoverCandidateShipmentDto"
               }
             ]
+          },
+          "packSeq": {
+            "type": "number",
+            "description": "Story 4-5a (A21) — the live pack’s number; absent for an order packed before cartons were recorded (one carton, pack 1)"
+          },
+          "cartonCount": {
+            "type": "number",
+            "description": "Story 4-5a (A21) — the live pack’s carton count; absent as packSeq"
+          },
+          "defaultWeightGrams": {
+            "type": "number",
+            "nullable": true,
+            "description": "Story 4-5a (A33) — the handover’s weight default: the live pack’s gross when ≤ 1,000,000 g (null above it), else the last pack measurement"
           }
         },
         "required": [
@@ -62625,6 +63025,18 @@
               "ready_to_dispatch"
             ]
           },
+          "packSeq": {
+            "type": "number",
+            "description": "Story 4-5a (D6, additive): the live pack’s number — a carton label of a lower pack is stale. Absent for an order packed before cartons were recorded (pack 1, one carton) and from an older server"
+          },
+          "cartonCount": {
+            "type": "number",
+            "description": "Story 4-5a (D6, additive): the live pack’s carton count; absent as packSeq"
+          },
+          "codAmountPaise": {
+            "type": "number",
+            "description": "Story 4-5a (A44, additive): the COD amount in paise (carton 1 carries the COD label); absent when prepaid"
+          },
           "shipment": {
             "nullable": true,
             "type": "object",
@@ -62834,6 +63246,10 @@
           "dispatchParcelsTruncated": {
             "type": "boolean",
             "description": "Story 4-4a (additive): true when dispatchParcels was capped at 2000 — hand over newer parcels on the web, or refresh later"
+          },
+          "packCartons": {
+            "type": "boolean",
+            "description": "Story 4-5a (A32, additive): true when this server records cartons on a pack — the handheld offers New carton only then. Absent from an older server (which would drop `cartons` from a synced pack): one carton only"
           }
         },
         "required": [
