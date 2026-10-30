@@ -21,11 +21,12 @@ export class AttachmentUploadFilter implements ExceptionFilter {
       throw new ProblemException(
         'attachment-too-large',
         422,
-        'Photo too large',
-        `The photo exceeds the ${MAX_ATTACHMENT_UPLOAD_BYTES}-byte (10 MB) cap.`,
+        // Story 4-4a (A42) — generic: the filter guards photos, PDFs and documents.
+        'File too large',
+        `The file exceeds the ${MAX_ATTACHMENT_UPLOAD_BYTES}-byte (10 MB) cap.`,
       );
     }
-    throw new ProblemException('validation-failed', 400, 'Invalid photo upload', `The upload is malformed: ${exception.message}.`);
+    throw new ProblemException('validation-failed', 400, 'Invalid upload', `The upload is malformed: ${exception.message}.`);
   }
 }
 
@@ -36,4 +37,18 @@ export const ATTACHMENT_UPLOAD_LIMITS = {
   fields: 4,
   fieldSize: 256,
   parts: 6,
+} as const;
+
+/**
+ * Story 4-4a (A42, D19) — the client label upload's limits: up to six text
+ * fields (AWB, courier name, transporter, parcel count, replace) of at most
+ * 512 bytes — a 100-code-point courier name in UTF-8 (Devanagari is 3 bytes
+ * a letter) fits.
+ */
+export const CLIENT_LABEL_UPLOAD_LIMITS = {
+  fileSize: MAX_ATTACHMENT_UPLOAD_BYTES,
+  files: 1,
+  fields: 6,
+  fieldSize: 512,
+  parts: 8,
 } as const;

@@ -150,6 +150,13 @@ export const AUDIT_NO_OP_ARMS = {
     isRecord(snapshot.allocation) &&
     Array.isArray(snapshot.allocation.allocated) &&
     snapshot.allocation.allocated.length === 0,
+  /**
+   * Story 4-4a (A11, A48) — `ClientLabelCommand.verifyLabel` of a label
+   * already verified (or a late device verify after the handover): the key
+   * stored with `{shipment, verified: false}`, nothing written or audited.
+   */
+  'shipment.verify:already-verified': (snapshot: unknown) =>
+    isRecord(snapshot) && sameKeys(snapshot, ['shipment', 'verified']) && snapshot.verified === false && isRecord(snapshot.shipment),
   /** Story 6-1b — `SecondFactorCommand.reset` of a user with no two-factor sign-in and no enrolment code. */
   'users.resetSecondFactor:not-enrolled': (snapshot: unknown) =>
     isRecord(snapshot) &&

@@ -1820,6 +1820,25 @@ export class CatalogAdjustReasonDto {
   label!: string;
 }
 
+/** Story 4-4a — one parcel's live shipment, as the device reads it. */
+export class CatalogDispatchParcelShipmentDto {
+  @ApiProperty({ format: 'uuid' }) shipmentId!: string;
+  @ApiProperty({ enum: ['client-label', 'courier-label'] }) kind!: string;
+  @ApiProperty({ description: 'The AWB as stored (normalised)' }) awb!: string;
+  @ApiProperty() courierName!: string;
+  @ApiProperty() labelVerified!: boolean;
+}
+
+/** Story 4-4a — one parcel awaiting a courier. */
+export class CatalogDispatchParcelDto {
+  @ApiProperty({ format: 'uuid' }) orderId!: string;
+  @ApiProperty({ format: 'uuid' }) clientId!: string;
+  @ApiProperty() orderLabel!: string;
+  @ApiProperty({ description: 'The parcel tag code (`O` + the order id’s last 16 hex digits)' }) parcelTagCode!: string;
+  @ApiProperty({ enum: ['accepted', 'ready_to_dispatch'] }) status!: string;
+  @ApiProperty({ type: CatalogDispatchParcelShipmentDto, nullable: true }) shipment!: CatalogDispatchParcelShipmentDto | null;
+}
+
 export class CatalogSnapshotResponse {
   @ApiProperty({ description: 'ISO-8601 UTC capture time' })
   generatedAt!: string;
@@ -1949,6 +1968,16 @@ export class CatalogSnapshotResponse {
       "Story 3-2b (additive): the stock adjustment's reason vocabulary with labels, in order — the handheld's Adjust reason chips (every reason needs the note the adjustment always carries). An older server omits it, and the handheld then offers no Adjust",
   })
   adjustReasons!: readonly CatalogAdjustReasonDto[];
+
+  @ApiProperty({
+    type: [CatalogDispatchParcelDto],
+    description:
+      "Story 4-4a (additive): the parcels awaiting a courier — the warehouse's packed orders, plus its accepted orders holding a live client-arranged shipment (never one with a carrier shipment), at most 2000, oldest first. The pack bench verifies a client label against it; the handover matches scanned AWBs and parcel tags against it. An older server omits it (the device reads it as empty)",
+  })
+  dispatchParcels!: readonly CatalogDispatchParcelDto[];
+
+  @ApiProperty({ description: 'Story 4-4a (additive): true when dispatchParcels was capped at 2000 — hand over newer parcels on the web, or refresh later' })
+  dispatchParcelsTruncated!: boolean;
 }
 
 // ── story 2-9a: the GRN document ────────────────────────────────────────────

@@ -731,6 +731,11 @@ export class OutboundFacade {
     return read === null ? null : this.shipping.portalOrderShippingView(read);
   }
 
+  /** A18, A39 — the device snapshot's dispatch parcels, in their own transaction (the shell composes sequentially). */
+  async getDispatchParcels(tenantId: string, warehouseId: string): Promise<{ parcels: DispatchParcel[]; truncated: boolean }> {
+    return withTenantTransaction(this.db, tenantId, (tx) => this.shipping.dispatchParcelsInTx(tx, tenantId, warehouseId));
+  }
+
   /** A18, A39 — the device snapshot's dispatch parcels (in-tx ONLY — the `getPickTasksInTx` rule). */
   async dispatchParcelsInTx(tx: TenantTx, tenantId: string, warehouseId: string): Promise<{ parcels: DispatchParcel[]; truncated: boolean }> {
     return this.shipping.dispatchParcelsInTx(tx, tenantId, warehouseId);

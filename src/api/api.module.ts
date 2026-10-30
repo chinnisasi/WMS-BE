@@ -5,6 +5,7 @@ import { DevicesController } from './devices.controller';
 import { InventoryController } from './inventory.controller';
 import { InboundController } from './inbound.controller';
 import { OutboundController } from './outbound.controller';
+import { ShippingController } from './shipping.controller';
 import { ReceivingController } from './receiving.controller';
 import { GateInController } from './gate-in.controller';
 import { DockController } from './dock.controller';
@@ -107,6 +108,8 @@ import { RecallsModule } from '../modules/recalls/recalls.module';
     InventoryController,
     InboundController,
     OutboundController,
+    // Story 4-4a — client-arranged shipping (the staff and handheld routes).
+    ShippingController,
     ReceivingController,
     // Story 2-3a — the gate-in (record, amend, unload — web and device —,
     // gate-out, list, detail) through `GateInFacade` (inbound).

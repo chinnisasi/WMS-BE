@@ -54,6 +54,9 @@ export interface PortalOrderRow {
   readonly followOnSeq: number | null;
   readonly followOnOrderId: string | null;
   readonly createdAt: string;
+  /** Story 4-4a — the live shipment's AWB and courier; omitted when the order has none. */
+  readonly awb?: string;
+  readonly courierName?: string;
 }
 
 export interface PortalOrderComponent {
@@ -97,6 +100,8 @@ interface OrderHeaderRow {
   followOnOrderId: string | null;
   createdAt: string;
   createdAtText: string;
+  awb: string | null;
+  courierName: string | null;
 }
 
 function headerSelect(tenantId: string): ReturnType<typeof sql> {
@@ -120,7 +125,13 @@ function headerSelect(tenantId: string): ReturnType<typeof sql> {
               where fo.tenant_id = o.tenant_id and fo.follow_on_of_order_id = o.id and fo.client_id = o.client_id
               limit 1) as "followOnOrderId",
            o.created_at as "createdAt",
-           o.created_at::text as "createdAtText"
+           o.created_at::text as "createdAtText",
+           (select s.tracking_number from shipments s
+              where s.tenant_id = o.tenant_id and s.order_id = o.id and s.client_id = o.client_id and s.status <> 'voided'
+              limit 1) as "awb",
+           (select s.carrier_name from shipments s
+              where s.tenant_id = o.tenant_id and s.order_id = o.id and s.client_id = o.client_id and s.status <> 'voided'
+              limit 1) as "courierName"
     from orders o
     join warehouses w on w.tenant_id = o.tenant_id and w.id = o.warehouse_id
     where o.tenant_id = ${tenantId}::uuid`;
@@ -148,6 +159,8 @@ function toRow(row: OrderHeaderRow): PortalOrderRow {
     followOnSeq: row.followOnSeq === null ? null : Number(row.followOnSeq),
     followOnOrderId: row.followOnOrderId,
     createdAt: canonicalInstant(String(row.createdAt)),
+    ...(row.awb === null || row.awb === undefined ? {} : { awb: row.awb }),
+    ...(row.courierName === null || row.courierName === undefined ? {} : { courierName: row.courierName }),
   };
 }
 
