@@ -318,15 +318,18 @@ describe('operational registers (e2e, story 5-3a)', () => {
     // Two dispatches of O1: the FIRST wins (carrier and AWB from its event).
     await dispatch(o1, wh1, at(3, 9), { carrierName: 'BlueDart', trackingNumber: 'BD-111' });
     await dispatch(o1, wh1, at(4, 9), { carrierName: 'Delhivery', trackingNumber: 'DL-999' });
-    // …and TWO shipment rows (a manifested older one, a newer labelled one) — still one row per line.
-    await shipment(o1.orderId, wh1, at(2, 18), 'manifested', 'OldCarrier', 'OLD-1');
+    // …and TWO shipment rows (an older one, a newer labelled one) — still one row per line.
+    // Story 4-4a (0116, shipments_tenant_order_live_unique): an order holds ONE
+    // live shipment, so the older row is a VOIDED one now (two live rows are no
+    // longer a representable state); the register still reads the live one.
+    await shipment(o1.orderId, wh1, at(2, 18), 'voided', 'OldCarrier', 'OLD-1');
     await shipment(o1.orderId, wh1, at(3, 8), 'labelled', 'NewCarrier', 'NEW-2');
     // O2: ingested; its dispatch event names no carrier — the latest shipment is the fallback.
     const o2 = await insertOrder('O2', acme, at(5, 10), 'dispatched', { externalEventId: 'SHOP-1001' }, [['AC-PL', 1]]);
     await dispatch(o2, wh1, at(5, 15), {});
     await shipment(o2.orderId, wh1, at(5, 12), 'labelled', 'Ekart', 'AWB-22');
     // …and an OLDER shipment: the fallback is the LATEST one.
-    await shipment(o2.orderId, wh1, at(5, 11), 'manifested', 'OldEkart', 'AWB-OLD');
+    await shipment(o2.orderId, wh1, at(5, 11), 'voided', 'OldEkart', 'AWB-OLD');
     // O3: BETA's, not dispatched.
     await insertOrder('O3', beta, at(6, 10), 'accepted', {}, [['BE-PL', 4]]);
     // O5: a kit order — the kit line and its two exploded components.
@@ -509,11 +512,11 @@ describe('operational registers (e2e, story 5-3a)', () => {
     });
   }
 
-  async function shipment(orderId: string, warehouseId: string, labelledAt: string, status: 'labelled' | 'manifested', carrierName: string, trackingNumber: string): Promise<void> {
+  async function shipment(orderId: string, warehouseId: string, labelledAt: string, status: 'labelled' | 'manifested' | 'voided', carrierName: string, trackingNumber: string): Promise<void> {
     await sql`insert into shipments (id, tenant_id, warehouse_id, order_id, status, carrier_connection_id, carrier_code, carrier_name, tracking_number, label_document_ref,
-        labelled_by, labelled_at, manifest_id, created_at, updated_at)
+        labelled_by, labelled_at, manifest_id, voided_at, voided_by, created_at, updated_at)
       values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${orderId}, ${status}, ${uuidv7()}, 'manual', ${carrierName}, ${trackingNumber}, 'label://seed',
-        ${ownerUserId}, ${labelledAt}, ${status === 'manifested' ? uuidv7() : null}, ${labelledAt}, ${labelledAt})`;
+        ${ownerUserId}, ${labelledAt}, ${status === 'manifested' ? uuidv7() : null}, ${status === 'voided' ? labelledAt : null}, ${status === 'voided' ? ownerUserId : null}, ${labelledAt}, ${labelledAt})`;
   }
 
   /** A raw ledger event with a chosen `created_at` (the append path stamps `now()`): the window's edges. */

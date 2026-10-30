@@ -3913,6 +3913,9 @@ describe('architecture: the client-emails module (story 5-2b)', () => {
       '../inbound/inbound.module',
       // Story 2-9a (D13) — the attachment registry's module.
       '../mail/mail.module',
+      // Story 4-4a (D8) — the stored-file renderer reads the bytes through the attachments facade.
+      '../attachments/attachments.facade',
+      '../attachments/attachments.module',
     ]);
     const offenders: string[] = [];
     for (const file of moduleFiles) {
