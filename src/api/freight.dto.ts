@@ -498,6 +498,8 @@ export class FreightConsignmentViewDto {
   @ApiProperty({ type: FreightConsigneeDto }) consignee!: FreightConsigneeDto;
   @ApiProperty({ type: FreightLrDto }) lr!: FreightLrDto;
   @ApiProperty({ type: FreightPackagesDto }) packages!: FreightPackagesDto;
+  @ApiProperty({ required: false, type: [String], description: 'The live loaded package codes, sorted (≤ 200; empty once dispatched) — the expanded row’s per-package Load tick' })
+  loadedCodes?: string[];
   @ApiProperty({ type: Number, nullable: true }) weightGrams!: number | null;
   @ApiProperty({ required: false, type: FreightGateDto, description: '4-6a’s gate before departure; absent when not judged' }) gate?: FreightGateDto;
   @ApiProperty({ type: FreightEwayDto }) eway!: FreightEwayDto;

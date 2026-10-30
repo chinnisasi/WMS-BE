@@ -340,6 +340,12 @@ describe('B2B freight dispatch (e2e, story 4-9a)', () => {
 
     const detail = await http().get(`${API}/${tenantId}/outbound/freight-loads/${load.id}`).set('Authorization', `Bearer ${opsToken}`).expect(200);
     expect(detail.body.totals).toMatchObject({ consignments: 2, packages: 4, loaded: 4, pallets: 2, grossWeightGrams: 805_900, weightKnown: true, overCapacity: false });
+    // A30 — the expanded row's per-package ticks: the live loaded codes, sorted.
+    expect(detail.body.consignments[1].loadedCodes).toEqual([cartonCode(so1, 1, 1), cartonCode(so1, 1, 2), cartonCode(so1, 1, 3)].sort());
+    expect(detail.body.consignments[0].loadedCodes).toEqual([cartonCode(so3, 1, 1)]);
+    // A30 — the orders list (Pack & Dispatch's rows) names each planned order's truck in one batch.
+    const listed = (await http().get(`${API}/${tenantId}/warehouses/${warehouseId}/outbound/orders?limit=100`).set('Authorization', `Bearer ${opsToken}`).expect(200)).body.items as { id: string; freight?: unknown }[];
+    expect(listed.find((row) => row.id === so1)?.freight).toEqual({ loadId: load.id, loadCode: load.code, stopSeq: 2 });
 
     // The plan sheet prints before departure.
     const plan = await http().get(`${API}/${tenantId}/outbound/freight-loads/${load.id}/loading-sheet?format=pdf`).set('Authorization', `Bearer ${opsToken}`).buffer(true)
@@ -639,6 +645,8 @@ describe('B2B freight dispatch (e2e, story 4-9a)', () => {
     await expectAuditRow({ tenantId, key: cancelLoadKey, action: 'freight_load.cancelled', targetType: 'freight_load', targetId: load.id, actorUserId: opsId });
     expect(await orderStatus(so8)).toBe('ready_to_dispatch');
     expect(await consignmentOf(so8)).toMatchObject({ status: 'removed', remove_reason: 'Load cancelled: Truck did not report' });
+    const rows = (await http().get(`${API}/${tenantId}/warehouses/${warehouseId}/outbound/orders?limit=100`).set('Authorization', `Bearer ${opsToken}`).expect(200)).body.items as { id: string; freight?: unknown }[];
+    expect(rows.find((row) => row.id === so8)?.freight).toBeNull();
     expect((await post(`freight-loads/${load.id}/cancel`, { reason: 'again' }).expect(409)).body.code).toBe('load-not-open');
     // Freed, the order now dispatches per order.
     await http().post(`${API}/${tenantId}/outbound/orders/${so8}/dispatch`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({}).expect((r) => expect([200, 201]).toContain(r.status));

@@ -1,4 +1,4 @@
-import { freightLrSearchQuery } from './freight.read';
+import { freightLrSearchQuery, plannedTrucksOfOrdersInTx } from './freight.read';
 import { FreightService, type DeviceFreightLoad, type FreightCandidate, type FreightCandidatesQuery, type FreightLoadListQuery, type FreightLoadListRow } from './freight.service';
 import type { CancelFreightLoadCommand, CreateFreightLoadCommand, FreightLoadSnapshot, FreightOrdersCommand, FreightScanSnapshot, RecordFreightScanCommand, RemoveFreightOrderCommand, UpdateFreightLoadCommand } from './freight-load.command';
 import type { DispatchFreightLoadCommand, FreightDispatchSnapshot } from './freight-dispatch.command';
@@ -301,6 +301,8 @@ export interface OrderEntry {
   readonly updatedAt: string;
   /** Story 4-6a (A16) — the consignment gate's state today (the list rows only; optional). */
   readonly consignmentState?: string;
+  /** Story 4-9a (A30) — the truck the order is planned on (the list rows only; optional — absent from an older server). */
+  readonly freight?: { readonly loadId: string; readonly loadCode: string; readonly stopSeq: number } | null;
 }
 
 /** Story 4-2c — one order line as the channel writeback reads it: what SHIPPED (Σ picks), base units. */
@@ -1720,6 +1722,9 @@ export class OutboundFacade {
         const state = consignmentStates.get(items[i]!.id);
         if (state !== undefined) (items[i] as { consignmentState?: string }).consignmentState = state;
       }
+      // Story 4-9a (A30) — each row's planned freight consignment, one batch for the page.
+      const trucks = await plannedTrucksOfOrdersInTx(tx, tenantId, rows.map((row) => row.id));
+      for (const item of items) (item as { freight?: unknown }).freight = trucks.get(item.id) ?? null;
       const page = buildPage(
         rows.map((row, index) => ({
           createdAt: fullPrecisionInstant(row.createdAtText),

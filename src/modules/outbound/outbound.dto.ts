@@ -688,6 +688,20 @@ export class OrderEntryDto {
     description: "Story 4-6a — the consignment gate today (the brand's tax document and e-way bill): the Docs cell. Optional",
   })
   consignmentState?: string;
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    type: () => OrderEntryFreightDto,
+    description: 'Story 4-9a (A30) — the truck the order is planned on (its load and stop), null when none: the Shipping cell reads "On truck LD-0007 (stop 3)". The list rows only; optional',
+  })
+  freight?: OrderEntryFreightDto | null;
+}
+
+export class OrderEntryFreightDto {
+  @ApiProperty({ format: 'uuid' }) loadId!: string;
+  @ApiProperty() loadCode!: string;
+  @ApiProperty() stopSeq!: number;
 }
 
 export class OrderListResponse {

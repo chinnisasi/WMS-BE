@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, ne } from 'drizzle-orm';
 import {
   freightConsignments,
   freightLoads,
@@ -106,6 +106,22 @@ export async function plannedConsignmentOfOrderInTx(
     .where(and(eq(freightConsignments.tenantId, tenantId), eq(freightConsignments.orderId, orderId), eq(freightConsignments.status, 'planned')))
     .limit(1);
   return rows[0] ?? null;
+}
+
+/** A30 — the planned consignment (its load and stop) of each of a page's orders, one query; absent when none. */
+export async function plannedTrucksOfOrdersInTx(
+  tx: TenantTx,
+  tenantId: string,
+  orderIds: readonly string[],
+): Promise<Map<string, { readonly loadId: string; readonly loadCode: string; readonly stopSeq: number }>> {
+  const ids = [...new Set(orderIds)];
+  if (ids.length === 0) return new Map();
+  const rows = await tx
+    .select({ orderId: freightConsignments.orderId, loadId: freightConsignments.loadId, loadCode: freightLoads.code, stopSeq: freightConsignments.stopSeq })
+    .from(freightConsignments)
+    .innerJoin(freightLoads, and(eq(freightLoads.tenantId, freightConsignments.tenantId), eq(freightLoads.id, freightConsignments.loadId)))
+    .where(and(eq(freightConsignments.tenantId, tenantId), inArray(freightConsignments.orderId, ids), eq(freightConsignments.status, 'planned')));
+  return new Map(rows.map((row) => [row.orderId, { loadId: row.loadId, loadCode: row.loadCode, stopSeq: row.stopSeq }]));
 }
 
 /**
@@ -332,6 +348,8 @@ export interface FreightConsignmentView {
   readonly consignee: { readonly name: string | null; readonly city: string | null; readonly state: string | null; readonly pincode: string | null };
   readonly lr: { readonly number: string | null; readonly date: string | null; readonly terms: string | null };
   readonly packages: { readonly total: number; readonly pallets: number; readonly loaded: number; readonly staleScans: number; readonly packed: boolean };
+  /** A30 — the consignment's live loaded package codes, sorted (≤ 200; empty once dispatched). Optional on read. */
+  readonly loadedCodes?: readonly string[];
   readonly weightGrams: number | null;
   /** 4-6a's gate (live before departure); absent when the national threshold is missing (an enrichment). */
   readonly gate?: { readonly state: string; readonly blocking: boolean } | null;
@@ -479,6 +497,7 @@ export async function freightLoadViewInTx(
       },
       lr: { number: row.lrNumber, date: row.lrDate, terms: row.freightTerms },
       packages,
+      loadedCodes: (scansByConsignment.get(row.id) ?? []).map((scan) => scan.packageCode).sort(),
       weightGrams,
       ...(row.status === 'planned' && gate !== undefined ? { gate: { state: gate.state, blocking: gate.blocking } } : {}),
       eway: { number: record?.ewayBillNumber ?? null, validUntil: record?.ewayValidUntil ?? null },
@@ -559,23 +578,3 @@ export async function freightLoadViewInTx(
   return { view, sheet };
 }
 
-/**
- * The scan count of a load's live consignments (no row lock — evidence for the
- * counts). Filtered by the consignments' ids so `(tenant_id, consignment_id,
- * status)` serves it (`freight_load_scans` has no load index).
- */
-export async function liveScanCountsInTx(tx: TenantTx, tenantId: string, loadId: string): Promise<Map<string, number>> {
-  const ids = (
-    await tx
-      .select({ id: freightConsignments.id })
-      .from(freightConsignments)
-      .where(and(eq(freightConsignments.tenantId, tenantId), eq(freightConsignments.loadId, loadId), ne(freightConsignments.status, 'removed')))
-  ).map((row) => row.id);
-  if (ids.length === 0) return new Map();
-  const rows = await tx
-    .select({ consignmentId: freightLoadScans.consignmentId, n: sql<number>`count(*)::int` })
-    .from(freightLoadScans)
-    .where(and(eq(freightLoadScans.tenantId, tenantId), inArray(freightLoadScans.consignmentId, ids), eq(freightLoadScans.status, 'loaded')))
-    .groupBy(freightLoadScans.consignmentId);
-  return new Map(rows.map((row) => [row.consignmentId, Number(row.n)]));
-}
