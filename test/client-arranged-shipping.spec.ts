@@ -3,7 +3,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import postgres from 'postgres';
 import request from 'supertest';
-import { PDFDocument, PDFDict } from 'pdf-lib';
+import type { PDFDict } from 'pdf-lib';
+import { PDFDocument } from 'pdf-lib';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
@@ -99,7 +100,6 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
   let store: MemoryFileStore;
 
   let tenantId: string;
-  let ownerId: string;
   let ownerToken: string;
   let opsToken: string;
   let opsId: string;
@@ -135,7 +135,6 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
     const ownerEmail = `owner-${ulid().toLowerCase()}@example.com`;
     const registered = await http().post(API).set(KEY_HEADER, ulid()).send({ name: `Ship Co ${ulid()}`, ownerEmail, password: PASSWORD }).expect(201);
     tenantId = registered.body.tenant.id as string;
-    ownerId = registered.body.owner.id as string;
     ownerToken = (await mintSignIn(app, { email: ownerEmail, password: PASSWORD })).body.accessToken as string;
     const ops = await member('ops_manager');
     opsToken = ops.token;
@@ -832,5 +831,4 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
     expect((await handOver({ parcels: [...ids, uuidv7()].map((orderId, i) => ({ orderId, awb: `AWBOVER${String(i).padStart(4, '0')}` })) }).expect(400)).body.code).toBe('validation-failed');
   });
 
-  void ownerId;
 });

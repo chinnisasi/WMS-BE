@@ -8,7 +8,7 @@ import { isUniqueViolationOn, ProblemException } from '../../shared/problem-deta
 import { clientInactive, shareLockClientInTx } from '../clients/clients.facade';
 import { assertPermission, type Capability } from '../tenancy/permissions';
 import { getMemberPortalFactsIn, getMemberRoleIn } from '../tenancy/tenancy.service';
-import { AttachmentsFacade, attachmentObjectKey } from '../attachments/attachments.facade';
+import { attachmentObjectKey } from '../attachments/attachments.facade';
 import {
   assertReservationLive,
   lockReservationInTx,
@@ -17,7 +17,7 @@ import {
   type AttachmentSource,
   type ShippingDocKind,
 } from '../attachments/attachment-records';
-import type { SanitizedFile } from '../attachments/attachments.facade';
+import type { SanitizedFile , AttachmentsFacade} from '../attachments/attachments.facade';
 
 /**
  * Story 4-4a — what the client-arranged shipping commands share: the replay

@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { PDFDict, PDFDocument, PDFName, PDFString } from 'pdf-lib';
+import type { PDFDict} from 'pdf-lib';
+import { PDFDocument, PDFName, PDFString } from 'pdf-lib';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { MAX_PDF_PAGES, sanitizePdf, sanitizeShippingFile } from './pdf-sanitize';
 
