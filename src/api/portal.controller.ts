@@ -450,6 +450,39 @@ export class PortalController {
     return JSON.parse(JSON.stringify(shipping)) as PortalOrderShippingResponse;
   }
 
+  @Get(':tenantId/portal/orders/:orderId/packing-slip')
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Story 4-5a — this order’s packing slip as an A4 PDF, once it is packed or dispatched: the parties, the lines with batches and serials, the cartons and their contents, and "This is not a tax invoice". Named `{order label}-packing-slip.pdf`',
+  })
+  @ApiProduces('application/pdf')
+  @ApiResponse({ status: 200, description: 'The PDF', content: { 'application/pdf': { schema: { type: 'string', format: 'binary' } } } })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed orderId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("No packed order of this client — unknown, another client's, or not packed yet (not-found)") })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async orderPackingSlip(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @CurrentPortalSession() session: PortalSession,
+    @Res() res: Response,
+  ): Promise<void> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const file = await this.outbound.portalPackingSlip(tenantId, session.clientId, orderId);
+    if (file === null) throw notFound('Order', orderId);
+    res.status(200);
+    res.setHeader('Content-Type', file.contentType);
+    res.setHeader('Content-Length', String(file.body.length));
+    res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(file.body);
+  }
+
   @Post(':tenantId/portal/orders/:orderId/shipment/client-label')
   @HttpCode(HttpStatus.CREATED)
   @UseGuards(PortalSessionGuard)

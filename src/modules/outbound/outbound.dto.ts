@@ -51,6 +51,8 @@ import { CONSIGNEE_RESOLUTIONS } from '../partners/partners.facade';
 // gate every HTTP caller actually hits. (`order.command` / `pick.command`
 // set the precedent above; `pack.command` imports no DTO, so no cycle.)
 import { MAX_DIMENSION_MM, MAX_SCAN_LINES, MAX_WEIGHT_GRAMS } from './pack.command';
+import { MAX_CARTONS_PER_PACK, MAX_PACK_SEQ, MAX_SCAN_LINES_PER_CARTON, ORDER_PACK_STATUSES } from './cartons';
+import { MAX_RECARTON_REASON_LENGTH } from './carton.command';
 import { GSTIN_RE, gstinDtoTransform } from '../../shared/primitives/gstin';
 import { MAX_HANDLING_UNITS_PER_REQUEST } from '../catalog/handling-unit';
 import { MAX_CARRIER_NAME_LENGTH, MAX_TRACKING_NUMBER_LENGTH } from './dispatch.command';
@@ -1566,6 +1568,58 @@ export class PackScanLineDto {
 }
 
 /**
+ * Story 4-5a (A7) — one carton of a pack: the units scanned into it and its
+ * own measurements. The DEVICE shape (`DevicePackCartonDto`) omits the
+ * dimensions — the handheld never measures boxes.
+ */
+export class DevicePackCartonDto {
+  @ApiProperty({
+    type: [PackScanLineDto],
+    description: 'What the operator scanned into THIS carton (per SKU, summed as the top-level scan is). At least one line.',
+    minItems: 1,
+    maxItems: MAX_SCAN_LINES_PER_CARTON,
+  })
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(MAX_SCAN_LINES_PER_CARTON)
+  @ValidateNested({ each: true })
+  @Type(() => PackScanLineDto)
+  scanned!: PackScanLineDto[];
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    type: Number,
+    minimum: 1,
+    maximum: MAX_WEIGHT_GRAMS,
+    description: 'Optional carton weight in grams.',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(MAX_WEIGHT_GRAMS)
+  weightGrams?: number | null;
+}
+
+/** Story 4-5a (A7) — one carton on the web: the device shape plus optional dimensions. */
+export class PackCartonDto extends DevicePackCartonDto {
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    type: PackDimensionsDto,
+    description: 'Optional carton dimensions in millimetres — all three sides together, or the object omitted.',
+  })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => PackDimensionsDto)
+  dimensionsMm?: PackDimensionsDto | null;
+}
+
+const PACK_CARTONS_DOC =
+  'Story 4-5a — optional: the cartons the parcel was packed into, in order (carton 1 first). Per SKU the cartons must add up to `scanned` exactly, a catch-weight case sits in exactly one carton, and the top-level weightGrams and dimensionsMm must then be absent (weigh each carton). Omitted, the pack is one carton holding the whole scan.';
+
+/**
  * POST /tenants/{tenantId}/outbound/orders/{orderId}/pack body — the scanned
  * contents of the parcel, verified against what the order actually had
  * PICKED (never against what it ordered: after story 4.4 a short-picked order
@@ -1609,6 +1663,54 @@ export class PackOrderDto {
   @ValidateNested()
   @Type(() => PackDimensionsDto)
   dimensionsMm?: PackDimensionsDto | null;
+
+  @ApiProperty({
+    required: false,
+    type: [PackCartonDto],
+    minItems: 1,
+    maxItems: MAX_CARTONS_PER_PACK,
+    description: PACK_CARTONS_DOC,
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(MAX_CARTONS_PER_PACK)
+  @ValidateNested({ each: true })
+  @Type(() => PackCartonDto)
+  cartons?: PackCartonDto[];
+}
+
+/** Story 4-5a — one SKU in one packed carton (base units). */
+export class PackedCartonLineDto {
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty({ description: 'Units of this SKU in the carton, in base UoM' })
+  qty!: number;
+}
+
+/** Story 4-5a — one carton of a pack, as the pack response carries it. */
+export class PackedCartonDto {
+  @ApiProperty({ minimum: 1, maximum: MAX_CARTONS_PER_PACK })
+  seq!: number;
+
+  @ApiProperty({ description: 'The carton code printed on its label: the parcel tag + ".{pack}.{carton}"' })
+  code!: string;
+
+  @ApiProperty({ type: Number, nullable: true })
+  weightGrams!: number | null;
+
+  @ApiProperty({ type: PackDimensionsDto, nullable: true })
+  dimensionsMm!: PackDimensionsDto | null;
+
+  @ApiProperty({ description: 'Units in the carton, in base UoM (across SKUs — a count, not a measure)' })
+  unitCount!: number;
+
+  @ApiProperty({ type: [PackedCartonLineDto] })
+  lines!: readonly PackedCartonLineDto[];
 }
 
 /** One line of the packing slip. */
@@ -1728,6 +1830,20 @@ export class PackDto {
 
   @ApiProperty({ type: [PackedLineDto] })
   lines!: readonly PackedLineDto[];
+
+  @ApiProperty({
+    required: false,
+    minimum: 1,
+    description: 'Story 4-5a — the pack number (1 at pack). Absent only on a replayed response stored before 4-5a — read absent as 1.',
+  })
+  packSeq?: number;
+
+  @ApiProperty({
+    required: false,
+    type: () => [PackedCartonDto],
+    description: 'Story 4-5a — the cartons the parcel was packed into. Absent only on a replayed response stored before 4-5a — read absent as one carton.',
+  })
+  cartons?: readonly PackedCartonDto[];
 }
 
 export class PackResponse {
@@ -1745,10 +1861,186 @@ export class PackResponse {
  * `forbidNonWhitelisted`) a device body that sends it is REFUSED with a 400;
  * the web surface keeps the arm (review W6, story 10.7).
  */
-export class DevicePackDto extends OmitType(PackOrderDto, ['dimensionsMm'] as const) {
+export class DevicePackDto extends OmitType(PackOrderDto, ['dimensionsMm', 'cartons'] as const) {
   @ApiProperty({ format: 'uuid', description: 'The fully-picked order being packed' })
   @IsUUID()
   orderId!: string;
+
+  @ApiProperty({
+    required: false,
+    type: [DevicePackCartonDto],
+    minItems: 1,
+    maxItems: MAX_CARTONS_PER_PACK,
+    description: `${PACK_CARTONS_DOC} The device never measures boxes, so a carton carries no dimensionsMm.`,
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(MAX_CARTONS_PER_PACK)
+  @ValidateNested({ each: true })
+  @Type(() => DevicePackCartonDto)
+  cartons?: DevicePackCartonDto[];
+}
+
+// ── Cartons (Story 4-5a) ────────────────────────────────────────────────────
+
+/** POST /tenants/{tenantId}/outbound/orders/{orderId}/cartons body — re-split a packed order (A8). */
+export class RecartonOrderDto {
+  @ApiProperty({
+    type: [PackCartonDto],
+    minItems: 1,
+    maxItems: MAX_CARTONS_PER_PACK,
+    description:
+      'The new split, carton 1 first: per SKU it must hold exactly what was packed (and every catch-weight case, each in one carton).',
+  })
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(MAX_CARTONS_PER_PACK)
+  @ValidateNested({ each: true })
+  @Type(() => PackCartonDto)
+  cartons!: PackCartonDto[];
+
+  @ApiProperty({ minLength: 1, maxLength: MAX_RECARTON_REASON_LENGTH, description: 'Why the order is re-packed (1–200 characters)' })
+  @IsString()
+  @Length(1, MAX_RECARTON_REASON_LENGTH)
+  reason!: string;
+}
+
+export class PackCartonLineViewDto {
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty()
+  skuName!: string;
+
+  @ApiProperty({ description: 'The SKU’s base UoM' })
+  uom!: string;
+
+  @ApiProperty({ description: 'Units of this SKU in the carton, in base UoM' })
+  qty!: number;
+
+  @ApiProperty({ type: [String], nullable: true, description: 'Catch weight — the cases in this carton, sorted; null otherwise' })
+  handlingUnitIds!: string[] | null;
+
+  @ApiProperty({
+    type: () => [CartonCaseViewDto],
+    required: false,
+    description: 'Catch weight — each case as a person finds it (beside handlingUnitIds, same order): its label’s barcode text and its receipt weight',
+  })
+  handlingUnits?: CartonCaseViewDto[];
+}
+
+export class CartonCaseViewDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ description: 'The case label’s barcode text (a case label encodes its handling-unit id)' })
+  code!: string;
+
+  @ApiProperty({ type: Number, nullable: true, description: 'Grams captured at receipt; null when the case is no longer on record' })
+  weightGrams!: number | null;
+}
+
+export class UomTotalDto {
+  @ApiProperty()
+  uom!: string;
+
+  @ApiProperty({ description: 'Base units of this UoM' })
+  qty!: number;
+}
+
+export class PackCartonViewDto {
+  @ApiProperty({ minimum: 1, maximum: MAX_CARTONS_PER_PACK })
+  seq!: number;
+
+  @ApiProperty({ description: 'The carton code on its label: the parcel tag + ".{pack}.{carton}"' })
+  code!: string;
+
+  @ApiProperty({ type: Number, nullable: true })
+  weightGrams!: number | null;
+
+  @ApiProperty({ type: PackDimensionsDto, nullable: true })
+  dimensionsMm!: PackDimensionsDto | null;
+
+  @ApiProperty({ description: 'SKUs in the carton' })
+  lineCount!: number;
+
+  @ApiProperty({ type: [UomTotalDto], description: 'Per-UoM totals — never a cross-UoM unit total' })
+  totals!: UomTotalDto[];
+
+  @ApiProperty({ type: [PackCartonLineViewDto] })
+  lines!: PackCartonLineViewDto[];
+}
+
+export class PackViewDto {
+  @ApiProperty({ minimum: 1, maximum: MAX_PACK_SEQ })
+  packSeq!: number;
+
+  @ApiProperty({ enum: [...ORDER_PACK_STATUSES] })
+  status!: string;
+
+  @ApiProperty({ description: 'True for an order packed before cartons were recorded (one virtual carton)' })
+  legacy!: boolean;
+
+  @ApiProperty({ description: 'False when the documents print the live parties ("Party details are current, not as at packing")' })
+  partiesFrozen!: boolean;
+
+  @ApiProperty()
+  cartonCount!: number;
+
+  @ApiProperty({ type: Number, nullable: true, description: 'Σ carton weights when every carton is weighed, else null' })
+  grossWeightGrams!: number | null;
+
+  @ApiProperty({ description: 'ISO-8601 UTC — the physical pack (a re-carton keeps it)' })
+  packedAt!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  packedBy!: string;
+
+  @ApiProperty({ type: [PackCartonViewDto] })
+  cartons!: PackCartonViewDto[];
+}
+
+export class PackHistoryDto {
+  @ApiProperty()
+  packSeq!: number;
+
+  @ApiProperty({ enum: [...ORDER_PACK_STATUSES] })
+  status!: string;
+
+  @ApiProperty()
+  cartonCount!: number;
+
+  @ApiProperty({ type: String, nullable: true })
+  endedAt!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid' })
+  endedBy!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  endReason!: string | null;
+}
+
+export class OrderCartonsResponse {
+  @ApiProperty({ type: PackViewDto, description: 'The live pack, else the latest (a cancelled order shows its cancelled pack)' })
+  pack!: PackViewDto;
+
+  @ApiProperty({ type: [PackHistoryDto], description: 'Every pack of the order, newest first' })
+  history!: PackHistoryDto[];
+}
+
+export class RecartonResponse {
+  @ApiProperty({ type: PackViewDto, description: 'The live pack after the re-carton' })
+  pack!: PackViewDto;
+
+  @ApiProperty({ description: 'True when the split was the live one — nothing was written' })
+  unchanged!: boolean;
+
+  @ApiProperty({ description: 'True when a client label’s verification was cleared — re-verify the client label on the new boxes' })
+  clientLabelReverify!: boolean;
 }
 
 // ── Dispatch (Story 4.6) ────────────────────────────────────────────────────
@@ -2953,4 +3245,28 @@ export class OrderShelfLifeDto {
 export class OrderShelfLifeResponse {
   @ApiProperty({ type: OrderShelfLifeDto })
   orderShelfLife!: OrderShelfLifeDto;
+}
+
+/**
+ * Story 4-5a (A13, A14, A48) — the packing-document file routes' query. The
+ * pipe checks only that each is a string: the vocabularies, the `zpl` + `a4`
+ * refusal and the carton list are judged by `parsePackFileQuery` — AFTER the
+ * carton labels' `labels.execute` check, so a role without it gets 403
+ * whatever it sent.
+ */
+export class PackFileQueryDto {
+  @ApiProperty({ required: false, enum: ['pdf', 'zpl'], description: 'The file format (the slip defaults to pdf, the carton labels to zpl)' })
+  @IsOptional()
+  @IsString()
+  format?: string;
+
+  @ApiProperty({ required: false, enum: ['a4', 'label'], description: 'a4 (PDF only) or label (4×6 per carton); the slip defaults to a4, the carton labels to label' })
+  @IsOptional()
+  @IsString()
+  layout?: string;
+
+  @ApiProperty({ required: false, description: 'Comma-separated carton numbers, unique, 1–200 (default every carton)', example: '1,3' })
+  @IsOptional()
+  @IsString()
+  cartons?: string;
 }

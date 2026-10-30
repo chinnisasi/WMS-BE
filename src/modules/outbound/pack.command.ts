@@ -12,6 +12,7 @@ import {
   packVerificationFailures,
   picklistLines,
   picks,
+  shipments,
   skus,
 } from '../../shared/db/schema';
 import type { PackFailureEntry } from '../../shared/db/schema';
@@ -46,6 +47,20 @@ import { MAX_HANDLING_UNITS_PER_REQUEST } from '../catalog/handling-unit';
 import type { HandlingUnitPackAssignment } from '../catalog/catalog.facade';
 import { ORDER_OWNER_TYPE } from './order.command';
 import type { OrderSource, OrderStatus } from './order.command';
+import {
+  aggregateCartons,
+  assertCartonMeasurements,
+  assertCartonQuantities,
+  cartonValidation,
+  cartonsHashForm,
+  grossWeightOf,
+  packDimensionsOf,
+  shipmentWeightOf,
+  type AggregatedCarton,
+  type CartonSkuFacts,
+  type PackCartonInput,
+} from './cartons';
+import { cartonWriteOf, documentPartiesInTx, insertPackInTx, type CartonWrite } from './order-packs';
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
@@ -140,6 +155,34 @@ export interface PackOrderCommand {
   readonly weightGrams?: number | null | undefined;
   /** Optional parcel dimensions in millimetres — absence is never an error. */
   readonly dimensionsMm?: PackDimensionsInput | null | undefined;
+  /**
+   * Story 4-5a (A6) — the cartons the parcel was packed into: each carton's
+   * scanned lines and measurements. Absent (or null), the pack is one carton
+   * holding the whole scan with the top-level weight and dimensions, and the
+   * payload hashes byte-identically to main's. Present, the cartons must add
+   * up per SKU to `scanned` exactly and the top-level weight and dimensions
+   * must be absent. Typed loosely on purpose: the sync-report apply passes a
+   * payload no DTO validated, so `aggregateCartons` type-checks it (A32).
+   */
+  readonly cartons?: readonly PackCartonInput[] | null | undefined;
+}
+
+/** Story 4-5a — one carton line on the slip snapshot (base units). */
+export interface PackedCartonLineSnapshot {
+  readonly skuId: string;
+  readonly skuCode: string;
+  readonly qty: number;
+}
+
+/** Story 4-5a — one carton of the pack on the slip snapshot. */
+export interface PackedCartonSnapshot {
+  readonly seq: number;
+  readonly code: string;
+  readonly weightGrams: number | null;
+  readonly dimensionsMm: PackDimensionsInput | null;
+  /** Base units, Σ lines. */
+  readonly unitCount: number;
+  readonly lines: readonly PackedCartonLineSnapshot[];
 }
 
 // ── snapshots ────────────────────────────────────────────────────────────────
@@ -198,6 +241,13 @@ export interface PackSnapshot {
     /** Total units in the parcel — the sum of every line's `packedQty`. */
     readonly totalUnits: number;
     readonly lines: readonly PackedLineSnapshot[];
+    /**
+     * Story 4-5a (A6, A7) — the pack's number (1 at pack) and its cartons.
+     * Optional: a snapshot stored before 4-5a lacks both, and every reader
+     * treats absent as one legacy carton.
+     */
+    readonly packSeq?: number;
+    readonly cartons?: readonly PackedCartonSnapshot[];
   };
 }
 
@@ -261,6 +311,13 @@ export class PackCommandService {
     // collide on `idempotency-key-reuse`. The measurements ARE intent (a
     // re-weigh is a different claim about the parcel) and hash as given.
     const { totals: scannedBySku, handlingUnitIdsBySku } = aggregateScan(command.scanned);
+    // Story 4-5a (A6, A32) — the cartons' shape, above the transaction: pure
+    // request shape, so a malformed body is a 400 before anything is read.
+    // `null` reads as absent (sync-report passes `?? null`).
+    const bodyCartons =
+      command.cartons === undefined || command.cartons === null
+        ? null
+        : aggregateCartonsOfPack(command, scannedBySku, handlingUnitIdsBySku);
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       orderId: command.orderId,
@@ -278,6 +335,9 @@ export class PackCommandService {
         .map(([skuId, qty]) => ({ skuId, qty, handlingUnitIds: handlingUnitIdsBySku.get(skuId) })),
       weightGrams: command.weightGrams ?? undefined,
       dimensionsMm: command.dimensionsMm ?? undefined,
+      // Story 4-5a — ONLY when the body carries cartons, so a body without
+      // them hashes byte-identically to main (pinned in packing.spec.ts).
+      ...(bodyCartons === null ? {} : { cartons: cartonsHashForm(bodyCartons) }),
     });
 
     // The Valkey counter restores the released holds owe are RETURNED by the
@@ -294,7 +354,7 @@ export class PackCommandService {
     // apply) reaches, so all three are covered by construction.
     let committed: { snapshot: PackSnapshot; counterRestores: ReadonlyMap<string, number>; warehouseId: string | null };
     try {
-      committed = await this.packInTransaction(command, idempotencyKey, payloadHash, scannedBySku, handlingUnitIdsBySku);
+      committed = await this.packInTransaction(command, idempotencyKey, payloadHash, scannedBySku, handlingUnitIdsBySku, bodyCartons);
     } catch (err) {
       if (err instanceof PackMismatchError) {
         await this.recordPackFailure(command, idempotencyKey, err);
@@ -366,6 +426,7 @@ export class PackCommandService {
     payloadHash: string,
     scannedBySku: ReadonlyMap<string, number>,
     handlingUnitIdsBySku: ReadonlyMap<string, readonly string[]>,
+    bodyCartons: readonly AggregatedCarton[] | null,
   ): Promise<{ snapshot: PackSnapshot; counterRestores: ReadonlyMap<string, number>; warehouseId: string | null }> {
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
       // ── authority: the role is re-read from the DB per command (AD-10) ──
@@ -398,8 +459,15 @@ export class PackCommandService {
       }
 
       // ── input shape (400 before anything is read) ───────────────────────
-      const weightGrams = this.assertWeight(command.weightGrams);
-      const dimensionsMm = this.assertDimensions(command.dimensionsMm);
+      const topWeightGrams = this.assertWeight(command.weightGrams);
+      const topDimensionsMm = this.assertDimensions(command.dimensionsMm);
+      // Story 4-5a (A6, D2) — each carton's measurements under the pack
+      // bounds; the device entry (route or sync) never measures boxes.
+      if (bodyCartons !== null) {
+        assertCartonMeasurements(bodyCartons, {
+          device: command.deviceId !== undefined || command.entry === 'sync',
+        });
+      }
 
       // ── the order, locked (the exactly-once serializer) ─────────────────
       // `for('update')` is what makes "an order reaches Ready-to-Dispatch
@@ -606,6 +674,11 @@ export class PackCommandService {
       // each-counted SKU is not a discrepancy to reconcile, it is a value the
       // unit cannot hold.
       assertScanPrecision(command.scanned, skuById);
+      // Story 4-5a (A31) — every carton holds a quantity its SKU can express,
+      // judged on each carton's raw lines (6.5 + 3.5 of an each is refused).
+      if (bodyCartons !== null) {
+        assertCartonQuantities(bodyCartons, cartonSkuFactsOf(skuById));
+      }
       this.assertScanMatchesPicked(order.warehouseId, order.id, pickedBySku, scannedBySku, skuById);
 
       // ── story 10.3: the catch-weight units, resolved BEFORE any write ────
@@ -625,6 +698,42 @@ export class PackCommandService {
         handlingUnitIdsBySku,
         skuById,
       );
+
+      // ── story 4-5a: the parties and the cartons, read BEFORE the flip ────
+      // The reads finish before the ledger appends below take the warehouse
+      // advisory (A6). The parties are frozen now; the cartons are the body's
+      // or one carton holding the whole scan with the top-level measurements.
+      const parties = await documentPartiesInTx(tx, command.tenantId, order.clientId, order.warehouseId);
+      const cartonWrites: readonly CartonWrite[] =
+        bodyCartons !== null
+          ? bodyCartons.map(cartonWriteOf)
+          : [
+              {
+                seq: 1,
+                weightGrams: topWeightGrams,
+                dimensionsMm: topDimensionsMm,
+                lines: [...scannedBySku.entries()]
+                  .filter(([, qty]) => qty > 0)
+                  .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+                  .map(([skuId, qty]) => ({ skuId, qty, handlingUnitIds: handlingUnitIdsBySku.get(skuId) ?? null })),
+              },
+            ];
+      // The live client-arranged shipment, locked after the order (the
+      // cancel-restock order) — its piece count follows the cartons (A40).
+      const liveShipmentRows = await tx
+        .select({ id: shipments.id, kind: shipments.kind, status: shipments.status })
+        .from(shipments)
+        .where(and(eq(shipments.tenantId, command.tenantId), eq(shipments.orderId, order.id), sql`${shipments.status} <> 'voided'`))
+        .orderBy(asc(shipments.id))
+        .for('update');
+      // A33 / A39 — what the `pack.packed` docs and the snapshot's top level
+      // carry: the gross only when every carton is weighed and it fits a
+      // shipment; dimensions only for a one-carton pack.
+      const weightGrams =
+        bodyCartons === null
+          ? topWeightGrams
+          : shipmentWeightOf(grossWeightOf(bodyCartons), MAX_WEIGHT_GRAMS);
+      const dimensionsMm = bodyCartons === null ? topDimensionsMm : packDimensionsOf(bodyCartons);
 
       // ── the flip (conditional — the exactly-once backstop) ──────────────
       const packedAt = nowIso();
@@ -802,6 +911,44 @@ export class PackCommandService {
       // state authority (the snapshot reads it live through the facade), so a
       // released hold already reads `released` everywhere.
 
+      // ── story 4-5a: the pack, its cartons and lines (after the ledger) ───
+      const written = await insertPackInTx(tx, {
+        tenantId: command.tenantId,
+        warehouseId: order.warehouseId,
+        clientId: order.clientId,
+        orderId: order.id,
+        seq: 1,
+        source: command.entry === 'sync' ? 'sync' : command.deviceId !== undefined ? 'handheld' : 'web',
+        deviceId: command.deviceId ?? null,
+        packedBy: command.actorUserId,
+        packedAt,
+        parties,
+        partiesFrozenAt: packedAt,
+        now: packedAt,
+        cartons: cartonWrites,
+      });
+      // A40 — a live client-arranged `labelled` shipment counts the cartons.
+      for (const shipment of liveShipmentRows) {
+        if (shipment.kind !== 'carrier' && shipment.status === 'labelled') {
+          await tx
+            .update(shipments)
+            .set({ packageCount: written.cartons.length, updatedAt: packedAt })
+            .where(and(eq(shipments.id, shipment.id), eq(shipments.tenantId, command.tenantId)));
+        }
+      }
+      const cartonSnapshots: PackedCartonSnapshot[] = written.cartons.map((carton) => ({
+        seq: carton.seq,
+        code: carton.code,
+        weightGrams: carton.weightGrams,
+        dimensionsMm: carton.dimensionsMm,
+        unitCount: fromMilli(carton.unitCount),
+        lines: carton.lines.map((line) => ({
+          skuId: line.skuId,
+          skuCode: skuById.get(line.skuId)?.code ?? line.skuId,
+          qty: fromMilli(line.qty),
+        })),
+      }));
+
       const snapshot: PackSnapshot = {
         pack: {
           orderId: order.id,
@@ -823,6 +970,8 @@ export class PackCommandService {
           dimensionsMm,
           totalUnits: fromMilli(totalUnits),
           lines: packedLines,
+          packSeq: written.seq,
+          cartons: cartonSnapshots,
         },
       };
 
@@ -1312,6 +1461,34 @@ function namedSample(items: readonly string[]): string {
   }
   const shown = items.slice(0, MAX_ENUMERATED_IN_DETAIL).join('; ');
   return `${shown}; … and ${items.length - MAX_ENUMERATED_IN_DETAIL} more`;
+}
+
+/**
+ * Story 4-5a (A6) — the body's cartons, judged against the top-level scan. With
+ * cartons, the top-level weight and dimensions must be absent ("weigh each
+ * carton"); `null` is absent (A32 — sync-report passes `?? null`).
+ */
+function aggregateCartonsOfPack(
+  command: PackOrderCommand,
+  totals: ReadonlyMap<string, number>,
+  handlingUnitIdsBySku: ReadonlyMap<string, readonly string[]>,
+): AggregatedCarton[] {
+  if ((command.weightGrams ?? null) !== null) {
+    throw cartonValidation('With cartons, weigh each carton — the top-level weightGrams must be absent.');
+  }
+  if ((command.dimensionsMm ?? null) !== null) {
+    throw cartonValidation('With cartons, measure each carton — the top-level dimensionsMm must be absent.');
+  }
+  return aggregateCartons(command.cartons, { totals, handlingUnitIdsBySku });
+}
+
+/** The SKU facts `assertCartonQuantities` reads, from the pack's SKU read. */
+export function cartonSkuFactsOf(
+  skuById: ReadonlyMap<string, { code: string; uom: string; catchWeightTracked: boolean }>,
+): Map<string, CartonSkuFacts> {
+  const facts = new Map<string, CartonSkuFacts>();
+  for (const [id, sku] of skuById) facts.set(id, { code: sku.code, uom: sku.uom, catchWeight: sku.catchWeightTracked });
+  return facts;
 }
 
 function packValidation(detail: string): ProblemException {

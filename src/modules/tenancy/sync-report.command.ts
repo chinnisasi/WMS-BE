@@ -479,6 +479,9 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
   'pack.execute': [
     ['orderId', 'uuid'],
     ['scanned', 'array'],
+    // Story 4-5a (A7, A32) — the cartons, when the device packed more than
+    // one; the command's `aggregateCartons` type-checks every element.
+    ['cartons', 'array-or-absent'],
   ],
   'excursion.record': [
     ['warehouseId', 'uuid'],
@@ -1849,6 +1852,8 @@ export class SyncReportCommand {
             orderId: payload.orderId as string,
             scanned: payload.scanned as unknown as PackCommand['scanned'],
             weightGrams: (payload.weightGrams ?? null) as number | null | undefined,
+            // Story 4-5a (A7, D8) — passed as stored; the command judges its shape.
+            cartons: (payload.cartons ?? null) as unknown as PackCommand['cartons'],
           },
           idempotencyKey,
         )) as unknown as Record<string, unknown>;

@@ -17,6 +17,7 @@ import { EMAIL_GATEWAY, type LogEmailGateway } from '../src/modules/mail/email.g
 import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
 import { REJECTED_OP_DECISIONS_BY_TYPE } from '../src/modules/tenancy/sync-report.command';
 import { parcelTagCode } from '../src/shared/primitives/parcel-tag';
+import { cartonCode } from '../src/shared/primitives/carton-code';
 import { portalShippingStatus } from '../src/modules/outbound/shipping.read';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow, noOpIdempotencyKey } from './support/audit-guard';
@@ -247,6 +248,25 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
     await fixtures.pickAllLines(ready.picklist);
     await http().post(`${API}/${tenantId}/outbound/orders/${ready.orderId}/pack`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
       .send({ scanned: scannedOf(ready.picklist), weightGrams: 900 }).expect(201);
+    return ready.orderId;
+  }
+
+  /**
+   * Story 4-5a — a PACKED order of `units` A-TEE packed into `cartons` cartons
+   * (one unit each, the rest in the last), each weighed `weightGrams`.
+   */
+  async function cartonPackedOrder(cartons: number, extra: Record<string, unknown> = {}, weightGrams = 500, units = cartons): Promise<string> {
+    const ready = await fixtures.releasedWave([{ skuId: sku.get('A-TEE')!, quantity: units }], { clientOrderRef: `SO-${ulid().slice(18)}`, ...extra });
+    await fixtures.pickAllLines(ready.picklist);
+    const skuId = sku.get('A-TEE')!;
+    const body =
+      cartons === 1
+        ? { scanned: scannedOf(ready.picklist), weightGrams }
+        : {
+            scanned: scannedOf(ready.picklist),
+            cartons: Array.from({ length: cartons }, (_, i) => ({ scanned: [{ skuId, qty: i === cartons - 1 ? units - (cartons - 1) : 1 }], weightGrams })),
+          };
+    await http().post(`${API}/${tenantId}/outbound/orders/${ready.orderId}/pack`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send(body).expect(201);
     return ready.orderId;
   }
 
@@ -491,7 +511,9 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
     const pdf = await labelPdf(1);
     await portalLabel(verified, { awb: '1234-5678-9013', courierName: 'Delhivery' }, pdf).expect(201);
     await verify(verified, { scannedCode: '123456789013', method: 'scan' }).expect(200);
-    const advised = await packedOrder('A-TEE', { orderType: 'b2c', codAmountPaise: 49900 });
+    // Story 4-5a (A37) — a post-4-5a pack is a stored pack, so a parcel count
+    // of 2 must match its cartons: the order is packed in two.
+    const advised = await cartonPackedOrder(2, { orderType: 'b2c', codAmountPaise: 49900 });
     await awbAdvice(advised, { awb: 'AWBHO00002', courierName: 'Delhivery' }).expect(201);
     const bare = await packedOrder();
     const key = ulid();
@@ -1238,6 +1260,248 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
       expect(rows).toHaveLength(1);
       expect(rows[0]!.payload.dispatch).toMatchObject({ orderStatus: 'dispatched', trackingNumber: awb, carrierName: 'Delhivery' });
     }
+  });
+
+  // ── story 4-5a: cartons at the handover (A21, A33, A34, A37, A40, A44) ─────
+
+  const cartonsOf = async (orderId: string) =>
+    (await sql`select seq, pack_seq, handover_id, handover_scanned_at from order_cartons where order_id = ${orderId} order by pack_seq, seq`) as unknown as {
+      seq: number;
+      pack_seq: number;
+      handover_id: string | null;
+      handover_scanned_at: string | null;
+    }[];
+  const handoverDetail = async (handoverId: string) =>
+    (await http().get(`${API}/${tenantId}/outbound/handovers/${handoverId}`).set('Authorization', `Bearer ${opsToken}`).expect(200)).body.handover as {
+      parcels: { orderId: string; packageCount: number; weightGrams: number | null; cartons: Record<string, unknown> }[];
+    };
+
+  it('AC5 — cartons at the web handover: a count of 2 against 3 cartons is refused per parcel; 3 with two codes scanned hands over, records the two, defaults the weight to the gross, and the detail reads 3 cartons, 2 scanned; the hash adds the sorted codes', async () => {
+    const orderId = await cartonPackedOrder(3, {}, 400);
+    const codes = [1, 2, 3].map((seq) => cartonCode(orderId, 1, seq));
+    const refused = await handOver({ parcels: [{ orderId, awb: 'AWBCTN0001', packageCount: 2, cartonCodes: [codes[0]] }] }).expect(409);
+    expect(refused.body.code).toBe('handover-parcels-refused');
+    expect(refused.body.parcels).toEqual([expect.objectContaining({ orderId, code: 'package-count-mismatch' })]);
+    expect(await orderStatus(orderId)).toBe('ready_to_dispatch');
+    const key = ulid();
+    // Scanner noise: lower case and a trailing CR are canonicalised.
+    const res = await handOver({ parcels: [{ orderId, awb: 'AWBCTN0001', packageCount: 3, cartonCodes: [` ${codes[1]!.toLowerCase()}\r`, codes[0]] }] }, opsToken, key).expect(201);
+    expect(res.body.handover.packageCount).toBe(3);
+    expect(await storedHash(key)).toBe(
+      hashCommandPayload({
+        arm: 'handover',
+        surface: 'web',
+        tenantId,
+        warehouseId,
+        clientId: acme,
+        courier: { transporterId: null, courierName: 'Delhivery' },
+        pickupPersonName: 'Ravi',
+        pickupPersonPhone: null,
+        vehicleNumber: 'KA01AB1234',
+        occurredAt: null,
+        note: null,
+        parcels: [{ orderId, awb: 'AWBCTN0001', packageCount: 3, weightGrams: null, cartonCodes: [codes[0], codes[1]].sort() }],
+        photoRefs: null,
+      }),
+    );
+    const handedOverAt = (await sql`select handed_over_at from courier_handovers where id = ${res.body.handover.id as string}`)[0]!.handed_over_at as string;
+    const rows = await cartonsOf(orderId);
+    expect(rows.map((row) => [row.seq, row.handover_id])).toEqual([
+      [1, res.body.handover.id],
+      [2, res.body.handover.id],
+      [3, null],
+    ]);
+    expect(new Date(rows[0]!.handover_scanned_at!).toISOString()).toBe(new Date(handedOverAt).toISOString());
+    const [shipment] = await shipmentsOf(orderId);
+    expect(shipment).toMatchObject({ package_count: 3, weight_grams: 1200 });
+    const detail = await handoverDetail(res.body.handover.id as string);
+    expect(detail.parcels[0]!.cartons).toEqual({ cartonCount: 3, scanned: 2, legacy: false, codCartonScanned: null, staleCartonLabels: false });
+    // The count left out defaults to the cartons (A40).
+    const other = await cartonPackedOrder(2);
+    const res2 = await handOver({ parcels: [{ orderId: other, awb: 'AWBCTN0002' }] }).expect(201);
+    expect(res2.body.handover.packageCount).toBe(2);
+    expect((await shipmentsOf(other))[0]).toMatchObject({ package_count: 2, weight_grams: 1000 });
+  });
+
+  it('carton codes are shape-checked: a carton twice (by the parsed code) and more than 200 codes are 400; another order’s code, a carton past the count and an unreadable code are carton-not-current', async () => {
+    const orderId = await cartonPackedOrder(2);
+    const otherOrder = await cartonPackedOrder(1);
+    const one = cartonCode(orderId, 1, 1);
+    expect((await handOver({ parcels: [{ orderId, awb: 'AWBSHAPE01', cartonCodes: [one, ` ${one.toLowerCase()} `] }] }).expect(400)).body.code).toBe('validation-failed');
+    expect((await handOver({ parcels: [{ orderId, awb: 'AWBSHAPE01', cartonCodes: Array.from({ length: 201 }, (_, i) => `X${i}`) }] }).expect(400)).body.code).toBe('validation-failed');
+    for (const code of [cartonCode(otherOrder, 1, 1), cartonCode(orderId, 1, 3), 'NOT-A-CARTON']) {
+      const res = await handOver({ parcels: [{ orderId, awb: 'AWBSHAPE01', cartonCodes: [code] }] }).expect(409);
+      expect(res.body.parcels).toEqual([expect.objectContaining({ orderId, code: 'carton-not-current' })]);
+    }
+    // An empty list is absent: 4-4a's parcel.
+    await handOver({ parcels: [{ orderId, awb: 'AWBSHAPE01', cartonCodes: [] }] }).expect(201);
+  });
+
+  it('A37 — a stale carton label after a re-carton: refused on the web; on the handheld accepted (the parcel left), not recorded, flagged; the device is judged on its count only when it sent codes; another order’s code is refused there too', async () => {
+    const orderId = await cartonPackedOrder(2, {}, 500, 3);
+    const skuId = sku.get('A-TEE')!;
+    await http().post(`${API}/${tenantId}/outbound/orders/${orderId}/cartons`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+      .send({ cartons: [{ scanned: [{ skuId, qty: 2 }] }, { scanned: [{ skuId, qty: 1 }] }], reason: 'Re-split at the dock' }).expect(201);
+    const stale = cartonCode(orderId, 1, 2);
+    const web = await handOver({ parcels: [{ orderId, awb: 'AWBSTALE01', cartonCodes: [stale] }] }).expect(409);
+    expect(web.body.parcels).toEqual([expect.objectContaining({ code: 'carton-not-current' })]);
+    // The device: a pre-4-5a handheld's queued op (no codes) with a wrong count is judged as 4-4a judged it.
+    const legacyCount = await cartonPackedOrder(2);
+    const foreign = await cartonPackedOrder(2);
+    const res = await handOver(
+      {
+        occurredAt: new Date(Date.now() - 60_000).toISOString(),
+        parcels: [
+          { orderId, awb: 'AWBSTALE01', cartonCodes: [stale, cartonCode(orderId, 2, 1)] },
+          { orderId: legacyCount, awb: 'AWBSTALE02', packageCount: 5 },
+          { orderId: foreign, awb: 'AWBSTALE03', cartonCodes: [cartonCode(orderId, 2, 2)] },
+        ],
+      },
+      operatorToken,
+    ).expect(201);
+    expect(res.body.parcels.map((p: { orderId: string }) => p.orderId).sort()).toEqual([orderId, legacyCount].sort());
+    expect(res.body.refused).toEqual([expect.objectContaining({ orderId: foreign, code: 'carton-not-current' })]);
+    const rows = await cartonsOf(orderId);
+    expect(rows.filter((row) => row.handover_id !== null).map((row) => [row.pack_seq, row.seq])).toEqual([[2, 1]]);
+    const detail = await handoverDetail(res.body.handover.id as string);
+    const entry = detail.parcels.find((p) => p.orderId === orderId)!;
+    expect(entry.cartons).toEqual({ cartonCount: 2, scanned: 1, legacy: false, codCartonScanned: null, staleCartonLabels: true });
+    expect(detail.parcels.find((p) => p.orderId === legacyCount)!.packageCount).toBe(5);
+  });
+
+  it('A34/A40 — a legacy order (packed before cartons) keeps 4-4a’s outcome: its client label’s 3 pieces hand over with 3 or with the count omitted; its one virtual carton’s scan is accepted, not recorded', async () => {
+    const legacy = async (awb: string) => {
+      const orderId = await packedOrder();
+      await sql`delete from order_carton_lines where order_id = ${orderId}`;
+      await sql`delete from order_cartons where order_id = ${orderId}`;
+      await sql`delete from order_packs where order_id = ${orderId}`;
+      await staffLabel(orderId, { awb, courierName: 'Delhivery', packageCount: '3' }, await labelPdf(1)).expect(201);
+      await verify(orderId, { scannedCode: awb, method: 'scan' }).expect(200);
+      return orderId;
+    };
+    const omitted = await legacy('AWBLEG0001');
+    const explicit = await legacy('AWBLEG0002');
+    const res = await handOver({ parcels: [{ orderId: omitted, cartonCodes: [cartonCode(omitted, 1, 1)] }, { orderId: explicit, packageCount: 3 }] }).expect(201);
+    expect(res.body.handover.packageCount).toBe(6);
+    expect((await shipmentsOf(omitted))[0]!.package_count).toBe(3);
+    expect((await shipmentsOf(explicit))[0]!.package_count).toBe(3);
+    const detail = await handoverDetail(res.body.handover.id as string);
+    expect(detail.parcels.find((p) => p.orderId === omitted)!.cartons).toEqual({ cartonCount: 1, scanned: 0, legacy: true, codCartonScanned: null, staleCartonLabels: false });
+  });
+
+  it('A44 — a COD order handed over without carton 1 scanned is recorded codCartonScanned false (audit and detail); with carton 1 it is true', async () => {
+    const missing = await cartonPackedOrder(3, { orderType: 'b2c', codAmountPaise: 125000 });
+    const scanned = await cartonPackedOrder(2, { orderType: 'b2c', codAmountPaise: 50000 });
+    const key = ulid();
+    const res = await handOver(
+      {
+        parcels: [
+          { orderId: missing, awb: 'AWBCOD0001', cartonCodes: [cartonCode(missing, 1, 2), cartonCode(missing, 1, 3)] },
+          { orderId: scanned, awb: 'AWBCOD0002', cartonCodes: [cartonCode(scanned, 1, 1)] },
+        ],
+      },
+      opsToken,
+      key,
+    ).expect(201);
+    const audit = (await sql`select changes from audit_events where tenant_id = ${tenantId} and reference = ${key} and action = 'handover.created'`)[0]!.changes as {
+      cartons: { orderId: string; codCartonScanned?: boolean; cartonCount: number; scanned: number }[];
+    };
+    expect(audit.cartons.find((entry) => entry.orderId === missing)).toEqual({ orderId: missing, cartonCount: 3, scanned: 2, codCartonScanned: false });
+    expect(audit.cartons.find((entry) => entry.orderId === scanned)).toEqual({ orderId: scanned, cartonCount: 2, scanned: 1, codCartonScanned: true });
+    const detail = await handoverDetail(res.body.handover.id as string);
+    expect(detail.parcels.find((p) => p.orderId === missing)!.cartons.codCartonScanned).toBe(false);
+    expect(detail.parcels.find((p) => p.orderId === scanned)!.cartons.codCartonScanned).toBe(true);
+  });
+
+  it('A33 — heavy B2B: 40 cartons × 30 kg default no weight into the shipment (over the 1,000 kg bound); a typed weight still lands', async () => {
+    const heavy = await cartonPackedOrder(40, {}, 30_000);
+    const typed = await cartonPackedOrder(40, {}, 30_000);
+    await handOver({ parcels: [{ orderId: heavy, awb: 'AWBHEAVY01' }, { orderId: typed, awb: 'AWBHEAVY02', weightGrams: 999_000 }] }).expect(201);
+    expect((await shipmentsOf(heavy))[0]).toMatchObject({ package_count: 40, weight_grams: null });
+    expect((await shipmentsOf(typed))[0]).toMatchObject({ package_count: 40, weight_grams: 999_000 });
+    expect((await sql`select gross_weight_grams from order_packs where order_id = ${heavy}`)[0]!.gross_weight_grams).toBe(1_200_000);
+  });
+
+  it('no deadlock: a re-carton and a handover of the same order run together — both complete, exactly one wins, neither is 40P01 or 500', async () => {
+    for (let round = 0; round < 3; round++) {
+      const orderId = await cartonPackedOrder(2, {}, 500, 3);
+      const skuId = sku.get('A-TEE')!;
+      const [recarton, handover] = await Promise.all([
+        http().post(`${API}/${tenantId}/outbound/orders/${orderId}/cartons`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+          .send({ cartons: [{ scanned: [{ skuId, qty: 3 }] }], reason: 'One box' }),
+        handOver({ parcels: [{ orderId, awb: `AWBRACE0${round}`, cartonCodes: [cartonCode(orderId, 1, 1), cartonCode(orderId, 1, 2)] }] }),
+      ]);
+      expect([recarton.status, handover.status].sort()).toEqual([201, 409]);
+      if (recarton.status === 201) expect(handover.body.parcels[0].code).toBe('carton-not-current');
+      else expect(recarton.body.code).toBe('order-not-packed');
+    }
+  });
+
+  it('D6/A32/A21 — the device snapshot says packCartons and gives each parcel its live pack and COD; the candidates carry the pack and the weight default', async () => {
+    const orderId = await cartonPackedOrder(3, { orderType: 'b2c', codAmountPaise: 70000 }, 250);
+    const legacy = await packedOrder();
+    await sql`delete from order_carton_lines where order_id = ${legacy}`;
+    await sql`delete from order_cartons where order_id = ${legacy}`;
+    await sql`delete from order_packs where order_id = ${legacy}`;
+    const snapshot = await http().get(`${API}/${tenantId}/devices/catalog-snapshot?warehouseId=${warehouseId}`).set('Authorization', `Bearer ${operatorToken}`).expect(200);
+    expect(snapshot.body.packCartons).toBe(true);
+    const parcels = snapshot.body.dispatchParcels as Record<string, unknown>[];
+    expect(parcels.find((p) => p.orderId === orderId)).toMatchObject({ packSeq: 1, cartonCount: 3, codAmountPaise: 70000 });
+    const bare = parcels.find((p) => p.orderId === legacy)!;
+    expect('packSeq' in bare || 'cartonCount' in bare || 'codAmountPaise' in bare).toBe(false);
+    const candidates = await http().get(`${API}/${tenantId}/warehouses/${warehouseId}/outbound/handover-candidates?clientId=${acme}&limit=200`).set('Authorization', `Bearer ${opsToken}`).expect(200);
+    const items = candidates.body.items as Record<string, unknown>[];
+    expect(items.find((c) => c.orderId === orderId)).toMatchObject({ packSeq: 1, cartonCount: 3, defaultWeightGrams: 750, codAmountPaise: 70000 });
+    const legacyItem = items.find((c) => c.orderId === legacy)!;
+    expect('packSeq' in legacyItem).toBe(false);
+    expect(legacyItem.defaultWeightGrams).toBe(900);
+  });
+
+  it('review — after a re-carton the LIVE pack is the measurement source: the candidates’ weight default and the handed-over shipment’s weight and size follow it, never the ledger’s pack 1', async () => {
+    const skuId = sku.get('A-TEE')!;
+    const recarton = (orderId: string, cartons: Record<string, unknown>[]) =>
+      http().post(`${API}/${tenantId}/outbound/orders/${orderId}/cartons`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+        .send({ cartons, reason: 'Re-boxed' }).expect(201);
+    // One measured box → two weighed cartons 700 + 900 (gross 1,600; no single box, so no size).
+    const ready = await fixtures.releasedWave([{ skuId, quantity: 2 }], { clientOrderRef: `SO-${ulid().slice(18)}` });
+    await fixtures.pickAllLines(ready.picklist);
+    await http().post(`${API}/${tenantId}/outbound/orders/${ready.orderId}/pack`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+      .send({ scanned: scannedOf(ready.picklist), weightGrams: 1_000, dimensionsMm: { lengthMm: 400, widthMm: 300, heightMm: 200 } }).expect(201);
+    const split = ready.orderId;
+    await recarton(split, [
+      { scanned: [{ skuId, qty: 1 }], weightGrams: 700 },
+      { scanned: [{ skuId, qty: 1 }], weightGrams: 900 },
+    ]);
+    // Two cartons → one carton with a size (1,500 g, 50 × 40 × 30 cm).
+    const merged = await cartonPackedOrder(2, {}, 500, 2);
+    await recarton(merged, [{ scanned: [{ skuId, qty: 2 }], weightGrams: 1_500, dimensionsMm: { lengthMm: 500, widthMm: 400, heightMm: 300 } }]);
+
+    const candidates = await http().get(`${API}/${tenantId}/warehouses/${warehouseId}/outbound/handover-candidates?clientId=${acme}&limit=200`).set('Authorization', `Bearer ${opsToken}`).expect(200);
+    const items = candidates.body.items as Record<string, unknown>[];
+    expect(items.find((c) => c.orderId === split)).toMatchObject({ packSeq: 2, cartonCount: 2, defaultWeightGrams: 1_600 });
+    expect(items.find((c) => c.orderId === merged)).toMatchObject({ packSeq: 2, cartonCount: 1, defaultWeightGrams: 1_500 });
+
+    await handOver({ parcels: [{ orderId: split, awb: 'AWBLIVE001' }, { orderId: merged, awb: 'AWBLIVE002' }] }).expect(201);
+    expect((await shipmentsOf(split))[0]).toMatchObject({ package_count: 2, weight_grams: 1_600, length_mm: null, width_mm: null, height_mm: null });
+    expect((await shipmentsOf(merged))[0]).toMatchObject({ package_count: 1, weight_grams: 1_500, length_mm: 500, width_mm: 400, height_mm: 300 });
+  });
+
+  it('review — a device parcel that carries carton codes is judged on its count: a packageCount other than the live carton count is refused package-count-mismatch', async () => {
+    const orderId = await cartonPackedOrder(3);
+    const fine = await cartonPackedOrder(1);
+    const res = await handOver(
+      {
+        occurredAt: new Date(Date.now() - 60_000).toISOString(),
+        parcels: [
+          { orderId, awb: 'AWBDEVCNT1', packageCount: 2, cartonCodes: [cartonCode(orderId, 1, 1)] },
+          { orderId: fine, awb: 'AWBDEVCNT2' },
+        ],
+      },
+      operatorToken,
+    ).expect(201);
+    expect(res.body.parcels.map((p: { orderId: string }) => p.orderId)).toEqual([fine]);
+    expect(res.body.refused).toEqual([expect.objectContaining({ orderId, code: 'package-count-mismatch' })]);
+    expect(await orderStatus(orderId)).toBe('ready_to_dispatch');
   });
 
   it('A44 — the portal status derivation', () => {

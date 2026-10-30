@@ -672,6 +672,31 @@ describe('pack bench: device snapshot arms + device pack route (e2e, story 10.7)
     }).expect(400);
   });
 
+  it('story 4-5a: the device route packs into cartons (each weighed, the ledger weight the gross) and refuses a carton with dimensions', async () => {
+    const { orderId, line } = await pickedOrder('BENCH-CHARLIE', 3, 'bench-cartons');
+    // A carton with dimensions is refused at the edge (DevicePackCartonDto has no such arm).
+    await devicePack({
+      orderId,
+      scanned: [{ skuId: line.skuId, qty: 3 }],
+      cartons: [{ scanned: [{ skuId: line.skuId, qty: 3 }], dimensionsMm: { lengthMm: 100, widthMm: 100, heightMm: 100 } }],
+    } as unknown as DevicePackBody).expect(400);
+    const packed = await devicePack({
+      orderId,
+      scanned: [{ skuId: line.skuId, qty: 3 }],
+      cartons: [
+        { scanned: [{ skuId: line.skuId, qty: 2 }], weightGrams: 1200 },
+        { scanned: [{ skuId: line.skuId, qty: 1 }], weightGrams: 300 },
+      ],
+    } as unknown as DevicePackBody).expect(201);
+    expect(packed.body.pack.packSeq).toBe(1);
+    expect(packed.body.pack.weightGrams).toBe(1500);
+    expect((packed.body.pack.cartons as { seq: number; unitCount: number; weightGrams: number }[]).map((c) => [c.seq, c.unitCount, c.weightGrams])).toEqual([
+      [1, 2, 1200],
+      [2, 1, 300],
+    ]);
+    expect(await orderStatus(orderId)).toBe('ready_to_dispatch');
+  });
+
   /** A fresh device + a badge-in session for a user of the given role. */
   async function badgedSessionForRole(role: string, pin: string, tag: string): Promise<{ token: string; deviceId: string }> {
     const operatorEmail = `${tag}-${role}-${ulid().toLowerCase()}@example.com`;

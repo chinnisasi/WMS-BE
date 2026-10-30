@@ -1,7 +1,8 @@
 import { SHEET_PARCELS_SHOWN } from './client-shipment-document';
 import { renderEmail } from './index';
 import { decodeClientReceiptParams, type ClientReceiptEmailParams } from './client-receipt';
-import { decodeClientDispatchParams, type ClientDispatchEmailParams } from './client-dispatch';
+import { createHash } from 'node:crypto';
+import { DISPATCH_SLIP_FAILED, DISPATCH_SLIP_TOO_LARGE, decodeClientDispatchParams, packingSlipFileName, renderClientDispatchEmail, type ClientDispatchEmailParams } from './client-dispatch';
 import { EMAIL_TEMPLATES, EMAIL_TEMPLATE_PRIORITY, CLIENT_EMAIL_TEMPLATES } from '../mail-rules';
 
 /**
@@ -102,6 +103,21 @@ describe('client notices (story 5-2b)', () => {
     expect(mail.text).toContain('reply to this email or ask Acme 3PL');
     expect(mail.text).not.toContain('Short-shipped');
     expect(renderEmail('client-dispatch', { ...dispatch, carrierName: null }, context).subject).toBe('ACME Brand: order PO-77 dispatched — DL123');
+  });
+
+  it('story 4-5a (A20, A49): the none arm is 5-2b\'s bytes exactly (golden computed on the pre-4-5a renderer); attached / too-large / failed each say one sentence', () => {
+    const portal = 'https://app.wms.test/portal/orders';
+    const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+    expect(hash(renderClientDispatchEmail(dispatch, portal, null))).toBe('ca2bc6872ae56fd8618c8f6061c7fe50ae9f738facd6f2167a02289d3091f1be');
+    expect(hash(renderEmail('client-dispatch', dispatch, context))).toBe(hash(renderClientDispatchEmail(dispatch, portal, null, 'none')));
+    const attached = renderEmail('client-dispatch', dispatch, { ...context, attachment: 'attached' });
+    expect(attached.text).toContain('The packing slip is attached (PO-77-packing-slip.pdf).');
+    expect(attached.html).toContain('The packing slip is attached (PO-77-packing-slip.pdf).');
+    expect(renderEmail('client-dispatch', dispatch, { ...context, attachment: 'too-large' }).text).toContain(DISPATCH_SLIP_TOO_LARGE);
+    expect(DISPATCH_SLIP_TOO_LARGE).toBe('The packing slip is too large to attach — download it from the client portal.');
+    expect(renderEmail('client-dispatch', dispatch, { ...context, attachment: 'failed' }).text).toContain(DISPATCH_SLIP_FAILED);
+    expect(renderEmail('client-dispatch', dispatch, context).text).not.toContain('packing slip');
+    expect(packingSlipFileName('PO/77 #2')).toBe('PO_77__2-packing-slip.pdf');
   });
 
   it('…and N more lines', () => {

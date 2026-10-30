@@ -52,6 +52,10 @@ export class ClientEmailsModule implements OnModuleInit {
    */
   onModuleInit(): void {
     this.attachments.register('grn-pdf', (tx, tenantId, clientId, grnId) => this.inbound.grnDocumentPdfInTx(tx, tenantId, clientId, grnId));
+    // Story 4-5a (A20) — the dispatch email's packing slip (client audience),
+    // on the registry's client-stamped, read-only transaction; null when the
+    // order is not that client's or not dispatched (sent without the file).
+    this.attachments.register('packing-slip-pdf', (tx, tenantId, clientId, orderId) => this.outbound.packingSlipPdfInTx(tx, tenantId, clientId, orderId));
     // Story 4-4a (D8) — a shipping document or a signed-sheet page: the stored
     // bytes (attachments) under the derived file name (outbound), both read on
     // the registry's client-stamped, read-only transaction.

@@ -3,7 +3,10 @@ import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import { fromMilli } from '../../shared/primitives/quantity';
-import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
+import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
+import { assertPermission } from '../tenancy/permissions';
+import type { PackageLabelQuery, PackageLabelsFile } from '../../shared/labels/shipping/package-labels-file';
+import { vendorReturnPackageLabelsInTx } from './vendor-return-labels';
 import { findDamagedBinInTx } from '../tenancy/receiving-bin';
 import { CatalogFacade } from '../catalog/catalog.facade';
 import { InventoryFacade } from '../inventory/inventory.facade';
@@ -100,6 +103,18 @@ export class VendorReturnFacade {
 
   cancel(command: CancelVendorReturnCommand, key: string): Promise<VendorReturnView> {
     return this.command.cancel(command, key);
+  }
+
+  /** Story 4-5a (A22) — `labels.execute`, alone in its own transaction (the 2-10b shape: 403 whatever was sent). */
+  async assertCanPrintPackageLabels(tenantId: string, actorUserId: string): Promise<void> {
+    await withTenantTransaction(this.db, tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, tenantId, actorUserId), 'labels.execute');
+    });
+  }
+
+  /** Story 4-5a (A22, A43) — the RTV's 4×6 package labels (a file read; no key, no audit). */
+  packageLabels(tenantId: string, id: string, query: PackageLabelQuery): Promise<PackageLabelsFile> {
+    return withTenantTransaction(this.db, tenantId, (tx) => vendorReturnPackageLabelsInTx(tx, tenantId, id, query), { accessMode: 'read only' });
   }
 
   get(tenantId: string, id: string): Promise<VendorReturnView> {

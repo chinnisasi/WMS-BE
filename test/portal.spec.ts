@@ -739,8 +739,9 @@ describe('client portal (e2e, story 21-7)', () => {
       // plus 4-7a's two returns reads, plus 5-6a's two credit/debit note reads,
       // plus 3-7a's three recall reads (the list, one recall, its report),
       // plus 4-1c's order import, plus 4-7c's two return-to-client reads,
-      // plus 2-9a's GRN document file, plus 4-4a's Shipping read and its three uploads.
-      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(32);
+      // plus 2-9a's GRN document file, plus 4-4a's Shipping read and its three uploads,
+      // plus 4-5a's packing slip.
+      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(33);
     });
 
     it('a portal token is refused on EVERY operator route — reads and writes — with the exact fence detail', async () => {
@@ -1231,6 +1232,8 @@ describe('client portal (e2e, story 21-7)', () => {
           '/tenants/{tenantId}/portal/orders/{orderId}',
           // Story 4-4a — the Shipping section and the client's uploads.
           '/tenants/{tenantId}/portal/orders/{orderId}/documents',
+          // Story 4-5a — the order's packing slip.
+          '/tenants/{tenantId}/portal/orders/{orderId}/packing-slip',
           '/tenants/{tenantId}/portal/orders/{orderId}/shipment/awb',
           '/tenants/{tenantId}/portal/orders/{orderId}/shipment/client-label',
           '/tenants/{tenantId}/portal/orders/{orderId}/shipping',

@@ -165,7 +165,10 @@ describe('migration 0116: client-arranged shipping', () => {
     expect(literals('attachments_doc_kind_check').filter((value) => value !== 'shipping-document')).toEqual([...SHIPPING_DOC_KINDS]);
     expect(literals('courier_handovers_source_check')).toEqual([...HANDOVER_SOURCES]);
     expect(literals('email_messages_template_check')).toEqual([...EMAIL_TEMPLATES]);
-    expect(literals('email_messages_attachment_kind_check')).toEqual([...EMAIL_ATTACHMENT_KINDS]);
+    // 0116's set: the TS tuple as it stood at 0116 (4-5a's 0117 appends
+    // `packing-slip-pdf`, pinned against the tuple by mail.spec.ts and
+    // packing-documents-migration.spec.ts).
+    expect(literals('email_messages_attachment_kind_check')).toEqual(EMAIL_ATTACHMENT_KINDS.filter((kind) => kind !== 'packing-slip-pdf'));
     expect(literals('client_contacts_email_events_check').filter((value, i, all) => all.indexOf(value) === i)).toEqual([...CLIENT_EMAIL_EVENTS]);
     // The twelve shipments CHECKs are NOT VALID (their VALIDATE is PENDING); the rest validated.
     const shipmentChecks = checks.filter((check) => check.conname.startsWith('shipments_') && !check.convalidated).map((check) => check.conname).sort();

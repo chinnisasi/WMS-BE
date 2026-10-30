@@ -1,0 +1,27 @@
+{
+  "comment": "Story 4-5a (A25, A38, A49) — shared carton-code vectors. Copied byte for byte into wms-be src/shared/primitives/, wms-fe src/lib/ and wms-mobile src/lib/ carton-code.vectors.json; each spec pins this file's sha256. A carton code is the order's parcel tag + '.' + pack seq (1-99) + '.' + carton seq (1-200), no leading zeros. Parsing trims and upper-cases first.",
+  "build": [
+    { "orderId": "01a18ba8-4743-79dd-8fe5-145b99902272", "packSeq": 1, "seq": 1, "code": "O8FE5145B99902272.1.1" },
+    { "orderId": "01a18ba8-4743-79dd-8fe5-145b99902272", "packSeq": 2, "seq": 3, "code": "O8FE5145B99902272.2.3" },
+    { "orderId": "00000000-0000-7000-8000-000000000000", "packSeq": 99, "seq": 200, "code": "O8000000000000000.99.200" },
+    { "orderId": "ffffffff-ffff-7fff-bfff-ffffffffffff", "packSeq": 10, "seq": 40, "code": "OBFFFFFFFFFFFFFFF.10.40" }
+  ],
+  "parse": [
+    { "input": "O8FE5145B99902272.1.2", "result": { "parcelTag": "O8FE5145B99902272", "packSeq": 1, "seq": 2 } },
+    { "input": "o8fe5145b99902272.2.3", "result": { "parcelTag": "O8FE5145B99902272", "packSeq": 2, "seq": 3 } },
+    { "input": "  O8FE5145B99902272.1.2\r", "result": { "parcelTag": "O8FE5145B99902272", "packSeq": 1, "seq": 2 } },
+    { "input": "O8000000000000000.99.200", "result": { "parcelTag": "O8000000000000000", "packSeq": 99, "seq": 200 } },
+    { "input": "O8FE5145B99902272.01.2", "result": null },
+    { "input": "O8FE5145B99902272.1.02", "result": null },
+    { "input": "O8FE5145B99902272.0.1", "result": null },
+    { "input": "O8FE5145B99902272.1.0", "result": null },
+    { "input": "O8FE5145B99902272.100.1", "result": null },
+    { "input": "O8FE5145B99902272.1.201", "result": null },
+    { "input": "O8FE5145B99902272", "result": null },
+    { "input": "O8FE5145B99902272.1", "result": null },
+    { "input": "O8FE5145B9990227.1.1", "result": null },
+    { "input": "O8FE5145B99902272-1-1", "result": null },
+    { "input": "RTV-0007.2", "result": null },
+    { "input": "", "result": null }
+  ]
+}

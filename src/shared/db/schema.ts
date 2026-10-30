@@ -4623,6 +4623,124 @@ export const courierHandovers = pgTable(
 export type CourierHandover = typeof courierHandovers.$inferSelect;
 
 /**
+ * Story 4-5a (A1) — a pack's document header. One LIVE pack per order
+ * (`order_packs_live_unique`): the pack writes seq 1, a re-carton supersedes
+ * the live pack and writes seq + 1, a cancel with restock cancels it. It
+ * freezes the parties the packing documents print (`document_parties`, guide
+ * §7q) — every stored pack freezes; only the read-side virtual pack of an
+ * order packed before 4-5a has none. Never hard-deleted. CHECKs and RLS (the
+ * 0041 client clause) are migration SQL only (0117).
+ */
+export const orderPacks = pgTable(
+  'order_packs',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    orderId: uuid('order_id').notNull(),
+    seq: smallint('seq').notNull(),
+    /** `live` | `superseded` | `cancelled` — `ORDER_PACK_STATUSES`. */
+    status: text('status').notNull(),
+    cartonCount: smallint('carton_count').notNull(),
+    /** Σ carton weights when every carton is weighed, else NULL (≤ 200,000,000). */
+    grossWeightGrams: integer('gross_weight_grams'),
+    documentParties: jsonb('document_parties').notNull(),
+    partiesFrozenAt: timestamp('parties_frozen_at', { withTimezone: true, mode: 'string' }).notNull(),
+    /** `web` | `handheld` | `sync` | `recarton` — `ORDER_PACK_SOURCES`. */
+    source: text('source').notNull(),
+    deviceId: uuid('device_id'),
+    packedBy: uuid('packed_by').notNull(),
+    packedAt: timestamp('packed_at', { withTimezone: true, mode: 'string' }).notNull(),
+    endedAt: timestamp('ended_at', { withTimezone: true, mode: 'string' }),
+    endedBy: uuid('ended_by'),
+    endReason: text('end_reason'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('order_packs_tenant_order_seq_unique').on(table.tenantId, table.orderId, table.seq),
+    uniqueIndex('order_packs_live_unique')
+      .on(table.tenantId, table.orderId)
+      .where(sql`${table.status} = 'live'`),
+  ],
+);
+
+export type OrderPack = typeof orderPacks.$inferSelect;
+
+/**
+ * Story 4-5a (A2) — one carton of one pack. `code` is the order's parcel tag
+ * + `.{pack seq}.{seq}` (`cartonCode`), tied to its row by
+ * `order_cartons_code_derived` and unique per tenant. Quantities are
+ * milli-units, weights grams, dimensions millimetres.
+ */
+export const orderCartons = pgTable(
+  'order_cartons',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    orderId: uuid('order_id').notNull(),
+    packId: uuid('pack_id').notNull(),
+    packSeq: smallint('pack_seq').notNull(),
+    seq: smallint('seq').notNull(),
+    code: text('code').notNull(),
+    weightGrams: integer('weight_grams'),
+    lengthMm: integer('length_mm'),
+    widthMm: integer('width_mm'),
+    heightMm: integer('height_mm'),
+    unitCount: bigint('unit_count', { mode: 'number' }).notNull(),
+    lineCount: smallint('line_count').notNull(),
+    handoverId: uuid('handover_id'),
+    handoverScannedAt: timestamp('handover_scanned_at', { withTimezone: true, mode: 'string' }),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('order_cartons_tenant_pack_seq_unique').on(table.tenantId, table.packId, table.seq),
+    index('order_cartons_tenant_order_pack_seq_idx').on(table.tenantId, table.orderId, table.packSeq),
+    // The handover detail's read: one handover's scanned cartons (0116's shipments_handover_idx shape).
+    index('order_cartons_tenant_handover_idx')
+      .on(table.tenantId, table.handoverId)
+      .where(sql`handover_id IS NOT NULL`),
+    uniqueIndex('order_cartons_tenant_code_unique').on(table.tenantId, table.code),
+  ],
+);
+
+export type OrderCarton = typeof orderCartons.$inferSelect;
+
+/**
+ * Story 4-5a (A3) — one SKU in one carton (the bench counts SKUs, never order
+ * lines). `qty` milli-units; `handling_unit_ids` a sorted JSON array of
+ * uuids, catch-weight only.
+ */
+export const orderCartonLines = pgTable(
+  'order_carton_lines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    orderId: uuid('order_id').notNull(),
+    cartonId: uuid('carton_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    qty: bigint('qty', { mode: 'number' }).notNull(),
+    handlingUnitIds: jsonb('handling_unit_ids'),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('order_carton_lines_carton_sku_unique').on(table.cartonId, table.skuId),
+    index('order_carton_lines_tenant_order_idx').on(table.tenantId, table.orderId),
+  ],
+);
+
+export type OrderCartonLine = typeof orderCartonLines.$inferSelect;
+
+/**
  * Transfer orders (Story 5-1, FR-18/FR-29): the two-leg relocation state
  * machine the movements module owns. A transfer moves stock Bin→Bin (same
  * warehouse) or Warehouse→Warehouse as TWO confirmed legs — outbound (source

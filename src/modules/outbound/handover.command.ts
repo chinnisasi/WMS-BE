@@ -3,12 +3,14 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { and, asc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { auditEvents, courierHandovers, orders, shipments, type CourierHandover, type Order, type Shipment } from '../../shared/db/schema';
+import { auditEvents, courierHandovers, orderCartons, orders, shipments, type CourierHandover, type Order, type OrderPack, type Shipment } from '../../shared/db/schema';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { awbProblem, normalizeAwb } from '../../shared/primitives/awb';
+import { parseCartonCode } from '../../shared/primitives/carton-code';
+import { parcelTagCode } from '../../shared/primitives/parcel-tag';
 import { normalizeCourierInput, type NormalizedCourier } from '../../shared/primitives/courier';
 import { orderLabelOf } from '../../shared/primitives/order-label';
 import { normalizePhone, PHONE_RE } from '../../shared/primitives/phone';
@@ -31,6 +33,8 @@ import { DispatchCommandService } from './dispatch.command';
 import { awbInUse, insertClientArrangedInTx, MAX_PACKAGE_COUNT } from './client-label.command';
 import { replayInTx, validation, writeKeyInTx } from './shipping-support';
 import { MAX_WEIGHT_GRAMS } from './pack.command';
+import { shareLockLivePacksInTx } from './order-packs';
+import { livePackFactsOfOrdersInTx } from './cartons.read';
 
 /**
  * Story 4-4a (A12, A32, A33, A36, A37, A40) — the courier handover: one
@@ -62,6 +66,10 @@ export const HANDOVER_PARCEL_REFUSALS = [
   'awb-required',
   'awb-in-use',
   'order-holds-recalled-batch',
+  // Story 4-5a (A21, D5) — appended LAST and classified last, so a parcel is
+  // judged on its cartons only once every 4-4a check passes.
+  'package-count-mismatch',
+  'carton-not-current',
 ] as const;
 export type HandoverParcelRefusal = (typeof HANDOVER_PARCEL_REFUSALS)[number];
 
@@ -76,7 +84,12 @@ export interface HandoverParcelInput {
   readonly awb?: string | null | undefined;
   readonly packageCount?: number | null | undefined;
   readonly weightGrams?: number | null | undefined;
+  /** Story 4-5a (A21) — the carton labels scanned onto the courier's pickup (≤ 200). */
+  readonly cartonCodes?: readonly string[] | null | undefined;
 }
+
+/** Story 4-5a (A21) — at most this many carton codes per parcel (`order_packs_carton_count_range`). */
+export const MAX_HANDOVER_CARTON_CODES = 200;
 
 export interface HandOverCommand {
   readonly tenantId: string;
@@ -149,8 +162,17 @@ interface NormalizedHandover {
   readonly vehicleNumber: string | null;
   readonly occurredAt: string | null;
   readonly note: string | null;
-  readonly parcels: readonly { orderId: string; awb: string | null; packageCount: number | null; weightGrams: number | null }[];
+  readonly parcels: readonly NormalizedHandoverParcel[];
   readonly photoRefs: readonly string[];
+}
+
+interface NormalizedHandoverParcel {
+  readonly orderId: string;
+  readonly awb: string | null;
+  readonly packageCount: number | null;
+  readonly weightGrams: number | null;
+  /** Story 4-5a — trimmed and upper-cased; absent (never empty) when none was scanned. */
+  readonly cartonCodes?: readonly string[];
 }
 
 /**
@@ -173,7 +195,14 @@ export function handoverHashInput(tenantId: string, surface: 'web' | 'device', w
     note: input.note,
     parcels: [...input.parcels]
       .sort((a, b) => (a.orderId < b.orderId ? -1 : a.orderId > b.orderId ? 1 : 0))
-      .map((parcel) => ({ orderId: parcel.orderId, awb: parcel.awb, packageCount: parcel.packageCount, weightGrams: parcel.weightGrams })),
+      .map((parcel) => ({
+        orderId: parcel.orderId,
+        awb: parcel.awb,
+        packageCount: parcel.packageCount,
+        weightGrams: parcel.weightGrams,
+        // Story 4-5a (A21, D5) — only when present, so a 4-4a key replays.
+        ...(parcel.cartonCodes === undefined ? {} : { cartonCodes: [...parcel.cartonCodes].sort() }),
+      })),
     photoRefs: input.photoRefs.length === 0 ? null : [...input.photoRefs].sort(),
   };
 }
@@ -271,6 +300,11 @@ export class HandoverCommand {
           { orderIds: foreign },
         );
       }
+      // Story 4-5a (A21, D5) — their live packs FOR SHARE in order-id order,
+      // after the orders and before the shipments: a re-carton takes order →
+      // pack → shipment, so the two serialise on the order lock and acquire
+      // in the same order.
+      const livePacks = await shareLockLivePacksInTx(tx, tenantId, orderRows.map((row) => row.id));
       // 6. their live shipments FOR UPDATE in id order.
       const shipmentRows =
         orderRows.length === 0
@@ -292,7 +326,7 @@ export class HandoverCommand {
       const courierName = transporter?.name ?? input.courier.courierName!;
 
       // ── the per-parcel classification, in body order ─────────────────────
-      const passing: { parcel: (typeof input.parcels)[number]; order: Order; shipment: Shipment | null }[] = [];
+      const passing: { parcel: (typeof input.parcels)[number]; order: Order; shipment: Shipment | null; livePack: OrderPack | null; cartons: CartonJudgement }[] = [];
       const refused: HandoverRefusedParcel[] = [];
       const refuse = (orderId: string, code: HandoverParcelRefusal, detail: string) => {
         const status = orderById.get(orderId)?.status;
@@ -349,8 +383,15 @@ export class HandoverCommand {
           refuse(order.id, 'order-holds-recalled-batch', `Order ${label} holds a lot under recall ${codes.join(', ')} — it cannot ship.`);
           continue;
         }
+        // Story 4-5a (A21, A34, A37) — the cartons, judged last.
+        const livePack = livePacks.get(order.id) ?? null;
+        const cartons = judgeCartons(order, label, parcel, livePack, surface);
+        if (cartons.refusal !== null) {
+          refuse(order.id, cartons.refusal.code, cartons.refusal.detail);
+          continue;
+        }
         awbsTaken.add(parcel.awb ?? shipment!.trackingNumber);
-        passing.push({ parcel, order, shipment });
+        passing.push({ parcel, order, shipment, livePack, cartons });
       }
 
       if (surface === 'web' && refused.length > 0) {
@@ -434,7 +475,10 @@ export class HandoverCommand {
       const memberOrders = passing.map((entry) => entry.order);
       const codOrders = memberOrders.filter((order) => order.codAmountPaise !== null);
       const codTotalPaise = codOrders.reduce((sum, order) => sum + Number(order.codAmountPaise), 0);
-      const packages = passing.map((entry) => entry.parcel.packageCount ?? entry.shipment?.packageCount ?? 1);
+      // Story 4-5a (A40) — the typed count, else the STORED live pack's cartons
+      // (never a virtual pack's — 4-4a's legacy default holds), else the
+      // shipment's, else 1.
+      const packages = passing.map((entry) => entry.parcel.packageCount ?? entry.livePack?.cartonCount ?? entry.shipment?.packageCount ?? 1);
       const packageCount = packages.reduce((sum, n) => sum + n, 0);
       const clientSnapshot = clientPartySnapshotOf(await getClientInTx(tx, tenantId, command.clientId));
       const party = await invoicePartyFactsInTx(tx, tenantId, command.warehouseId);
@@ -479,6 +523,10 @@ export class HandoverCommand {
 
       // The pack measurements and times (A12 step 2, A40).
       const packs = await this.inventory.packMeasurementsOfOrdersInTx(tx, tenantId, memberOrders.map((order) => order.id));
+      // Story 4-5a (A33, A39, D4) — a stored live pack is the measurement
+      // source (the gross only within the shipment bound; dimensions only for
+      // one carton); the ledger's pack docs serve a virtual pack only.
+      const packFacts = await livePackFactsOfOrdersInTx(tx, tenantId, memberOrders.map((order) => order.id));
       const results: HandoverParcelResult[] = [];
       const after: { orderId: string; warehouseId: string; restores: ReadonlyMap<string, number>; followOnOrderId: string | null }[] = [];
       const shipmentIds: string[] = [];
@@ -486,11 +534,14 @@ export class HandoverCommand {
         const { parcel, order } = entry;
         const label = orderLabelOf(order);
         const pack = packs.get(order.id) ?? null;
-        const weightGrams = parcel.weightGrams ?? pack?.weightGrams ?? null;
+        const facts = packFacts.get(order.id) ?? null;
+        const weightGrams = parcel.weightGrams ?? (facts !== null ? facts.weightGrams : (pack?.weightGrams ?? null));
         const dims =
-          pack !== null && pack.lengthMm !== null && pack.widthMm !== null && pack.heightMm !== null
-            ? { lengthMm: pack.lengthMm, widthMm: pack.widthMm, heightMm: pack.heightMm }
-            : null;
+          facts !== null
+            ? facts.dimensionsMm
+            : pack !== null && pack.lengthMm !== null && pack.widthMm !== null && pack.heightMm !== null
+              ? { lengthMm: pack.lengthMm, widthMm: pack.widthMm, heightMm: pack.heightMm }
+              : null;
         const count = packages[index]!;
         let shipment: Shipment;
         if (entry.shipment === null) {
@@ -546,6 +597,20 @@ export class HandoverCommand {
           shipment = updated;
         }
         shipmentIds.push(shipment.id);
+        // Story 4-5a (A21) — the scanned cartons of the live pack carry this handover.
+        if (entry.livePack !== null && entry.cartons.record.length > 0) {
+          await tx
+            .update(orderCartons)
+            .set({ handoverId, handoverScannedAt: handedOverAt })
+            .where(
+              and(
+                eq(orderCartons.tenantId, tenantId),
+                eq(orderCartons.packId, entry.livePack.id),
+                inArray(orderCartons.seq, [...entry.cartons.record]),
+                sql`${orderCartons.handoverId} is null`,
+              ),
+            );
+        }
         // A40 — a dispatch is never dated before its pack.
         const occurredAt = pack !== null && Date.parse(pack.packedAt) > Date.parse(handedOverAt) ? new Date(Date.parse(pack.packedAt)).toISOString() : handedOverAt;
         const dispatched = await this.dispatch.dispatchOrderInTx(tx, {
@@ -587,6 +652,17 @@ export class HandoverCommand {
       }
 
       const view = handoverViewOf(handover!);
+      // Story 4-5a (A21, A37, A44) — per order: its cartons, how many were
+      // scanned, whether the COD carton left, and any stale labels accepted.
+      const cartonChanges = passing
+        .filter((entry) => entry.livePack !== null || entry.parcel.cartonCodes !== undefined)
+        .map((entry) => ({
+          orderId: entry.order.id,
+          cartonCount: entry.livePack?.cartonCount ?? 1,
+          scanned: entry.cartons.accepted.length,
+          ...(entry.cartons.codCartonScanned === null ? {} : { codCartonScanned: entry.cartons.codCartonScanned }),
+          ...(entry.cartons.stale ? { staleCartonLabels: true } : {}),
+        }));
       await this.outbox.append(tx, {
         messageId: uuidv7(),
         tenantId,
@@ -603,7 +679,7 @@ export class HandoverCommand {
         targetType: 'courier_handover',
         targetId: handoverId,
         reference: key,
-        changes: { code, parcels: results.length, refused: refused.length, source: view.source },
+        changes: { code, parcels: results.length, refused: refused.length, source: view.source, ...(cartonChanges.length === 0 ? {} : { cartons: cartonChanges }) },
         occurredAt: now,
       });
       if (deviceId !== null) await touchDeviceInTx(tx, deviceId);
@@ -633,6 +709,82 @@ export function handoverViewOf(row: CourierHandover): HandoverView {
   };
 }
 
+/** Story 4-5a — how one parcel's cartons were judged. */
+interface CartonJudgement {
+  readonly refusal: { readonly code: 'package-count-mismatch' | 'carton-not-current'; readonly detail: string } | null;
+  /** The live pack's carton numbers scanned (recorded on `order_cartons` — a stored pack only). */
+  readonly record: readonly number[];
+  /** The current pack's carton numbers scanned (a virtual pack's too — accepted, not recorded). */
+  readonly accepted: readonly number[];
+  /** A44 — a COD order with cartons scanned: was carton 1 among them? Null when not judged. */
+  readonly codCartonScanned: boolean | null;
+  /** A37 — the device scanned a superseded pack's label (accepted: the parcel has left). */
+  readonly stale: boolean;
+}
+
+/**
+ * Story 4-5a (A21, A34, A37) — judge a parcel's cartons against the order's
+ * live pack (a stored row) or its virtual pack (packed before 4-5a: pack 1,
+ * one carton). `package-count-mismatch` only with a stored pack, and on the
+ * device only when the parcel carries carton codes (a pre-4-5a handheld's
+ * queued op is judged as 4-4a judged it). `carton-not-current`: an unreadable
+ * code, another order's, a pack number that is not the live one (a
+ * superseded pack's label is accepted on the device and flagged — the parcel
+ * has left), or a carton number past the count.
+ */
+function judgeCartons(
+  order: Order,
+  label: string,
+  parcel: NormalizedHandoverParcel,
+  livePack: OrderPack | null,
+  surface: 'web' | 'device',
+): CartonJudgement {
+  const codes = parcel.cartonCodes ?? [];
+  const refuse = (code: 'package-count-mismatch' | 'carton-not-current', detail: string): CartonJudgement => ({
+    refusal: { code, detail },
+    record: [],
+    accepted: [],
+    codCartonScanned: null,
+    stale: false,
+  });
+  if (livePack !== null && parcel.packageCount !== null && parcel.packageCount !== livePack.cartonCount && (surface === 'web' || codes.length > 0)) {
+    return refuse(
+      'package-count-mismatch',
+      `Order ${label} is packed in ${livePack.cartonCount} carton${livePack.cartonCount === 1 ? '' : 's'} — the parcel count reads ${parcel.packageCount}.`,
+    );
+  }
+  const tag = parcelTagCode(order.id);
+  const packSeq = livePack?.seq ?? 1;
+  const cartonCount = livePack?.cartonCount ?? 1;
+  const accepted: number[] = [];
+  let stale = false;
+  for (const code of codes) {
+    const parsed = parseCartonCode(code);
+    if (parsed === null || parsed.parcelTag !== tag) {
+      return refuse('carton-not-current', `Carton label ${code} is not order ${label}'s.`);
+    }
+    if (parsed.packSeq !== packSeq) {
+      if (livePack !== null && parsed.packSeq < packSeq && surface === 'device') {
+        stale = true;
+        continue;
+      }
+      return refuse('carton-not-current', `Carton label ${code} is from pack ${parsed.packSeq} — order ${label} is packed as pack ${packSeq}; reprint its labels.`);
+    }
+    if (parsed.seq > cartonCount) {
+      return refuse('carton-not-current', `Order ${label} has ${cartonCount} carton${cartonCount === 1 ? '' : 's'} — there is no carton ${parsed.seq}.`);
+    }
+    accepted.push(parsed.seq);
+  }
+  const scannedAny = codes.length > 0;
+  return {
+    refusal: null,
+    record: livePack === null ? [] : accepted,
+    accepted,
+    codCartonScanned: order.codAmountPaise !== null && scannedAny ? accepted.includes(1) : null,
+    stale,
+  };
+}
+
 /** The client's open client-arranged holder of an AWB, if any (the D6 read). */
 async function openAwbHolderInTx(tx: TenantTx, tenantId: string, clientId: string, awb: string): Promise<{ orderId: string; order: Order } | null> {
   const rows = await tx
@@ -650,6 +802,31 @@ async function openAwbHolderInTx(tx: TenantTx, tenantId: string, clientId: strin
     )
     .limit(1);
   return rows[0] ?? null;
+}
+
+/**
+ * Story 4-5a (A21, A38) — a parcel's scanned carton codes: an array of at most
+ * 200 strings, each trimmed and upper-cased; an empty array is absent; unique
+ * by the parsed `(parcelTag, packSeq, seq)` (an unreadable code by its text —
+ * it is refused per parcel as `carton-not-current`, never here).
+ */
+function normalizeCartonCodes(raw: unknown, index: number): string[] | null {
+  if (raw === undefined || raw === null) return null;
+  if (!Array.isArray(raw)) throw validation(`parcels[${index}].cartonCodes must be an array of carton codes.`);
+  if (raw.length === 0) return null;
+  if (raw.length > MAX_HANDOVER_CARTON_CODES) throw validation(`parcels[${index}].cartonCodes: at most ${MAX_HANDOVER_CARTON_CODES} cartons.`);
+  const seen = new Set<string>();
+  return raw.map((value: unknown) => {
+    if (typeof value !== 'string' || value.trim() === '' || value.length > 64) {
+      throw validation(`parcels[${index}].cartonCodes must be carton codes (e.g. O0123456789ABCDEF.1.2).`);
+    }
+    const code = value.trim().toUpperCase();
+    const parsed = parseCartonCode(code);
+    const identity = parsed === null ? `raw:${code}` : `${parsed.parcelTag}.${parsed.packSeq}.${parsed.seq}`;
+    if (seen.has(identity)) throw validation(`parcels[${index}].cartonCodes lists carton ${code} twice.`);
+    seen.add(identity);
+    return code;
+  });
 }
 
 /** Shape (400), above the transaction. */
@@ -701,7 +878,8 @@ function normalizeHandover(command: HandOverCommand): NormalizedHandover {
     if (weight !== null && (!Number.isInteger(weight) || weight < 1 || weight > MAX_WEIGHT_GRAMS)) {
       throw validation(`parcels[${index}].weightGrams must be a whole number of grams, 1–${MAX_WEIGHT_GRAMS}.`);
     }
-    return { orderId, awb, packageCount: count, weightGrams: weight };
+    const cartonCodes = normalizeCartonCodes(parcel.cartonCodes, index);
+    return { orderId, awb, packageCount: count, weightGrams: weight, ...(cartonCodes === null ? {} : { cartonCodes }) };
   });
   const refs = command.photoRefs ?? null;
   let photoRefs: string[] = [];

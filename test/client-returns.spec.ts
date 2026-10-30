@@ -27,6 +27,7 @@ import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
 import { expectAuditRow } from './support/audit-guard';
 import { linkVendor } from './support/linked-vendor';
+import { parseZplLabels, readPdfLabels, zplTexts } from './support/labels';
 
 // Story 4-7c — the return to client: returned units awaiting disposition
 // (RETURNS — the fourth disposition outcome, claimed out of the receipt
@@ -274,7 +275,7 @@ describe('story 4-7c: the return to client (e2e)', () => {
     for (const row of stored) skuIds.set(row.code, row.id);
   }
 
-  async function createMember(role: 'ops_manager' | 'operator'): Promise<{ email: string }> {
+  async function createMember(role: 'ops_manager' | 'operator' | 'accountant'): Promise<{ email: string }> {
     const email = `${role}-${ulid().toLowerCase()}@example.com`;
     const invited = await asOwner('post', '/users').send({ email, role }).expect(201);
     await http().post(`${API}/${tenantId}/accept-invite`).set(KEY_HEADER, ulid()).send({ token: invited.body.inviteToken as string, password: 'correct-horse-battery' }).expect(200);
@@ -1080,6 +1081,47 @@ describe('story 4-7c: the return to client (e2e)', () => {
     const cancelKey = ulid();
     await cancel(rtc, '  done  ', cancelKey).expect(200);
     expect(await storedHash(cancelKey)).toBe(hashCommandPayload({ tenantId, arm: 'rtc-cancel', clientReturnId: rtc.id, reason: 'done' }));
+  });
+
+  it('story 4-5a (A22, A43) — package labels: a picked RTC prints count=2 to its frozen return address (RETURN TO CLIENT, PACKAGE n/N, {code}.{n}); after dispatch the count defaults to the dispatched one and the carrier ref prints; a different count 409; a draft 409; unknown 404', async () => {
+    await receiveDamaged('CF', 2);
+    const rtc = await createOk([damagedLine('CF', 2)]);
+    const labels = (query: string, id = rtc.id) =>
+      http().get(`${API}/${tenantId}/client-returns/${id}/package-labels${query}`).set('Authorization', `Bearer ${opsToken}`).buffer(true).parse((res, cb) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => cb(null, Buffer.concat(chunks)));
+      });
+    const problem = (res: request.Response) => JSON.parse((res.body as Buffer).toString('utf8')) as { code: string };
+    expect(problem(await labels('?count=2').expect(409)).code).toBe('rtc-not-picked');
+    expect(problem(await labels('?count=2', uuidv7()).expect(404)).code).toBe('not-found');
+    await pick(rtc).expect(200);
+    expect(problem(await labels('').expect(400)).code).toBe('validation-failed');
+    const before = parseZplLabels((await labels('?count=2').expect(200)).body.toString('ascii'));
+    expect(before.map((label) => label.barcodes.map((bar) => bar.payload))).toEqual([[`${rtc.code}.1`], [`${rtc.code}.2`]]);
+    const words = zplTexts(before[1]!.raw).join(' | ');
+    expect(words).toContain(`RETURN TO CLIENT ${rtc.code}`);
+    expect(words).toContain('2/2');
+    expect(words).toContain('Returns Desk');
+    expect(words).toContain('7 Returns Lane');
+    await dispatch(rtc).expect(200);
+    const after = await labels('?format=pdf').expect(200);
+    expect(after.headers['content-disposition']).toBe(`attachment; filename="${rtc.code}-package-labels.pdf"`);
+    const pages = await readPdfLabels(after.body as Buffer);
+    expect(pages.map((page) => page.payloads)).toEqual([
+      ['AWB777', `${rtc.code}.1`],
+      ['AWB777', `${rtc.code}.2`],
+    ]);
+    expect(problem(await labels('?count=3').expect(409)).code).toBe('package-count-mismatch');
+    // Review — labels.execute is judged before any value the handler judges: an accountant sending a
+    // bad format still gets 403 role-denied, never the 400.
+    const accountant = await createMember('accountant');
+    const accountantToken = (await mintSignIn(app, { email: accountant.email, password: 'correct-horse-battery' })).body.accessToken as string;
+    const denied = await http()
+      .get(`${API}/${tenantId}/client-returns/${rtc.id}/package-labels?format=nope`)
+      .set('Authorization', `Bearer ${accountantToken}`)
+      .expect(403);
+    expect(denied.body.code).toBe('role-denied');
   });
 
   it('the tuples mirror their DB CHECKs; an old receipt-line read keeps its bytes (A6)', async () => {

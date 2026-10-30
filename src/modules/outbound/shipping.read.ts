@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import type { AttachmentRow, CourierHandover, Order, Shipment } from '../../shared/db/schema';
-import { courierHandovers, orders, shipments } from '../../shared/db/schema';
+import { auditEvents, courierHandovers, orderCartons, orderPacks, orders, shipments } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { orderLabelOf } from '../../shared/primitives/order-label';
@@ -186,6 +186,11 @@ export interface HandoverCandidate {
     readonly packageCount: number | null;
     readonly labelVerified: boolean;
   } | null;
+  /** Story 4-5a (A21) — the stored live pack; absent for a virtual pack. */
+  readonly packSeq?: number;
+  readonly cartonCount?: number;
+  /** Story 4-5a (A33, A39) — what the handover defaults the weight to. */
+  readonly defaultWeightGrams?: number | null;
 }
 
 export const HANDOVER_CANDIDATES_DEFAULT_LIMIT = 100;
@@ -226,7 +231,13 @@ export async function handoverCandidateRowsInTx(
   return { rows: rows.map((row) => ({ order: row.order, shipment: byOrder.get(row.order.id) ?? null, cursorAt: fullPrecisionInstant(row.cursorAt) })) };
 }
 
-export function candidateOf(order: Order, shipment: Shipment | null, packedAt: string | null): HandoverCandidate {
+export function candidateOf(
+  order: Order,
+  shipment: Shipment | null,
+  packedAt: string | null,
+  pack?: { readonly packSeq: number; readonly cartonCount: number } | null,
+  defaultWeightGrams?: number | null,
+): HandoverCandidate {
   return {
     orderId: order.id,
     orderLabel: orderLabelOf(order),
@@ -247,6 +258,9 @@ export function candidateOf(order: Order, shipment: Shipment | null, packedAt: s
             packageCount: shipment.packageCount,
             labelVerified: shipment.labelVerifiedAt !== null,
           },
+    // Story 4-5a (A21, A33) — optional: absent for a virtual pack / before packing.
+    ...(pack === null || pack === undefined ? {} : { packSeq: pack.packSeq, cartonCount: pack.cartonCount }),
+    ...(defaultWeightGrams === undefined ? {} : { defaultWeightGrams }),
   };
 }
 
@@ -339,10 +353,72 @@ export async function listHandoversInTx(
   };
 }
 
+/** Story 4-5a (A21, A34, A37, A44) — one order's cartons at a handover. */
+export interface HandoverCartonsRead {
+  readonly cartonCount: number;
+  readonly scanned: number;
+  readonly legacy: boolean;
+  readonly codCartonScanned: boolean | null;
+  readonly staleCartonLabels: boolean;
+}
+
 export interface HandoverDetailRead {
   readonly handover: CourierHandover;
   readonly parcels: readonly { shipment: Shipment; order: Order }[];
   readonly sheet: readonly UnsignedFile[];
+  /** Story 4-5a — by order id. */
+  readonly cartons: ReadonlyMap<string, HandoverCartonsRead>;
+}
+
+/**
+ * Story 4-5a — the cartons of a handover's orders: the live pack's count
+ * (an order packed before 4-5a has no row: "1 carton (packed before cartons
+ * were recorded)", A34), the cartons this handover scanned, and the two
+ * facts the command recorded in its audit `changes` (A37's stale labels,
+ * A44's COD carton).
+ */
+async function handoverCartonsInTx(tx: TenantTx, tenantId: string, handoverId: string, orderIds: readonly string[]): Promise<Map<string, HandoverCartonsRead>> {
+  const result = new Map<string, HandoverCartonsRead>();
+  if (orderIds.length === 0) return result;
+  const packs = await tx
+    .select({ orderId: orderPacks.orderId, cartonCount: orderPacks.cartonCount })
+    .from(orderPacks)
+    .where(and(eq(orderPacks.tenantId, tenantId), inArray(orderPacks.orderId, [...orderIds]), eq(orderPacks.status, 'live')));
+  const packByOrder = new Map(packs.map((row) => [row.orderId, row.cartonCount]));
+  const scans = await tx
+    .select({ orderId: orderCartons.orderId, n: sql<number>`count(*)::int` })
+    .from(orderCartons)
+    .where(and(eq(orderCartons.tenantId, tenantId), eq(orderCartons.handoverId, handoverId)))
+    .groupBy(orderCartons.orderId);
+  const scannedByOrder = new Map(scans.map((row) => [row.orderId, Number(row.n)]));
+  const audit = await tx
+    .select({ changes: auditEvents.changes })
+    .from(auditEvents)
+    .where(and(eq(auditEvents.tenantId, tenantId), eq(auditEvents.action, 'handover.created'), eq(auditEvents.targetId, handoverId)))
+    .limit(1);
+  const recorded = new Map<string, { codCartonScanned?: boolean; staleCartonLabels?: boolean }>();
+  const changes = audit[0]?.changes as { cartons?: unknown } | null | undefined;
+  if (changes !== null && changes !== undefined && Array.isArray(changes.cartons)) {
+    for (const entry of changes.cartons as { orderId?: unknown; codCartonScanned?: unknown; staleCartonLabels?: unknown }[]) {
+      if (typeof entry?.orderId !== 'string') continue;
+      recorded.set(entry.orderId, {
+        ...(typeof entry.codCartonScanned === 'boolean' ? { codCartonScanned: entry.codCartonScanned } : {}),
+        ...(entry.staleCartonLabels === true ? { staleCartonLabels: true } : {}),
+      });
+    }
+  }
+  for (const orderId of orderIds) {
+    const count = packByOrder.get(orderId);
+    const facts = recorded.get(orderId);
+    result.set(orderId, {
+      cartonCount: count ?? 1,
+      scanned: scannedByOrder.get(orderId) ?? 0,
+      legacy: count === undefined,
+      codCartonScanned: facts?.codCartonScanned ?? null,
+      staleCartonLabels: facts?.staleCartonLabels === true,
+    });
+  }
+  return result;
 }
 
 export async function handoverDetailInTx(tx: TenantTx, tenantId: string, handoverId: string): Promise<HandoverDetailRead | null> {
@@ -364,7 +440,8 @@ export async function handoverDetailInTx(tx: TenantTx, tenantId: string, handove
     await listByOwnerInTx(tx, { tenantId, ownerType: 'courier_handover', ownerIds: [handover.id], purposes: ['handover-sheet'] })
   ).filter((row) => row.status === 'attached');
   const names = shippingFileNames(handover.code, pages, await fileOrdinalsInTx(tx, { tenantId, ownerType: 'courier_handover', ownerIds: [handover.id], purposes: ['handover-sheet'] }));
-  return { handover, parcels, sheet: pages.map((row) => ({ row, fileName: names.get(row.id)! })) };
+  const cartons = await handoverCartonsInTx(tx, tenantId, handover.id, parcels.map((parcel) => parcel.order.id));
+  return { handover, parcels, sheet: pages.map((row) => ({ row, fileName: names.get(row.id)! })), cartons };
 }
 
 export function maskedPhoneOf(handover: CourierHandover, unmasked: boolean): string | null {
@@ -381,6 +458,11 @@ export interface DispatchParcel {
   readonly orderLabel: string;
   readonly parcelTagCode: string;
   readonly status: string;
+  /** Story 4-5a (D6) — the stored live pack; absent for a virtual pack (pack 1, one carton). */
+  readonly packSeq?: number;
+  readonly cartonCount?: number;
+  /** Story 4-5a (A44) — the COD amount (carton 1 carries its label); absent when prepaid. */
+  readonly codAmountPaise?: number;
   readonly shipment: {
     readonly shipmentId: string;
     readonly kind: ShipmentKind;
@@ -402,9 +484,11 @@ export async function dispatchParcelsInTx(tx: TenantTx, tenantId: string, wareho
            o.client_order_ref as "clientOrderRef", o.external_event_id as "externalEventId",
            o.follow_on_seq as "followOnSeq", o.follow_on_root_order_id as "followOnRootOrderId",
            s.id as "shipmentId", s.kind as "kind", s.tracking_number as "awb", s.carrier_name as "courierName",
-           (s.label_verified_at is not null) as "labelVerified"
+           (s.label_verified_at is not null) as "labelVerified",
+           o.cod_amount_paise as "codAmountPaise", p.seq as "packSeq", p.carton_count as "cartonCount"
     from orders o
     left join shipments s on s.tenant_id = o.tenant_id and s.order_id = o.id and s.status <> 'voided'
+    left join order_packs p on p.tenant_id = o.tenant_id and p.order_id = o.id and p.status = 'live'
     where o.tenant_id = ${tenantId}::uuid and o.warehouse_id = ${warehouseId}::uuid
       and (
         o.status = 'ready_to_dispatch'
@@ -426,6 +510,9 @@ export async function dispatchParcelsInTx(tx: TenantTx, tenantId: string, wareho
     awb: string | null;
     courierName: string | null;
     labelVerified: boolean | null;
+    codAmountPaise: string | number | null;
+    packSeq: number | null;
+    cartonCount: number | null;
   }[];
   const truncated = rows.length > DISPATCH_PARCELS_MAX;
   return {
@@ -442,6 +529,8 @@ export async function dispatchParcelsInTx(tx: TenantTx, tenantId: string, wareho
       }),
       parcelTagCode: parcelTagCode(row.orderId),
       status: row.status,
+      ...(row.packSeq === null || row.cartonCount === null ? {} : { packSeq: Number(row.packSeq), cartonCount: Number(row.cartonCount) }),
+      ...(row.codAmountPaise === null ? {} : { codAmountPaise: Number(row.codAmountPaise) }),
       shipment:
         row.shipmentId === null
           ? null

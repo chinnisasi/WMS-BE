@@ -2636,7 +2636,7 @@ describe('architecture: the client portal (story 21-7)', () => {
   const PORTAL_READS: readonly { file: string; methods: readonly string[] }[] = [
     { file: join(SRC_ROOT, 'modules', 'inventory', 'inventory.facade.ts'), methods: ['portalStock'] },
     // Story 4-4a — the order's Shipping section.
-    { file: join(SRC_ROOT, 'modules', 'outbound', 'outbound.facade.ts'), methods: ['portalOrders', 'portalOrder', 'portalOrderShipping'] },
+    { file: join(SRC_ROOT, 'modules', 'outbound', 'outbound.facade.ts'), methods: ['portalOrders', 'portalOrder', 'portalOrderShipping', 'portalPackingSlip'] },
     { file: join(SRC_ROOT, 'modules', 'inbound', 'inbound.facade.ts'), methods: ['portalAsns', 'portalAsn', 'portalPurchaseOrders', 'portalPurchaseOrder', 'portalGoodsReceipts', 'portalGoodsReceipt', 'portalGoodsReceiptFile'] },
     { file: join(SRC_ROOT, 'modules', 'billing', 'billing.facade.ts'), methods: ['portalInvoices', 'portalInvoice', 'portalInvoiceNotes', 'portalInvoiceNote'] },
     { file: join(SRC_ROOT, 'modules', 'clients', 'clients.facade.ts'), methods: ['portalMeIn'] },
@@ -2693,6 +2693,8 @@ describe('architecture: the client portal (story 21-7)', () => {
         'portalOrder',
         // Story 4-4a — the order's Shipping section.
         'portalOrderShipping',
+        // Story 4-5a — the order's packing slip.
+        'portalPackingSlip',
         'portalAsns',
         'portalAsn',
         'portalPurchaseOrders',
@@ -3576,7 +3578,8 @@ describe('architecture: the audit rule — every keyed command writes its audit 
     {
       helper: join(SRC_ROOT, 'modules', 'outbound', 'shipping-support.ts'),
       specifier: './shipping-support',
-      callers: ['client-label.command.ts', 'shipping-files.command.ts', 'handover.command.ts'].map((file) => join(SRC_ROOT, 'modules', 'outbound', file)),
+      // Story 4-5a — the re-carton (`carton.command.ts`) writes its key through it too.
+      callers: ['client-label.command.ts', 'shipping-files.command.ts', 'handover.command.ts', 'carton.command.ts'].map((file) => join(SRC_ROOT, 'modules', 'outbound', file)),
     },
   ];
 
@@ -3823,9 +3826,9 @@ describe('architecture: the mail module (story 5-1a)', () => {
     expect(facadeImporters).toBeGreaterThanOrEqual(3);
   });
 
-  it('story 2-9a: the mail module imports nothing from inbound or client-emails — the attachment registry is the port', () => {
+  it('story 2-9a: the mail module imports nothing from inbound, outbound or client-emails — the attachment registry is the port', () => {
     const offenders = mailFiles
-      .filter((file) => /from\s+['"][^'"]*(?:modules\/(?:inbound|client-emails)|\.\.\/(?:inbound|client-emails))\//.test(file.source))
+      .filter((file) => /from\s+['"][^'"]*(?:modules\/(?:inbound|outbound|client-emails)|\.\.\/(?:inbound|outbound|client-emails))\//.test(file.source))
       .map((file) => file.path);
     expect(offenders).toEqual([]);
   });
@@ -3836,6 +3839,16 @@ describe('architecture: the mail module (story 5-1a)', () => {
     expect(render).toMatch(/withTenantTransaction\(/);
     expect(render).toMatch(/\{\s*accessMode:\s*'read only',\s*clientId\s*\}/);
     expect(render).toMatch(/statement_timeout/);
+  });
+
+  it('story 4-5a (A20, A30): packing-slip-pdf renders through OutboundFacade.packingSlipPdfInTx on the registry transaction, which opens none of its own', () => {
+    const module = readFileSync(join(SRC_ROOT, 'modules', 'client-emails', 'client-emails.module.ts'), 'utf8');
+    expect(module).toMatch(/register\('packing-slip-pdf',\s*\(tx, tenantId, clientId, orderId\) => this\.outbound\.packingSlipPdfInTx\(tx, tenantId, clientId, orderId\)\)/);
+    const service = readFileSync(join(SRC_ROOT, 'modules', 'outbound', 'pack-documents.service.ts'), 'utf8');
+    const body = service.slice(service.indexOf('async packingSlipPdfInTx('));
+    const end = body.indexOf('\n  }\n');
+    expect(body.slice(0, end)).not.toMatch(/withTenantTransaction/);
+    expect(body.slice(0, end)).toMatch(/eq\(orders\.clientId, clientId\)/);
   });
 
   it('the mail module imports nothing from tenancy', () => {

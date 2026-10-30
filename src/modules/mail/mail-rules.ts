@@ -181,8 +181,10 @@ export function boundedEmailCode(code: string): string {
  * SEND time by the renderer a domain module registered for the kind
  * (`MailAttachmentRegistry`). Mirrored by 0115
  * `email_messages_attachment_kind_check` (pinned by test/mail.spec.ts).
+ * 4-4a (0116) added `stored-file`; 4-5a (0117, A4) adds `packing-slip-pdf`
+ * (the dispatch email's packing slip, paired with `client-dispatch`).
  */
-export const EMAIL_ATTACHMENT_KINDS = ['grn-pdf', 'stored-file'] as const;
+export const EMAIL_ATTACHMENT_KINDS = ['grn-pdf', 'stored-file', 'packing-slip-pdf'] as const;
 export type EmailAttachmentKind = (typeof EMAIL_ATTACHMENT_KINDS)[number];
 
 /** Above this an email is sent WITHOUT its file (the body says so — A16). The sender's default; a test lowers it. */

@@ -104,6 +104,16 @@ import { PickCommandService } from './pick.command';
 import type { PickSnapshot, PickTask, RecordPickCommand } from './pick.command';
 import { PackCommandService } from './pack.command';
 import type { PackOrderCommand, PackSnapshot } from './pack.command';
+import { CartonCommandService } from './carton.command';
+import type { RecartonOrderCommand, RecartonSnapshot } from './carton.command';
+import { liveCartonsOfOrdersInTx, livePackFactsOfOrdersInTx } from './cartons.read';
+import { PackDocumentsService, type PackDocumentFile, type PackFileQuery } from './pack-documents.service';
+export { parsePackFileQuery } from './pack-documents.service';
+export type { PackDocumentFile, PackFileQuery } from './pack-documents.service';
+import type { LiveCartonFacts, LivePackFacts, PackHistoryRecord, PackRecord, PackView } from './cartons.read';
+export type { RecartonOrderCommand, RecartonSnapshot } from './carton.command';
+export type { LiveCartonFacts, LivePackFacts, PackCartonView, PackHistoryRecord, PackRecord, PackView } from './cartons.read';
+export type { PackCartonInput } from './cartons';
 import { DispatchCommandService } from './dispatch.command';
 import type { DispatchOrderCommand, DispatchSnapshot } from './dispatch.command';
 import { ShipmentCommandService } from './shipment.command';
@@ -162,7 +172,7 @@ export type {
 } from './shipping-files.command';
 export type { FileView, HandoverDetailView, OrderShippingView, PortalFile, PortalOrderShippingView } from './shipping.service';
 export type { HandOverCommand, HandoverParcelInput, HandoverRefusedParcel, HandoverSnapshot, HandoverView } from './handover.command';
-export { HANDOVER_PARCEL_REFUSALS, MAX_HANDOVER_PARCELS, handoverHashInput } from './handover.command';
+export { HANDOVER_PARCEL_REFUSALS, MAX_HANDOVER_CARTON_CODES, MAX_HANDOVER_PARCELS, handoverHashInput } from './handover.command';
 export type { DispatchParcel, HandoverCandidate, HandoverListItem, PortalShippingStatus } from './shipping.read';
 export { PORTAL_SHIPPING_STATUSES, portalShippingStatus, DISPATCH_PARCELS_MAX } from './shipping.read';
 export type { ShipmentDocumentEmailFacts, ShipmentDocumentFactInput } from './shipping-mail';
@@ -611,6 +621,9 @@ export class OutboundFacade {
     @Inject(WaveCommandService) private readonly waveCommand: WaveCommandService,
     @Inject(PickCommandService) private readonly pickCommand: PickCommandService,
     @Inject(PackCommandService) private readonly packCommand: PackCommandService,
+    // Story 4-5a — the re-carton and the pack/carton reads.
+    @Inject(CartonCommandService) private readonly cartonCommand: CartonCommandService,
+    @Inject(PackDocumentsService) private readonly packDocuments: PackDocumentsService,
     @Inject(DispatchCommandService) private readonly dispatchCommand: DispatchCommandService,
     @Inject(ShipmentCommandService) private readonly shipmentCommand: ShipmentCommandService,
     @Inject(ManifestCommandService) private readonly manifestCommand: ManifestCommandService,
@@ -1756,6 +1769,77 @@ export class OutboundFacade {
    */
   async packOrder(command: PackOrderCommand, idempotencyKey: string): Promise<PackSnapshot> {
     return this.packCommand.packOrder(command, idempotencyKey);
+  }
+
+  // ── story 4-5a: cartons ───────────────────────────────────────────────────
+
+  /** A8 — `POST …/outbound/orders/{orderId}/cartons` (`pack.execute`): re-split a packed order. */
+  async recartonOrder(command: RecartonOrderCommand, idempotencyKey: string): Promise<RecartonSnapshot> {
+    return this.cartonCommand.recartonOrder(command, idempotencyKey);
+  }
+
+  /** A11 — `GET …/outbound/orders/{orderId}/cartons` (ungated): the pack and its history. */
+  async getOrderCartons(tenantId: string, orderId: string): Promise<{ pack: PackView; history: PackHistoryRecord[] }> {
+    return this.cartonCommand.getOrderCartons(tenantId, orderId);
+  }
+
+  /** A9 / A48 — the order's pack record (live, else latest stored, else virtual, else null) on the caller's transaction. */
+  async packRecordInTx(
+    tx: TenantTx,
+    tenantId: string,
+    order: { readonly id: string; readonly warehouseId: string; readonly status: string },
+  ): Promise<PackRecord | null> {
+    return this.cartonCommand.packRecordInTx(tx, tenantId, order);
+  }
+
+  /** D4 / A39 — the stored live packs' measurement facts (the handover, the candidates read). */
+  async livePackFactsOfOrdersInTx(tx: TenantTx, tenantId: string, orderIds: readonly string[]): Promise<Map<string, LivePackFacts>> {
+    return livePackFactsOfOrdersInTx(tx, tenantId, orderIds);
+  }
+
+  /** Decision 10 — the stored live cartons of several orders (4-9a's loading sheet and freight weight). */
+  async liveCartonsOfOrdersInTx(
+    tx: TenantTx,
+    tenantId: string,
+    orderIds: readonly string[],
+  ): Promise<Map<string, { readonly packSeq: number; readonly cartons: readonly LiveCartonFacts[] }>> {
+    return liveCartonsOfOrdersInTx(tx, tenantId, orderIds);
+  }
+
+  // ── story 4-5a: the packing documents ───────────────────────────────────
+
+  /** A13 — `GET …/outbound/orders/{orderId}/packing-slip` (ungated): the A4 slip or the 4×6 carton slips. */
+  async packingSlipFile(tenantId: string, orderId: string, query: PackFileQuery): Promise<PackDocumentFile> {
+    return this.packDocuments.packingSlipFile(tenantId, orderId, query);
+  }
+
+  /** A14 — `labels.execute` alone, before any query 400 (the 2-10b shape). */
+  async assertCanPrintCartonLabels(tenantId: string, actorUserId: string): Promise<void> {
+    return this.packDocuments.assertCanPrintCartonLabels(tenantId, actorUserId);
+  }
+
+  /** A14 — `GET …/outbound/orders/{orderId}/carton-labels` (`labels.execute`). */
+  async cartonLabelsFile(tenantId: string, actorUserId: string, orderId: string, query: PackFileQuery): Promise<PackDocumentFile> {
+    return this.packDocuments.cartonLabelsFile(tenantId, actorUserId, orderId, query);
+  }
+
+  /** A19 — the portal's packing slip (client audience); null = 404 (unknown, another client's, not packed). */
+  async portalPackingSlip(tenantId: string, clientId: string, orderId: string): Promise<PackDocumentFile | null> {
+    const doc = await withTenantTransaction(this.db, tenantId, (tx) => this.packDocuments.portalPackingSlipDocumentInTx(tx, tenantId, clientId, orderId), {
+      accessMode: 'read only',
+      clientId,
+    });
+    return doc === null ? null : this.packDocuments.clientPackingSlipFile(doc);
+  }
+
+  /** A20 — the dispatch email's `packing-slip-pdf` renderer, on the mail registry's stamped read-only transaction. */
+  async packingSlipPdfInTx(
+    tx: TenantTx,
+    tenantId: string,
+    clientId: string,
+    orderId: string,
+  ): Promise<{ filename: string; contentType: string; content: Uint8Array } | null> {
+    return this.packDocuments.packingSlipPdfInTx(tx, tenantId, clientId, orderId);
   }
 
   // ── dispatch (Story 4.6) ──────────────────────────────────────────────────

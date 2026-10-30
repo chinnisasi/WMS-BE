@@ -1,4 +1,5 @@
 import type { INestApplication } from '@nestjs/common';
+import { createHash } from 'node:crypto';
 import postgres from 'postgres';
 import request, { type Test as SupertestTest } from 'supertest';
 import Redis from 'ioredis';
@@ -106,6 +107,8 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
     'PAK-MIXB', // …its sibling line, withdrawn by the same wave cancel
     'PAK-HOLD', // review loop 1: the short pick's orphaned remainder hold
     'PAK-KEYS', // review loop 1: replay with reordered dimension keys
+    'PAK-GOLD', // 4-5a: the pack hash golden
+    'PAK-GOLD2', // 4-5a: the unmeasured hash golden
   ] as const;
 
   let suiteDb: SuiteDatabase;
@@ -1139,6 +1142,51 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
       .expect(201);
     expect(reordered.body).toEqual(first.body);
     expect(await packEvents(orderId)).toHaveLength(1);
+  });
+
+  it('story 4-5a (A49) — the pack golden: a body without cartons stores this payload_hash byte for byte, and the snapshot carries exactly these keys', async () => {
+    // Written and green on main's pack.command.ts BEFORE 4-5a touched it: the
+    // literal JSON below is the pre-4-5a fingerprint shape. A body without
+    // `cartons` must keep hashing to it, or every op queued on a handheld
+    // before the deploy would collide on idempotency-key-reuse when it lands.
+    const { orderId, skuId } = await pickedOrder('PAK-GOLD', 3, 'gold');
+    const key = ulid();
+    const res = await packOrder(
+      orderId,
+      { scanned: [{ skuId, qty: 2 }, { skuId, qty: 1 }], weightGrams: 900, dimensionsMm: { lengthMm: 300, widthMm: 200, heightMm: 100 } },
+      operatorWebToken,
+      key,
+    ).expect(201);
+    const literal =
+      `{"tenantId":"${tenantId}","orderId":"${orderId}","scanned":[{"skuId":"${skuId}","qty":3000}],` +
+      `"weightGrams":900,"dimensionsMm":{"lengthMm":300,"widthMm":200,"heightMm":100}}`;
+    const expected = createHash('sha256').update(literal, 'utf8').digest('hex');
+    const stored = await sql<{ payload_hash: string }[]>`
+      select payload_hash from idempotency_keys where tenant_id = ${tenantId} and key = ${key}
+    `;
+    expect(stored[0]!.payload_hash).toBe(expected);
+
+    // The unmeasured shape drops both keys (undefined is not serialised).
+    const bare = await pickedOrder('PAK-GOLD2', 2, 'gold2');
+    const bareKey = ulid();
+    await packOrder(bare.orderId, { scanned: [{ skuId: bare.skuId, qty: 2 }] }, operatorWebToken, bareKey).expect(201);
+    const bareLiteral = `{"tenantId":"${tenantId}","orderId":"${bare.orderId}","scanned":[{"skuId":"${bare.skuId}","qty":2000}]}`;
+    const bareStored = await sql<{ payload_hash: string }[]>`
+      select payload_hash from idempotency_keys where tenant_id = ${tenantId} and key = ${bareKey}
+    `;
+    expect(bareStored[0]!.payload_hash).toBe(createHash('sha256').update(bareLiteral, 'utf8').digest('hex'));
+
+    // The snapshot key set: main's keys (4-5a adds exactly packSeq and cartons).
+    const MAIN_PACK_KEYS = [
+      'clientOrderRef', 'codAmountPaise', 'dimensionsMm', 'externalEventId', 'integrationId', 'lines',
+      'orderId', 'orderStatus', 'orderType', 'packedAt', 'packedBy', 'priority', 'shipByDate', 'source',
+      'tenantId', 'totalUnits', 'warehouseId', 'weightGrams',
+    ];
+    const ADDED_BY_4_5A = ['cartons', 'packSeq'];
+    const keys = Object.keys(res.body.pack as Record<string, unknown>).sort();
+    expect(keys.filter((k) => !ADDED_BY_4_5A.includes(k))).toEqual(MAIN_PACK_KEYS);
+    expect(keys.filter((k) => ADDED_BY_4_5A.includes(k)).length === 0 || keys.filter((k) => ADDED_BY_4_5A.includes(k)).sort().join() === ADDED_BY_4_5A.join()).toBe(true);
+    expect(Object.keys(res.body).sort()).toEqual(['pack']);
   });
 
   it('the order detail read reports the new arm', async () => {
