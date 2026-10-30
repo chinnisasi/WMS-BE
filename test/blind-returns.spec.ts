@@ -534,6 +534,31 @@ describe('blind returns (e2e, story 4-7b)', () => {
     expect(foreign.body.suggestedOrderId).toBeNull();
   });
 
+  it('the order-reference arm after 4-2c (D6): the exact pass names a follow-on by its printed label and a root by its bare number; the chain alone would give no suggestion', async () => {
+    const root = await dispatchedOrder([{ skuId: sku('BA-1'), quantity: 1 }], { clientOrderRef: 'FO-77' });
+    const follow = await dispatchedOrder([{ skuId: sku('BA-1'), quantity: 1 }], { clientOrderRef: 'FO-77-TMP' });
+    // Make the second order the root's backorder follow-on (4-2c's shape: it carries the root's number).
+    await sql`update orders set client_order_ref = 'FO-77', follow_on_of_order_id = ${root.orderId}, follow_on_root_order_id = ${root.orderId}, follow_on_seq = 1 where tenant_id = ${tenantId} and id = ${follow.orderId}`;
+    const printed = await receiveBlind({ parcelReference: 'FO-77-BO1', entries: [{ skuId: sku('BA-1'), qty: 1 }] }).expect(201);
+    expect(printed.body).toMatchObject({ suggestedOrderId: follow.orderId, matchKind: 'order-reference' });
+    const bare = await receiveBlind({ parcelReference: 'FO-77', entries: [{ skuId: sku('BA-1'), qty: 1 }] }).expect(201);
+    expect(bare.body).toMatchObject({ suggestedOrderId: root.orderId, matchKind: 'order-reference' });
+  });
+
+  it('portal stock counts a pending parcel in on-hand (A17) while the portal returns list omits it', async () => {
+    const stockOf = async (): Promise<number> => {
+      const res = await http().get(`${API}/${tenantId}/portal/stock?limit=100`).set('Authorization', `Bearer ${portalBrand}`).expect(200);
+      return (res.body.items as { skuId: string; onHand: number }[])
+        .filter((row) => row.skuId === sku('BA-1'))
+        .reduce((acc, row) => acc + row.onHand, 0);
+    };
+    const before = await stockOf();
+    const res = await receiveBlind({ entries: [{ skuId: sku('BA-1'), qty: 2 }] }).expect(201);
+    expect(await stockOf()).toBe(before + 2);
+    const list = await http().get(`${API}/${tenantId}/portal/returns?limit=100`).set('Authorization', `Bearer ${portalBrand}`).expect(200);
+    expect((list.body.items as { id: string }[]).some((item) => item.id === res.body.rmaId)).toBe(false);
+  });
+
   // ── accept ─────────────────────────────────────────────────────────────────
 
   it('accept with the order: the line links, its units open to disposition (4-7a refused while pending — review-pending / exceeds-awaiting — and allowed after), the order\'s returnable falls, a second RMA refuses exceeds-returnable; the portal lists it only once accepted', async () => {
@@ -695,7 +720,18 @@ describe('blind returns (e2e, story 4-7b)', () => {
     const key = ulid();
     // `other` needs a note (400, above the transaction).
     expect((await reject(rmaId, { reasonCode: 'other' }).expect(400)).body.code).toBe('validation-failed');
+    // A pending serial is not awaiting a disposition: the device restock answers serial-not-awaiting.
+    const pendingSerial = await http()
+      .post(`${API}/${tenantId}/returns/restocks`)
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ warehouseId, skuId: sku('BA-SER'), qty: 1, batchCode: null, serialNumbers: ['BS-3'], toBinId: stockBin, occurredAt: nowUtc() })
+      .expect(409);
+    expect(pendingSerial.body.code).toBe('serial-not-awaiting');
     const rejected = await reject(rmaId, { reasonCode: 'other', note: '  scanned at the wrong dock  ' }, key).expect(200);
+    // Replay: the same key and body answer the stored snapshot; nothing is reversed twice.
+    const replayedReject = await reject(rmaId, { reasonCode: 'other', note: '  scanned at the wrong dock  ' }, key).expect(200);
+    expect(replayedReject.body).toEqual(rejected.body);
     expect(rejected.body).toMatchObject({ reviewStatus: 'rejected', reviewReasonCode: 'other', reviewNote: 'scanned at the wrong dock' });
     await expectAuditRow({ tenantId, key, action: 'return_authorization.blind_rejected', targetType: 'return_authorization', targetId: rmaId, actorUserId: opsUserId });
     expect(await onHandIn(bin, sku('BA-SER'))).toBe(serBefore - 1000);

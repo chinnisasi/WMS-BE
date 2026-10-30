@@ -1166,9 +1166,7 @@ export class BlindReturnCommand {
       );
 
       // The receipts' own review rows (their refused entries), for the trail.
-      const reviewOpIds = [...new Set(lines.map((line) => line.receiptKey))]
-        .map((key) => key)
-        .filter((key): key is string => key !== null);
+      const reviewOpIds = [...new Set(lines.map((line) => line.receiptKey))].filter((key): key is string => key !== null);
       const keyRows =
         reviewOpIds.length === 0
           ? []
