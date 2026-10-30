@@ -136,6 +136,8 @@ export interface ClientReturnView {
         /** A2 — as entered at dispatch, else the brand's frozen GSTIN; null when neither. */
         readonly consigneeGstin: string | null;
         readonly declaredValuePaise: number | null;
+        /** Story 4-6a (A41) — no value was sent, so the e-way threshold was not judged. Optional: older views lack it. */
+        readonly ewayUnjudged?: boolean;
         readonly ewayBill: { readonly number: string; readonly date: string; readonly validUntil: string | null } | null;
         readonly transporterId: string | null;
         readonly transporter: TransporterSnapshotV1 | null;
@@ -298,6 +300,7 @@ async function composeView(tx: TenantTx, tenantId: string, row: ClientReturnRow,
             consignorGstin: row.consignorGstin ?? client.gstin,
             consigneeGstin: row.consigneeGstin ?? client.gstin,
             declaredValuePaise: row.declaredValuePaise,
+            ewayUnjudged: row.declaredValuePaise === null,
             ewayBill:
               row.ewayBillNumber === null || row.ewayBillDate === null
                 ? null

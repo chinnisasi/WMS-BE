@@ -17,6 +17,7 @@ import {
 import { ApiProperty } from '@nestjs/swagger';
 import { MAX_QUANTITY_BASE, MIN_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../../shared/primitives/quantity';
 import { RTV_BRAND_DOCUMENT_TYPES, type BrandDocumentType } from '../../shared/primitives/consignment-capture';
+import { EWAY_EXEMPTION_REASONS } from '../../shared/primitives/consignment-record';
 import { PartnerAddressDto, VendorSnapshotDto } from '../partners/partners.dto';
 import {
   MAX_RTV_LINES,
@@ -132,6 +133,20 @@ export class PickVendorReturnDto {
   lines!: PickVendorReturnLineDto[];
 }
 
+/** Story 4-6a (A41) — why a consignment above the e-way threshold travels without a bill. */
+export class EwayExemptionDto {
+  @ApiProperty({ enum: [...EWAY_EXEMPTION_REASONS] })
+  @IsOptional()
+  @IsString()
+  reason?: string;
+
+  @ApiProperty({ type: String, nullable: true, required: false, description: 'Required for "other" (1–200)' })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsString()
+  note?: string | null;
+}
+
 /** The brand's movement document the goods travel under. */
 export class BrandDocumentDto {
   @ApiProperty({ enum: [...RTV_BRAND_DOCUMENT_TYPES], description: "The brand's delivery challan, or its invoice" })
@@ -214,6 +229,27 @@ export class DispatchVendorReturnDto {
   @Type(() => Number)
   @IsInt()
   packageCount?: number;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    required: false,
+    minimum: 0,
+    maximum: 1_000_000_000_000,
+    description: "Story 4-6a — the consignment value on the brand's document in paise, judged against the e-way threshold (above it an e-way bill number or an exemption is required). Optional on the API for older callers; the web always sends it",
+  })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @Type(() => Number)
+  @IsInt()
+  declaredValuePaise?: number | null;
+
+  @ApiProperty({ type: () => EwayExemptionDto, nullable: true, required: false, description: 'Story 4-6a — instead of an e-way bill above the threshold' })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @ValidateNested()
+  @Type(() => EwayExemptionDto)
+  ewayExemption?: EwayExemptionDto | null;
 }
 
 /** POST /tenants/{tenantId}/vendor-returns/{id}/cancel (`rtv.manage`). */
@@ -369,6 +405,12 @@ export class RtvEwayBillDto {
 }
 
 export class RtvDispatchDto extends RtvActorStampDto {
+  @ApiProperty({ type: Number, nullable: true, required: false, description: 'Story 4-6a — the declared consignment value in paise, judged against the e-way threshold; null when none was sent' })
+  declaredValuePaise?: number | null;
+
+  @ApiProperty({ required: false, description: 'Story 4-6a — true when no value was sent, so the e-way threshold was not judged (an older caller)' })
+  ewayUnjudged?: boolean;
+
   @ApiProperty({ type: RtvBrandDocumentDto })
   brandDocument!: RtvBrandDocumentDto;
 

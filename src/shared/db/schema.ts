@@ -7638,7 +7638,7 @@ export const clientReturns = pgTable(
     consignorGstin: text('consignor_gstin'),
     /** A2 — the brand registration that receives the goods (as sent; null = the frozen client GSTIN). */
     consigneeGstin: text('consignee_gstin'),
-    /** A9 — the consignor's declared value, integer paise (printed, never judged). */
+    /** A9 — the consignor's declared value, integer paise — judged against the e-way threshold (4-6a). */
     declaredValuePaise: bigint('declared_value_paise', { mode: 'number' }),
     ewayBillNumber: text('eway_bill_number'),
     ewayBillDate: date('eway_bill_date', { mode: 'string' }),

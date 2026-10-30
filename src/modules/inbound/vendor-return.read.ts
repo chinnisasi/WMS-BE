@@ -94,6 +94,13 @@ export interface VendorReturnView {
         readonly vehicleNumber: string | null;
         readonly trackingRef: string | null;
         readonly packageCount: number;
+        /**
+         * Story 4-6a (A22, A41) — the declared consignment value (paise), and
+         * whether the e-way threshold went unjudged (no value was sent — an
+         * older API caller). Optional: a view stored before 4-6a lacks them.
+         */
+        readonly declaredValuePaise?: number | null;
+        readonly ewayUnjudged?: boolean;
       })
     | null;
   readonly cancellation: (RtvActorStamp & { readonly reason: string }) | null;
@@ -250,6 +257,8 @@ async function composeView(tx: TenantTx, tenantId: string, row: VendorReturn, li
             vehicleNumber: row.vehicleNumber,
             trackingRef: row.trackingRef,
             packageCount: row.packageCount!,
+            declaredValuePaise: row.declaredValuePaise === null ? null : Number(row.declaredValuePaise),
+            ewayUnjudged: row.declaredValuePaise === null,
           },
     cancellation:
       row.cancelledBy === null || row.cancelledAt === null || row.cancelReason === null

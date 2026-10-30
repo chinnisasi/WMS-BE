@@ -161,25 +161,42 @@ export function assertConsignmentRecordShape(n: NormalizedConsignmentRecord): Va
     throw invalid('ewayBill.date is before brandDocument.date — an e-way bill is generated for an issued document.');
   }
   // 5. the exemption.
-  if (n.ewayExemptionReason !== null || n.ewayExemptionNote !== null) {
-    if (n.ewayBillNumber !== null) {
-      throw invalid('Send the e-way bill or an exemption, not both.');
-    }
-    if (n.ewayExemptionReason === null || !(EWAY_EXEMPTION_REASONS as readonly string[]).includes(n.ewayExemptionReason)) {
-      throw invalid(`ewayExemption.reason must be one of ${JSON.stringify(EWAY_EXEMPTION_REASONS)} (got ${JSON.stringify(n.ewayExemptionReason)}).`);
-    }
-    if (n.ewayExemptionNote !== null && (typeof n.ewayExemptionNote !== 'string' || codePoints(n.ewayExemptionNote) > L.exemptionNote)) {
-      throw invalid(`ewayExemption.note is 1–${L.exemptionNote} characters.`);
-    }
-    if (n.ewayExemptionReason === 'other' && n.ewayExemptionNote === null) {
-      throw invalid('ewayExemption.note is required for the reason "other" — say why no e-way bill is needed.');
-    }
-  }
+  assertEwayExemptionShape(n.ewayExemptionReason, n.ewayExemptionNote, n.ewayBillNumber !== null);
   // 6. the reason (an amendment's; required after dispatch, behind the replay).
   if (n.reason !== null && (typeof n.reason !== 'string' || codePoints(n.reason) > L.reason)) {
     throw invalid(`reason is 1–${L.reason} characters.`);
   }
   return n as ValidConsignmentRecord;
+}
+
+/**
+ * A8, A41 — an e-way exemption's shape (shared with the RTV and RTC
+ * dispatches): never beside an e-way bill, a reason from the vocabulary, a
+ * 1–200 character note, required for `other`. Absent (both null) passes.
+ */
+export function assertEwayExemptionShape(reason: string | null, note: string | null, hasEwayBill: boolean): void {
+  if (reason === null && note === null) return;
+  if (hasEwayBill) {
+    throw invalid('Send the e-way bill or an exemption, not both.');
+  }
+  if (reason === null || !(EWAY_EXEMPTION_REASONS as readonly string[]).includes(reason)) {
+    throw invalid(`ewayExemption.reason must be one of ${JSON.stringify(EWAY_EXEMPTION_REASONS)} (got ${JSON.stringify(reason)}).`);
+  }
+  if (note !== null && (typeof note !== 'string' || codePoints(note) > CONSIGNMENT_RECORD_LIMITS.exemptionNote)) {
+    throw invalid(`ewayExemption.note is 1–${CONSIGNMENT_RECORD_LIMITS.exemptionNote} characters.`);
+  }
+  if (reason === 'other' && note === null) {
+    throw invalid('ewayExemption.note is required for the reason "other" — say why no e-way bill is needed.');
+  }
+}
+
+/** A41 — an exemption as a dispatch body carries it, trimmed (blank as null). */
+export function normalizeEwayExemption(input: { readonly reason?: string | null | undefined; readonly note?: string | null | undefined } | null | undefined): {
+  readonly reason: string | null;
+  readonly note: string | null;
+} {
+  const e = input ?? null;
+  return { reason: e === null ? null : trimmed(e.reason), note: e === null ? null : trimmed(e.note) };
 }
 
 /** A8 — an e-way bill number as printed: `1234 5678 9012`. Anything else is returned as given. */
