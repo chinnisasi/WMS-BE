@@ -951,21 +951,26 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
     expect(reManifested.body.detail).toContain('manifested');
     expect(reManifested.body.detail).toContain('not in the labelled state');
 
-    // The auto-stamp reads only a `labelled` shipment (4.6c): dispatching the
-    // manifested order with NO free text carries NEITHER carrier arm — the
-    // manifest closure took the shipment out of the auto-stamp's read.
+    // Story 4-4a (A13) — the OLD behaviour here was a defect, now fixed: the
+    // auto-stamp read only a `labelled` shipment, so an order dispatched after
+    // its manifest lost its tracking number. It reads the LIVE (non-voided)
+    // shipment now, so the manifested order's dispatch with NO free text
+    // carries the label's carrier and tracking.
     const dispatched = await dispatchOrder(first.orderId).expect(201);
-    expect(dispatched.body.dispatch.carrierName).toBeNull();
-    expect(dispatched.body.dispatch.trackingNumber).toBeNull();
+    expect(dispatched.body.dispatch.carrierName).toBe('Sandbox');
+    expect(dispatched.body.dispatch.trackingNumber).toBe(firstLabel.body.shipment.trackingNumber);
     const events = (await sql`
       select reference_doc from ledger_events
       where tenant_id = ${tenantId} and type = 'dispatch.dispatched'
         and reference_doc->>'orderId' = ${first.orderId}
     `) as unknown as { reference_doc: Record<string, unknown> }[];
     expect(events).toHaveLength(1);
-    expect(events[0]!.reference_doc).toMatchObject({ kind: 'dispatch', orderId: first.orderId });
-    expect(events[0]!.reference_doc.carrierName).toBeUndefined();
-    expect(events[0]!.reference_doc.trackingNumber).toBeUndefined();
+    expect(events[0]!.reference_doc).toMatchObject({
+      kind: 'dispatch',
+      orderId: first.orderId,
+      carrierName: 'Sandbox',
+      trackingNumber: firstLabel.body.shipment.trackingNumber,
+    });
 
     // The writeback event and the audit row ride the same transaction.
     const outbox = await sql`

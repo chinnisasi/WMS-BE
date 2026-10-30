@@ -1,11 +1,11 @@
-import { and, eq } from 'drizzle-orm';
-import { shipments, type Shipment } from '../../shared/db/schema';
+import { and, eq, ne } from 'drizzle-orm';
+import { shipments, type Order, type Shipment } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { canonicalInstant } from '../../shared/primitives/time';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
-import { removeAttachmentIfLiveInTx } from '../attachments/attachment-records';
+import { listByOwnerInTx, removeAttachmentIfLiveInTx } from '../attachments/attachment-records';
 
 /**
  * Story 4-4a — the pieces every client-arranged shipment writer shares: the
@@ -77,4 +77,75 @@ export async function voidClientArrangedShipmentInTx(
     payload: shipmentVoidedPayload(voided, input.at, input.actorUserId),
   });
   return voided;
+}
+
+/**
+ * The order's LIVE shipment (any kind, any status but `voided`), or null. One
+ * row at most (`shipments_tenant_order_live_unique`). A plain read: every
+ * writer of an order's shipment holds the order row `FOR UPDATE` first.
+ */
+export async function liveShipmentOfOrderInTx(tx: TenantTx, tenantId: string, orderId: string): Promise<Shipment | null> {
+  const rows = await tx
+    .select()
+    .from(shipments)
+    .where(and(eq(shipments.tenantId, tenantId), eq(shipments.orderId, orderId), ne(shipments.status, 'voided')))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+/** The `shipment.document-shared` outbox payload (D6 — a staff-internal event; no webhook carries it). */
+export interface ShipmentDocumentSharedPayload {
+  readonly attachmentId: string;
+  readonly clientId: string;
+  readonly orderId: string | null;
+  readonly handoverId: string | null;
+  readonly purpose: 'shipping-document' | 'handover-sheet';
+  readonly docKind: string | null;
+}
+
+export const SHIPMENT_DOCUMENT_SHARED_EVENT = 'shipment.document-shared';
+
+/** Appends one `shipment.document-shared` for one stored file. */
+export async function appendDocumentSharedInTx(
+  tx: TenantTx,
+  outbox: OutboxSink,
+  input: { readonly tenantId: string; readonly at: string; readonly payload: ShipmentDocumentSharedPayload },
+): Promise<void> {
+  await outbox.append(tx, {
+    messageId: uuidv7(),
+    tenantId: input.tenantId,
+    type: SHIPMENT_DOCUMENT_SHARED_EVENT,
+    occurredAt: input.at,
+    payload: { ...input.payload },
+  });
+}
+
+/**
+ * A47 — at dispatch (per-order or by a handover), every live, warehouse-
+ * captured shipping document of the order (`attached`, source not `portal`)
+ * is shared with the client: one event each.
+ */
+export async function shareOrderDocumentsInTx(
+  tx: TenantTx,
+  outbox: OutboxSink,
+  input: { readonly tenantId: string; readonly order: Pick<Order, 'id' | 'clientId'>; readonly handoverId: string | null; readonly at: string },
+): Promise<number> {
+  const rows = (
+    await listByOwnerInTx(tx, { tenantId: input.tenantId, ownerType: 'order', ownerIds: [input.order.id], purposes: ['shipping-document'] })
+  ).filter((row) => row.status === 'attached' && row.source !== 'portal');
+  for (const row of rows) {
+    await appendDocumentSharedInTx(tx, outbox, {
+      tenantId: input.tenantId,
+      at: input.at,
+      payload: {
+        attachmentId: row.id,
+        clientId: input.order.clientId,
+        orderId: input.order.id,
+        handoverId: input.handoverId,
+        purpose: 'shipping-document',
+        docKind: row.docKind,
+      },
+    });
+  }
+  return rows.length;
 }

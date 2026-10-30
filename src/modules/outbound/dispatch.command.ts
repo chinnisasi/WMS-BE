@@ -1,6 +1,6 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import type { OrderType } from './order-urgency';
-import { and, asc, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { auditEvents, idempotencyKeys, orderLines, orders, picks, shipments, skus } from '../../shared/db/schema';
@@ -24,6 +24,8 @@ import { openLiveRecallLinesForBatchesInTx } from '../recalls/open-recall-lines'
 import { ORDER_OWNER_TYPE, orderSnapshotInTx } from './order.command';
 import { followOnRemainder, orderLabelOf } from './follow-on';
 import type { OrderSource, OrderStatus } from './order.command';
+import type { Order } from '../../shared/db/schema';
+import { liveShipmentOfOrderInTx, shareOrderDocumentsInTx } from './client-arranged';
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
@@ -63,6 +65,34 @@ export interface DispatchOrderCommand {
   readonly carrierName?: string | null | undefined;
   /** Optional free-text tracking reference — same contract as the carrier. */
   readonly trackingNumber?: string | null | undefined;
+}
+
+/** Story 4-4a (A13) — the dispatch body's input (a seam 4-5a/4-6a/4-9a/4-10a cite by these names). */
+export interface DispatchOrderInTxInput {
+  readonly tenantId: string;
+  /** The order, locked `FOR UPDATE` by the caller, its status guards passed (`ready_to_dispatch`). */
+  readonly order: Order;
+  readonly actorUserId: string;
+  /** Free text (the per-order dispatch) or the shipment's courier (a handover); null auto-stamps from the live shipment. */
+  readonly carrierName: string | null;
+  readonly trackingNumber: string | null;
+  /** The business time: the ledger events' `occurredAt`, the snapshot's `dispatchedAt`, the outbox. */
+  readonly occurredAt: string;
+  /** The server time: the ledger events' `recordedAt` (billing reads it), the row stamps, the audit. */
+  readonly recordedAt: string;
+  /** True when the caller already key-share locked every picked batch (a handover, in one sorted set). */
+  readonly batchesLocked: boolean;
+  /** The caller's key — the audit rows' reference. */
+  readonly idempotencyKey: string;
+  /** Story 4-4a — the handover closing the order (named by the shared documents' payload). */
+  readonly handoverId?: string | null;
+}
+
+export interface DispatchOrderInTxResult {
+  readonly snapshot: DispatchSnapshot;
+  /** The Valkey restores the caller applies AFTER its commit (`applyCounterRestores`). */
+  readonly counterRestores: ReadonlyMap<string, number>;
+  readonly followOnOrderId: string | null;
 }
 
 // ── snapshots ────────────────────────────────────────────────────────────────
@@ -295,359 +325,32 @@ export class DispatchCommandService {
         );
       }
 
-      // ── story 3-7a (A2/A3): no recalled lot leaves the building ─────────
-      // The batches this order's picks drew (the `pick.picked` events — the
-      // per-batch record; `picks.batch_id` is null on a multi-batch draw),
-      // EVERY one locked `FOR KEY SHARE` in id order with no status filter:
-      // it conflicts with the `FOR UPDATE` every block and recall command
-      // takes, so "the recall or the dispatch, whichever commits first" is
-      // well defined — a recall committed first is seen below (409), and a
-      // recall arriving later waits for this dispatch, which then appears in
-      // its `dispatched` trace. Only an OPEN LIVE recall refuses: a lot
-      // blocked for any other reason (qc-failed, expiry-review …) still
-      // ships, exactly as 3-3a left it, and a mock recall is a drill. Lock
-      // order: order row → batch key-share → (the appends below) the
-      // warehouse advisory — guide §1, A15.
-      const pickedBatchIds = await this.inventory.pickedBatchRefsOfOrderInTx(tx, command.tenantId, order.id);
-      await this.catalog.keyShareLockBatchesInTx(tx, command.tenantId, pickedBatchIds);
-      const recalled = await openLiveRecallLinesForBatchesInTx(tx, command.tenantId, pickedBatchIds);
-      if (recalled.length > 0) {
-        const batchCodes = (await this.catalog.batchFactsByIdsInTx(tx, command.tenantId, recalled.map((line) => line.batchId)));
-        const codes = [...new Set(recalled.map((line) => batchCodes.get(line.batchId)?.code ?? line.batchId))].sort();
-        const recallCodes = [...new Set(recalled.map((line) => line.recallCode))].sort();
+      // ── story 4-4a (A13, decision 5): a client-arranged order leaves only
+      // through a courier handover — after the status guards, before the
+      // recall guard. Read under the order lock (every shipment writer of
+      // this order holds it first).
+      const live = await liveShipmentOfOrderInTx(tx, command.tenantId, order.id);
+      if (live !== null && live.kind !== 'carrier') {
         throw new ProblemException(
-          'order-holds-recalled-batch',
+          'dispatch-via-handover',
           409,
-          'Order holds a recalled lot',
-          `Order "${orderLabelOf(order)}" holds units of lot ${codes.join(', ')} under recall ${recallCodes.join(', ')} — it cannot ship. ` +
-            `Release the lot from the recall (close ${recallCodes.join(', ')} with it in releaseBatchIds), or cancel the order with restock (its units go back to stock; the lot stays blocked).`,
-          { batchCodes: codes, recallCodes },
+          'Order is dispatched by a courier handover',
+          `Order "${orderLabelOf(order)}" has a client-arranged shipment (${live.carrierName} ${live.trackingNumber}) — hand it over to the courier: the handover dispatches it.`,
+          { shipmentId: live.id },
         );
       }
 
-      // ── Story 4.6c auto-stamp: the order's labelled shipment, if any ────
-      // When the caller sends no free-text carrier arm, the adapter-issued
-      // carrier/tracking from the labelled shipment (4.6c) rides the
-      // dispatch record instead — the tracking lands on the ledger's
-      // reference docs (the durable shipment record this system already
-      // has) and on the snapshot. PER-ARM: a given free-text arm still wins
-      // (a manual courier recorded by hand is exactly the case the
-      // free-text fields exist for), and the PAYLOAD HASH is unchanged —
-      // the auto-stamp is not intent, so an existing key replays exactly
-      // as before this story.
-      const shipmentRows = await tx
-        .select({
-          carrierName: shipments.carrierName,
-          trackingNumber: shipments.trackingNumber,
-        })
-        .from(shipments)
-        .where(
-          and(
-            eq(shipments.tenantId, command.tenantId),
-            eq(shipments.orderId, order.id),
-            eq(shipments.status, 'labelled'),
-          ),
-        )
-        .limit(1);
-      const labelledShipment = shipmentRows[0] ?? null;
-      const stampedCarrierName = carrierName ?? labelledShipment?.carrierName ?? null;
-      const stampedTracking = trackingNumber ?? labelledShipment?.trackingNumber ?? null;
-
-      // ── the flip (conditional — the exactly-once backstop) ──────────────
-      const dispatchedAt = nowIso();
-      const flipped = await tx
-        .update(orders)
-        .set({ status: 'dispatched', updatedAt: dispatchedAt })
-        .where(
-          and(
-            eq(orders.id, order.id),
-            eq(orders.tenantId, command.tenantId),
-            eq(orders.status, 'ready_to_dispatch'),
-          ),
-        )
-        .returning();
-      if (flipped[0] === undefined) {
-        // Unreachable beneath the row lock above; kept as the backstop that
-        // rolls the whole transaction back rather than journalling a
-        // shipment against an order this command did not actually move.
-        throw dispatchConflict(
-          'Order is already dispatched',
-          `Order "${order.id}" moved out of "ready_to_dispatch" concurrently — an order dispatches once.`,
-        );
-      }
-
-      // ── the order's lines and what actually shipped on each ─────────────
-      // `picks` is the record of units that MOVED: a zero-unit short pick
-      // wrote no row (contributing nothing, correctly) and a multi-slice
-      // order line wrote several (which sum, correctly). What shipped is
-      // exactly what was picked — the pack bench already verified that.
-      const lines = await tx
-        .select()
-        .from(orderLines)
-        .where(and(eq(orderLines.tenantId, command.tenantId), eq(orderLines.orderId, order.id)))
-        .orderBy(asc(orderLines.createdAt), asc(orderLines.id));
-      const pickRows = await tx
-        // Story 10.1: `::bigint`; `int8` returns as a string, coerced below.
-        .select({ orderLineId: picks.orderLineId, qty: sql<string>`sum(${picks.qty})::bigint` })
-        .from(picks)
-        .where(and(eq(picks.tenantId, command.tenantId), eq(picks.orderId, order.id)))
-        .groupBy(picks.orderLineId);
-      const pickedByLine = new Map(pickRows.map((row) => [row.orderLineId, Number(row.qty)]));
-
-      const skuIds = [...new Set(lines.map((line) => line.skuId))];
-      const skuRows =
-        skuIds.length === 0
-          ? []
-          : await tx
-              .select({ id: skus.id, code: skus.code, name: skus.name })
-              .from(skus)
-              .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.id, skuIds)));
-      const skuById = new Map(skuRows.map((row) => [row.id, row]));
-
-      // ── story 4-2c: the follow-on for what did not ship ─────────────────
-      // Per line `qty − Σ picks` (decision 2 / A9: plain lines from one base
-      // unit, kits by whole kits). Created in THIS transaction, so the
-      // dispatch and its follow-on commit or roll back together. No
-      // create-time check runs (A6 — it is the remainder of an order already
-      // accepted); the allocation re-checks SKU status and licences.
-      const remainder = followOnRemainder(
-        lines.map((line) => ({ id: line.id, skuId: line.skuId, qty: line.qty, parentLineId: line.parentLineId, ratePaise: line.ratePaise })),
-        pickedByLine,
-      );
-
-      // ── the ledger: one ZERO-quantity event per order line ──────────────
-      // Picking already drew these units out of stock entirely (`pick.picked`
-      // carries `toBinId: null`), so a dispatch has no bin to move between:
-      // both arms are null, the magnitude is 0, and `appendMovement` folds no
-      // projection. The event is the durable record of the SHIPMENT — and of
-      // the carrier arms, which have nowhere else durable to live.
-      const dispatchedLines: DispatchedLineSnapshot[] = [];
-      let totalUnits = 0;
-      for (const line of lines) {
-        const dispatchedQty = pickedByLine.get(line.id) ?? 0;
-        // ANNOTATED, not inferred: an object literal assigned to a typed
-        // binding is excess-property checked, so a key the grammar's
-        // `dispatch` arm does not declare is a compile error rather than a
-        // field the ledger quietly persists outside its declared shape.
-        const referenceDoc: LedgerReferenceDoc = {
-          kind: 'dispatch',
-          orderId: order.id,
-          orderLineId: line.id,
-          // Story 10.1: the reference doc is a DOCUMENT — it ships verbatim
-          // on the ledger timeline, so it speaks base units.
-          dispatchedQty: fromMilli(dispatchedQty),
-          // Optional and additive: the keys serialize only when present, so
-          // a dispatch with no carrier recorded carries neither. 4.6c: the
-          // labelled shipment's adapter-issued arms auto-stamp when the
-          // caller sent no free text (per-arm — a given arm wins).
-          ...(stampedCarrierName === null ? {} : { carrierName: stampedCarrierName }),
-          ...(stampedTracking === null ? {} : { trackingNumber: stampedTracking }),
-        };
-        const appended = await this.inventory.appendLedgerEventInTx(tx, {
-          tenantId: command.tenantId,
-          warehouseId: order.warehouseId,
-          type: 'dispatch.dispatched',
-          skuId: line.skuId,
-          quantityDelta: signedQuantity(0),
-          fromBinId: null,
-          toBinId: null,
-          batchRef: null,
-          serialRef: null,
-          actorUserId: command.actorUserId,
-          occurredAt: dispatchedAt,
-          recordedAt: dispatchedAt,
-          referenceDoc,
-        });
-        const sku = skuById.get(line.skuId);
-        // A SKU the read did not return falls back to its ID, never to an
-        // empty string: this record is durable (it IS the idempotency
-        // snapshot), and a blank code is a line nobody can identify later.
-        dispatchedLines.push({
-          orderLineId: line.id,
-          skuId: line.skuId,
-          skuCode: sku?.code ?? line.skuId,
-          skuName: sku?.name ?? line.skuId,
-          // Base units at the response/outbox edge (story 10.1).
-          orderedQty: fromMilli(line.qty),
-          dispatchedQty: fromMilli(dispatchedQty),
-          shortfallQty: fromMilli(line.qty - dispatchedQty),
-          ledgerEventId: appended.eventId,
-        });
-        totalUnits = assertExactQuantity(totalUnits + dispatchedQty, 'dispatch total units');
-      }
-
-      // ── the ATP correction: every `committed` hold retires ──────────────
-      // Owner-keyed through the facade (AD-6), never id-keyed: 4.4's short
-      // pick releases an order line's whole hold and re-grants the remainder
-      // as a NEW row that no outbound column references, so a caller
-      // collecting `order_lines.reservation_id` would miss holds.
-      //
-      // Conditional on `state = 'committed'` inside the facade, which is what
-      // preserves AD-12: exactly one dispatch retires a hold. A line whose
-      // hold is already `released` (4.4's re-grant path, 4.5's dead-hold
-      // sweep, a zero-unit short pick) simply does not come back from the
-      // read — nothing to retire and nothing double-restored.
-      //
-      // In the SAME transaction as the flip and the events, under the
-      // warehouse advisory lock the appends above already took. The Valkey
-      // mirror is NOT applied here — it rides OUT and lands after the commit.
-      const committedHolds = await this.inventory.committedReservationsByOwnerInTx(
-        tx,
-        command.tenantId,
-        order.warehouseId,
-        ORDER_OWNER_TYPE,
-        lines.map((line) => line.id),
-      );
-      const counterRestores = new Map<string, number>();
-      const retiredReservationIds: string[] = [];
-      for (const hold of committedHolds) {
-        await this.inventory.retireCommittedReservationInTx(tx, command.tenantId, hold.id);
-        counterRestores.set(
-          hold.skuId,
-          // The sum reaches the Valkey counter, where a rounded value is a
-          // permanently wrong ATP nobody notices (story 10.1).
-          assertExactQuantity(
-            (counterRestores.get(hold.skuId) ?? 0) + hold.quantity,
-            `dispatch counter restore for sku ${hold.skuId}`,
-          ),
-        );
-        retiredReservationIds.push(hold.id);
-      }
-      // `order_lines.reservation_id` / `reserved_qty` are deliberately NOT
-      // cleared, for the same reason 4.5 left them alone: the journal is the
-      // state authority (the order detail reads it live through the facade),
-      // so a retired hold already reads `released` everywhere, and the line
-      // keeps naming the hold that actually served it.
-
-      const followOnOrderId = remainder.length === 0 ? null : uuidv7();
-      if (followOnOrderId !== null) {
-        // Decision 3 — the identity, address and urgency copied; never the
-        // COD (decision 4: the first parcel's COD rides its label, manifest
-        // and dispatch record — the follow-on is prepaid), never the source
-        // payload hash (a follow-on is no delivery), never a reservation.
-        // `orders_follow_on_of_unique` is the backstop; the order row lock
-        // above already makes a second follow-on of this parent unreachable.
-        await tx.insert(orders).values({
-          id: followOnOrderId,
-          tenantId: order.tenantId,
-          clientId: order.clientId,
-          warehouseId: order.warehouseId,
-          status: 'accepted',
-          source: order.source,
-          integrationId: order.integrationId,
-          externalEventId: order.externalEventId,
-          sourcePayloadHash: null,
-          destinationContactName: order.destinationContactName,
-          destinationPhone: order.destinationPhone,
-          destinationLine1: order.destinationLine1,
-          destinationLine2: order.destinationLine2,
-          destinationCity: order.destinationCity,
-          destinationState: order.destinationState,
-          destinationPincode: order.destinationPincode,
-          consigneeGstin: order.consigneeGstin,
-          consigneeLegalName: order.consigneeLegalName,
-          clientOrderRef: order.clientOrderRef,
-          orderType: order.orderType,
-          priority: order.priority,
-          shipByDate: order.shipByDate,
-          codAmountPaise: null,
-          followOnOfOrderId: order.id,
-          followOnRootOrderId: order.followOnRootOrderId ?? order.id,
-          followOnSeq: (order.followOnSeq ?? 0) + 1,
-          createdAt: dispatchedAt,
-          updatedAt: dispatchedAt,
-        });
-        const newLineIds = new Map(remainder.map((plan) => [plan.sourceLineId, uuidv7()]));
-        await tx.insert(orderLines).values(
-          remainder.map((plan) => ({
-            id: newLineIds.get(plan.sourceLineId)!,
-            tenantId: order.tenantId,
-            orderId: followOnOrderId,
-            skuId: plan.skuId,
-            qty: plan.qty,
-            reservedQty: 0,
-            reservationId: null,
-            // Every line is backordered at "acceptance" (SM-4's history and
-            // the list's `backordered` filter read this); the allocation
-            // never changes it (decision 5).
-            status: 'backordered',
-            parentLineId: plan.parentSourceLineId === null ? null : newLineIds.get(plan.parentSourceLineId)!,
-            ratePaise: plan.ratePaise,
-          })),
-        );
-        const followOnRow = (await tx.select().from(orders).where(eq(orders.id, followOnOrderId)).limit(1))[0]!;
-        const followOnSnapshot = await orderSnapshotInTx(tx, this.inventory, followOnRow);
-        // A12 — its OWN event, never `order.created`: no consumer of a new
-        // client order may count a remainder as one.
-        await this.outbox.append(tx, {
-          messageId: uuidv7(),
-          tenantId: command.tenantId,
-          type: 'order.follow-on-created',
-          occurredAt: dispatchedAt,
-          payload: { order: followOnSnapshot.order, parentOrderId: order.id },
-        });
-        await tx.insert(auditEvents).values({
-          id: uuidv7(),
-          tenantId: command.tenantId,
-          actorUserId: command.actorUserId,
-          action: 'order.follow-on-created',
-          targetType: 'order',
-          targetId: followOnOrderId,
-          reference: idempotencyKey,
-          occurredAt: dispatchedAt,
-        });
-        this.logger.log(
-          `Order ${orderLabelOf(order)} shipped short — follow-on ${orderLabelOf({ ...order, id: followOnOrderId, followOnRootOrderId: order.followOnRootOrderId ?? order.id, followOnSeq: (order.followOnSeq ?? 0) + 1 })} (${followOnOrderId}) opened with ${remainder.length} line(s).`,
-        );
-      }
-
-      const snapshot: DispatchSnapshot = {
-        dispatch: {
-          orderId: order.id,
-          tenantId: order.tenantId,
-          warehouseId: order.warehouseId,
-          orderStatus: 'dispatched',
-          source: order.source as OrderSource,
-          integrationId: order.integrationId,
-          externalEventId: order.externalEventId,
-          clientOrderRef: order.clientOrderRef,
-          // Story 4-2a — the amount the courier collects (read through).
-          orderType: order.orderType as OrderType | null,
-          codAmountPaise: order.codAmountPaise,
-          dispatchedBy: command.actorUserId,
-          dispatchedAt: canonicalInstant(dispatchedAt),
-          // 4.6c: the labelled shipment's carrier/tracking auto-stamp when no
-          // free text was given (per-arm); free text wins when present.
-          carrierName: stampedCarrierName,
-          trackingNumber: stampedTracking,
-          totalUnits: fromMilli(totalUnits),
-          followOnOrderId,
-          followOnOfOrderId: order.followOnOfOrderId,
-          followOnRootOrderId: order.followOnRootOrderId,
-          followOnSeq: order.followOnSeq,
-          retiredReservationIds,
-          lines: dispatchedLines,
-        },
-      };
-
-      // ── in-transaction outbox append (AD-7) — before the idempotency key ─
-      await this.outbox.append(tx, {
-        messageId: uuidv7(),
+      const now = nowIso();
+      const { snapshot, counterRestores } = await this.dispatchOrderInTx(tx, {
         tenantId: command.tenantId,
-        type: 'order.dispatched',
-        occurredAt: dispatchedAt,
-        payload: { dispatch: snapshot.dispatch },
-      });
-
-      await tx.insert(auditEvents).values({
-        id: uuidv7(),
-        tenantId: command.tenantId,
+        order,
         actorUserId: command.actorUserId,
-        action: 'order.dispatched',
-        targetType: 'order',
-        targetId: order.id,
-        reference: idempotencyKey,
-        occurredAt: dispatchedAt,
+        carrierName,
+        trackingNumber,
+        occurredAt: now,
+        recordedAt: now,
+        batchesLocked: false,
+        idempotencyKey,
       });
 
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
@@ -672,24 +375,419 @@ export class DispatchCommandService {
     // journal (which already reads `released`) repairs the counter at the
     // next rebuild or reaper parity pass.
     if (committed.warehouseId !== null) {
-      for (const [skuId, units] of committed.counterRestores) {
-        try {
-          await this.inventory.restoreReservedUnits(
-            command.tenantId,
-            committed.warehouseId,
-            skuId,
-            units,
-          );
-        } catch (err) {
-          this.logger.error(
-            `Dispatch counter restore failed — reserved over-counts for this scope until the ` +
-              `next rebuild (order ${committed.snapshot.dispatch.orderId}, sku ${skuId}, ` +
-              `${units} unit(s)): ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-      }
+      await this.applyCounterRestores(command.tenantId, committed.warehouseId, committed.snapshot.dispatch.orderId, committed.counterRestores);
     }
     return committed.snapshot;
+  }
+
+  /**
+   * Story 4-4a (A13) — the dispatch BODY, from the recall guard to the audit
+   * row, on the caller's transaction with the order already locked and its
+   * status guards passed. `dispatchOrder` calls it with `occurredAt =
+   * recordedAt = now` and `batchesLocked: false`, so its events, snapshot and
+   * outbox are byte-identical to before the extraction (the A31 goldens); a
+   * courier handover calls it once per order with the handover's time and the
+   * batches of every member order already key-share locked. Returns the
+   * snapshot, the counter restores the caller applies after its commit, and
+   * the follow-on it opened. Writes no idempotency key (the caller does).
+   */
+  async dispatchOrderInTx(tx: TenantTx, input: DispatchOrderInTxInput): Promise<DispatchOrderInTxResult> {
+    const order = input.order;
+    // ── story 3-7a (A2/A3): no recalled lot leaves the building ─────────
+    // The batches this order's picks drew (the `pick.picked` events — the
+    // per-batch record; `picks.batch_id` is null on a multi-batch draw),
+    // EVERY one locked `FOR KEY SHARE` in id order with no status filter:
+    // it conflicts with the `FOR UPDATE` every block and recall command
+    // takes, so "the recall or the dispatch, whichever commits first" is
+    // well defined — a recall committed first is seen below (409), and a
+    // recall arriving later waits for this dispatch, which then appears in
+    // its `dispatched` trace. Only an OPEN LIVE recall refuses: a lot
+    // blocked for any other reason (qc-failed, expiry-review …) still
+    // ships, exactly as 3-3a left it, and a mock recall is a drill. Lock
+    // order: order row → batch key-share → (the appends below) the
+    // warehouse advisory — guide §1, A15.
+    // Story 4-4a — a handover already locked EVERY member order's batches
+    // together, in one sorted set (`batchesLocked`); the guard still runs.
+    const pickedBatchIds = await this.inventory.pickedBatchRefsOfOrderInTx(tx, input.tenantId, order.id);
+    if (!input.batchesLocked) {
+      await this.catalog.keyShareLockBatchesInTx(tx, input.tenantId, pickedBatchIds);
+    }
+    const recalled = await openLiveRecallLinesForBatchesInTx(tx, input.tenantId, pickedBatchIds);
+    if (recalled.length > 0) {
+      const batchCodes = (await this.catalog.batchFactsByIdsInTx(tx, input.tenantId, recalled.map((line) => line.batchId)));
+      const codes = [...new Set(recalled.map((line) => batchCodes.get(line.batchId)?.code ?? line.batchId))].sort();
+      const recallCodes = [...new Set(recalled.map((line) => line.recallCode))].sort();
+      throw new ProblemException(
+        'order-holds-recalled-batch',
+        409,
+        'Order holds a recalled lot',
+        `Order "${orderLabelOf(order)}" holds units of lot ${codes.join(', ')} under recall ${recallCodes.join(', ')} — it cannot ship. ` +
+          `Release the lot from the recall (close ${recallCodes.join(', ')} with it in releaseBatchIds), or cancel the order with restock (its units go back to stock; the lot stays blocked).`,
+        { batchCodes: codes, recallCodes },
+      );
+    }
+
+    // ── Story 4.6c auto-stamp: the order's labelled shipment, if any ────
+    // When the caller sends no free-text carrier arm, the adapter-issued
+    // carrier/tracking from the labelled shipment (4.6c) rides the
+    // dispatch record instead — the tracking lands on the ledger's
+    // reference docs (the durable shipment record this system already
+    // has) and on the snapshot. PER-ARM: a given free-text arm still wins
+    // (a manual courier recorded by hand is exactly the case the
+    // free-text fields exist for), and the PAYLOAD HASH is unchanged —
+    // the auto-stamp is not intent, so an existing key replays exactly
+    // as before this story.
+    const shipmentRows = await tx
+      .select({
+        carrierName: shipments.carrierName,
+        trackingNumber: shipments.trackingNumber,
+      })
+      .from(shipments)
+      .where(
+        and(
+          eq(shipments.tenantId, input.tenantId),
+          eq(shipments.orderId, order.id),
+          // Story 4-4a (A13, folded defect) — the LIVE shipment, not only a
+          // `labelled` one: an order dispatched after its 4.6c manifest
+          // used to lose its tracking number.
+          ne(shipments.status, 'voided'),
+        ),
+      )
+      .limit(1);
+    const labelledShipment = shipmentRows[0] ?? null;
+    const stampedCarrierName = input.carrierName ?? labelledShipment?.carrierName ?? null;
+    const stampedTracking = input.trackingNumber ?? labelledShipment?.trackingNumber ?? null;
+
+    // ── the flip (conditional — the exactly-once backstop) ──────────────
+    const dispatchedAt = input.occurredAt;
+    const recordedAt = input.recordedAt;
+    const flipped = await tx
+      .update(orders)
+      .set({ status: 'dispatched', updatedAt: recordedAt })
+      .where(
+        and(
+          eq(orders.id, order.id),
+          eq(orders.tenantId, input.tenantId),
+          eq(orders.status, 'ready_to_dispatch'),
+        ),
+      )
+      .returning();
+    if (flipped[0] === undefined) {
+      // Unreachable beneath the row lock above; kept as the backstop that
+      // rolls the whole transaction back rather than journalling a
+      // shipment against an order this command did not actually move.
+      throw dispatchConflict(
+        'Order is already dispatched',
+        `Order "${order.id}" moved out of "ready_to_dispatch" concurrently — an order dispatches once.`,
+      );
+    }
+
+    // ── the order's lines and what actually shipped on each ─────────────
+    // `picks` is the record of units that MOVED: a zero-unit short pick
+    // wrote no row (contributing nothing, correctly) and a multi-slice
+    // order line wrote several (which sum, correctly). What shipped is
+    // exactly what was picked — the pack bench already verified that.
+    const lines = await tx
+      .select()
+      .from(orderLines)
+      .where(and(eq(orderLines.tenantId, input.tenantId), eq(orderLines.orderId, order.id)))
+      .orderBy(asc(orderLines.createdAt), asc(orderLines.id));
+    const pickRows = await tx
+      // Story 10.1: `::bigint`; `int8` returns as a string, coerced below.
+      .select({ orderLineId: picks.orderLineId, qty: sql<string>`sum(${picks.qty})::bigint` })
+      .from(picks)
+      .where(and(eq(picks.tenantId, input.tenantId), eq(picks.orderId, order.id)))
+      .groupBy(picks.orderLineId);
+    const pickedByLine = new Map(pickRows.map((row) => [row.orderLineId, Number(row.qty)]));
+
+    const skuIds = [...new Set(lines.map((line) => line.skuId))];
+    const skuRows =
+      skuIds.length === 0
+        ? []
+        : await tx
+            .select({ id: skus.id, code: skus.code, name: skus.name })
+            .from(skus)
+            .where(and(eq(skus.tenantId, input.tenantId), inArray(skus.id, skuIds)));
+    const skuById = new Map(skuRows.map((row) => [row.id, row]));
+
+    // ── story 4-2c: the follow-on for what did not ship ─────────────────
+    // Per line `qty − Σ picks` (decision 2 / A9: plain lines from one base
+    // unit, kits by whole kits). Created in THIS transaction, so the
+    // dispatch and its follow-on commit or roll back together. No
+    // create-time check runs (A6 — it is the remainder of an order already
+    // accepted); the allocation re-checks SKU status and licences.
+    const remainder = followOnRemainder(
+      lines.map((line) => ({ id: line.id, skuId: line.skuId, qty: line.qty, parentLineId: line.parentLineId, ratePaise: line.ratePaise })),
+      pickedByLine,
+    );
+
+    // ── the ledger: one ZERO-quantity event per order line ──────────────
+    // Picking already drew these units out of stock entirely (`pick.picked`
+    // carries `toBinId: null`), so a dispatch has no bin to move between:
+    // both arms are null, the magnitude is 0, and `appendMovement` folds no
+    // projection. The event is the durable record of the SHIPMENT — and of
+    // the carrier arms, which have nowhere else durable to live.
+    const dispatchedLines: DispatchedLineSnapshot[] = [];
+    let totalUnits = 0;
+    for (const line of lines) {
+      const dispatchedQty = pickedByLine.get(line.id) ?? 0;
+      // ANNOTATED, not inferred: an object literal assigned to a typed
+      // binding is excess-property checked, so a key the grammar's
+      // `dispatch` arm does not declare is a compile error rather than a
+      // field the ledger quietly persists outside its declared shape.
+      const referenceDoc: LedgerReferenceDoc = {
+        kind: 'dispatch',
+        orderId: order.id,
+        orderLineId: line.id,
+        // Story 10.1: the reference doc is a DOCUMENT — it ships verbatim
+        // on the ledger timeline, so it speaks base units.
+        dispatchedQty: fromMilli(dispatchedQty),
+        // Optional and additive: the keys serialize only when present, so
+        // a dispatch with no carrier recorded carries neither. 4.6c: the
+        // labelled shipment's adapter-issued arms auto-stamp when the
+        // caller sent no free text (per-arm — a given arm wins).
+        ...(stampedCarrierName === null ? {} : { carrierName: stampedCarrierName }),
+        ...(stampedTracking === null ? {} : { trackingNumber: stampedTracking }),
+      };
+      const appended = await this.inventory.appendLedgerEventInTx(tx, {
+        tenantId: input.tenantId,
+        warehouseId: order.warehouseId,
+        type: 'dispatch.dispatched',
+        skuId: line.skuId,
+        quantityDelta: signedQuantity(0),
+        fromBinId: null,
+        toBinId: null,
+        batchRef: null,
+        serialRef: null,
+        actorUserId: input.actorUserId,
+        occurredAt: dispatchedAt,
+        recordedAt,
+        referenceDoc,
+      });
+      const sku = skuById.get(line.skuId);
+      // A SKU the read did not return falls back to its ID, never to an
+      // empty string: this record is durable (it IS the idempotency
+      // snapshot), and a blank code is a line nobody can identify later.
+      dispatchedLines.push({
+        orderLineId: line.id,
+        skuId: line.skuId,
+        skuCode: sku?.code ?? line.skuId,
+        skuName: sku?.name ?? line.skuId,
+        // Base units at the response/outbox edge (story 10.1).
+        orderedQty: fromMilli(line.qty),
+        dispatchedQty: fromMilli(dispatchedQty),
+        shortfallQty: fromMilli(line.qty - dispatchedQty),
+        ledgerEventId: appended.eventId,
+      });
+      totalUnits = assertExactQuantity(totalUnits + dispatchedQty, 'dispatch total units');
+    }
+
+    // ── the ATP correction: every `committed` hold retires ──────────────
+    // Owner-keyed through the facade (AD-6), never id-keyed: 4.4's short
+    // pick releases an order line's whole hold and re-grants the remainder
+    // as a NEW row that no outbound column references, so a caller
+    // collecting `order_lines.reservation_id` would miss holds.
+    //
+    // Conditional on `state = 'committed'` inside the facade, which is what
+    // preserves AD-12: exactly one dispatch retires a hold. A line whose
+    // hold is already `released` (4.4's re-grant path, 4.5's dead-hold
+    // sweep, a zero-unit short pick) simply does not come back from the
+    // read — nothing to retire and nothing double-restored.
+    //
+    // In the SAME transaction as the flip and the events, under the
+    // warehouse advisory lock the appends above already took. The Valkey
+    // mirror is NOT applied here — it rides OUT and lands after the commit.
+    const committedHolds = await this.inventory.committedReservationsByOwnerInTx(
+      tx,
+      input.tenantId,
+      order.warehouseId,
+      ORDER_OWNER_TYPE,
+      lines.map((line) => line.id),
+    );
+    const counterRestores = new Map<string, number>();
+    const retiredReservationIds: string[] = [];
+    for (const hold of committedHolds) {
+      await this.inventory.retireCommittedReservationInTx(tx, input.tenantId, hold.id);
+      counterRestores.set(
+        hold.skuId,
+        // The sum reaches the Valkey counter, where a rounded value is a
+        // permanently wrong ATP nobody notices (story 10.1).
+        assertExactQuantity(
+          (counterRestores.get(hold.skuId) ?? 0) + hold.quantity,
+          `dispatch counter restore for sku ${hold.skuId}`,
+        ),
+      );
+      retiredReservationIds.push(hold.id);
+    }
+    // `order_lines.reservation_id` / `reserved_qty` are deliberately NOT
+    // cleared, for the same reason 4.5 left them alone: the journal is the
+    // state authority (the order detail reads it live through the facade),
+    // so a retired hold already reads `released` everywhere, and the line
+    // keeps naming the hold that actually served it.
+
+    const followOnOrderId = remainder.length === 0 ? null : uuidv7();
+    if (followOnOrderId !== null) {
+      // Decision 3 — the identity, address and urgency copied; never the
+      // COD (decision 4: the first parcel's COD rides its label, manifest
+      // and dispatch record — the follow-on is prepaid), never the source
+      // payload hash (a follow-on is no delivery), never a reservation.
+      // `orders_follow_on_of_unique` is the backstop; the order row lock
+      // above already makes a second follow-on of this parent unreachable.
+      await tx.insert(orders).values({
+        id: followOnOrderId,
+        tenantId: order.tenantId,
+        clientId: order.clientId,
+        warehouseId: order.warehouseId,
+        status: 'accepted',
+        source: order.source,
+        integrationId: order.integrationId,
+        externalEventId: order.externalEventId,
+        sourcePayloadHash: null,
+        destinationContactName: order.destinationContactName,
+        destinationPhone: order.destinationPhone,
+        destinationLine1: order.destinationLine1,
+        destinationLine2: order.destinationLine2,
+        destinationCity: order.destinationCity,
+        destinationState: order.destinationState,
+        destinationPincode: order.destinationPincode,
+        consigneeGstin: order.consigneeGstin,
+        consigneeLegalName: order.consigneeLegalName,
+        clientOrderRef: order.clientOrderRef,
+        orderType: order.orderType,
+        priority: order.priority,
+        shipByDate: order.shipByDate,
+        codAmountPaise: null,
+        followOnOfOrderId: order.id,
+        followOnRootOrderId: order.followOnRootOrderId ?? order.id,
+        followOnSeq: (order.followOnSeq ?? 0) + 1,
+        createdAt: recordedAt,
+        updatedAt: recordedAt,
+      });
+      const newLineIds = new Map(remainder.map((plan) => [plan.sourceLineId, uuidv7()]));
+      await tx.insert(orderLines).values(
+        remainder.map((plan) => ({
+          id: newLineIds.get(plan.sourceLineId)!,
+          tenantId: order.tenantId,
+          orderId: followOnOrderId,
+          skuId: plan.skuId,
+          qty: plan.qty,
+          reservedQty: 0,
+          reservationId: null,
+          // Every line is backordered at "acceptance" (SM-4's history and
+          // the list's `backordered` filter read this); the allocation
+          // never changes it (decision 5).
+          status: 'backordered',
+          parentLineId: plan.parentSourceLineId === null ? null : newLineIds.get(plan.parentSourceLineId)!,
+          ratePaise: plan.ratePaise,
+        })),
+      );
+      const followOnRow = (await tx.select().from(orders).where(eq(orders.id, followOnOrderId)).limit(1))[0]!;
+      const followOnSnapshot = await orderSnapshotInTx(tx, this.inventory, followOnRow);
+      // A12 — its OWN event, never `order.created`: no consumer of a new
+      // client order may count a remainder as one.
+      await this.outbox.append(tx, {
+        messageId: uuidv7(),
+        tenantId: input.tenantId,
+        type: 'order.follow-on-created',
+        occurredAt: dispatchedAt,
+        payload: { order: followOnSnapshot.order, parentOrderId: order.id },
+      });
+      await tx.insert(auditEvents).values({
+        id: uuidv7(),
+        tenantId: input.tenantId,
+        actorUserId: input.actorUserId,
+        action: 'order.follow-on-created',
+        targetType: 'order',
+        targetId: followOnOrderId,
+        reference: input.idempotencyKey,
+        occurredAt: recordedAt,
+      });
+      this.logger.log(
+        `Order ${orderLabelOf(order)} shipped short — follow-on ${orderLabelOf({ ...order, id: followOnOrderId, followOnRootOrderId: order.followOnRootOrderId ?? order.id, followOnSeq: (order.followOnSeq ?? 0) + 1 })} (${followOnOrderId}) opened with ${remainder.length} line(s).`,
+      );
+    }
+
+    const snapshot: DispatchSnapshot = {
+      dispatch: {
+        orderId: order.id,
+        tenantId: order.tenantId,
+        warehouseId: order.warehouseId,
+        orderStatus: 'dispatched',
+        source: order.source as OrderSource,
+        integrationId: order.integrationId,
+        externalEventId: order.externalEventId,
+        clientOrderRef: order.clientOrderRef,
+        // Story 4-2a — the amount the courier collects (read through).
+        orderType: order.orderType as OrderType | null,
+        codAmountPaise: order.codAmountPaise,
+        dispatchedBy: input.actorUserId,
+        dispatchedAt: canonicalInstant(dispatchedAt),
+        // 4.6c: the labelled shipment's carrier/tracking auto-stamp when no
+        // free text was given (per-arm); free text wins when present.
+        carrierName: stampedCarrierName,
+        trackingNumber: stampedTracking,
+        totalUnits: fromMilli(totalUnits),
+        followOnOrderId,
+        followOnOfOrderId: order.followOnOfOrderId,
+        followOnRootOrderId: order.followOnRootOrderId,
+        followOnSeq: order.followOnSeq,
+        retiredReservationIds,
+        lines: dispatchedLines,
+      },
+    };
+
+    // ── in-transaction outbox append (AD-7) — before the idempotency key ─
+    await this.outbox.append(tx, {
+      messageId: uuidv7(),
+      tenantId: input.tenantId,
+      type: 'order.dispatched',
+      occurredAt: dispatchedAt,
+      payload: { dispatch: snapshot.dispatch },
+    });
+
+    await tx.insert(auditEvents).values({
+      id: uuidv7(),
+      tenantId: input.tenantId,
+      actorUserId: input.actorUserId,
+      action: 'order.dispatched',
+      targetType: 'order',
+      targetId: order.id,
+      reference: input.idempotencyKey,
+      occurredAt: recordedAt,
+    });
+
+    // ── story 4-4a (A47): the order's documents reach the client ───────
+    // Every live, warehouse-captured shipping document attached before the
+    // dispatch is shared now (an outbox row each — no hash or snapshot
+    // changes). A portal upload is the client's own, never echoed back.
+    await shareOrderDocumentsInTx(tx, this.outbox, {
+      tenantId: input.tenantId,
+      order,
+      handoverId: input.handoverId ?? null,
+      at: dispatchedAt,
+    });
+
+    return { snapshot, counterRestores, followOnOrderId };
+  }
+
+  /**
+   * The counter mirror of one committed dispatch (the 4.4 journal-first
+   * order). NOTHING HERE MAY THROW: each restore is isolated and a failure is
+   * logged; the journal repairs the counter at the next rebuild. Story 4-4a —
+   * public, so a courier handover applies each member order's after its commit.
+   */
+  async applyCounterRestores(tenantId: string, warehouseId: string, orderId: string, restores: ReadonlyMap<string, number>): Promise<void> {
+    for (const [skuId, units] of restores) {
+      try {
+        await this.inventory.restoreReservedUnits(tenantId, warehouseId, skuId, units);
+      } catch (err) {
+        this.logger.error(
+          `Dispatch counter restore failed — reserved over-counts for this scope until the ` +
+            `next rebuild (order ${orderId}, sku ${skuId}, ` +
+            `${units} unit(s)): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
   }
 
   // ── input validation (400 before any write) ───────────────────────────────
