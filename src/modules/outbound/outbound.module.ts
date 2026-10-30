@@ -7,6 +7,7 @@ import { OrderCommandService } from './order.command';
 import { WaveCommandService } from './wave.command';
 import { PickCommandService } from './pick.command';
 import { PackCommandService } from './pack.command';
+import { CartonCommandService } from './carton.command';
 import { DispatchCommandService } from './dispatch.command';
 import { AllocationCommandService } from './allocation.command';
 import { ShipmentCommandService } from './shipment.command';
@@ -105,6 +106,8 @@ import { ShippingService } from './shipping.service';
     WaveCommandService,
     PickCommandService,
     PackCommandService,
+    // Story 4-5a — the re-carton and the cartons read.
+    CartonCommandService,
     DispatchCommandService,
     ShipmentCommandService,
     ManifestCommandService,

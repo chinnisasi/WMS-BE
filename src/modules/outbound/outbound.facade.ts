@@ -104,6 +104,13 @@ import { PickCommandService } from './pick.command';
 import type { PickSnapshot, PickTask, RecordPickCommand } from './pick.command';
 import { PackCommandService } from './pack.command';
 import type { PackOrderCommand, PackSnapshot } from './pack.command';
+import { CartonCommandService } from './carton.command';
+import type { RecartonOrderCommand, RecartonSnapshot } from './carton.command';
+import { liveCartonsOfOrdersInTx, livePackFactsOfOrdersInTx } from './cartons.read';
+import type { LiveCartonFacts, LivePackFacts, PackHistoryRecord, PackRecord, PackView } from './cartons.read';
+export type { RecartonOrderCommand, RecartonSnapshot } from './carton.command';
+export type { LiveCartonFacts, LivePackFacts, PackCartonView, PackHistoryRecord, PackRecord, PackView } from './cartons.read';
+export type { PackCartonInput } from './cartons';
 import { DispatchCommandService } from './dispatch.command';
 import type { DispatchOrderCommand, DispatchSnapshot } from './dispatch.command';
 import { ShipmentCommandService } from './shipment.command';
@@ -611,6 +618,8 @@ export class OutboundFacade {
     @Inject(WaveCommandService) private readonly waveCommand: WaveCommandService,
     @Inject(PickCommandService) private readonly pickCommand: PickCommandService,
     @Inject(PackCommandService) private readonly packCommand: PackCommandService,
+    // Story 4-5a — the re-carton and the pack/carton reads.
+    @Inject(CartonCommandService) private readonly cartonCommand: CartonCommandService,
     @Inject(DispatchCommandService) private readonly dispatchCommand: DispatchCommandService,
     @Inject(ShipmentCommandService) private readonly shipmentCommand: ShipmentCommandService,
     @Inject(ManifestCommandService) private readonly manifestCommand: ManifestCommandService,
@@ -1756,6 +1765,41 @@ export class OutboundFacade {
    */
   async packOrder(command: PackOrderCommand, idempotencyKey: string): Promise<PackSnapshot> {
     return this.packCommand.packOrder(command, idempotencyKey);
+  }
+
+  // ── story 4-5a: cartons ───────────────────────────────────────────────────
+
+  /** A8 — `POST …/outbound/orders/{orderId}/cartons` (`pack.execute`): re-split a packed order. */
+  async recartonOrder(command: RecartonOrderCommand, idempotencyKey: string): Promise<RecartonSnapshot> {
+    return this.cartonCommand.recartonOrder(command, idempotencyKey);
+  }
+
+  /** A11 — `GET …/outbound/orders/{orderId}/cartons` (ungated): the pack and its history. */
+  async getOrderCartons(tenantId: string, orderId: string): Promise<{ pack: PackView; history: PackHistoryRecord[] }> {
+    return this.cartonCommand.getOrderCartons(tenantId, orderId);
+  }
+
+  /** A9 / A48 — the order's pack record (live, else latest stored, else virtual, else null) on the caller's transaction. */
+  async packRecordInTx(
+    tx: TenantTx,
+    tenantId: string,
+    order: { readonly id: string; readonly warehouseId: string; readonly status: string },
+  ): Promise<PackRecord | null> {
+    return this.cartonCommand.packRecordInTx(tx, tenantId, order);
+  }
+
+  /** D4 / A39 — the stored live packs' measurement facts (the handover, the candidates read). */
+  async livePackFactsOfOrdersInTx(tx: TenantTx, tenantId: string, orderIds: readonly string[]): Promise<Map<string, LivePackFacts>> {
+    return livePackFactsOfOrdersInTx(tx, tenantId, orderIds);
+  }
+
+  /** Decision 10 — the stored live cartons of several orders (4-9a's loading sheet and freight weight). */
+  async liveCartonsOfOrdersInTx(
+    tx: TenantTx,
+    tenantId: string,
+    orderIds: readonly string[],
+  ): Promise<Map<string, { readonly packSeq: number; readonly cartons: readonly LiveCartonFacts[] }>> {
+    return liveCartonsOfOrdersInTx(tx, tenantId, orderIds);
   }
 
   // ── dispatch (Story 4.6) ──────────────────────────────────────────────────

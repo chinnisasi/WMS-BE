@@ -37,6 +37,7 @@ import type { ShipmentStatus } from './shipment.command';
 import { orderLabelOf } from './follow-on';
 import { CANCELLED_VOID_REASON, shipmentVoidedPayload } from './client-arranged';
 import { removeAttachmentIfLiveInTx } from '../attachments/attachment-records';
+import { endLivePackInTx, lockLivePackInTx } from './order-packs';
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
@@ -334,6 +335,10 @@ export class CancelRestockCommandService {
         }
       }
 
+      // ── story 4-5a (A10): the live pack, locked after the order and before
+      // the shipments (the re-carton's order → pack → shipment) ───────────
+      const livePack = await lockLivePackInTx(tx, command.tenantId, order.id);
+
       // ── the shipment row, locked (A1): labelled → void, manifested → 409 ─
       const shipmentRows = await tx
         .select()
@@ -614,6 +619,18 @@ export class CancelRestockCommandService {
         }
         voidedRow = voided[0];
         voidedShipment = { id: labelled.id, carrierName: labelled.carrierName, trackingNumber: labelled.trackingNumber };
+      }
+
+      // ── story 4-5a (A10): the live pack is cancelled with the order ──────
+      if (livePack !== null) {
+        await endLivePackInTx(tx, {
+          tenantId: command.tenantId,
+          packId: livePack.id,
+          status: 'cancelled',
+          endedAt: restockedAt,
+          endedBy: command.actorUserId,
+          endReason: null,
+        });
       }
 
       // ── the lines stop claiming stock; the order flips ──────────────────

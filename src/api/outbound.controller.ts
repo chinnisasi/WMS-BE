@@ -15,7 +15,7 @@ import type { DeviceSession, TenantSession } from '../modules/tenancy/jwt-sessio
 import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/idempotency-guard';
 import { UUID_RE } from '../shared/primitives/ids';
 import { OutboundFacade } from '../modules/outbound/outbound.facade';
-import type { ListOrdersFilter } from '../modules/outbound/outbound.facade';
+import type { ListOrdersFilter, PackCartonInput, PackView } from '../modules/outbound/outbound.facade';
 import { assertInstantRange } from '../shared/primitives/instant-range';
 import type { OrderLineDto } from '../modules/outbound/outbound.dto';
 import { toAddressDto } from '../modules/tenancy/tenancy.dto';
@@ -53,6 +53,10 @@ import {
   OrderShelfLifeResponse,
   OrderResponse,
   PackOrderDto,
+  OrderCartonsResponse,
+  PackViewDto,
+  RecartonOrderDto,
+  RecartonResponse,
   PackResponse,
   PickResponse,
   RecordPickDto,
@@ -466,10 +470,84 @@ export class OutboundController {
         // absent so an unmeasured parcel hashes identically either way.
         weightGrams: dto.weightGrams ?? undefined,
         dimensionsMm: dto.dimensionsMm ?? undefined,
+        // Story 4-5a (A6) — absent stays absent (main's hash).
+        ...(dto.cartons === undefined ? {} : { cartons: packCartonsOf(dto.cartons) }),
       },
       key,
     );
     return { pack: { ...snapshot.pack, lines: snapshot.pack.lines.map((line) => ({ ...line })) } };
+  }
+
+  @Post(':tenantId/outbound/orders/:orderId/cartons')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'pack.execute — story 4-5a: re-packs a packed order into a new set of cartons on the web — the same goods, a new split. The live pack is superseded (its carton labels stop scanning at the handover) and the next pack is written with the parties the first pack froze. A client-arranged label’s piece count follows, and its verification is cleared (re-verify it on the new boxes). The live split sent again is a no-op that stores the key',
+  })
+  @ApiBody({ type: RecartonOrderDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: RecartonResponse, description: 'The live pack after the re-carton (a replay re-serves it)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key or path parameter, a malformed carton (an empty carton, a fractional each, a case in two cartons, a measurement out of bounds), or a missing reason (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks pack.execute (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Order, or a carton’s SKU, does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The order is not packed or has left (order-not-packed, naming its status); a carrier label covers it (shipment-labelled-by-carrier — cancel and re-pack); the order is on its 99th pack (recarton-limit); or a concurrent idempotent request (conflict). Nothing is written') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('The new cartons do not hold exactly what was packed (carton-contents-mismatch, `skus[{skuCode, packed, cartoned}]`); or an idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async recartonOrder(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: RecartonOrderDto,
+  ): Promise<RecartonResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.outbound.recartonOrder(
+      { tenantId, actorUserId: session.userId, orderId, cartons: packCartonsOf(dto.cartons), reason: dto.reason },
+      key,
+    );
+    return { pack: packViewBody(snapshot.pack), unchanged: snapshot.unchanged, clientLabelReverify: snapshot.clientLabelReverify };
+  }
+
+  @Get(':tenantId/outbound/orders/:orderId/cartons')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Story 4-5a — an order’s cartons: the live pack (else the latest — a cancelled order shows its cancelled pack) with each carton’s code, weight, size and contents (per-UoM totals), and every pack in its history. An order packed before cartons were recorded reads as one legacy carton. A document read — no capability beyond the session',
+  })
+  @ApiOkResponse({ type: OrderCartonsResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed path parameter (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Order does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The order has never been packed (order-not-packed, naming its status)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async getOrderCartons(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<OrderCartonsResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const read = await this.outbound.getOrderCartons(tenantId, orderId);
+    return {
+      pack: packViewBody(read.pack),
+      history: read.history.map((entry) => ({
+        packSeq: entry.seq,
+        status: entry.status,
+        cartonCount: entry.cartonCount,
+        endedAt: entry.endedAt,
+        endedBy: entry.endedBy,
+        endReason: entry.endReason,
+      })),
+    };
   }
 
   @Post(':tenantId/outbound/orders/:orderId/dispatch')
@@ -1264,6 +1342,8 @@ export class OutboundController {
         // dimensionsMm deliberately ABSENT: the device never captures parcel
         // dimensions (the web surface keeps the arm), and an unmeasured
         // parcel hashes identically to its absence.
+        // Story 4-5a (A6) — the cartons, without dimensions (the DTO omits them).
+        ...(dto.cartons === undefined ? {} : { cartons: packCartonsOf(dto.cartons) }),
       },
       key,
     );
@@ -1387,4 +1467,60 @@ function assertOwnTenant(session: TenantSession, tenantId: string): void {
   }
 }
 
+/**
+ * Story 4-5a — a pack body's cartons across the edge, with the scan lines'
+ * spelling normalised exactly as the top-level scan's is (an empty
+ * handlingUnitIds is absent, an explicit null measurement is absent) so the
+ * hash cannot tell two spellings of one carton apart.
+ */
+function packCartonsOf(
+  cartons: readonly {
+    readonly scanned: readonly { readonly skuId: string; readonly qty: number; readonly handlingUnitIds?: readonly string[] | null }[];
+    readonly weightGrams?: number | null;
+    readonly dimensionsMm?: { readonly lengthMm: number; readonly widthMm: number; readonly heightMm: number } | null;
+  }[],
+): PackCartonInput[] {
+  return cartons.map((carton) => ({
+    scanned: carton.scanned.map((line) => ({
+      skuId: line.skuId,
+      qty: line.qty,
+      handlingUnitIds:
+        line.handlingUnitIds != null && line.handlingUnitIds.length > 0 ? line.handlingUnitIds : undefined,
+    })),
+    weightGrams: carton.weightGrams ?? undefined,
+    dimensionsMm:
+      carton.dimensionsMm == null
+        ? undefined
+        : { lengthMm: carton.dimensionsMm.lengthMm, widthMm: carton.dimensionsMm.widthMm, heightMm: carton.dimensionsMm.heightMm },
+  }));
+}
 
+/** Story 4-5a — a pack view as its response body (an exact key set; arrays copied off the readonly record). */
+function packViewBody(view: PackView): PackViewDto {
+  return {
+    packSeq: view.packSeq,
+    status: view.status,
+    legacy: view.legacy,
+    partiesFrozen: view.partiesFrozen,
+    cartonCount: view.cartonCount,
+    grossWeightGrams: view.grossWeightGrams,
+    packedAt: view.packedAt,
+    packedBy: view.packedBy,
+    cartons: view.cartons.map((carton) => ({
+      seq: carton.seq,
+      code: carton.code,
+      weightGrams: carton.weightGrams,
+      dimensionsMm: carton.dimensionsMm === null ? null : { ...carton.dimensionsMm },
+      lineCount: carton.lineCount,
+      totals: carton.totals.map((total) => ({ uom: total.uom, qty: total.qty })),
+      lines: carton.lines.map((line) => ({
+        skuId: line.skuId,
+        skuCode: line.skuCode,
+        skuName: line.skuName,
+        uom: line.uom,
+        qty: line.qty,
+        handlingUnitIds: line.handlingUnitIds === null ? null : [...line.handlingUnitIds],
+      })),
+    })),
+  };
+}

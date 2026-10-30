@@ -427,6 +427,8 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'handover.parcels_refused', targetType: 'rejected_op' },
   { action: 'handover.sheet_attached', targetType: 'attachment' },
   { action: 'handover_photo.uploaded', targetType: 'attachment' },
+  // Story 4-5a — a packed order re-split into cartons (`CartonCommandService`).
+  { action: 'order.recartoned', targetType: 'order' },
   // Story 3-5b — the stock take (`StockTakeCommand`) and the count-task
   // cancel. The take's verbs also write one `count.variance.resolved` per
   // posted or recounted variance under the same key.

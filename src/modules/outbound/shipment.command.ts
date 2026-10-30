@@ -22,6 +22,7 @@ import {
 import type { CarrierLabelRequest } from '../carriers/carriers.facade';
 import { MAX_DIMENSION_MM, MAX_WEIGHT_GRAMS } from './pack.command';
 import type { PackDimensionsInput } from './pack.command';
+import { liveCartonsOfOrdersInTx } from './cartons.read';
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
@@ -292,6 +293,9 @@ export class ShipmentCommandService {
       // ── the port: the adapter call is the FIRST non-DB step, and every
       // guard above is before it. On adapter failure NOTHING is written —
       // the order stays `ready_to_dispatch`, the retry stays a fresh submit.
+      // Story 4-5a (A41) — the live cartons: the piece count and, for an
+      // adapter that books pieces, each carton's measurements.
+      const liveCartons = (await liveCartonsOfOrdersInTx(tx, command.tenantId, [order.id])).get(order.id) ?? null;
       const request: CarrierLabelRequest = {
         orderRef: order.id,
         weightGrams,
@@ -299,6 +303,15 @@ export class ShipmentCommandService {
         // Story 4-2a — the amount to collect rides to the adapter (the
         // sandbox ignores it; a real adapter must send it).
         codAmountPaise: order.codAmountPaise,
+        ...(liveCartons === null
+          ? {}
+          : {
+              packages: liveCartons.cartons.map((carton) => ({
+                seq: carton.seq,
+                weightGrams: carton.weightGrams,
+                dimensions: carton.dimensionsMm,
+              })),
+            }),
       };
       const label = await labelThroughAdapter(connection.carrierCode, credential, request);
 
@@ -328,6 +341,8 @@ export class ShipmentCommandService {
           heightMm: dimensionsMm?.heightMm ?? null,
           labelledBy: command.actorUserId,
           labelledAt,
+          // Story 4-5a (A41) — one AWB covers every live carton.
+          ...(liveCartons === null ? {} : { packageCount: liveCartons.cartons.length }),
         });
       } catch (err) {
         if (

@@ -157,6 +157,16 @@ export const AUDIT_NO_OP_ARMS = {
    */
   'shipment.verify:already-verified': (snapshot: unknown) =>
     isRecord(snapshot) && sameKeys(snapshot, ['shipment', 'verified']) && snapshot.verified === false && isRecord(snapshot.shipment),
+  /**
+   * Story 4-5a (A8 step 9) — `CartonCommandService.recartonOrder` with the
+   * live pack's own split: the key stored with `{pack, unchanged: true,
+   * clientLabelReverify}`, nothing written or audited.
+   */
+  'order.recarton:unchanged': (snapshot: unknown) =>
+    isRecord(snapshot) &&
+    sameKeys(snapshot, ['pack', 'unchanged', 'clientLabelReverify']) &&
+    snapshot.unchanged === true &&
+    isRecord(snapshot.pack),
   /** Story 6-1b — `SecondFactorCommand.reset` of a user with no two-factor sign-in and no enrolment code. */
   'users.resetSecondFactor:not-enrolled': (snapshot: unknown) =>
     isRecord(snapshot) &&

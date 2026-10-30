@@ -52,6 +52,17 @@ export interface CarrierLabelRequest {
    * unchanged); a real adapter (4-6d) MUST send it.
    */
   readonly codAmountPaise: number | null;
+  /**
+   * Story 4-5a (A41) — the cartons the shipment covers, in order: one AWB for
+   * every piece. Optional and additive: the sandbox ignores it (its canonical
+   * string is unchanged); a real adapter that books pieces sends it. Absent on
+   * an order packed before 4-5a.
+   */
+  readonly packages?: readonly {
+    readonly seq: number;
+    readonly weightGrams: number | null;
+    readonly dimensions: { readonly lengthMm: number; readonly widthMm: number; readonly heightMm: number } | null;
+  }[];
 }
 
 /** What a label arm answers: the adapter-issued identity of the shipment. */
