@@ -165,9 +165,17 @@ export class FreightLoadCommand {
       const loadId = uuidv7();
       let added: Order[] = [];
       if (orderIds.length > 0) {
+        await lockOrdersInTx(tx, tenantId, orderIds);
+        // Replay under the order locks, before the classification would refuse the winner's own orders.
+        const parked = await replayInTx(tx, tenantId, key, payloadHash);
+        if (parked !== null) return parked as FreightLoadSnapshot;
         added = await this.classifyAdditionsInTx(tx, tenantId, warehouseId, orderIds, 0);
       }
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${freightLoadSequenceLockKey(tenantId)}, 0))`);
+      // The second replay, under the sequence lock (and the order locks): a same-key
+      // duplicate parked behind the winner wakes to its snapshot (guide §1).
+      const raced = await replayInTx(tx, tenantId, key, payloadHash);
+      if (raced !== null) return raced as FreightLoadSnapshot;
       const seq = await tx
         .select({ n: sql<number>`coalesce(max(substring(${freightLoads.code} from '^LD-([0-9]{1,9})$')::int), 0)` })
         .from(freightLoads)
@@ -663,6 +671,10 @@ export class FreightLoadCommand {
       await assertUnstampedInTx(tx);
       // FOR SHARE: scanners never queue each other; the departure's FOR UPDATE waits for them.
       const load = await lockLoadInTx(tx, tenantId, loadId, 'share');
+      // The load is only SHARED, so two same-key scans would not queue on it:
+      // a per-key advisory serialises them, and the replay under it hands the
+      // parked duplicate the winner's snapshot (guide §1).
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`${tenantId}:freight-scan:${key}`}, 0))`);
       const second = await replayInTx(tx, tenantId, key, payloadHash);
       if (second !== null) return second as FreightScanSnapshot;
       if (load === null) throw loadNotFound(loadId);
@@ -820,6 +832,11 @@ export class FreightLoadCommand {
       return snapshot;
     });
   }
+}
+
+/** The named orders `FOR UPDATE` in id order (lock only). */
+async function lockOrdersInTx(tx: TenantTx, tenantId: string, orderIds: readonly string[]): Promise<void> {
+  await tx.select({ id: orders.id }).from(orders).where(and(eq(orders.tenantId, tenantId), inArray(orders.id, [...orderIds].sort()))).orderBy(asc(orders.id)).for('update');
 }
 
 /** A9 — `vehicleReportedAt` in `[now − 7 days, now + 2 min]`, judged after the replay. */

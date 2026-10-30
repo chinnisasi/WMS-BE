@@ -18,7 +18,7 @@ import { orderLabelOf } from '../../shared/primitives/order-label';
 import { maskPhone } from '../../shared/primitives/phone';
 import { canonicalInstant } from '../../shared/primitives/time';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
-import { consignmentRef } from '../../shared/primitives/freight';
+import { consignmentRef, normalizeLr } from '../../shared/primitives/freight';
 import type { PackMeasurement } from '../inventory/inventory.facade';
 import { getClientsInTx, type ClientPartySnapshotV1 } from '../clients/clients.facade';
 import { fileOrdinalsInTx, listByOwnerInTx } from '../attachments/attachment-records';
@@ -130,6 +130,30 @@ export async function assertNotOnFreightLoadInTx(tx: TenantTx, tenantId: string,
     `Order ${orderLabelOf(order)} is booked on a truck${code === null ? '' : ` (${code})`} — it leaves with the truck; remove it from the load first.`,
     code === null ? {} : { loadCode: code },
   );
+}
+
+/**
+ * A61 — the dispatched consignments whose LR is the normalised reference, of
+ * one client's orders in one warehouse (exported so the suite EXPLAINs the
+ * REAL query; on `freight_consignments_lr_idx`).
+ */
+export function freightLrSearchQuery(tx: TenantTx, tenantId: string, clientId: string, warehouseId: string, reference: string) {
+  return tx
+    .selectDistinct({ orderId: orders.id })
+    .from(freightConsignments)
+    .innerJoin(orders, and(eq(orders.tenantId, freightConsignments.tenantId), eq(orders.id, freightConsignments.orderId)))
+    .where(
+      and(
+        eq(freightConsignments.tenantId, tenantId),
+        eq(freightConsignments.lrNumber, normalizeLr(reference)),
+        eq(freightConsignments.status, 'dispatched'),
+        eq(freightConsignments.clientId, clientId),
+        eq(orders.clientId, clientId),
+        eq(orders.warehouseId, warehouseId),
+        eq(orders.status, 'dispatched'),
+      ),
+    )
+    .orderBy(orders.id);
 }
 
 // ── package sets ───────────────────────────────────────────────────────────

@@ -1,3 +1,4 @@
+import { freightLrSearchQuery } from './freight.read';
 import { FreightService, type DeviceFreightLoad, type FreightCandidate, type FreightCandidatesQuery, type FreightLoadListQuery, type FreightLoadListRow } from './freight.service';
 import type { CancelFreightLoadCommand, CreateFreightLoadCommand, FreightLoadSnapshot, FreightOrdersCommand, FreightScanSnapshot, RecordFreightScanCommand, RemoveFreightOrderCommand, UpdateFreightLoadCommand } from './freight-load.command';
 import type { DispatchFreightLoadCommand, FreightDispatchSnapshot } from './freight-dispatch.command';
@@ -1359,22 +1360,7 @@ export class OutboundFacade {
     // Story 4-9a (A61) — a dispatched freight consignment's LR joins the AWB
     // arm: one distinct order set (an LR shared by two orders → two matches
     // → no suggestion, the existing rule).
-    const lr = await tx
-      .selectDistinct({ orderId: orders.id })
-      .from(freightConsignments)
-      .innerJoin(orders, and(eq(orders.tenantId, freightConsignments.tenantId), eq(orders.id, freightConsignments.orderId)))
-      .where(
-        and(
-          eq(freightConsignments.tenantId, tenantId),
-          eq(freightConsignments.lrNumber, normalizeAwb(reference)),
-          eq(freightConsignments.status, 'dispatched'),
-          eq(freightConsignments.clientId, clientId),
-          eq(orders.clientId, clientId),
-          eq(orders.warehouseId, warehouseId),
-          eq(orders.status, 'dispatched'),
-        ),
-      )
-      .orderBy(orders.id);
+    const lr = await freightLrSearchQuery(tx, tenantId, clientId, warehouseId, reference);
     const byAwb = [...new Set([...awb, ...lr].map((row) => row.orderId))].sort();
     if (byAwb.length > 0) return byAwb.map((orderId) => ({ orderId, matchKind: 'awb' as const }));
     const candidates = await tx

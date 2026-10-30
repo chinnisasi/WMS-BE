@@ -276,6 +276,53 @@ export async function orderFreightBlockInTx(tx: TenantTx, tenantId: string, orde
   };
 }
 
+/**
+ * A20, A60, A68 — one page of a warehouse's loads (exported so the suite
+ * EXPLAINs the REAL query). Each consignment-side filter is a semi-join that
+ * a partial index of `freight_consignments` serves: the client filter
+ * `freight_consignments_client_live_idx`, POD pending
+ * `freight_consignments_pod_pending_idx`, delivery exceptions
+ * `freight_consignments_delivery_exceptions_idx`; the open set rides
+ * `freight_loads_open_idx` (or the warehouse keyset index).
+ */
+export function freightLoadsListQuery(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  query: { readonly view: FreightListView; readonly clientId?: string | undefined; readonly from?: string | undefined; readonly to?: string | undefined; readonly after?: { readonly at: string; readonly id: string } | null },
+  limit: number,
+) {
+  const view = query.view;
+  const byDispatch = view === 'dispatched' || view === 'pod-pending' || view === 'delivery-exceptions';
+  const at = byDispatch ? sql`"freight_loads"."dispatched_at"` : sql`"freight_loads"."created_at"`;
+  const status = view === 'open' ? 'open' : view === 'cancelled' ? 'cancelled' : 'dispatched';
+  const filters: SQL[] = [sql`"freight_loads"."tenant_id" = ${tenantId}::uuid`, sql`"freight_loads"."warehouse_id" = ${warehouseId}::uuid`, sql`"freight_loads"."status" = ${status}`];
+  if (query.from !== undefined) filters.push(sql`${at} >= ${istMidnightOf(query.from)}::timestamptz`);
+  if (query.to !== undefined) filters.push(sql`${at} < ${istMidnightOf(addIsoDays(query.to, 1))}::timestamptz`);
+  if (query.clientId !== undefined) {
+    filters.push(
+      sql`"freight_loads"."id" in (select fc.load_id from freight_consignments fc where fc.tenant_id = ${tenantId}::uuid and fc.client_id = ${query.clientId.toLowerCase()}::uuid and fc.status <> 'removed')`,
+    );
+  }
+  if (view === 'pod-pending') {
+    filters.push(
+      sql`"freight_loads"."id" in (select fc.load_id from freight_consignments fc where fc.tenant_id = ${tenantId}::uuid and fc.warehouse_id = ${warehouseId}::uuid and fc.status = 'dispatched' and fc.delivery_outcome is null)`,
+    );
+  }
+  if (view === 'delivery-exceptions') {
+    filters.push(
+      sql`"freight_loads"."id" in (select fc.load_id from freight_consignments fc where fc.tenant_id = ${tenantId}::uuid and fc.warehouse_id = ${warehouseId}::uuid and fc.delivery_outcome in ('refused', 'delivered-with-exceptions'))`,
+    );
+  }
+  if (query.after !== undefined && query.after !== null) filters.push(sql`(${at}, "freight_loads"."id") < (${query.after.at}::timestamptz, ${query.after.id}::uuid)`);
+  return tx
+    .select({ load: freightLoads, cursorAt: sql<string>`${at}::text` })
+    .from(freightLoads)
+    .where(and(...filters))
+    .orderBy(byDispatch ? desc(freightLoads.dispatchedAt) : desc(freightLoads.createdAt), desc(freightLoads.id))
+    .limit(limit);
+}
+
 @Injectable()
 export class FreightService {
   private readonly logger = new Logger('FreightService');
@@ -369,28 +416,7 @@ export class FreightService {
     const after = decodeKeyset(query.cursor);
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       await assertWarehouseInTenant(tx, tenantId, warehouseId);
-      const byDispatch = view === 'dispatched' || view === 'pod-pending' || view === 'delivery-exceptions';
-      const at = byDispatch ? sql`"freight_loads"."dispatched_at"` : sql`"freight_loads"."created_at"`;
-      const status = view === 'open' ? 'open' : view === 'cancelled' ? 'cancelled' : 'dispatched';
-      const filters: SQL[] = [sql`"freight_loads"."tenant_id" = ${tenantId}::uuid`, sql`"freight_loads"."warehouse_id" = ${warehouseId}::uuid`, sql`"freight_loads"."status" = ${status}`];
-      if (query.from !== undefined) filters.push(sql`${at} >= ${istMidnightOf(query.from)}::timestamptz`);
-      if (query.to !== undefined) filters.push(sql`${at} < ${istMidnightOf(addIsoDays(query.to, 1))}::timestamptz`);
-      if (query.clientId !== undefined) {
-        filters.push(sql`exists (select 1 from freight_consignments fc where fc.tenant_id = "freight_loads"."tenant_id" and fc.client_id = ${query.clientId.toLowerCase()}::uuid and fc.load_id = "freight_loads"."id" and fc.status <> 'removed')`);
-      }
-      if (view === 'pod-pending') {
-        filters.push(sql`exists (select 1 from freight_consignments fc where fc.tenant_id = "freight_loads"."tenant_id" and fc.load_id = "freight_loads"."id" and fc.status = 'dispatched' and fc.delivery_outcome is null)`);
-      }
-      if (view === 'delivery-exceptions') {
-        filters.push(sql`exists (select 1 from freight_consignments fc where fc.tenant_id = "freight_loads"."tenant_id" and fc.load_id = "freight_loads"."id" and fc.delivery_outcome in ('refused', 'delivered-with-exceptions'))`);
-      }
-      if (after !== null) filters.push(sql`(${at}, "freight_loads"."id") < (${after.at}::timestamptz, ${after.id}::uuid)`);
-      const rows = await tx
-        .select({ load: freightLoads, cursorAt: sql<string>`${at}::text` })
-        .from(freightLoads)
-        .where(and(...filters))
-        .orderBy(byDispatch ? desc(freightLoads.dispatchedAt) : desc(freightLoads.createdAt), desc(freightLoads.id))
-        .limit(limit + 1);
+      const rows = await freightLoadsListQuery(tx, tenantId, warehouseId, { view, clientId: query.clientId, from: query.from, to: query.to, after }, limit + 1);
       const page = rows.slice(0, limit);
       const loadIds = page.map((row) => row.load.id);
       const members = loadIds.length === 0
