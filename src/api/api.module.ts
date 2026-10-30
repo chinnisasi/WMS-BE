@@ -57,6 +57,7 @@ import { ValkeyModule } from '../shared/valkey/valkey.module';
 import { ReadinessService } from './readiness.service';
 import { ClientWebhooksController } from './client-webhooks.controller';
 import { ClientWebhooksModule } from '../modules/client-webhooks/client-webhooks.module';
+import { ClientEmailsModule } from '../modules/client-emails/client-emails.module';
 import { RecallsController } from './recalls.controller';
 import { RecallsModule } from '../modules/recalls/recalls.module';
 
@@ -98,7 +99,7 @@ import { RecallsModule } from '../modules/recalls/recalls.module';
   // Story 21-7 — SharedModule: Nest instantiates a route guard in the
   // CONTROLLER's module, so `PortalSessionGuard`'s DATABASE dependency must
   // resolve here too.
-  imports: [SharedModule, ValkeyModule, InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule, ClientsModule, BillingModule, NotificationsModule, ReturnsModule, PartnersModule, ClientWebhooksModule, RecallsModule],
+  imports: [SharedModule, ValkeyModule, InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule, ClientsModule, BillingModule, NotificationsModule, ReturnsModule, PartnersModule, ClientWebhooksModule, ClientEmailsModule, RecallsModule],
   controllers: [
     HealthController,
     EchoController,

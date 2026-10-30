@@ -3751,6 +3751,69 @@ describe('architecture: the mail module (story 5-1a)', () => {
     const queueWriter = facade.slice(facade.indexOf('export async function queueEmailInTx'), facade.indexOf('export async function cancelUserEmailsInTx'));
     expect(queueWriter.length).toBeGreaterThan(100);
     expect(GATEWAY.test(queueWriter)).toBe(false);
+    // Story 5-2b (A13) — the client-notice writer too.
+    const clientWriter = facade.slice(facade.indexOf('export async function queueClientEmailInTx'), facade.indexOf('export async function cancelClientEmailsToInTx'));
+    expect(clientWriter.length).toBeGreaterThan(100);
+    expect(clientWriter).toContain('.insert(emailMessages)');
+    expect(GATEWAY.test(clientWriter)).toBe(false);
+  });
+});
+
+describe('architecture: the client-emails module (story 5-2b)', () => {
+  const root = join(SRC_ROOT, 'modules', 'client-emails');
+  const moduleFiles = files.filter((file) => file.path.startsWith(root) && !file.path.endsWith('.spec.ts'));
+  const ENQUEUE = join(root, 'client-emails.enqueue.ts');
+  const NETWORK = /from\s+['"](?:node:)?(?:https?|tls|net|dns(?:\/promises)?|undici)['"]|\bfetch\(|EMAIL_GATEWAY|EmailGateway\b|email\.gateway|client-sesv2/;
+
+  it('the detectors bite', () => {
+    expect(moduleFiles.length).toBeGreaterThanOrEqual(5);
+    expect(NETWORK.test("import https from 'node:https';")).toBe(true);
+    expect(NETWORK.test('await fetch(url)')).toBe(true);
+    expect(NETWORK.test("import { EMAIL_GATEWAY } from '../mail/email.gateway';")).toBe(true);
+  });
+
+  it('no file in the module opens a socket or holds the mail gateway — the enqueue only queues (the mail sender sends)', () => {
+    expect(moduleFiles.filter((file) => NETWORK.test(file.source)).map((file) => file.path)).toEqual([]);
+    expect(readFileSync(ENQUEUE, 'utf8')).toMatch(/queueClientEmailInTx/);
+  });
+
+  it('it owns no table: no drizzle write and no raw write anywhere in the module', () => {
+    const WRITE = /\.(insert|update|delete)\(\s*[a-zA-Z]+\s*\)|\b(insert into|update|delete from)\s+[a-z_]+\s+(set|values|where|\()/i;
+    expect(moduleFiles.filter((file) => WRITE.test(file.source)).map((file) => file.path)).toEqual([]);
+  });
+
+  it('it imports siblings only through their facades and exported …InTx functions', () => {
+    const ALLOWED = new Set([
+      '../mail/mail.facade',
+      '../clients/clients.facade',
+      '../tenancy/tenancy.service',
+      '../outbound/outbound.facade',
+      '../catalog/catalog.facade',
+      '../inbound/inbound.facade',
+      '../outbound/outbound.module',
+      '../catalog/catalog.module',
+      '../inbound/inbound.module',
+    ]);
+    const offenders: string[] = [];
+    for (const file of moduleFiles) {
+      for (const match of file.source.matchAll(/from\s+['"](\.\.\/[a-z-]+\/[^'"]+)['"]/g)) {
+        if (!ALLOWED.has(match[1]!)) offenders.push(`${file.path}: ${match[1]}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+    // Meaningful: the enqueue reads the outbound facade and queues through mail.facade.
+    const enqueue = readFileSync(ENQUEUE, 'utf8');
+    expect(enqueue).toMatch(/from '\.\.\/outbound\/outbound\.facade'/);
+    expect(enqueue).toMatch(/from '\.\.\/mail\/mail\.facade'/);
+  });
+
+  it('the payload decoders are ONE copy, in shared/primitives (D2): no module defines decodeReceipt / decodeDispatch', () => {
+    const DEFINES = /export function (decodeReceipt|decodeDispatch)\b/;
+    expect(files.filter((file) => DEFINES.test(file.source)).map((file) => file.path)).toEqual([
+      join(SRC_ROOT, 'shared', 'primitives', 'client-event-facts.ts'),
+    ]);
+    const facts = readFileSync(join(SRC_ROOT, 'shared', 'primitives', 'client-event-facts.ts'), 'utf8');
+    expect([...facts.matchAll(/from\s+['"]([^'"]+)['"]/g)].map((match) => match[1]).every((target) => target!.startsWith('./'))).toBe(true);
   });
 });
 

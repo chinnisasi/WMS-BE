@@ -665,6 +665,10 @@ describe('email service and invite emails (e2e, story 5-1a)', () => {
 
     it('the worker with EMAIL_MAX_PER_TICK=1 and two tenants with due rows: exactly one sent, both tenants still swept; the walk rotates so a backlog starves no one', async () => {
       const worker = new EmailSenderWorker(app.get(AUTH_DATABASE) as never, mail);
+      // Story 5-2b (A7) — the per-tenant reserve would send these invites past
+      // the spent budget; it is off here so this test keeps pinning the shared
+      // budget and its rotation (the reserve is pinned in test/client-emails.spec.ts).
+      worker.priorityReserve = 0;
       // Drain what earlier tests left due, so only the two tenants below have work.
       await withEnv({ EMAIL_MAX_PER_TICK: '1000' }, () => worker.tick());
       // `a` registers first, so it sorts first (uuidv7) — and it has a backlog of two.

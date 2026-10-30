@@ -21,6 +21,7 @@ import { ReportingModule } from './modules/reporting/reporting.module';
 import { ReturnsModule } from './modules/returns/returns.module';
 import { TenancyModule } from './modules/tenancy/tenancy.module';
 import { ClientWebhooksModule } from './modules/client-webhooks/client-webhooks.module';
+import { ClientEmailsModule } from './modules/client-emails/client-emails.module';
 import { RecallsModule } from './modules/recalls/recalls.module';
 import { JobsModule } from './jobs/jobs.module';
 
@@ -62,6 +63,8 @@ import { JobsModule } from './jobs/jobs.module';
     ReturnsModule,
     // Story 5-2a — client webhooks (the queue, the sender, the staff surface).
     ClientWebhooksModule,
+    // Story 5-2b — receipt and dispatch emails (an outbox subscriber + the log read).
+    ClientEmailsModule,
     JobsModule,
     ApiModule,
   ],

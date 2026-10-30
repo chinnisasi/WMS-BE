@@ -1,0 +1,46 @@
+/**
+ * Story 5-2b — the client-emails module's rules. Pure: no database, no
+ * network; the one environment read is `clientEmailEnabled`.
+ */
+
+/** The outbox events this module emails about, and the public event (5-2a's names) each one is. */
+export const CLIENT_EMAIL_SOURCE_EVENTS = {
+  'grn.recorded': 'receipt.recorded',
+  'order.dispatched': 'order.dispatched',
+} as const;
+export type ClientEmailSourceEvent = keyof typeof CLIENT_EMAIL_SOURCE_EVENTS;
+export const CLIENT_EMAIL_SOURCE_EVENT_TYPES = Object.keys(CLIENT_EMAIL_SOURCE_EVENTS) as ClientEmailSourceEvent[];
+
+/**
+ * Decision 9, A5 — at most this many client notices per (client, template)
+ * per IST day, counted at enqueue over every row of the day in ANY status.
+ * An event queues all of its recipients while the count is below it, else
+ * none (all-or-nothing; one event may overshoot by at most 19). The D2C
+ * guard until the daily digest (5-2d).
+ */
+export const CLIENT_EMAIL_DAILY_CAP = 500;
+
+/**
+ * An event APPENDED more than this long ago (its outbox row id's uuidv7 time
+ * — never `occurredAt`, which can be device time) is acked without mail: a
+ * deploy backlog, or an operator's replay days later. Far inside the 90-day
+ * dedupe window, so a replay can never send twice.
+ */
+export const CLIENT_EMAIL_STALE_EVENT_MS = 24 * 60 * 60 * 1000;
+
+/** The log read's page bounds. */
+export const CLIENT_EMAIL_LOG_PAGE_DEFAULT = 50;
+export const CLIENT_EMAIL_LOG_PAGE_MAX = 100;
+
+/**
+ * A4 — the kill switch, `CLIENT_EMAIL_ENABLED` (`true` | `false`, default
+ * `false`). Off: the subscriber acks every event and writes nothing, and the
+ * log read answers `clientMailEnabled: false` (opt-ins can still be edited).
+ * Client mail goes to addresses staff typed in, on the shared SES account:
+ * production enables it only once the SNS bounce/complaint intake ships (or
+ * the risk is accepted in writing) — DEPLOY §2. Read per call, so a suite
+ * flips it per test. Anything but `true` (any case, trimmed) is off.
+ */
+export function clientEmailEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (env.CLIENT_EMAIL_ENABLED ?? '').trim().toLowerCase() === 'true';
+}

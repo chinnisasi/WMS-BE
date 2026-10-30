@@ -9,6 +9,7 @@ import { withTenantTransaction } from '../src/shared/db/tenant-scope';
 import type { Database } from '../src/shared/db/db';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { CLIENT_CONTACT_ROLES, ADJUSTMENT_PENDING_STATUSES, COUNT_TASK_STATUSES, COUNT_VARIANCE_STATUSES, REJECTED_OP_STATUSES } from '../src/shared/db/schema';
+import { CLIENT_EMAIL_EVENTS } from '../src/modules/clients/clients.schema';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { assertClientTakesWorkInTx, lockClientInTx } from '../src/modules/clients/clients.facade';
 import { ChannelsIngestCommand } from '../src/modules/channels/channels.ingest.command';
@@ -385,6 +386,15 @@ describe('story 1-2a: the client master record', () => {
       const def = await constraintDef('client_contacts_roles_check');
       const literals = [...def.matchAll(/'([a-z]+)'::text/g)].map((match) => match[1]!);
       expect([...new Set(literals)].sort()).toEqual([...CLIENT_CONTACT_ROLES].sort());
+    });
+
+    it('story 5-2b: the email-events CHECK names exactly CLIENT_EMAIL_EVENTS, in order', async () => {
+      const def = await constraintDef('client_contacts_email_events_check');
+      // The ARRAY[...] literal first (the subset), then one array_positions term per event.
+      const listed = /ARRAY\[([^\]]+)\]/.exec(def)![1]!;
+      expect([...listed.matchAll(/'([a-z.]+)'::text/g)].map((match) => match[1]!)).toEqual([...CLIENT_EMAIL_EVENTS]);
+      const positions = [...def.matchAll(/array_positions\([^,]+, '([a-z.]+)'::text\)/g)].map((match) => match[1]!);
+      expect(positions).toEqual([...CLIENT_EMAIL_EVENTS]);
     });
 
     it('the wind-down status lists are subsets of (or equal to) the owners’ vocabularies', () => {

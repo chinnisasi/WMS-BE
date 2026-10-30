@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Inject, Param, Patch, Post, Put, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Inject, Param, Patch, Post, Put, Query, UseGuards } from '@nestjs/common';
 import {
   ApiBearerAuth,
   ApiBody,
@@ -22,6 +22,8 @@ import { ClientsFacade, type ClientSnapshot } from '../modules/clients/clients.f
 import {
   ClientContactListResponse,
   ClientContactResponse,
+  ClientEmailLogResponse,
+  UpdateClientEmailSettingsDto,
   ClientListResponse,
   ClientAllocationPolicyResponse,
   ClientReceivingPolicyResponse,
@@ -36,8 +38,12 @@ import {
   UpdateClientStatusDto,
   UpdateClientTaxDetailsDto,
 } from './clients.dto';
-import type { ClientContactDto, ClientDto } from './clients.dto';
-import type { ClientContactSnapshot } from '../modules/clients/clients.facade';
+import type { ClientContactDto, ClientContactListItemDto, ClientDto } from './clients.dto';
+// Story 5-2b — bound to @Query(): a value import (the ValidationPipe reads the class).
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { ClientEmailLogQuery } from './clients.dto';
+import type { ClientContactListEntry, ClientContactSnapshot } from '../modules/clients/clients.facade';
+import { ClientEmailsFacade } from '../modules/client-emails/client-emails.facade';
 import { toAddressDto } from '../modules/tenancy/tenancy.dto';
 import { CatalogFacade } from '../modules/catalog/catalog.facade';
 import { InventoryFacade } from '../modules/inventory/inventory.facade';
@@ -71,6 +77,8 @@ export class ClientsController {
     // here beside the catalog count: the clients module reaches inventory only
     // for its departure blockers (`inventory/client-wind-down`), never its facade.
     @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
+    // Story 5-2b — the client's email log (`client-emails`, whose rows are the mail module's).
+    @Inject(ClientEmailsFacade) private readonly emails: ClientEmailsFacade,
   ) {}
 
   @Get(':tenantId/clients')
@@ -476,7 +484,7 @@ export class ClientsController {
   ): Promise<ClientContactListResponse> {
     assertOwnTenant(session, tenantId);
     assertUuidParam('clientId', clientId);
-    return { items: (await this.facade.listClientContacts(tenantId, clientId)).map(toContactDto) };
+    return { items: (await this.facade.listClientContacts(tenantId, clientId)).map(toContactListItemDto) };
   }
 
   @Post(':tenantId/clients/:clientId/contacts')
@@ -514,6 +522,7 @@ export class ClientsController {
         email: dto.email,
         phone: dto.phone,
         roles: dto.roles,
+        emailEvents: dto.emailEvents,
       },
       key,
     );
@@ -563,6 +572,7 @@ export class ClientsController {
         phone: dto.phone,
         roles: dto.roles,
         isPrimary: dto.isPrimary,
+        emailEvents: dto.emailEvents,
       },
       key,
     );
@@ -602,6 +612,80 @@ export class ClientsController {
     );
     return { contact: toContactDto(snapshot.contact) };
   }
+
+  // ── Story 5-2b — receipt and dispatch emails (literal segments under :clientId) ──
+
+  @Patch(':tenantId/clients/:clientId/email-settings')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Sets a client's email settings (owner-only, clients.manage): the Reply-To of its receipt and dispatch emails, stored lower-cased; null clears it. An unchanged value is a no-op (nothing written or audited; the key is stored). Story 5-2b",
+  })
+  @ApiBody({ type: UpdateClientEmailSettingsDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: ClientResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed clientId, or a replyTo that is not an email address (validation-failed, naming replyTo)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks clients.manage — owner only (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No client with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent request with the same Idempotency-Key (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'clientId', format: 'uuid' })
+  async updateEmailSettings(
+    @Param('tenantId') tenantId: string,
+    @Param('clientId') clientId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: UpdateClientEmailSettingsDto,
+  ): Promise<ClientResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam('clientId', clientId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.command.updateEmailSettings(
+      { tenantId, actorUserId: session.userId, clientId, replyTo: dto.replyTo },
+      key,
+    );
+    return { client: toClientDto(snapshot.client) };
+  }
+
+  @Get(':tenantId/clients/:clientId/emails')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Lists a client's receipt and dispatch emails, newest first (any staff session; never the portal), with whether mail and client emails are on and whether today's daily limit was reached. Story 5-2b",
+  })
+  @ApiOkResponse({ type: ClientEmailLogResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed clientId, cursor, limit or problems flag (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No client with this id exists in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'clientId', format: 'uuid' })
+  async listEmails(
+    @Param('tenantId') tenantId: string,
+    @Param('clientId') clientId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: ClientEmailLogQuery,
+  ): Promise<ClientEmailLogResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam('clientId', clientId);
+    const log = await this.emails.listClientEmails(tenantId, clientId, {
+      problems: query.problems === 'true',
+      ...(query.cursor === undefined ? {} : { cursor: query.cursor }),
+      ...(query.limit === undefined ? {} : { limit: query.limit }),
+    });
+    return {
+      items: log.items.map((item) => ({ ...item })),
+      nextCursor: log.nextCursor,
+      mailEnabled: log.mailEnabled,
+      clientMailEnabled: log.clientMailEnabled,
+      capReachedToday: { receipt: log.capReachedToday.receipt, dispatch: log.capReachedToday.dispatch },
+    };
+  }
 }
 
 function toContactDto(contact: ClientContactSnapshot): ClientContactDto {
@@ -615,6 +699,16 @@ function toContactDto(contact: ClientContactSnapshot): ClientContactDto {
     isPrimary: contact.isPrimary,
     createdAt: contact.createdAt,
     updatedAt: contact.updatedAt,
+    // Story 5-2b — a contact snapshot stored before 5-2b replays without it.
+    emailEvents: [...(contact.emailEvents ?? [])],
+  };
+}
+
+/** Story 5-2b — a contact as the list returns it: plus its latest client email (list-only). */
+function toContactListItemDto(contact: ClientContactListEntry): ClientContactListItemDto {
+  return {
+    ...toContactDto(contact),
+    lastEmail: contact.lastEmail === null ? null : { status: contact.lastEmail.status, errorCode: contact.lastEmail.errorCode, at: contact.lastEmail.at },
   };
 }
 
@@ -629,6 +723,8 @@ function toClientDto(client: ClientSnapshot): ClientDto {
   // unset; a pre-1-2a one carries no addresses — read them as null.
   return {
     ...client,
+    // Story 5-2b — a snapshot stored before 5-2b carries no Reply-To.
+    emailReplyTo: client.emailReplyTo ?? null,
     registeredAddress: client.registeredAddress ?? null,
     returnAddress: toAddressDto(client.returnAddress ?? null),
     taxDetails: client.taxDetails ?? {

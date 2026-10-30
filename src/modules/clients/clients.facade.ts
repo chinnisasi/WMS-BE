@@ -5,17 +5,25 @@ import type { Database } from '../../shared/db/db';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import {
+  CLIENT_EMAIL_EVENTS,
+  MAX_CLIENT_CONTACTS,
   MAX_CLIENT_LIST,
   clientContacts,
   clients,
   isAllocationRule,
   type AllocationRule,
   type ClientContactRole,
+  type ClientEmailEvent,
   type ClientStatus,
 } from './clients.schema';
+import { latestClientEmailsByAddressInTx, type LatestClientEmail } from '../mail/mail.facade';
 import type { UserRole, UserStatus } from '../../shared/db/schema';
 import { getMemberPortalFactsIn } from '../tenancy/tenancy.service';
 import { addressFromColumns, type AddressSnapshot } from '../../shared/primitives/address';
+
+// Story 5-2b (D10) — the email-event vocabulary, re-exported for the siblings
+// that reach this module only through its facade (`client-emails`).
+export { CLIENT_EMAIL_EVENTS, CLIENT_EMAIL_EVENT_TEMPLATE, type ClientEmailEvent } from './clients.schema';
 
 /** One client as every read of this module returns it. */
 export interface ClientSnapshot {
@@ -53,6 +61,13 @@ export interface ClientSnapshot {
    * (every fresh read carries it).
    */
   readonly allocationPolicy?: ClientAllocationPolicy;
+  /**
+   * Story 5-2b — the Reply-To of the client's receipt and dispatch emails
+   * (null = the deployment's). OPTIONAL on the type: a
+   * `ClientMutationSnapshot` stored before 5-2b replays without it (the
+   * controller reads it `?? null`); every fresh read carries it.
+   */
+  readonly emailReplyTo?: string | null;
 }
 
 /**
@@ -178,6 +193,21 @@ export interface ClientContactSnapshot {
   readonly isPrimary: boolean;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /**
+   * Story 5-2b — the client emails this contact opted into (sorted, in
+   * vocabulary order). OPTIONAL on the type: a contact snapshot stored before
+   * 5-2b replays without it (the controller reads it `?? []`).
+   */
+  readonly emailEvents?: readonly ClientEmailEvent[];
+}
+
+/**
+ * Story 5-2b — one contact as the contacts LIST returns it: the snapshot plus
+ * the latest client email to its address (`lastEmail`, null when none) — a
+ * list-only field, never on a stored mutation snapshot.
+ */
+export interface ClientContactListEntry extends ClientContactSnapshot {
+  readonly lastEmail: LatestClientEmail | null;
 }
 
 export function toClientContactSnapshot(row: typeof clientContacts.$inferSelect): ClientContactSnapshot {
@@ -191,6 +221,7 @@ export function toClientContactSnapshot(row: typeof clientContacts.$inferSelect)
     isPrimary: row.isPrimary,
     createdAt: new Date(row.createdAt).toISOString(),
     updatedAt: new Date(row.updatedAt).toISOString(),
+    emailEvents: row.emailEvents as ClientEmailEvent[],
   };
 }
 
@@ -241,6 +272,7 @@ export function toClientSnapshot(row: typeof clients.$inferSelect): ClientSnapsh
     }),
     receivingPolicy: receivingPolicyOf(row),
     allocationPolicy: allocationPolicyOf(row),
+    emailReplyTo: row.emailReplyTo,
   };
 }
 
@@ -314,7 +346,7 @@ export class ClientsFacade {
    * by id (at most 20). 404 when the client is not this tenant's. A staff
    * read (any operator session — decision 6); never a portal read.
    */
-  async listClientContacts(tenantId: string, clientId: string): Promise<ClientContactSnapshot[]> {
+  async listClientContacts(tenantId: string, clientId: string): Promise<ClientContactListEntry[]> {
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       await assertClientInTenantInTx(tx, tenantId, clientId);
       const rows = await tx
@@ -322,7 +354,10 @@ export class ClientsFacade {
         .from(clientContacts)
         .where(and(eq(clientContacts.tenantId, tenantId), eq(clientContacts.clientId, clientId)))
         .orderBy(desc(clientContacts.isPrimary), asc(clientContacts.name), asc(clientContacts.id));
-      return rows.map(toClientContactSnapshot);
+      // Story 5-2b — each contact's latest client email (the badge), one
+      // indexed read for the whole list.
+      const latest = await latestClientEmailsByAddressInTx(tx, tenantId, clientId, rows.map((row) => row.email));
+      return rows.map((row) => ({ ...toClientContactSnapshot(row), lastEmail: latest.get(row.email) ?? null }));
     });
   }
 
@@ -407,6 +442,40 @@ export async function assertClientInTenantInTx(
     throw clientNotFound(clientId);
   }
   return row;
+}
+
+/**
+ * Story 5-2b (A3) — the contacts of a client opted into `event`, sorted by
+ * email, at most `MAX_CLIENT_CONTACTS` (the client's whole contact list is
+ * bounded at it). The recipients of one client email; `client-emails` never
+ * queries `client_contacts` itself.
+ *
+ * Read `FOR SHARE`: a contact edit or remove (which updates or deletes the
+ * row) committing during an in-flight enqueue either waits for the enqueue to
+ * commit — so its cancel then sees and cancels the rows just queued — or, if
+ * it locked first, makes the enqueue wait and re-read the committed opt-out.
+ * Either way no row is queued past an opt-out that has already cancelled.
+ */
+export async function subscribedContactsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  clientId: string,
+  event: ClientEmailEvent,
+): Promise<{ id: string; email: string }[]> {
+  if (!(CLIENT_EMAIL_EVENTS as readonly string[]).includes(event)) return [];
+  return tx
+    .select({ id: clientContacts.id, email: clientContacts.email })
+    .from(clientContacts)
+    .where(
+      and(
+        eq(clientContacts.tenantId, tenantId),
+        eq(clientContacts.clientId, clientId),
+        sql`${clientContacts.emailEvents} @> array[${event}]::text[]`,
+      ),
+    )
+    .orderBy(asc(clientContacts.email))
+    .limit(MAX_CLIENT_CONTACTS)
+    .for('share');
 }
 
 /**

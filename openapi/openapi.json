@@ -30447,6 +30447,255 @@
         ]
       }
     },
+    "/tenants/{tenantId}/clients/{clientId}/email-settings": {
+      "patch": {
+        "operationId": "ClientsController_updateEmailSettings",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateClientEmailSettingsDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed clientId, or a replyTo that is not an email address (validation-failed, naming replyTo)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks clients.manage — owner only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Sets a client's email settings (owner-only, clients.manage): the Reply-To of its receipt and dispatch emails, stored lower-cased; null clears it. An unchanged value is a no-op (nothing written or audited; the key is stored). Story 5-2b",
+        "tags": [
+          "clients"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/clients/{clientId}/emails": {
+      "get": {
+        "operationId": "ClientsController_listEmails",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "problems",
+            "required": false,
+            "in": "query",
+            "description": "`true`: only problems — not sent (failed, expired) or refused by the allowlist",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "true",
+                "false"
+              ]
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "The previous page’s nextCursor",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientEmailLogResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed clientId, cursor, limit or problems flag (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists a client's receipt and dispatch emails, newest first (any staff session; never the portal), with whether mail and client emails are on and whether today's daily limit was reached. Story 5-2b",
+        "tags": [
+          "clients"
+        ]
+      }
+    },
     "/tenants/{tenantId}/clients/{clientId}/webhook-endpoints": {
       "get": {
         "operationId": "ClientWebhooksController_list",
@@ -68435,6 +68684,11 @@
                 "$ref": "#/components/schemas/ClientAllocationPolicyDto"
               }
             ]
+          },
+          "emailReplyTo": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 5-2b — the Reply-To of the client’s receipt and dispatch emails; null = the server’s default"
           }
         },
         "required": [
@@ -68448,7 +68702,8 @@
           "updatedAt",
           "taxDetails",
           "registeredAddress",
-          "returnAddress"
+          "returnAddress",
+          "emailReplyTo"
         ]
       },
       "ClientListResponse": {
@@ -68786,6 +69041,185 @@
           "minOutboundShelfLifeDays"
         ]
       },
+      "ClientContactLastEmailDto": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "sending",
+              "sent",
+              "failed",
+              "skipped",
+              "expired",
+              "cancelled"
+            ]
+          },
+          "errorCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "Why it was not sent (a provider code such as suppressed, or a local one such as expired or allowlist); null when sent or queued"
+          },
+          "at": {
+            "type": "string",
+            "description": "ISO-8601 UTC — when its status last changed"
+          }
+        },
+        "required": [
+          "status",
+          "errorCode",
+          "at"
+        ]
+      },
+      "ClientContactListItemDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string",
+            "description": "Lower-cased"
+          },
+          "phone": {
+            "type": "string",
+            "nullable": true
+          },
+          "roles": {
+            "type": "array",
+            "description": "In vocabulary order; empty = a general contact",
+            "items": {
+              "type": "string",
+              "enum": [
+                "operations",
+                "billing",
+                "returns"
+              ]
+            }
+          },
+          "isPrimary": {
+            "type": "boolean",
+            "description": "Exactly one contact is primary while any exist — listed first, the default recipient of client notifications"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC creation time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC last update"
+          },
+          "emailEvents": {
+            "type": "array",
+            "description": "Story 5-2b — the client emails this contact receives, in vocabulary order; empty = none",
+            "items": {
+              "type": "string",
+              "enum": [
+                "receipt.recorded",
+                "order.dispatched"
+              ]
+            }
+          },
+          "lastEmail": {
+            "nullable": true,
+            "description": "The latest receipt or dispatch email to this address for this client; null when none",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ClientContactLastEmailDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "clientId",
+          "name",
+          "email",
+          "phone",
+          "roles",
+          "isPrimary",
+          "createdAt",
+          "updatedAt",
+          "emailEvents",
+          "lastEmail"
+        ]
+      },
+      "ClientContactListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "description": "The primary first, then by name, then by id (at most 20)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientContactListItemDto"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "CreateClientContactDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "example": "Asha Rao",
+            "minLength": 1,
+            "maxLength": 120,
+            "description": "1-120 characters (code points) once trimmed"
+          },
+          "email": {
+            "type": "string",
+            "example": "asha@acme.example",
+            "maxLength": 254,
+            "description": "An ASCII address, stored trimmed and lower-cased; unique per client"
+          },
+          "phone": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 20,
+            "description": "Omit, null or blank for none"
+          },
+          "roles": {
+            "type": "array",
+            "description": "What the contact is for — none is a general contact. No role twice",
+            "items": {
+              "type": "string",
+              "enum": [
+                "operations",
+                "billing",
+                "returns"
+              ]
+            }
+          },
+          "emailEvents": {
+            "type": "array",
+            "description": "Story 5-2b — the client emails this contact receives: receipt.recorded (each GRN), order.dispatched (each order). Omitted = none. No event twice; refused on the warehouse’s own (self) client",
+            "items": {
+              "type": "string",
+              "enum": [
+                "receipt.recorded",
+                "order.dispatched"
+              ]
+            }
+          }
+        },
+        "required": [
+          "name",
+          "email"
+        ]
+      },
       "ClientContactDto": {
         "type": "object",
         "properties": {
@@ -68831,6 +69265,17 @@
           "updatedAt": {
             "type": "string",
             "description": "ISO-8601 UTC last update"
+          },
+          "emailEvents": {
+            "type": "array",
+            "description": "Story 5-2b — the client emails this contact receives, in vocabulary order; empty = none",
+            "items": {
+              "type": "string",
+              "enum": [
+                "receipt.recorded",
+                "order.dispatched"
+              ]
+            }
           }
         },
         "required": [
@@ -68842,62 +69287,8 @@
           "roles",
           "isPrimary",
           "createdAt",
-          "updatedAt"
-        ]
-      },
-      "ClientContactListResponse": {
-        "type": "object",
-        "properties": {
-          "items": {
-            "description": "The primary first, then by name, then by id (at most 20)",
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ClientContactDto"
-            }
-          }
-        },
-        "required": [
-          "items"
-        ]
-      },
-      "CreateClientContactDto": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string",
-            "example": "Asha Rao",
-            "minLength": 1,
-            "maxLength": 120,
-            "description": "1-120 characters (code points) once trimmed"
-          },
-          "email": {
-            "type": "string",
-            "example": "asha@acme.example",
-            "maxLength": 254,
-            "description": "An ASCII address, stored trimmed and lower-cased; unique per client"
-          },
-          "phone": {
-            "type": "string",
-            "nullable": true,
-            "maxLength": 20,
-            "description": "Omit, null or blank for none"
-          },
-          "roles": {
-            "type": "array",
-            "description": "What the contact is for — none is a general contact. No role twice",
-            "items": {
-              "type": "string",
-              "enum": [
-                "operations",
-                "billing",
-                "returns"
-              ]
-            }
-          }
-        },
-        "required": [
-          "name",
-          "email"
+          "updatedAt",
+          "emailEvents"
         ]
       },
       "ClientContactResponse": {
@@ -68944,8 +69335,149 @@
           "isPrimary": {
             "type": "boolean",
             "description": "true makes this the primary contact (the previous primary is cleared). false is refused — make another contact primary instead"
+          },
+          "emailEvents": {
+            "type": "array",
+            "description": "Story 5-2b — omitted = unchanged; [] = none. Dropping an event cancels its still-queued emails to this contact",
+            "items": {
+              "type": "string",
+              "enum": [
+                "receipt.recorded",
+                "order.dispatched"
+              ]
+            }
           }
         }
+      },
+      "UpdateClientEmailSettingsDto": {
+        "type": "object",
+        "properties": {
+          "replyTo": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 254,
+            "example": "accounts@3pl.example.in",
+            "description": "The Reply-To of the client’s receipt and dispatch emails (stored trimmed and lower-cased); null or blank clears it — the server’s default Reply-To then applies. Required"
+          }
+        },
+        "required": [
+          "replyTo"
+        ]
+      },
+      "ClientEmailLogItemDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "receipt",
+              "dispatch"
+            ]
+          },
+          "subjectLabel": {
+            "type": "string",
+            "description": "The GRN code (a receipt) or the order reference (a dispatch)"
+          },
+          "to": {
+            "type": "string",
+            "description": "The recipient"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "sending",
+              "sent",
+              "failed",
+              "skipped",
+              "expired",
+              "cancelled"
+            ]
+          },
+          "errorCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "Why it was not sent, skipped or cancelled (e.g. suppressed, expired, allowlist, provider-off, unsubscribed)"
+          },
+          "attempts": {
+            "type": "number",
+            "minimum": 0
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC — when it was queued"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC — when its status last changed"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "subjectLabel",
+          "to",
+          "status",
+          "errorCode",
+          "attempts",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "ClientEmailCapDto": {
+        "type": "object",
+        "properties": {
+          "receipt": {
+            "type": "boolean",
+            "description": "Today’s receipt emails reached the daily limit (500) — later receipts today were not emailed"
+          },
+          "dispatch": {
+            "type": "boolean",
+            "description": "Today’s dispatch emails reached the daily limit (500) — later dispatches today were not emailed"
+          }
+        },
+        "required": [
+          "receipt",
+          "dispatch"
+        ]
+      },
+      "ClientEmailLogResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "description": "Newest first",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientEmailLogItemDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          },
+          "mailEnabled": {
+            "type": "boolean",
+            "description": "Mail is sent on this server at all (EMAIL_PROVIDER is not off)"
+          },
+          "clientMailEnabled": {
+            "type": "boolean",
+            "description": "Client emails are switched on on this server (CLIENT_EMAIL_ENABLED)"
+          },
+          "capReachedToday": {
+            "$ref": "#/components/schemas/ClientEmailCapDto"
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor",
+          "mailEnabled",
+          "clientMailEnabled",
+          "capReachedToday"
+        ]
       },
       "WebhookEndpointListEntryDto": {
         "type": "object",

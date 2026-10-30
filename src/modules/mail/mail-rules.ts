@@ -8,8 +8,41 @@
  * `email_messages_template_check` (0089; story 6-1c re-added it in 0103 with
  * the reset link and the password-changed notice).
  */
-export const EMAIL_TEMPLATES = ['user-invite', 'password-reset', 'password-changed'] as const;
+export const EMAIL_TEMPLATES = ['user-invite', 'password-reset', 'password-changed', 'client-receipt', 'client-dispatch'] as const;
 export type EmailTemplate = (typeof EMAIL_TEMPLATES)[number];
+
+/**
+ * Story 5-2b — the client notices: a receipt and a dispatch email to a client
+ * brand's opted-in contacts, queued by the `client-emails` outbox subscriber
+ * through `queueClientEmailInTx` (each row carries `client_id` and a
+ * `dedupe_key` — the 0114 `email_messages_client_shape_check`).
+ */
+export const CLIENT_EMAIL_TEMPLATES = ['client-receipt', 'client-dispatch'] as const satisfies readonly EmailTemplate[];
+export type ClientEmailTemplate = (typeof CLIENT_EMAIL_TEMPLATES)[number];
+
+/**
+ * Story 5-2b (A7, D3) — the claim order, stored per row in
+ * `email_messages.priority` (0114 `email_messages_priority_check`): account
+ * mail (an invite, a reset link, the password-changed notice) is 0 and is
+ * claimed before any client notice (1) — a client's dispatch backlog must
+ * never delay an invite or a reset link. Exhaustive over the templates.
+ */
+export const EMAIL_TEMPLATE_PRIORITY = {
+  'user-invite': 0,
+  'password-reset': 0,
+  'password-changed': 0,
+  'client-receipt': 1,
+  'client-dispatch': 1,
+} as const satisfies Record<EmailTemplate, 0 | 1>;
+
+/**
+ * Story 5-2b (A7, D7) — when the worker's shared tick budget is spent, each
+ * tenant may still claim up to this many priority-0 (account) rows, so an
+ * invite or a reset never waits behind another tenant's client backlog. The
+ * WORKER passes it (`sendDue(t, limit, {priorityReserve})`); a bare
+ * `sendDue(t, n)` keeps its meaning.
+ */
+export const EMAIL_PRIORITY_RESERVE = 5;
 
 /**
  * The lifecycle (0089 `email_messages_status_check`):
@@ -55,8 +88,8 @@ export function emailBackoffMs(attempts: number): number {
  * `stale` (a `sending` row past 10 minutes, or a send whose outcome is
  * unknown — a timeout after the request left), `unsealable` (the secret no
  * longer opens: the key rotated out), `render` (the stored parameters no
- * longer render), `superseded` / `deactivated` / `accepted` (a cancel), `allowlist` /
- * `provider-off` (a skip).
+ * longer render), `superseded` / `deactivated` / `accepted` / `unsubscribed`
+ * (a cancel), `allowlist` / `provider-off` (a skip).
  */
 export const EMAIL_LOCAL_CODES = [
   'stale',
@@ -68,6 +101,9 @@ export const EMAIL_LOCAL_CODES = [
   'accepted',
   'allowlist',
   'provider-off',
+  // Story 5-2b — a client email's contact was removed, changed its address or
+  // dropped the event while the row was still queued.
+  'unsubscribed',
 ] as const;
 
 export type EmailErrorClass = 'transient' | 'config' | 'permanent' | 'unknown-outcome';

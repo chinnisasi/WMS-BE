@@ -437,6 +437,14 @@ export const clients = pgTable(
      * `ClientsCommand.updateReceivingPolicy` (`clients.manage`).
      */
     deriveExpiry: boolean('derive_expiry').notNull().default(true),
+    /**
+     * Story 5-2b — the Reply-To of the client's receipt and dispatch emails
+     * (lower-cased, trimmed; null → the deployment's `EMAIL_REPLY_TO`, else
+     * none). The `clients_email_reply_to_format` CHECK lives ONLY in
+     * `drizzle/0114_client_emails.sql`. Written only by
+     * `ClientsCommand.updateEmailSettings` (`clients.manage`).
+     */
+    emailReplyTo: text('email_reply_to'),
   },
   (table) => [
     uniqueIndex('clients_tenant_id_code_unique').on(table.tenantId, table.code),
@@ -481,6 +489,14 @@ export const clientContacts = pgTable(
     phone: text('phone'),
     roles: text('roles').array().notNull().default(sql`'{}'::text[]`),
     isPrimary: boolean('is_primary').notNull().default(false),
+    /**
+     * Story 5-2b — the client emails this contact opted into, a subset of
+     * `CLIENT_EMAIL_EVENTS` (`receipt.recorded`, `order.dispatched`), sorted;
+     * empty by default (nobody is emailed until staff tick the box). The
+     * `client_contacts_email_events_check` CHECK lives ONLY in
+     * `drizzle/0114_client_emails.sql`.
+     */
+    emailEvents: text('email_events').array().notNull().default(sql`'{}'::text[]`),
     ...tenantTimestamps,
   },
   (table) => [
@@ -6854,11 +6870,41 @@ export const emailMessages = pgTable(
     nextAttemptAt: timestamp('next_attempt_at', { withTimezone: true, mode: 'string' }).notNull(),
     providerMessageId: text('provider_message_id'),
     errorCode: text('error_code'),
+    /**
+     * Story 5-2b — the client a receipt or dispatch email concerns (null for
+     * account mail); set exactly when `dedupe_key` is
+     * (`email_messages_client_shape_check`).
+     */
+    clientId: uuid('client_id'),
+    /**
+     * Story 5-2b — `{template}:{subjectId}:{email}` on a client email: unique
+     * per tenant (`email_messages_dedupe_unique`), so a re-delivered event
+     * queues nothing new. Null on account mail.
+     */
+    dedupeKey: text('dedupe_key'),
+    /**
+     * Story 5-2b (A7, D3) — the claim order: 0 for account mail (invite,
+     * reset, password changed), 1 for client mail (`EMAIL_TEMPLATE_PRIORITY`).
+     */
+    priority: smallint('priority').notNull().default(0),
     ...tenantTimestamps,
   },
   (table) => [
     index('email_messages_tenant_status_next_attempt_idx').on(table.tenantId, table.status, table.nextAttemptAt),
     index('email_messages_tenant_user_created_idx').on(table.tenantId, table.userId, table.createdAt.desc()),
+    // Story 5-2b — the client-email dedupe, the log and the contact badge, the
+    // claim order (A7), and the worker's cross-tenant discovery (PENDING mail).
+    uniqueIndex('email_messages_dedupe_unique').on(table.tenantId, table.dedupeKey).where(sql`dedupe_key IS NOT NULL`),
+    index('email_messages_client_created_idx')
+      .on(table.tenantId, table.clientId, table.createdAt.desc(), table.id.desc())
+      .where(sql`client_id IS NOT NULL`),
+    index('email_messages_client_address_idx')
+      .on(table.tenantId, table.clientId, table.toEmail, table.createdAt.desc(), table.id.desc())
+      .where(sql`client_id IS NOT NULL`),
+    index('email_messages_claim_idx').on(table.tenantId, table.status, table.priority, table.nextAttemptAt),
+    index('email_messages_pending_next_idx').on(table.nextAttemptAt).where(sql`status = 'pending'`),
+    index('email_messages_pending_created_idx').on(table.createdAt).where(sql`status = 'pending'`),
+    index('email_messages_updated_idx').on(table.status, table.updatedAt),
   ],
 );
 

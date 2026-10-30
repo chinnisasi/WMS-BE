@@ -186,6 +186,19 @@ export async function getWarehouseNameInTx(tx: TenantTx, tenantId: string, wareh
 }
 
 /**
+ * Story 5-2b (D5) — the tenant's display name, in the caller's transaction
+ * (a client email's From name and footer). 404 when absent, the
+ * `getWarehouseNameInTx` shape.
+ */
+export async function getTenantNameInTx(tx: TenantTx, tenantId: string): Promise<string> {
+  const rows = await tx.select({ name: tenants.name }).from(tenants).where(eq(tenants.id, tenantId)).limit(1);
+  if (rows.length === 0) {
+    throw new ProblemException('not-found', 404, 'Tenant not found', 'No tenant with this id exists.');
+  }
+  return rows[0]!.name;
+}
+
+/**
  * The ASN import (2026-10-17) — which of a file's warehouse codes name a
  * warehouse of this tenant, in bulk: the set of UPPER-CASED codes that exist
  * (matched case-insensitively). Tells "another warehouse" from "no such
