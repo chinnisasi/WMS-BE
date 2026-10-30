@@ -1,11 +1,14 @@
 /**
  * Story 4-6a (A15, A36, A42) — the consignment gate: may this client order
  * leave, given its client's documents rule, its own figures and its live
- * consignment record? ONE pure function, evaluated by the per-order dispatch
- * (`dispatchOrderInTx`), the courier handover's classification, the staff and
- * portal reads, the worklists and the documents-needed email. Mirrored
- * byte-for-byte in wms-fe (`src/lib/consignment-gate.ts`) and pinned by one
- * shared vector file (`consignment-gate.vectors.json`, beside each copy — D10).
+ * consignment record? ONE pure function. wms-be evaluates it in the per-order
+ * dispatch (`dispatchOrderInTx`), the courier handover's classification, the
+ * staff and portal reads, the worklists and the documents-needed email. This
+ * file is byte-identical in wms-be (`src/shared/primitives/consignment-gate.ts`)
+ * and wms-fe (`src/lib/consignment-gate.ts`), where it is the drift guard: the
+ * web renders the gate the server judged and takes its vocabulary from here.
+ * One shared vector file (`consignment-gate.vectors.json`, beside each copy,
+ * sha256-pinned in both repos — D10) runs against each copy.
  *
  * Money is integer paise as plain numbers (A42): the rated value is computed
  * in BigInt by the caller and converted after `Number.isSafeInteger`.
