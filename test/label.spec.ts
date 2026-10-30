@@ -13,6 +13,7 @@ import {
 import { SHIPMENT_STATUSES } from '../src/modules/outbound/shipment.command';
 import { sealCredential } from '../src/modules/carriers/carrier-credentials';
 import { CAPABILITIES, ROLE_CAPABILITIES } from '../src/modules/tenancy/permissions';
+import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
@@ -120,6 +121,7 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
     'LBL-AUTH', // the authority arms
     'LBL-WH2', // the second-warehouse manifest refusal
     'LBL-SEAL', // the unreadable-sealed-credential 503
+    'LBL-GOLD', // story 4-4a (A31) — the label and manifest literal goldens
   ] as const;
 
   beforeAll(async () => {
@@ -981,6 +983,71 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
       where tenant_id = ${tenantId} and target_id = ${manifest.id as string} and action = 'manifest.created'
     `;
     expect(audit).toHaveLength(1);
+  });
+
+  // ── story 4-4a (A31): literal goldens, pinned BEFORE the extraction ────────
+
+  async function storedKey(key: string): Promise<{ payloadHash: string; snapshot: Record<string, unknown> }> {
+    const rows = (await sql`
+      select payload_hash, response_snapshot from idempotency_keys where tenant_id = ${tenantId} and key = ${key}
+    `) as unknown as { payload_hash: string; response_snapshot: unknown }[];
+    const raw = rows[0]!.response_snapshot;
+    return {
+      payloadHash: rows[0]!.payload_hash,
+      snapshot: (typeof raw === 'string' ? JSON.parse(raw) : raw) as Record<string, unknown>,
+    };
+  }
+
+  it('A31 goldens: createShipmentLabel and createManifest hash and store exactly these keys', async () => {
+    const { orderId } = await packedOrder('LBL-GOLD', 1, 'gold');
+    const labelKey = ulid();
+    const labelled = await labelOrder(orderId, sandboxConnectionId, { weightGrams: 750 }, operatorWebToken, labelKey).expect(201);
+    const label = await storedKey(labelKey);
+    expect(label.payloadHash).toBe(
+      hashCommandPayload({ command: 'outbound.label', tenantId, orderId, carrierConnectionId: sandboxConnectionId, weightGrams: 750 }),
+    );
+    expect(Object.keys(label.snapshot)).toEqual(['shipment']);
+    expect(Object.keys(label.snapshot.shipment as object).sort()).toEqual([
+      'carrierCode',
+      'carrierConnectionId',
+      'carrierName',
+      'codAmountPaise',
+      'dimensionsMm',
+      'id',
+      'labelDocumentRef',
+      'labelledAt',
+      'labelledBy',
+      'manifestId',
+      'orderId',
+      'status',
+      'tenantId',
+      'trackingNumber',
+      'warehouseId',
+      'weightGrams',
+    ]);
+
+    const shipmentId = labelled.body.shipment.id as string;
+    const manifestKey = ulid();
+    await createManifest([shipmentId], operatorWebToken, manifestKey).expect(201);
+    const manifest = await storedKey(manifestKey);
+    expect(manifest.payloadHash).toBe(
+      hashCommandPayload({ command: 'outbound.manifest', tenantId, warehouseId, shipmentIds: [shipmentId] }),
+    );
+    expect(Object.keys(manifest.snapshot)).toEqual(['manifest']);
+    expect(Object.keys(manifest.snapshot.manifest as object).sort()).toEqual([
+      'carrierCode',
+      'carrierConnectionId',
+      'codShipmentCount',
+      'codTotalPaise',
+      'createdAt',
+      'createdBy',
+      'id',
+      'shipmentCount',
+      'shipmentIds',
+      'tenantId',
+      'updatedAt',
+      'warehouseId',
+    ]);
   });
 
   it('refuses a manifest naming a MISSING or FOREIGN shipment id — the foreign row reads as ABSENT through RLS', async () => {
