@@ -1217,8 +1217,17 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // Story 4-5a (0117) — order_packs, order_cartons, order_carton_lines, each
       // with the client clause on both arms. 158 → 161.
       // Story 4-6a (0118) — order_consignment_records, the client clause on both arms. 161 → 162.
-      expect(policies).toHaveLength(162);
-      for (const table of ['shipments', 'courier_handovers', 'order_packs', 'order_cartons', 'order_carton_lines', 'order_consignment_records']) {
+      // Story 4-9a (0119, A35) — freight_consignments with the client clause;
+      // freight_loads and freight_load_scans STAFF-ONLY (a client stamp sees
+      // and writes no row). 162 → 165.
+      expect(policies).toHaveLength(165);
+      for (const table of ['freight_loads', 'freight_load_scans']) {
+        const row = policies.find((candidate) => candidate.tablename === table)!;
+        expect(row.qual).toContain("(NULLIF(current_setting('app.client_id'::text, true), ''::text) IS NULL)");
+        expect(row.qual).not.toContain('client_id = ');
+        expect(row.with_check).toContain("(NULLIF(current_setting('app.client_id'::text, true), ''::text) IS NULL)");
+      }
+      for (const table of ['shipments', 'courier_handovers', 'order_packs', 'order_cartons', 'order_carton_lines', 'order_consignment_records', 'freight_consignments']) {
         const row = policies.find((candidate) => candidate.tablename === table)!;
         expect(row.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
         expect(row.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");

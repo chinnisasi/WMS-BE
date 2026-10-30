@@ -742,8 +742,9 @@ describe('client portal (e2e, story 21-7)', () => {
       // plus 3-7a's three recall reads (the list, one recall, its report),
       // plus 4-1c's order import, plus 4-7c's two return-to-client reads,
       // plus 2-9a's GRN document file, plus 4-4a's Shipping read and its three uploads,
-      // plus 4-5a's packing slip, plus 4-6a's Tax documents (read, record) and needed list.
-      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(36);
+      // plus 4-5a's packing slip, plus 4-6a's Tax documents (read, record) and needed list,
+      // plus 4-9a's freight note.
+      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(37);
     });
 
     it('a portal token is refused on EVERY operator route — reads and writes — with the exact fence detail', async () => {
@@ -767,7 +768,8 @@ describe('client portal (e2e, story 21-7)', () => {
       // Story 3-1 adds the fourth either-family route: the bin-to-bin move.
       // Story 3-2b — the stock adjustment joined (web or handheld): five.
       // Story 4-4a — the label verification and the courier handover: seven.
-      expect(anyRoutes).toHaveLength(7);
+      // Story 4-9a — the freight scan and the departure (web or handheld): nine.
+      expect(anyRoutes).toHaveLength(9);
       for (const route of anyRoutes) {
         const res = await send(route.method, route.path, portalA.token);
         expect({ route: route.path, status: res.status, code: res.body.code, detail: res.body.detail }).toEqual({
@@ -1238,6 +1240,8 @@ describe('client portal (e2e, story 21-7)', () => {
           '/tenants/{tenantId}/portal/orders/{orderId}/consignment',
           // Story 4-4a — the Shipping section and the client's uploads.
           '/tenants/{tenantId}/portal/orders/{orderId}/documents',
+          // Story 4-9a (A22) — the order's freight note.
+          '/tenants/{tenantId}/portal/orders/{orderId}/freight-note',
           // Story 4-5a — the order's packing slip.
           '/tenants/{tenantId}/portal/orders/{orderId}/packing-slip',
           '/tenants/{tenantId}/portal/orders/{orderId}/shipment/awb',

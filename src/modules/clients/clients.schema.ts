@@ -93,6 +93,8 @@ export const CLIENT_EMAIL_EVENTS = [
   'shipment.documents',
   // Story 4-6a (A20, A47) — a packed order waiting for the brand's invoice or e-way bill.
   'consignment.documents-needed',
+  // Story 4-9a (A27) — a truck consignment delivered, delivered with exceptions or refused.
+  'delivery.recorded',
 ] as const;
 export type ClientEmailEvent = (typeof CLIENT_EMAIL_EVENTS)[number];
 
@@ -104,4 +106,6 @@ export const CLIENT_EMAIL_EVENT_TEMPLATE = {
   'shipment.documents': 'client-shipment-document',
   // Story 4-6a — the documents-needed reminder.
   'consignment.documents-needed': 'client-documents-needed',
+  // Story 4-9a — the delivery update.
+  'delivery.recorded': 'client-delivery-update',
 } as const satisfies Record<ClientEmailEvent, ClientEmailTemplate>;

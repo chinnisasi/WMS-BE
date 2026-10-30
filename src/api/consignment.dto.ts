@@ -292,17 +292,26 @@ export class ConsignmentWorklistRowDto {
   @ApiProperty({ type: String, nullable: true }) packedAt!: string | null;
 }
 
+export class ConsignmentExceptionFreightDto {
+  @ApiProperty({ format: 'uuid' }) consignmentId!: string;
+  @ApiProperty({ format: 'uuid' }) loadId!: string;
+  @ApiProperty() loadCode!: string;
+  @ApiProperty() dispatchedAt!: string;
+}
+
 export class ConsignmentExceptionRowDto {
   @ApiProperty({ format: 'uuid' }) orderId!: string;
   @ApiProperty() orderLabel!: string;
   @ApiProperty({ format: 'uuid' }) clientId!: string;
   @ApiProperty() clientCode!: string;
-  @ApiProperty({ format: 'uuid' }) shipmentId!: string;
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'The flagged handover shipment; null on a truck consignment’s row (4-9a)' }) shipmentId!: string | null;
   @ApiProperty({ type: String, nullable: true, format: 'uuid' }) handoverId!: string | null;
   @ApiProperty({ type: String, nullable: true }) handoverCode!: string | null;
   @ApiProperty({ type: String, nullable: true }) handedOverAt!: string | null;
   @ApiProperty({ enum: [...CONSIGNMENT_GATE_CODES] }) code!: string;
   @ApiProperty({ enum: [...CONSIGNMENT_GATE_STATES], description: 'Re-judged on the handover day' }) state!: string;
+  @ApiProperty({ required: false, type: () => ConsignmentExceptionFreightDto, description: 'Story 4-9a (A20) — a truck consignment that left without the documents; absent on a handover row' })
+  freight?: ConsignmentExceptionFreightDto;
 }
 
 export class ConsignmentWorklistQueryDto {

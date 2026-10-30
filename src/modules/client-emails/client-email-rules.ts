@@ -12,6 +12,8 @@ export const CLIENT_EMAIL_SOURCE_EVENTS = {
   // Story 4-6a (A20, A47) — a packed order still waiting for the brand's
   // documents (queued only when the gate read AT DELIVERY is blocking).
   'order.packed': 'consignment.documents-needed',
+  // Story 4-9a (A27) — a freight consignment's delivery recorded (or amended).
+  'freight_consignment.delivered': 'delivery.recorded',
 } as const;
 export type ClientEmailSourceEvent = keyof typeof CLIENT_EMAIL_SOURCE_EVENTS;
 export const CLIENT_EMAIL_SOURCE_EVENT_TYPES = Object.keys(CLIENT_EMAIL_SOURCE_EVENTS) as ClientEmailSourceEvent[];

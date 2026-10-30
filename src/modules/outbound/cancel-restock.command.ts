@@ -1,3 +1,4 @@
+import { removeFromFreightOnCancelInTx } from './freight-support';
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
@@ -336,6 +337,11 @@ export class CancelRestockCommandService {
           throw new ProblemException('conflict', 409, 'Order is not cancellable', `Order ${orderLabel(order)} reads "${String(unknown)}".`);
         }
       }
+
+      // ── story 4-9a (A19, D16): the planned freight consignment removed
+      // ("Order cancelled", its scans unloaded) — after the order lock,
+      // before the pack and shipments locks (order → consignment → pack).
+      await removeFromFreightOnCancelInTx(tx, { tenantId: command.tenantId, orderId: order.id, actorUserId: command.actorUserId, at: nowIso(), idempotencyKey });
 
       // ── story 4-5a (A10): the live pack, locked after the order and before
       // the shipments (the re-carton's order → pack → shipment) ───────────

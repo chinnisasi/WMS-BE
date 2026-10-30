@@ -1,6 +1,7 @@
 import {
   formatBaseQuantity,
   formatQuantity,
+  type DeliveryFact,
   type DispatchFact,
   type ReceiptFact,
   type SkuLabel,
@@ -11,6 +12,7 @@ import { brandDocumentWords, formatRupees } from '../../shared/primitives/consig
 import {
   CLIENT_EMAIL_MAX_LINES,
   SHEET_PARCELS_SHOWN,
+  type ClientDeliveryUpdateEmailParams,
   type ClientDocumentsNeededEmailParams,
   type DocumentsNeededReason,
   type ClientShipmentDocumentEmailParams,
@@ -167,6 +169,7 @@ export function buildDispatchEmailParams(
     readonly kitParentLineIds: ReadonlySet<string>;
   },
   documents: DispatchDocumentsFact | null = null,
+  freight: DispatchFreightFact | null = null,
 ): ClientDispatchEmailParams {
   const kept = fact.lines.filter((line) => !names.kitParentLineIds.has(line.orderLineId));
   const lines: ClientDispatchLineParams[] = kept.map((line) => {
@@ -204,7 +207,52 @@ export function buildDispatchEmailParams(
           taxDocument: { label: brandDocumentWords(documents.brandDocumentType), number: documents.brandDocumentNumber, date: documents.brandDocumentDate },
           ...(documents.ewayBillNumber === null ? {} : { ewayBill: { number: documents.ewayBillNumber, validUntil: documents.ewayValidUntil } }),
         }),
+    // Story 4-9a (A27) — only for an order that left on a truck.
+    ...(freight === null ? {} : { freight: { consignmentRef: freight.consignmentRef, vehicleNumber: freight.vehicleNumber, packageCount: freight.packageCount } }),
   };
+}
+
+/** Story 4-9a (A27) — the truck an order left on (its freight consignment's frozen carriage). */
+export interface DispatchFreightFact {
+  readonly consignmentRef: string;
+  readonly vehicleNumber: string;
+  readonly packageCount: number;
+}
+
+/**
+ * Story 4-9a (A27) — the `client-delivery-update` params, key by key from the
+ * frozen `freight_consignment.delivered` payload; the order's label and city
+ * are read at delivery (the payload's city wins when it carries one).
+ */
+export function buildDeliveryUpdateEmailParams(
+  fact: DeliveryFact,
+  order: { readonly orderRef: string; readonly consigneeCity: string | null },
+  names: Omit<ClientEmailNames, 'warehouseName'>,
+): ClientDeliveryUpdateEmailParams {
+  return {
+    tenantName: names.tenantName,
+    clientName: names.clientName,
+    orderId: fact.orderId,
+    orderRef: order.orderRef,
+    consigneeCity: fact.consigneeCity ?? order.consigneeCity,
+    consignmentRef: fact.consignmentRef,
+    outcome: fact.outcome,
+    deliveredAt: fact.deliveredAt,
+    receiverName: fact.receiverName,
+    shortPackageCount: fact.shortPackageCount,
+    damagedPackageCount: fact.damagedPackageCount,
+    note: fact.note,
+    transporterName: fact.transporterName,
+    lrNumber: fact.lrNumber,
+    vehicleNumber: fact.vehicleNumber,
+    amended: fact.amended,
+    replyTo: names.replyTo,
+  };
+}
+
+/** Story 4-9a (A27) — one row per (consignment, delivery version, recipient): `{consignmentId}:{deliverySeq}`. */
+export function deliverySubjectId(fact: Pick<DeliveryFact, 'consignmentId' | 'deliverySeq'>): string {
+  return `${fact.consignmentId}:${fact.deliverySeq}`;
 }
 
 /** Story 4-6a (A20) — the order an `order.packed` payload names, or null when malformed. */
@@ -247,7 +295,8 @@ export function buildDocumentsNeededEmailParams(
 // ── story 4-4a: a shared shipping document ─────────────────────────────────
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const DOC_KINDS = ['invoice', 'challan', 'eway-bill', 'pod', 'other'] as const;
+// Story 4-9a — `lr` (a scanned lorry receipt) joined SHIPPING_DOC_KINDS.
+const DOC_KINDS = ['invoice', 'challan', 'eway-bill', 'pod', 'other', 'lr'] as const;
 
 /** D6 — the `shipment.document-shared` payload, decoded key by key; null when malformed. */
 export function decodeDocumentShared(payload: unknown): ShipmentDocumentFactInput | null {

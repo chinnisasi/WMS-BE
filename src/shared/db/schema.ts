@@ -4651,6 +4651,198 @@ export const courierHandovers = pgTable(
 export type CourierHandover = typeof courierHandovers.$inferSelect;
 
 /**
+ * Story 4-9a (A1, A47, A66) — a freight load: one truck. One warehouse, one
+ * transporter (a transporter partner frozen at departure, or a typed name),
+ * one vehicle, FTL or LTL, any number of clients' orders as consignments. It
+ * holds several clients' rows, so its RLS is STAFF-ONLY (no client clause: a
+ * client-stamped session sees and writes no row — 0119). Every CHECK and the
+ * policy live ONLY in `drizzle/0119_freight_dispatch.sql`. No FKs.
+ */
+export const freightLoads = pgTable(
+  'freight_loads',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    /** `LD-NNNN`. */
+    code: text('code').notNull(),
+    /** `open` | `dispatched` | `cancelled` — `FREIGHT_LOAD_STATUSES`. */
+    status: text('status').notNull(),
+    /** `ftl` | `ltl` — `FREIGHT_MODES`. */
+    mode: text('mode').notNull(),
+    transporterPartnerId: uuid('transporter_partner_id'),
+    transporterSnapshot: jsonb('transporter_snapshot'),
+    transporterName: text('transporter_name').notNull(),
+    vehicleType: text('vehicle_type'),
+    vehicleNumber: text('vehicle_number'),
+    containerNumber: text('container_number'),
+    vehicleCapacityKg: integer('vehicle_capacity_kg'),
+    vehicleReportedAt: timestamp('vehicle_reported_at', { withTimezone: true, mode: 'string' }),
+    driverName: text('driver_name'),
+    driverPhone: text('driver_phone'),
+    driverLicenceNumber: text('driver_licence_number'),
+    dockDoor: text('dock_door'),
+    seals: jsonb('seals').notNull().default(sql`'[]'::jsonb`),
+    loadingStartedAt: timestamp('loading_started_at', { withTimezone: true, mode: 'string' }),
+    dispatchedAt: timestamp('dispatched_at', { withTimezone: true, mode: 'string' }),
+    dispatchedBy: uuid('dispatched_by'),
+    /** `web` | `handheld`. */
+    dispatchSource: text('dispatch_source'),
+    dispatchDeviceId: uuid('dispatch_device_id'),
+    dispatchedOrderCount: smallint('dispatched_order_count'),
+    packageCount: integer('package_count'),
+    grossWeightGrams: bigint('gross_weight_grams', { mode: 'number' }),
+    warehouseSnapshot: jsonb('warehouse_snapshot'),
+    ewayPartBConfirmedAt: timestamp('eway_part_b_confirmed_at', { withTimezone: true, mode: 'string' }),
+    ewayPartBConfirmedBy: uuid('eway_part_b_confirmed_by'),
+    /** A66 — the departure's gross was above the stated capacity (acknowledged). */
+    capacityExceeded: boolean('capacity_exceeded').notNull().default(false),
+    cancelledAt: timestamp('cancelled_at', { withTimezone: true, mode: 'string' }),
+    cancelledBy: uuid('cancelled_by'),
+    cancelReason: text('cancel_reason'),
+    note: text('note'),
+    createdBy: uuid('created_by').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('freight_loads_tenant_code_unique').on(table.tenantId, table.code),
+    // The warehouse list's keyset.
+    index('freight_loads_tenant_warehouse_created_idx').on(table.tenantId, table.warehouseId, table.createdAt.desc(), table.id.desc()),
+    // The open set (the device snapshot, the Open view).
+    index('freight_loads_open_idx')
+      .on(table.tenantId, table.warehouseId, table.createdAt)
+      .where(sql`status = 'open'`),
+  ],
+);
+
+export type FreightLoad = typeof freightLoads.$inferSelect;
+
+/**
+ * Story 4-9a (A2, A42, A47, A60, A68) — one client order on one load. One live
+ * consignment per order for ever (`freight_consignments_order_live_unique`; a
+ * dispatched one stays live). At departure it freezes the brand
+ * (`client_snapshot`) and the only load facts a client ever reads
+ * (`carriage_snapshot`, `CarriageSnapshotV1`, written once). The delivery is a
+ * fact here — the order stays `dispatched`. RLS: the 0041 client clause.
+ */
+export const freightConsignments = pgTable(
+  'freight_consignments',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    loadId: uuid('load_id').notNull(),
+    orderId: uuid('order_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    /** `planned` | `removed` | `dispatched` — `FREIGHT_CONSIGNMENT_STATUSES`. */
+    status: text('status').notNull(),
+    stopSeq: smallint('stop_seq').notNull(),
+    lrNumber: text('lr_number'),
+    lrDate: date('lr_date', { mode: 'string' }),
+    /** `paid` | `to-pay` | `tbb` — `FREIGHT_TERMS`. */
+    freightTerms: text('freight_terms'),
+    lrRecordedAt: timestamp('lr_recorded_at', { withTimezone: true, mode: 'string' }),
+    lrRecordedBy: uuid('lr_recorded_by'),
+    removedAt: timestamp('removed_at', { withTimezone: true, mode: 'string' }),
+    removedBy: uuid('removed_by'),
+    removeReason: text('remove_reason'),
+    dispatchedAt: timestamp('dispatched_at', { withTimezone: true, mode: 'string' }),
+    packageCount: smallint('package_count'),
+    palletCount: smallint('pallet_count'),
+    loadedPackageCount: smallint('loaded_package_count'),
+    weightGrams: bigint('weight_grams', { mode: 'number' }),
+    /** `packages-unscanned` | `not-on-device-list`. */
+    loadException: text('load_exception'),
+    /** 4-6a's three gate codes. */
+    complianceException: text('compliance_exception'),
+    clientSnapshot: jsonb('client_snapshot'),
+    carriageSnapshot: jsonb('carriage_snapshot'),
+    /** `delivered` | `delivered-with-exceptions` | `refused` — `DELIVERY_OUTCOMES`. */
+    deliveryOutcome: text('delivery_outcome'),
+    deliveredAt: timestamp('delivered_at', { withTimezone: true, mode: 'string' }),
+    receiverName: text('receiver_name'),
+    shortPackageCount: smallint('short_package_count'),
+    damagedPackageCount: smallint('damaged_package_count'),
+    deliveryNote: text('delivery_note'),
+    deliverySeq: smallint('delivery_seq').notNull().default(0),
+    deliveryRecordedAt: timestamp('delivery_recorded_at', { withTimezone: true, mode: 'string' }),
+    deliveryRecordedBy: uuid('delivery_recorded_by'),
+    addedBy: uuid('added_by').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('freight_consignments_order_live_unique')
+      .on(table.tenantId, table.orderId)
+      .where(sql`status <> 'removed'`),
+    index('freight_consignments_tenant_load_stop_idx').on(table.tenantId, table.loadId, table.stopSeq, table.id),
+    index('freight_consignments_client_dispatched_idx')
+      .on(table.tenantId, table.clientId, table.dispatchedAt.desc(), table.id.desc())
+      .where(sql`status = 'dispatched'`),
+    index('freight_consignments_client_live_idx')
+      .on(table.tenantId, table.clientId, table.loadId)
+      .where(sql`status <> 'removed'`),
+    index('freight_consignments_lr_idx')
+      .on(table.tenantId, table.lrNumber)
+      .where(sql`lr_number IS NOT NULL`),
+    index('freight_consignments_pod_pending_idx')
+      .on(table.tenantId, table.warehouseId, table.dispatchedAt, table.id)
+      .where(sql`status = 'dispatched' AND delivery_outcome IS NULL`),
+    index('freight_consignments_delivery_exceptions_idx')
+      .on(table.tenantId, table.warehouseId, table.deliveredAt.desc())
+      .where(sql`delivery_outcome IN ('refused', 'delivered-with-exceptions')`),
+  ],
+);
+
+export type FreightConsignment = typeof freightConsignments.$inferSelect;
+
+/**
+ * Story 4-9a (A3, A44, A45) — one package scanned onto one load. Unique while
+ * `loaded` per (consignment, code), so a re-added order never inherits a dead
+ * row. Never deleted: an unload or a removal sets `unloaded`. A scan synced
+ * after the departure but taken before it is `after_departure`. Staff-only
+ * RLS (A1's shape).
+ */
+export const freightLoadScans = pgTable(
+  'freight_load_scans',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    loadId: uuid('load_id').notNull(),
+    consignmentId: uuid('consignment_id').notNull(),
+    orderId: uuid('order_id').notNull(),
+    packageCode: text('package_code').notNull(),
+    packSeq: smallint('pack_seq').notNull(),
+    packageSeq: smallint('package_seq').notNull(),
+    /** `loaded` | `unloaded`. */
+    status: text('status').notNull(),
+    scannedAt: timestamp('scanned_at', { withTimezone: true, mode: 'string' }).notNull(),
+    scannedBy: uuid('scanned_by').notNull(),
+    /** `web` | `handheld`. */
+    source: text('source').notNull(),
+    deviceId: uuid('device_id'),
+    afterDeparture: boolean('after_departure').notNull().default(false),
+    unloadedAt: timestamp('unloaded_at', { withTimezone: true, mode: 'string' }),
+    unloadedBy: uuid('unloaded_by'),
+    unloadReason: text('unload_reason'),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('freight_load_scans_loaded_unique')
+      .on(table.tenantId, table.consignmentId, table.packageCode)
+      .where(sql`status = 'loaded'`),
+    index('freight_load_scans_tenant_consignment_status_idx').on(table.tenantId, table.consignmentId, table.status),
+  ],
+);
+
+export type FreightLoadScan = typeof freightLoadScans.$inferSelect;
+
+/**
  * Story 4-5a (A1) — a pack's document header. One LIVE pack per order
  * (`order_packs_live_unique`): the pack writes seq 1, a re-carton supersedes
  * the live pack and writes seq + 1, a cancel with restock cancels it. It
@@ -4724,6 +4916,10 @@ export const orderCartons = pgTable(
     unitCount: bigint('unit_count', { mode: 'number' }).notNull(),
     lineCount: smallint('line_count').notNull(),
     handoverId: uuid('handover_id'),
+    /** Story 4-9a (A4) — `carton` | `pallet` (`PACKAGE_TYPES`); a constant default. */
+    packageType: text('package_type').notNull().default('carton'),
+    /** Story 4-9a (A4) — a pallet's "said to contain" carton count (1–9,999), else NULL. */
+    innerCount: smallint('inner_count'),
     handoverScannedAt: timestamp('handover_scanned_at', { withTimezone: true, mode: 'string' }),
     createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
   },

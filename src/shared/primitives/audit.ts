@@ -60,6 +60,10 @@ export const AUDIT_TARGET_TYPES = [
   'batch_recall',
   // Story 4-4a — a courier handover (`handover.created`).
   'courier_handover',
+  // Story 4-9a — a freight load (`freight_load.created | updated |
+  // orders_added | order_removed | stops_reordered | package_loaded |
+  // package_unloaded | dispatched | cancelled | sheet_attached`).
+  'freight_load',
   'bin',
   // Story 3-1 — a bin-to-bin move (`stock.moved`; `targetId` = the moveId on
   // its events' reference doc — there is no move table, the ledger is its record).
@@ -427,6 +431,22 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'handover.parcels_refused', targetType: 'rejected_op' },
   { action: 'handover.sheet_attached', targetType: 'attachment' },
   { action: 'handover_photo.uploaded', targetType: 'attachment' },
+  // Story 4-9a (A36, A58) — the freight load (`FreightLoadCommand`,
+  // `FreightDispatchCommand`, the sheet and photo uploads) and its
+  // consignments' LR and delivery (target the order).
+  { action: 'freight_load.created', targetType: 'freight_load' },
+  { action: 'freight_load.updated', targetType: 'freight_load' },
+  { action: 'freight_load.orders_added', targetType: 'freight_load' },
+  { action: 'freight_load.order_removed', targetType: 'freight_load' },
+  { action: 'freight_load.stops_reordered', targetType: 'freight_load' },
+  { action: 'freight_load.package_loaded', targetType: 'freight_load' },
+  { action: 'freight_load.package_unloaded', targetType: 'freight_load' },
+  { action: 'freight_load.dispatched', targetType: 'freight_load' },
+  { action: 'freight_load.cancelled', targetType: 'freight_load' },
+  { action: 'freight_load.sheet_attached', targetType: 'freight_load' },
+  { action: 'freight_photo.uploaded', targetType: 'attachment' },
+  { action: 'freight_consignment.lr_recorded', targetType: 'order' },
+  { action: 'freight_consignment.delivery_recorded', targetType: 'order' },
   // Story 4-5a — a packed order re-split into cartons (`CartonCommandService`).
   { action: 'order.recartoned', targetType: 'order' },
   // Story 3-5b — the stock take (`StockTakeCommand`) and the count-task

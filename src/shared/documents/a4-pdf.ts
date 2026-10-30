@@ -20,6 +20,16 @@ export interface DocumentRun {
   readonly font: 'regular' | 'bold';
   /** Already normalised and WinAnsi-folded. */
   readonly text: string;
+  /** Story 4-9a (A25) — additive: `white` over a fill (a reversed band); absent draws black. */
+  readonly color?: 'white';
+}
+
+/** Story 4-9a (A25) — a filled black rectangle (a reversed band's ground), drawn first: the rules and the runs draw over it. */
+export interface DocumentFill {
+  readonly x: number;
+  readonly y: number;
+  readonly w: number;
+  readonly h: number;
 }
 
 /** A thin horizontal or vertical rule. */
@@ -50,9 +60,14 @@ export interface DocumentPage {
   readonly rules: readonly DocumentRule[];
   /** Story 4-5a — additive: a page without barcodes (the GRN) draws byte-identically. */
   readonly barcodes?: readonly DocumentBarcode[];
+  /** Story 4-9a (A25) — additive: filled rectangles under the runs (never read as bars: not in the barcode bands). */
+  readonly fills?: readonly DocumentFill[];
+  /** Story 4-9a (A25) — additive: a landscape page (841.89 × 595.28 pt); absent draws portrait, byte-identically. */
+  readonly landscape?: boolean;
 }
 
 const BLACK = rgb(0, 0, 0);
+const WHITE = rgb(1, 1, 1);
 
 export async function drawDocumentPdf(
   pages: readonly DocumentPage[],
@@ -70,13 +85,17 @@ export async function drawDocumentPdf(
     bold: await doc.embedFont(StandardFonts.HelveticaBold),
   };
   for (const layout of pages) {
-    const page = doc.addPage([A4_WIDTH_PT, A4_HEIGHT_PT]);
+    const page = doc.addPage(layout.landscape === true ? [A4_HEIGHT_PT, A4_WIDTH_PT] : [A4_WIDTH_PT, A4_HEIGHT_PT]);
+    // Fills first: a reversed band is a ground, so the rules and the runs draw over it (never hidden by it).
+    for (const fill of layout.fills ?? []) {
+      page.drawRectangle({ x: fill.x, y: fill.y, width: fill.w, height: fill.h, color: BLACK, borderWidth: 0 });
+    }
     for (const rule of layout.rules) {
       page.drawLine({ start: { x: rule.x1, y: rule.y1 }, end: { x: rule.x2, y: rule.y2 }, thickness: rule.width, color: BLACK });
     }
     for (const run of layout.runs) {
       if (run.text.length === 0) continue;
-      page.drawText(run.text, { x: run.x, y: run.y, size: run.size, font: fonts[run.font], color: BLACK });
+      page.drawText(run.text, { x: run.x, y: run.y, size: run.size, font: fonts[run.font], color: run.color === 'white' ? WHITE : BLACK });
     }
     const barcodes = layout.barcodes ?? [];
     if (barcodes.length > 0) {

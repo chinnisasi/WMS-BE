@@ -1,5 +1,5 @@
 import { and, asc, desc, eq, inArray, isNotNull, isNull, sql } from 'drizzle-orm';
-import { orderLines, orderPacks, orders, shipments, courierHandovers, type Order } from '../../shared/db/schema';
+import { orderLines, orderPacks, orders, shipments, courierHandovers, freightConsignments, freightLoads, type Order } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { canonicalInstant, istDateOf } from '../../shared/primitives/time';
 import { orderLabelOf } from '../../shared/primitives/order-label';
@@ -190,13 +190,16 @@ export interface ConsignmentExceptionRow {
   readonly orderLabel: string;
   readonly clientId: string;
   readonly clientCode: string;
-  readonly shipmentId: string;
+  /** The flagged shipment (a courier handover); null on a freight consignment's row (4-9a). */
+  readonly shipmentId: string | null;
   readonly handoverId: string | null;
   readonly handoverCode: string | null;
   readonly handedOverAt: string | null;
   readonly code: string;
   /** The live record's state on the handover day now (still blocking — a cleared exception is not listed). */
   readonly state: ConsignmentGateState;
+  /** Story 4-9a (A20) — a truck consignment that left without the documents: its load and departure. Absent on a handover row. */
+  readonly freight?: { readonly consignmentId: string; readonly loadId: string; readonly loadCode: string; readonly dispatchedAt: string };
 }
 
 async function inChunks<T>(rows: readonly Order[], fn: (chunk: readonly Order[]) => Promise<T[]>): Promise<T[]> {
@@ -318,32 +321,57 @@ export async function consignmentExceptionsInTx(
 ): Promise<{ rows: ConsignmentExceptionRow[]; truncated: boolean }> {
   // Scan up to 5,000 flagged rows (newest first), drop the ones a late record
   // cleared, keep 500: the cap applies AFTER the cleared filter.
-  const rows = await consignmentExceptionsQuery(tx, tenantId, warehouseId, clientId, CONSIGNMENT_EXCEPTIONS_SCAN + 1);
-  let truncated = rows.length > CONSIGNMENT_EXCEPTIONS_SCAN;
-  rows.splice(CONSIGNMENT_EXCEPTIONS_SCAN);
-  if (rows.length === 0) return { rows: [], truncated };
-  const facts = await consignmentFactsOfOrdersInTx(tx, tenantId, rows.map((row) => row.shipment.orderId));
+  const handoverRows = await consignmentExceptionsQuery(tx, tenantId, warehouseId, clientId, CONSIGNMENT_EXCEPTIONS_SCAN + 1);
+  // Story 4-9a (A20) — the dispatched truck consignments flagged at a device
+  // departure, unioned in, judged on their `dispatched_at`'s IST date.
+  const freightRows = await freightExceptionsQuery(tx, tenantId, warehouseId, clientId, CONSIGNMENT_EXCEPTIONS_SCAN + 1);
+  const merged = [
+    ...handoverRows.map((row) => ({ at: row.shipment.handedOverAt ?? row.shipment.updatedAt, orderId: row.shipment.orderId, handover: row, freight: null })),
+    ...freightRows.map((row) => ({ at: row.consignment.dispatchedAt!, orderId: row.consignment.orderId, handover: null, freight: row })),
+  ].sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  let truncated = handoverRows.length > CONSIGNMENT_EXCEPTIONS_SCAN || freightRows.length > CONSIGNMENT_EXCEPTIONS_SCAN || merged.length > CONSIGNMENT_EXCEPTIONS_SCAN;
+  merged.splice(CONSIGNMENT_EXCEPTIONS_SCAN);
+  if (merged.length === 0) return { rows: [], truncated };
+  const facts = await consignmentFactsOfOrdersInTx(tx, tenantId, merged.map((row) => row.orderId));
   const thresholds = new NationalThresholds(tx);
   const out: ConsignmentExceptionRow[] = [];
-  for (const { shipment, handoverCode } of rows) {
-    const fact = facts.get(shipment.orderId);
+  for (const entry of merged) {
+    const fact = facts.get(entry.orderId);
     if (fact === undefined) continue;
-    const day = shipment.handedOverAt === null ? istDateOf(shipment.updatedAt) : istDateOf(shipment.handedOverAt);
+    const day = istDateOf(entry.at);
     // A37 — judged as the order stood on the handover day (open), never as `dispatched`.
     const gate = judgeConsignment(fact, await thresholds.on(day), day, 'ready_to_dispatch');
     if (fact.live !== null && gate.state === 'ready') continue;
-    out.push({
-      orderId: fact.order.id,
-      orderLabel: fact.label,
-      clientId: fact.order.clientId,
-      clientCode: fact.clientCode,
-      shipmentId: shipment.id,
-      handoverId: shipment.handoverId,
-      handoverCode: handoverCode ?? null,
-      handedOverAt: shipment.handedOverAt === null ? null : canonicalInstant(shipment.handedOverAt),
-      code: shipment.complianceException!,
-      state: gate.state,
-    });
+    if (entry.handover !== null) {
+      const { shipment, handoverCode } = entry.handover;
+      out.push({
+        orderId: fact.order.id,
+        orderLabel: fact.label,
+        clientId: fact.order.clientId,
+        clientCode: fact.clientCode,
+        shipmentId: shipment.id,
+        handoverId: shipment.handoverId,
+        handoverCode: handoverCode ?? null,
+        handedOverAt: shipment.handedOverAt === null ? null : canonicalInstant(shipment.handedOverAt),
+        code: shipment.complianceException!,
+        state: gate.state,
+      });
+    } else {
+      const { consignment, loadCode } = entry.freight!;
+      out.push({
+        orderId: fact.order.id,
+        orderLabel: fact.label,
+        clientId: fact.order.clientId,
+        clientCode: fact.clientCode,
+        shipmentId: null,
+        handoverId: null,
+        handoverCode: null,
+        handedOverAt: null,
+        code: consignment.complianceException!,
+        state: gate.state,
+        freight: { consignmentId: consignment.id, loadId: consignment.loadId, loadCode, dispatchedAt: canonicalInstant(consignment.dispatchedAt!) },
+      });
+    }
     if (out.length > CONSIGNMENT_EXCEPTIONS_MAX) break;
   }
   if (out.length > CONSIGNMENT_EXCEPTIONS_MAX) {
@@ -368,6 +396,25 @@ export function consignmentExceptionsQuery(tx: TenantTx, tenantId: string, wareh
       ),
     )
     .orderBy(desc(shipments.handedOverAt), desc(shipments.id))
+    .limit(limit);
+}
+
+/** Story 4-9a (A20, A60) — the flagged dispatched freight consignments (the staff read; the load's code is staff data). */
+export function freightExceptionsQuery(tx: TenantTx, tenantId: string, warehouseId: string, clientId: string | null, limit: number = CONSIGNMENT_EXCEPTIONS_SCAN + 1) {
+  return tx
+    .select({ consignment: freightConsignments, loadCode: freightLoads.code })
+    .from(freightConsignments)
+    .innerJoin(freightLoads, and(eq(freightLoads.tenantId, freightConsignments.tenantId), eq(freightLoads.id, freightConsignments.loadId)))
+    .where(
+      and(
+        eq(freightConsignments.tenantId, tenantId),
+        eq(freightConsignments.warehouseId, warehouseId),
+        eq(freightConsignments.status, 'dispatched'),
+        isNotNull(freightConsignments.complianceException),
+        ...(clientId === null ? [] : [eq(freightConsignments.clientId, clientId)]),
+      ),
+    )
+    .orderBy(desc(freightConsignments.dispatchedAt), desc(freightConsignments.id))
     .limit(limit);
 }
 

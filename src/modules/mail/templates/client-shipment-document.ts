@@ -12,7 +12,7 @@ import { asRecord, clientFooter, clientFromName, clientHtml, countField, instant
  * at enqueue (`OutboundFacade.shipmentDocumentEmailFactsInTx`).
  */
 
-export const SHIPMENT_DOCUMENT_KINDS = ['invoice', 'challan', 'eway-bill', 'pod', 'other', 'handover-sheet'] as const;
+export const SHIPMENT_DOCUMENT_KINDS = ['invoice', 'challan', 'eway-bill', 'pod', 'other', 'handover-sheet', 'lr'] as const;
 export type ShipmentDocumentKind = (typeof SHIPMENT_DOCUMENT_KINDS)[number];
 
 /** The document words the subject and body use. */
@@ -23,6 +23,8 @@ export const SHIPMENT_DOCUMENT_WORD: Readonly<Record<ShipmentDocumentKind, strin
   pod: 'Proof of delivery',
   other: 'Document',
   'handover-sheet': 'Signed handover sheet',
+  // Story 4-9a — a scanned lorry receipt.
+  lr: 'Lorry receipt',
 };
 
 /** A sheet's parcel list is shown up to this many; the rest is "…and N more". */

@@ -1,7 +1,10 @@
 import { WEBHOOK_BODY_MAX_BYTES } from './webhook-rules';
 import {
   buildWebhookBody,
+  decodeDelivery,
   decodeDispatch,
+  deliveryData,
+  deliverySubjectUuid,
   decodeReceipt,
   dispatchData,
   formatQuantity,
@@ -177,5 +180,76 @@ describe('webhook payloads (story 5-2a)', () => {
     expect(parsed.data.lineCount).toBe(3000);
     expect(parsed.data.lines).toBeUndefined();
     expect(parsed.data.totalUnits).toBe('3000');
+  });
+
+  describe('story 4-9a (A28, A67) — order.delivered', () => {
+    const CONS = '019a0000-0000-7000-8000-0000000000c9';
+    const CLIENT = '019a0000-0000-7000-8000-0000000000ca';
+    const deliveryPayload = {
+      consignmentId: CONS,
+      orderId: ORDER,
+      clientId: CLIENT,
+      warehouseId: WH,
+      deliverySeq: 2,
+      outcome: 'delivered-with-exceptions',
+      deliveredAt: '2026-11-02T05:50:00.000Z',
+      receiverName: 'A. Kumar',
+      shortPackageCount: 0,
+      damagedPackageCount: 1,
+      note: 'pallet 4 crushed corner',
+      lrNumber: '4410',
+      transporterName: 'VRL Logistics',
+      vehicleNumber: 'KA01AB1234',
+      dispatchedAt: '2026-10-30T10:35:00.000Z',
+      consignmentRef: 'LD-0007/03',
+      amended: true,
+      recordedAt: '2026-11-02T06:00:00.000Z',
+      // Staff-only facts a payload might carry must never reach the body.
+      driverPhone: '+919800000000',
+      loadId: '019a0000-0000-7000-8000-0000000000cb',
+    };
+    const deliveredHead: WebhookEnvelopeHead = { ...head, type: 'order.delivered' };
+
+    it('the v1 body is pinned key by key, with no lines key at all', () => {
+      const fact = decodeDelivery(deliveryPayload)!;
+      const body = buildWebhookBody(deliveredHead, deliveryData(fact, { warehouseCode: 'BLR-1', clientOrderRef: 'PO-77', channelOrderRef: '#1042' }, head.occurredAt));
+      expect(body).toBe(
+        '{"id":"019a0000-0000-7000-8000-000000000001","type":"order.delivered","schemaVersion":1,"occurredAt":"2026-10-27T10:00:00.000Z","createdAt":"2026-10-27T10:00:01.000Z","client":{"code":"ACME"},' +
+          '"data":{"orderId":"019a0000-0000-7000-8000-0000000000b1","clientOrderRef":"PO-77","channelOrderRef":"#1042","warehouseCode":"BLR-1","consignmentRef":"LD-0007/03",' +
+          '"dispatchedAt":"2026-10-30T10:35:00.000Z","deliveredAt":"2026-11-02T05:50:00.000Z","outcome":"delivered-with-exceptions","transporterName":"VRL Logistics","lrNumber":"4410",' +
+          '"vehicleNumber":"KA01AB1234","receiverName":"A. Kumar","shortPackages":0,"damagedPackages":1,"note":"pallet 4 crushed corner","amended":true,"deliverySeq":2,"recordedAt":"2026-11-02T06:00:00.000Z"}}',
+      );
+      expect(body).not.toContain('driverPhone');
+      expect(body).not.toContain('loadId');
+      expect(body).not.toContain(CLIENT);
+    });
+
+    it('an older payload without recordedAt dates the record by the event; absent counts read null (never a made-up 0)', () => {
+      const older: Record<string, unknown> = { ...deliveryPayload };
+      for (const key of ['recordedAt', 'shortPackageCount', 'damagedPackageCount']) delete older[key];
+      const built = deliveryData(decodeDelivery({ ...older, outcome: 'delivered', amended: false, deliverySeq: 1 })!, { warehouseCode: 'BLR-1', clientOrderRef: null, channelOrderRef: null }, head.occurredAt);
+      expect(built.data.recordedAt).toBe(head.occurredAt);
+      expect(built.data.shortPackages).toBeNull();
+      expect(built.data.damagedPackages).toBeNull();
+      expect(built.lines).toEqual([]);
+    });
+
+    it('malformed delivery payloads decode to null', () => {
+      expect(decodeDelivery({})).toBeNull();
+      expect(decodeDelivery({ ...deliveryPayload, outcome: 'lost' })).toBeNull();
+      expect(decodeDelivery({ ...deliveryPayload, deliverySeq: 0 })).toBeNull();
+      expect(decodeDelivery({ ...deliveryPayload, clientId: 'nope' })).toBeNull();
+      expect(decodeDelivery({ ...deliveryPayload, amended: 'yes' })).toBeNull();
+    });
+
+    it('the subject is one uuid per recorded version: deterministic, distinct per seq and per consignment', () => {
+      const a = deliverySubjectUuid(CONS, 1);
+      expect(a).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+      expect(deliverySubjectUuid(CONS, 1)).toBe(a);
+      // A literal golden: the derivation is the contract a stored event's subject was written by.
+      expect(a).toBe('817d71a1-83ef-5dd4-b6a4-32eed0bdc4a4');
+      expect(deliverySubjectUuid(CONS, 2)).not.toBe(a);
+      expect(deliverySubjectUuid(ORDER, 1)).not.toBe(a);
+    });
   });
 });

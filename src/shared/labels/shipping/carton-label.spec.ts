@@ -1,6 +1,6 @@
 import { parseZplLabels, readPdfLabels, zplTexts } from '../../../../test/support/labels';
 import { assertLabelBands, type ShippingLabel } from './fields';
-import { cartonLabel, cmText, indianRupees, kgText, labelShipperOf } from './carton-label';
+import { cartonLabel, cmText, indianRupees, kgText, labelShipperOf, stcText } from './carton-label';
 import { B2C, WORST_B2B, cartonInput } from './fixtures';
 import { renderShippingLabelsPdf } from './pdf';
 import { renderShippingLabelsZpl } from './zpl';
@@ -107,6 +107,37 @@ describe('story 4-5a — the carton label (A16, A42, decision 6)', () => {
     expect(pages[0]!.height).toBeCloseTo(595.28, 1);
     expect(pages[0]!.payloads).toEqual(['O8FE5145B99902272.1.1', 'O8FE5145B99902272.1.2']);
     expect(pages[1]!.payloads).toEqual(['O8FE5145B99902272.1.3']);
+  });
+
+  it('story 4-9a (A24): a pallet prints PALLET in the box and STC n CARTONS in the order band; a carton and an absent type are byte-identical', () => {
+    const base = cartonLabel(cartonInput());
+    expect(cartonLabel(cartonInput({ packageType: 'carton' }))).toEqual(base);
+    expect(cartonLabel(cartonInput({ innerCount: null }))).toEqual(base);
+    expect(stcText(600)).toBe('STC 600 CARTONS');
+    expect(stcText(1)).toBe('STC 1 CARTON');
+    expect(stcText(null)).toBeNull();
+    const pallet = cartonLabel(cartonInput({ packageType: 'pallet', innerCount: 600, clientOrderRef: 'SO-1' }));
+    expect(() => assertLabelBands(pallet)).not.toThrow();
+    const t = texts(pallet);
+    expect(t).toContain('PALLET');
+    expect(t).not.toContain('CARTON');
+    expect(t).toContain('1/2');
+    // No Ref line: the STC line sits on its own beside the payment.
+    expect(t).toContain('STC 600 CARTONS');
+    // Everything else is 4-5a's: only the box word and the one STC field differ.
+    const only = (label: typeof base) => label.fields.filter((f) => !(f.kind === 'text' && (f.text === 'PALLET' || f.text === 'CARTON' || f.text.startsWith('STC'))));
+    expect(only(pallet)).toEqual(only(cartonLabel(cartonInput({ clientOrderRef: 'SO-1' }))));
+  });
+
+  it('story 4-9a (A24): with a Ref line, the STC count joins the measurements line so the order band never overflows (also on the worst-case B2B label)', () => {
+    const label = cartonLabel(cartonInput({ packageType: 'pallet', innerCount: 9999 }));
+    expect(() => assertLabelBands(label)).not.toThrow();
+    expect(texts(label)).toContain('3.20 kg | 40x30x20 cm | STC 9999 CARTONS');
+    const worst = cartonLabel(cartonInput({ consignee: WORST_B2B, packageType: 'pallet', innerCount: 600, extraLines: ['EWB 1234 5678 9012'], marks: ['UN1263 Class 3'] }));
+    expect(() => assertLabelBands(worst)).not.toThrow();
+    expect(texts(worst).some((x) => x.includes('STC 600 CARTONS'))).toBe(true);
+    const unmeasured = cartonLabel(cartonInput({ packageType: 'pallet', innerCount: 12, weightGrams: null, dimensionsMm: null }));
+    expect(texts(unmeasured)).toContain('STC 12 CARTONS');
   });
 
   it('a fixed creation date gives identical bytes', async () => {

@@ -17,6 +17,7 @@ import {
   type EmailTemplate,
 } from './mail-rules';
 import type {
+  ClientDeliveryUpdateEmailParams,
   ClientDispatchEmailParams,
   ClientDocumentsNeededEmailParams,
   ClientReceiptEmailParams,
@@ -59,6 +60,8 @@ export {
 } from './mail-rules';
 export type { ClientEmailTemplate, EmailStatus, EmailTemplate } from './mail-rules';
 export type {
+  ClientDeliveryUpdateEmailParams,
+  DeliveryUpdateOutcome,
   ClientDispatchEmailParams,
   ClientDispatchLineParams,
   ClientDocumentsNeededEmailParams,
@@ -174,6 +177,12 @@ export type QueueClientEmailInput = {
       /** Story 4-6a (A20) — the documents-needed reminder: no file. */
       readonly template: 'client-documents-needed';
       readonly params: ClientDocumentsNeededEmailParams;
+      readonly attachment?: undefined;
+    }
+  | {
+      /** Story 4-9a (A27) — the delivery update: no file (the POD reaches the contact through 4-4a's document email). */
+      readonly template: 'client-delivery-update';
+      readonly params: ClientDeliveryUpdateEmailParams;
       readonly attachment?: undefined;
     }
 );
@@ -396,6 +405,7 @@ export async function clientEmailCountsTodayInTx(
     'client-dispatch': count('client-dispatch'),
     'client-shipment-document': count('client-shipment-document'),
     'client-documents-needed': count('client-documents-needed'),
+    'client-delivery-update': count('client-delivery-update'),
   };
 }
 

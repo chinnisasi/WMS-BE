@@ -263,7 +263,10 @@ describe('architecture: the order aggregate is outbound-module-owned (story 4.1)
     // the inventory twin).
     const outboundInternals = new RegExp(
       '(?:modules/outbound|\\.\\./outbound)/' +
-        '(?!(?:outbound\\.(facade|module|dto)|client-wind-down)[\'"])',
+        // Story 4-9a — `freight-carriage.read` is the declared free-function
+        // seam client-emails reads the frozen truck line through (drizzle and
+        // shared/ only — pinned below).
+        '(?!(?:outbound\\.(facade|module|dto)|client-wind-down|freight-carriage\\.read)[\'"])',
     );
     const siblingModules = files.filter(
       (file) =>
@@ -2666,7 +2669,7 @@ describe('architecture: the client portal (story 21-7)', () => {
     { file: join(SRC_ROOT, 'modules', 'inventory', 'inventory.facade.ts'), methods: ['portalStock'] },
     // Story 4-4a — the order's Shipping section.
     // Story 4-6a (A18) — the order's Tax documents and the needed list.
-    { file: join(SRC_ROOT, 'modules', 'outbound', 'outbound.facade.ts'), methods: ['portalOrders', 'portalOrder', 'portalOrderShipping', 'portalPackingSlip', 'portalOrderConsignment', 'portalConsignmentsNeeded'] },
+    { file: join(SRC_ROOT, 'modules', 'outbound', 'outbound.facade.ts'), methods: ['portalOrders', 'portalOrder', 'portalOrderShipping', 'portalPackingSlip', 'portalOrderConsignment', 'portalConsignmentsNeeded', 'portalFreightNote'] },
     { file: join(SRC_ROOT, 'modules', 'inbound', 'inbound.facade.ts'), methods: ['portalAsns', 'portalAsn', 'portalPurchaseOrders', 'portalPurchaseOrder', 'portalGoodsReceipts', 'portalGoodsReceipt', 'portalGoodsReceiptFile'] },
     { file: join(SRC_ROOT, 'modules', 'billing', 'billing.facade.ts'), methods: ['portalInvoices', 'portalInvoice', 'portalInvoiceNotes', 'portalInvoiceNote'] },
     { file: join(SRC_ROOT, 'modules', 'clients', 'clients.facade.ts'), methods: ['portalMeIn'] },
@@ -2728,6 +2731,8 @@ describe('architecture: the client portal (story 21-7)', () => {
         // Story 4-6a (A18) — the order's Tax documents and the needed list.
         'portalOrderConsignment',
         'portalConsignmentsNeeded',
+        // Story 4-9a (A22) — the order's freight note.
+        'portalFreightNote',
         'portalAsns',
         'portalAsn',
         'portalPurchaseOrders',
@@ -3630,7 +3635,16 @@ describe('architecture: the audit rule — every keyed command writes its audit 
       helper: join(SRC_ROOT, 'modules', 'outbound', 'shipping-support.ts'),
       specifier: './shipping-support',
       // Story 4-5a — the re-carton (`carton.command.ts`) writes its key through it too.
-      callers: ['client-label.command.ts', 'shipping-files.command.ts', 'handover.command.ts', 'carton.command.ts'].map((file) => join(SRC_ROOT, 'modules', 'outbound', file)),
+      // Story 4-9a — the freight commands write theirs through it as well.
+      callers: [
+        'client-label.command.ts',
+        'shipping-files.command.ts',
+        'handover.command.ts',
+        'carton.command.ts',
+        'freight-load.command.ts',
+        'freight-dispatch.command.ts',
+        'freight-consignment.command.ts',
+      ].map((file) => join(SRC_ROOT, 'modules', 'outbound', file)),
     },
   ];
 
@@ -3982,6 +3996,8 @@ describe('architecture: the client-emails module (story 5-2b)', () => {
       '../attachments/attachments.module',
       // Story 4-6a (A12, A47) — the consignment record's free-function seam (the stamped version the dispatch email names).
       '../invoicing/consignment-seam',
+      // Story 4-9a (A27, A69) — the freight facts' free-function seam (the frozen carriage, the delivered order's label).
+      '../outbound/freight-carriage.read',
     ]);
     const offenders: string[] = [];
     for (const file of moduleFiles) {
@@ -3994,6 +4010,15 @@ describe('architecture: the client-emails module (story 5-2b)', () => {
     const enqueue = readFileSync(ENQUEUE, 'utf8');
     expect(enqueue).toMatch(/from '\.\.\/outbound\/outbound\.facade'/);
     expect(enqueue).toMatch(/from '\.\.\/mail\/mail\.facade'/);
+  });
+
+  it('story 4-9a (A27): outbound/freight-carriage.read.ts imports only drizzle-orm and shared/ (a free-function seam) and never reads the staff-only freight tables', () => {
+    const source = readFileSync(join(SRC_ROOT, 'modules', 'outbound', 'freight-carriage.read.ts'), 'utf8');
+    const targets = [...source.matchAll(/from\s+['"]([^'"]+)['"]/g)].map((match) => match[1]!);
+    expect(targets.length).toBeGreaterThan(0);
+    expect(targets.filter((target) => target !== 'drizzle-orm' && !target.startsWith('../../shared/'))).toEqual([]);
+    expect(source).not.toMatch(/freightLoads|freightLoadScans|freight_loads|freight_load_scans/);
+    expect(readFileSync(ENQUEUE, 'utf8')).toContain(`from '../outbound/freight-carriage.read'`);
   });
 
   it('the payload decoders are ONE copy, in shared/primitives (D2): no module defines decodeReceipt / decodeDispatch', () => {
@@ -4214,6 +4239,8 @@ describe('architecture: batch recalls are recalls-module-owned (story 3-7a)', ()
     ['outbound', 'cancel-restock.command.ts'],
     // Story 4-4a — the courier handover classifies each order's recalled lots.
     ['outbound', 'handover.command.ts'],
+    // Story 4-9a — the freight departure classifies each order's recalled lots.
+    ['outbound', 'freight-dispatch.command.ts'],
     ['catalog', 'batch-block.command.ts'],
     ['inbound', 'receiving.command.ts'],
     ['inbound', 'receiving.facade.ts'],

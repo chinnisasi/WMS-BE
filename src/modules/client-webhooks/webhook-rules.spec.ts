@@ -10,6 +10,8 @@ import {
   parseRetryAfterMs,
   shouldAutoDisable,
   sortEventTypes,
+  WEBHOOK_EVENT_TYPES,
+  WEBHOOK_SOURCE_EVENTS,
   webhookNextWaitMs,
   webhookRetryDelayMs,
   webhookUrlWithoutQuery,
@@ -171,5 +173,15 @@ describe('webhook rules (story 5-2a)', () => {
 
   it('event types sort into the tuple order, duplicates dropped', () => {
     expect(sortEventTypes(['order.dispatched', 'receipt.recorded', 'order.dispatched'])).toEqual(['receipt.recorded', 'order.dispatched']);
+  });
+
+  it('story 4-9a (A28): order.delivered is subscribable and sourced from freight_consignment.delivered only', () => {
+    expect([...WEBHOOK_EVENT_TYPES]).toEqual(['receipt.recorded', 'order.dispatched', 'order.delivered']);
+    expect(WEBHOOK_SOURCE_EVENTS).toEqual({
+      'grn.recorded': 'receipt.recorded',
+      'order.dispatched': 'order.dispatched',
+      'freight_consignment.delivered': 'order.delivered',
+    });
+    expect(sortEventTypes(['order.delivered', 'receipt.recorded'])).toEqual(['receipt.recorded', 'order.delivered']);
   });
 });

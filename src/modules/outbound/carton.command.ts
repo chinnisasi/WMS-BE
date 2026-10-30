@@ -378,6 +378,8 @@ function aggregatedOf(record: PackRecord): AggregatedCarton[] {
       handlingUnitIdsBySku,
       weightGrams: carton.weightGrams,
       dimensionsMm: carton.dimensionsMm,
+      packageType: carton.packageType ?? 'carton',
+      innerCount: carton.innerCount ?? null,
     };
   });
 }

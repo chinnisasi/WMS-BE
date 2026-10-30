@@ -38,6 +38,7 @@ import { livePackFactsOfOrdersInTx } from './cartons.read';
 import type { ConsignmentGateCode } from '../../shared/primitives/consignment-gate';
 import { istDateOf } from '../../shared/primitives/time';
 import { consignmentFactsOfOrderRowsInTx, consignmentRefusal, judgeConsignment, NationalThresholds } from './consignment.read';
+import { liveConsignmentsOfOrdersInTx, plannedConsignmentOfOrderInTx } from './freight.read';
 
 /**
  * Story 4-4a (A12, A32, A33, A36, A37, A40) — the courier handover: one
@@ -73,6 +74,11 @@ export const HANDOVER_PARCEL_REFUSALS = [
   // judged on its cartons only once every 4-4a check passes.
   'package-count-mismatch',
   'carton-not-current',
+  // Story 4-9a (A19, D5) — after 4-5a's carton codes, before 4-6a's three
+  // (4-10a appends after those). CLASSIFIED right after
+  // `order-already-dispatched`: an order on a truck holds no shipment, so the
+  // shipment refusal would otherwise mask the cause.
+  'order-on-freight-load',
   // Story 4-6a (A14, A31, D4) — appended at the VERY END and judged last, so a
   // consignment code never masks a recall, AWB or carton refusal. The web
   // refuses them; a device parcel is handed over and flagged instead.
@@ -345,6 +351,13 @@ export class HandoverCommand {
       // dispatch is dated by (A40: never before its pack) — read here so the
       // classification judges the gate on the SAME date the dispatch takes.
       const consignmentFacts = await consignmentFactsOfOrderRowsInTx(tx, tenantId, orderRows);
+      // Story 4-9a (A19) — the member orders planned on a freight load (read under the order locks).
+      const onTruck = new Map<string, string>();
+      for (const [orderId, consignment] of await liveConsignmentsOfOrdersInTx(tx, tenantId, orderRows.map((row) => row.id))) {
+        if (consignment.status !== 'planned') continue;
+        const planned = await plannedConsignmentOfOrderInTx(tx, tenantId, orderId);
+        if (planned !== null) onTruck.set(orderId, planned.loadCode);
+      }
       const packs = await this.inventory.packMeasurementsOfOrdersInTx(tx, tenantId, orderRows.map((order) => order.id));
       const occurredAtOf = (orderId: string): string => {
         const pack = packs.get(orderId) ?? null;
@@ -382,6 +395,11 @@ export class HandoverCommand {
         }
         if (order.status === 'dispatched') {
           refuse(order.id, 'order-already-dispatched', `Order ${label} was already dispatched.`);
+          continue;
+        }
+        const truck = onTruck.get(order.id);
+        if (truck !== undefined) {
+          refuse(order.id, 'order-on-freight-load', `Order ${label} is on truck ${truck} — it leaves with the truck, or remove it from the load first.`);
           continue;
         }
         if (order.status !== 'ready_to_dispatch') {

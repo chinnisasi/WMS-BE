@@ -23,6 +23,7 @@ import {
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { MAX_HANDLING_UNITS_PER_REQUEST } from '../catalog/handling-unit';
 import { uomPrecision } from '../catalog/uom';
+import { FREIGHT_LIMITS, PACKAGE_TYPES, type PackageType } from '../../shared/primitives/freight';
 
 /** `order_packs.status` — mirrored by `order_packs_status_check` (0117). */
 export const ORDER_PACK_STATUSES = ['live', 'superseded', 'cancelled'] as const;
@@ -45,6 +46,10 @@ export const MAX_GROSS_WEIGHT_GRAMS = 200_000_000;
 /** One carton's weight and dimensions — the pack's bounds (`pack.command.ts`). */
 export const MAX_CARTON_WEIGHT_GRAMS = 1_000_000;
 export const MAX_CARTON_DIMENSION_MM = 100_000;
+/** Story 4-9a (A4) — a pallet's weight bound (`order_cartons_weight_range`, 0119). */
+export const MAX_PALLET_WEIGHT_GRAMS = FREIGHT_LIMITS.palletMaxGrams;
+/** Story 4-9a (A4) — a pallet's "said to contain" carton count (`order_cartons_inner_count`). */
+export const MAX_PALLET_INNER_COUNT = FREIGHT_LIMITS.innerCountMax;
 
 export interface CartonScanLine {
   readonly skuId: string;
@@ -64,6 +69,10 @@ export interface PackCartonInput {
   readonly scanned: readonly CartonScanLine[];
   readonly weightGrams?: number | null | undefined;
   readonly dimensionsMm?: CartonDimensions | null | undefined;
+  /** Story 4-9a (A19) — `carton` (the default) or `pallet`. */
+  readonly type?: PackageType | null | undefined;
+  /** Story 4-9a (A19) — a pallet's inner carton count, 1–9,999. */
+  readonly innerCount?: number | null | undefined;
 }
 
 /** One carton after `aggregateCartons`: its raw lines, its per-SKU totals and its measurements. */
@@ -78,6 +87,12 @@ export interface AggregatedCarton {
   readonly handlingUnitIdsBySku: ReadonlyMap<string, readonly string[]>;
   readonly weightGrams: number | null;
   readonly dimensionsMm: CartonDimensions | null;
+  /**
+   * Story 4-9a (A19) — the package type as sent (absent/null = `carton`); its
+   * vocabulary is judged behind the replay (`assertCartonMeasurements`).
+   */
+  readonly packageType: PackageType;
+  readonly innerCount: number | null;
 }
 
 /** The scan the cartons must add up to (the pack's top-level aggregate). */
@@ -116,6 +131,13 @@ function optionalDimensions(value: unknown, carton: number): CartonDimensions | 
   }
   // Key order fixed here, whatever order the body sent (the hash reads it).
   return { lengthMm, widthMm, heightMm };
+}
+
+/** Story 4-9a — absent and `null` are a carton; any other non-string is a 400 (the vocabulary is judged later). */
+function optionalPackageType(value: unknown, carton: number): PackageType {
+  if (value === undefined || value === null) return 'carton';
+  if (typeof value !== 'string') throw cartonValidation(`Carton ${carton}: type must be "carton" or "pallet".`);
+  return value as PackageType;
 }
 
 /**
@@ -220,6 +242,8 @@ export function aggregateCartons(raw: unknown, target?: CartonTotalsTarget): Agg
       handlingUnitIdsBySku,
       weightGrams: optionalInteger(entry.weightGrams, `Carton ${seq}: weightGrams`),
       dimensionsMm: optionalDimensions(entry.dimensionsMm, seq),
+      packageType: optionalPackageType(entry.type, seq),
+      innerCount: optionalInteger(entry.innerCount, `Carton ${seq}: innerCount`),
     });
   });
 
@@ -278,6 +302,9 @@ export interface CartonHashEntry {
   readonly scanned: readonly { readonly skuId: string; readonly qty: number; readonly handlingUnitIds: readonly string[] | undefined }[];
   readonly weightGrams: number | undefined;
   readonly dimensionsMm: CartonDimensions | undefined;
+  /** Story 4-9a (A19) — present ONLY on a pallet, so a carton body hashes byte-identically to 4-5a's. */
+  readonly type?: 'pallet';
+  readonly innerCount?: number | undefined;
 }
 
 /**
@@ -293,6 +320,7 @@ export function cartonsHashForm(cartons: readonly AggregatedCarton[]): CartonHas
       .map(([skuId, qty]) => ({ skuId, qty, handlingUnitIds: carton.handlingUnitIdsBySku.get(skuId) })),
     weightGrams: carton.weightGrams ?? undefined,
     dimensionsMm: carton.dimensionsMm ?? undefined,
+    ...(carton.packageType === 'pallet' ? { type: 'pallet' as const, innerCount: carton.innerCount ?? undefined } : {}),
   }));
 }
 
@@ -304,9 +332,25 @@ export function sameSplit(left: readonly AggregatedCarton[], right: readonly Agg
 /** Each carton's measurements under the pack bounds (A6 — after the replay). */
 export function assertCartonMeasurements(cartons: readonly AggregatedCarton[], options: { readonly device: boolean }): void {
   for (const carton of cartons) {
-    if (carton.weightGrams !== null && (carton.weightGrams < 1 || carton.weightGrams > MAX_CARTON_WEIGHT_GRAMS)) {
+    // Story 4-9a (A19) — the package type and a pallet's inner count.
+    if (!(PACKAGE_TYPES as readonly string[]).includes(carton.packageType)) {
+      throw cartonValidation(`Carton ${carton.seq}: type must be "carton" or "pallet" (got "${carton.packageType}").`);
+    }
+    const pallet = carton.packageType === 'pallet';
+    if (carton.innerCount !== null) {
+      if (!pallet) {
+        throw cartonValidation(`Carton ${carton.seq}: innerCount (cartons on a pallet) is a pallet's — this package is a carton.`);
+      }
+      if (carton.innerCount < 1 || carton.innerCount > MAX_PALLET_INNER_COUNT) {
+        throw cartonValidation(`Carton ${carton.seq}: innerCount must be 1–${MAX_PALLET_INNER_COUNT} cartons (got ${carton.innerCount}).`);
+      }
+    }
+    const maxWeight = pallet ? MAX_PALLET_WEIGHT_GRAMS : MAX_CARTON_WEIGHT_GRAMS;
+    if (carton.weightGrams !== null && (carton.weightGrams < 1 || carton.weightGrams > maxWeight)) {
       throw cartonValidation(
-        `Carton ${carton.seq}: weightGrams must be a positive whole number of grams, at most ${MAX_CARTON_WEIGHT_GRAMS} (got ${carton.weightGrams}).`,
+        pallet
+          ? `Pallet ${carton.seq}: weightGrams must be a positive whole number of grams, at most ${maxWeight} (got ${carton.weightGrams}).`
+          : `Carton ${carton.seq}: weightGrams must be a positive whole number of grams, at most ${maxWeight} (got ${carton.weightGrams}).`,
       );
     }
     if (carton.dimensionsMm !== null) {
@@ -324,6 +368,12 @@ export function assertCartonMeasurements(cartons: readonly AggregatedCarton[], o
         }
       }
     }
+  }
+  // Story 4-9a (A47) — the pack's gross stays within `order_packs_gross_weight_range`
+  // (reachable only with pallets: 200 × 3,000 kg would otherwise be a CHECK 500).
+  const gross = grossWeightOf(cartons);
+  if (gross !== null && gross > MAX_GROSS_WEIGHT_GRAMS) {
+    throw cartonValidation(`The packages weigh ${gross} g in all — a pack is at most ${MAX_GROSS_WEIGHT_GRAMS} g (200 t); split the order.`);
   }
 }
 

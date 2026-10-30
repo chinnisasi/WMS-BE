@@ -15353,7 +15353,8 @@
                       "challan",
                       "eway-bill",
                       "pod",
-                      "other"
+                      "other",
+                      "lr"
                     ]
                   }
                 },
@@ -15442,7 +15443,7 @@
             "bearer": []
           }
         ],
-        "summary": "Story 4-4a — dispatch.execute: attaches a shipping document to an order (an image or a PDF; invoice, challan, eway-bill, pod or other). Shared with the client by email at once when the order is dispatched, else at its dispatch",
+        "summary": "Story 4-4a — dispatch.execute: attaches a shipping document to an order (an image or a PDF; invoice, challan, eway-bill, pod, other or a scanned LR). Shared with the client by email at once when the order is dispatched, else at its dispatch",
         "tags": [
           "shipping"
         ]
@@ -16179,6 +16180,1967 @@
         "summary": "Story 4-4a — the warehouse’s courier handovers, newest first (keyset); from/to are IST dates, inclusive",
         "tags": [
           "shipping"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/outbound/freight-loads": {
+      "post": {
+        "operationId": "FreightController_createLoad",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateFreightLoadDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreightLoadResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed field (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Role lacks dispatch.execute (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown warehouse or transporter (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "freight-orders-refused (orders[{orderId, code}]), load-full, partner-not-transporter, transporter-inactive",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "idempotency-key-reuse",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-9a (A9) — dispatch.execute: a freight load (LD-NNNN) — FTL or LTL, one transporter (a partner or a typed name), the vehicle and driver so far, the dock door, and optionally its first orders (all-or-nothing)",
+        "tags": [
+          "freight"
+        ]
+      },
+      "get": {
+        "operationId": "FreightController_listLoads",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "view",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "open",
+                "dispatched",
+                "pod-pending",
+                "delivery-exceptions",
+                "cancelled"
+              ]
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Loads holding a live consignment of this client",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "IST date, inclusive",
+            "schema": {
+              "format": "date",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "IST date, inclusive",
+            "schema": {
+              "format": "date",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "description": "1–100 (default 50)",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreightLoadsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed filter or cursor (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown warehouse (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-9a (A20, A68) — a warehouse’s freight loads, newest first: open (default), dispatched, pod-pending, delivery-exceptions, cancelled; clientId filters to loads holding that client’s orders; from/to are IST dates over created (open, cancelled) or departed (the others)",
+        "tags": [
+          "freight"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/outbound/freight-candidates": {
+      "get": {
+        "operationId": "FreightController_candidates",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "city",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pincode",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "packed",
+                "accepted",
+                "all"
+              ]
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "description": "1–500 (default 200)",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreightCandidatesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed filter or cursor (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown warehouse (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-9a (A20) — the orders a load may take: the warehouse’s accepted or packed orders on no truck and with no live label, packed first, at most 2,000 scanned (truncated); filters client, state, city, pincode, packed/accepted",
+        "tags": [
+          "freight"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/freight-photos": {
+      "post": {
+        "operationId": "FreightController_stageFreightPhoto",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-op-operator",
+            "in": "header",
+            "description": "The capturing operator’s user id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "capturedAt": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "file": {
+                    "type": "string",
+                    "format": "binary"
+                  }
+                },
+                "required": [
+                  "capturedAt",
+                  "file"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StagedPhotoResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed key, x-op-operator, capturedAt or file (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The ref is stored with different bytes or another purpose (attachment-ref-conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Not a JPEG, PNG or WebP (attachment-type-unsupported)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "attachment-too-large, attachment-content-invalid, idempotency-key-reuse",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "200 photos waiting on this device (attachment-staging-limit)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "file-storage-unavailable, file-storage-failed, file-storage-busy",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-9a (A18) — the handheld’s signed loading-sheet photo (freight-photo.stage; the device credential + x-op-operator). Idempotency-Key = the photo ULID its departure names in photoRefs; bound to the load in either order (2-5a’s fate table). Never shared with a client",
+        "tags": [
+          "freight"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/freight-loads/{loadId}/orders/{orderId}/remove": {
+      "post": {
+        "operationId": "FreightController_removeOrder",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "loadId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FreightReasonDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreightLoadResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No reason (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "role-denied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown load, or the order is not planned on it (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "load-not-open",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "idempotency-key-reuse",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-9a (A11) — dispatch.execute: take a planned order off an open load (its scans unloaded); the other stops keep their numbers",
+        "tags": [
+          "freight"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/freight-loads/{loadId}/orders": {
+      "post": {
+        "operationId": "FreightController_addOrders",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "loadId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FreightOrderIdsDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreightLoadResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed or duplicate order id (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "role-denied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown load (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "load-not-open, load-full, freight-orders-refused (order-not-found, warehouse-mismatch, order-not-open, order-on-freight-load, order-has-courier-shipment)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "idempotency-key-reuse",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-9a (A10) — dispatch.execute: plan orders on an open load (all-or-nothing; one order rides one truck, whole)",
+        "tags": [
+          "freight"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/freight-loads/{loadId}/stops": {
+      "post": {
+        "operationId": "FreightController_reorderStops",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "loadId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FreightOrderIdsDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreightLoadResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "role-denied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown load (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "load-not-open, freight-members-changed (extensions.orderIds)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "idempotency-key-reuse",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-9a (A12) — dispatch.execute: the planned orders in delivery order (stop 1 first; loaded last stop first). The same order is a no-op that stores the key",
+        "tags": [
+          "freight"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/freight-loads/{loadId}/scans": {
+      "post": {
+        "operationId": "FreightController_recordScan",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "loadId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FreightScanDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The package was already loaded on this load (alreadyLoaded: true) — a no-op that stores the key; its replay answers 200 too",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreightScanResponse"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreightScanResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A blank code, an unknown action, no unload reason, occurredAt on the web (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token, or a device token without a badge-in (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "role-denied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown load (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "load-dispatched, load-cancelled, package-not-on-load (extensions.loadCode), carton-not-current, order-not-packed, consignment-removed, warehouse-mismatch",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "package-code-invalid, package-code-ambiguous, idempotency-key-reuse",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "device": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-9a (A13, A44, A45) — dispatch.execute: one package loaded onto (or unloaded from) the truck. Either session family: the web (a tick or a wedge scan), or the handheld’s freight.load-scan op (badge-in, occurredAt and warehouseId required). A package already loaded is a no-op that stores the key (200 semantics in a 201: alreadyLoaded). A scan taken before the departure and synced after counts",
+        "tags": [
+          "freight"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/freight-loads/{loadId}/dispatch": {
+      "post": {
+        "operationId": "FreightController_dispatchLoad",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "loadId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DispatchFreightLoadDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreightDispatchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed field, no dispatch decision, an LR shared by two clients, a departure before the loading (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token, or a device token without a badge-in (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "role-denied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown load (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "load-dispatched, load-cancelled, freight-members-changed, freight-orders-refused (orders[{orderId, code}]), eway-part-b-unconfirmed, load-over-capacity, eway-threshold-missing, transporter-inactive, partner-not-transporter, warehouse-mismatch, client-departed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "idempotency-key-reuse",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "device": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-9a (A14) — dispatch.execute: the truck leaves. Records the vehicle, driver, seals and the e-way Part B confirmation, decides each consignment (dispatch or leave), freezes the parties and dispatches every order sent through the shared dispatch body (4-6a’s gate judged once per order). The web is all-or-nothing; the handheld’s freight.dispatch op settles partially (the orders that left but could not be dispatched become one Discard-only review row)",
+        "tags": [
+          "freight"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/freight-loads/{loadId}/cancel": {
+      "post": {
+        "operationId": "FreightController_cancelLoad",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "loadId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FreightReasonDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreightLoadResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No reason (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "role-denied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown load (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "load-not-open",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "idempotency-key-reuse",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-9a (A15) — dispatch.execute: cancel an open load — every planned order is taken off (its scans unloaded); the orders themselves are untouched",
+        "tags": [
+          "freight"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/freight-loads/{loadId}/sheet": {
+      "post": {
+        "operationId": "FreightController_uploadSheet",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "loadId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary"
+                  }
+                },
+                "required": [
+                  "file"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShippingFileResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No file (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "role-denied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown load (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "loading-sheet-limit, load-cancelled",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Not an image or a PDF (attachment-type-unsupported)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "attachment-too-large, attachment-content-invalid, pdf-unreadable, pdf-too-many-pages, idempotency-key-reuse",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "file-storage-unavailable, file-storage-failed, file-storage-busy",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-9a (A18, A57) — dispatch.execute: a page of the signed loading sheet (an image or a PDF; ≤ 10 live pages). Never shared with a client (a multi-client document)",
+        "tags": [
+          "freight"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/freight-loads/{loadId}/loading-sheet": {
+      "get": {
+        "operationId": "FreightController_loadingSheet",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "loadId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "format",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pdf"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The loading sheet",
+            "content": {
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown load (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "load-cancelled",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-9a (A25) — the A4 loading sheet (landscape): a plan before departure (watermarked), final after. Staff and the transporter only. A file read: no key, no audit",
+        "tags": [
+          "freight"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/freight-loads/{loadId}": {
+      "get": {
+        "operationId": "FreightController_loadDetail",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "loadId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreightLoadViewDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown load (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-9a (A21) — one freight load: the vehicle, driver (the phone and licence unmasked for dispatch.execute), seals, Part B, totals, each consignment with its loading progress, gate, LR and delivery, the removed orders and the signed sheet pages",
+        "tags": [
+          "freight"
+        ]
+      },
+      "post": {
+        "operationId": "FreightController_updateLoad",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "loadId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateFreightLoadDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreightLoadResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed field (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "role-denied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown load or transporter (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "load-not-open, partner-not-transporter, transporter-inactive",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "idempotency-key-reuse",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-9a (A9) — dispatch.execute: edit an open load’s header (a full replacement). Unchanged is a no-op that stores the key",
+        "tags": [
+          "freight"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/freight-consignments/{consignmentId}/lr": {
+      "post": {
+        "operationId": "FreightController_recordLr",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "consignmentId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordFreightLrDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreightConsignmentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed LR or date, a second client’s LR, no reason after departure (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "role-denied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown consignment (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "consignment-removed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "idempotency-key-reuse",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-9a (A16, A49) — dispatch.execute: the consignment’s lorry receipt (captured, never issued); after departure a change needs a reason. One LR covers one client’s goods on a load. Unchanged is a no-op (200, unchanged: true)",
+        "tags": [
+          "freight"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/freight-consignments/{consignmentId}/delivery": {
+      "post": {
+        "operationId": "FreightController_recordDelivery",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "consignmentId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordFreightDeliveryDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreightConsignmentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed field, a delivery before the departure or in the future, more short + damaged than packages, no reason on an amendment (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "role-denied (an amendment by a dispatch.execute-only role: \"Only an office role can amend a recorded delivery\")",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown consignment (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "consignment-not-dispatched, delivery-amend-limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "idempotency-key-reuse",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-9a (A17, A48) — dispatch.execute: the proof of delivery — delivered, delivered with exceptions (short / damaged, a note) or refused (a note). The order stays dispatched. Amending a recorded delivery needs orders.manage and a reason; unchanged is a no-op (200, unchanged: true)",
+        "tags": [
+          "freight"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/freight-consignments/{consignmentId}/note": {
+      "get": {
+        "operationId": "FreightController_freightNote",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "consignmentId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "format",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pdf"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The freight note",
+            "content": {
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown consignment (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "consignment-not-dispatched",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-9a (A26) — the staff freight note of a dispatched consignment (portrait A4; the package codes and the barcode). A file read: no key, no audit",
+        "tags": [
+          "freight"
         ]
       }
     },
@@ -31122,6 +33084,7 @@
                 "batch_alert",
                 "batch_recall",
                 "courier_handover",
+                "freight_load",
                 "bin",
                 "bin_move",
                 "carrier_connection",
@@ -41082,6 +43045,94 @@
           }
         ],
         "summary": "Story 4-5a — this order’s packing slip as an A4 PDF, once it is packed or dispatched: the parties, the lines with batches and serials, the cartons and their contents, and \"This is not a tax invoice\". Named `{order label}-packing-slip.pdf`",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/orders/{orderId}/freight-note": {
+      "get": {
+        "operationId": "PortalController_orderFreightNote",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The PDF",
+            "content": {
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed orderId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No dispatched truck consignment of this client's order — unknown, another client's, or not left yet (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-9a (A22, A26) — this order’s freight note as an A4 PDF, once its truck has left: the brand c/o the warehouse, the consignee, the transporter, the vehicle, the LR, the packages and the receipt block the consignee signs. Named `{consignment ref}-freight-note.pdf`",
         "tags": [
           "portal"
         ]
@@ -52892,7 +54943,10 @@
               "rtc.pick",
               "shipment.verify-label",
               "handover.create",
-              "handover-photo.stage"
+              "handover-photo.stage",
+              "freight.load-scan",
+              "freight.dispatch",
+              "freight-photo.stage"
             ]
           },
           "classification": {
@@ -53077,7 +55131,10 @@
               "rtc.pick",
               "shipment.verify-label",
               "handover.create",
-              "handover-photo.stage"
+              "handover-photo.stage",
+              "freight.load-scan",
+              "freight.dispatch",
+              "freight-photo.stage"
             ]
           },
           "classification": {
@@ -57121,8 +59178,25 @@
             "type": "number",
             "nullable": true,
             "minimum": 1,
-            "maximum": 1000000,
-            "description": "Optional carton weight in grams."
+            "maximum": 3000000,
+            "description": "Optional package weight in grams: a carton at most 1,000,000, a pallet at most 3,000,000 (story 4-9a)."
+          },
+          "type": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "carton",
+              "pallet",
+              null
+            ],
+            "description": "Story 4-9a — the package type: `carton` (the default when absent) or `pallet` (labelled \"PALLET n/N\")."
+          },
+          "innerCount": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 9999,
+            "description": "Story 4-9a — a pallet only: the cartons on it (\"said to contain n cartons\")."
           },
           "dimensionsMm": {
             "nullable": true,
@@ -57282,6 +59356,19 @@
             "items": {
               "$ref": "#/components/schemas/PackedCartonLineDto"
             }
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "carton",
+              "pallet"
+            ],
+            "description": "Story 4-9a — present only on a pallet; absent is a carton."
+          },
+          "innerCount": {
+            "type": "number",
+            "nullable": true,
+            "description": "Story 4-9a — a pallet's inner carton count."
           }
         },
         "required": [
@@ -57583,6 +59670,19 @@
           "lineCount": {
             "type": "number",
             "description": "SKUs in the carton"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "carton",
+              "pallet"
+            ],
+            "description": "Story 4-9a — present only on a pallet; absent is a carton."
+          },
+          "innerCount": {
+            "type": "number",
+            "nullable": true,
+            "description": "Story 4-9a — a pallet's inner carton count."
           },
           "totals": {
             "description": "Per-UoM totals — never a cross-UoM unit total",
@@ -58493,6 +60593,26 @@
           "orderShelfLife"
         ]
       },
+      "OrderEntryFreightDto": {
+        "type": "object",
+        "properties": {
+          "loadId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "loadCode": {
+            "type": "string"
+          },
+          "stopSeq": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "loadId",
+          "loadCode",
+          "stopSeq"
+        ]
+      },
       "OrderEntryDto": {
         "type": "object",
         "properties": {
@@ -58628,6 +60748,16 @@
               "not-required"
             ],
             "description": "Story 4-6a — the consignment gate today (the brand's tax document and e-way bill): the Docs cell. Optional"
+          },
+          "freight": {
+            "nullable": true,
+            "description": "Story 4-9a (A30) — the truck the order is planned on (its load and stop), null when none: the Shipping cell reads \"On truck LD-0007 (stop 3)\". The list rows only; optional",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OrderEntryFreightDto"
+              }
+            ]
           }
         },
         "required": [
@@ -59923,8 +62053,25 @@
             "type": "number",
             "nullable": true,
             "minimum": 1,
-            "maximum": 1000000,
-            "description": "Optional carton weight in grams."
+            "maximum": 3000000,
+            "description": "Optional package weight in grams: a carton at most 1,000,000, a pallet at most 3,000,000 (story 4-9a)."
+          },
+          "type": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "carton",
+              "pallet",
+              null
+            ],
+            "description": "Story 4-9a — the package type: `carton` (the default when absent) or `pallet` (labelled \"PALLET n/N\")."
+          },
+          "innerCount": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 9999,
+            "description": "Story 4-9a — a pallet only: the cartons on it (\"said to contain n cartons\")."
           }
         },
         "required": [
@@ -60276,7 +62423,8 @@
             "enum": [
               "shipping-label",
               "shipping-document",
-              "handover-sheet"
+              "handover-sheet",
+              "loading-sheet"
             ]
           },
           "docKind": {
@@ -60288,6 +62436,7 @@
               "eway-bill",
               "pod",
               "other",
+              "lr",
               null
             ]
           },
@@ -60394,6 +62543,142 @@
           "sheet"
         ]
       },
+      "OrderFreightDeliveryDto": {
+        "type": "object",
+        "properties": {
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "delivered",
+              "delivered-with-exceptions",
+              "refused"
+            ]
+          },
+          "deliveredAt": {
+            "type": "string"
+          },
+          "receiverName": {
+            "type": "string",
+            "nullable": true
+          },
+          "short": {
+            "type": "number",
+            "nullable": true
+          },
+          "damaged": {
+            "type": "number",
+            "nullable": true
+          },
+          "note": {
+            "type": "string",
+            "nullable": true
+          },
+          "deliverySeq": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "outcome",
+          "deliveredAt",
+          "receiverName",
+          "short",
+          "damaged",
+          "note",
+          "deliverySeq"
+        ]
+      },
+      "OrderFreightBlockDto": {
+        "type": "object",
+        "properties": {
+          "consignmentId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "loadId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "loadCode": {
+            "type": "string"
+          },
+          "consignmentRef": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "planned",
+              "removed",
+              "dispatched"
+            ]
+          },
+          "stopSeq": {
+            "type": "number"
+          },
+          "lrNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "lrDate": {
+            "type": "string",
+            "nullable": true
+          },
+          "freightTerms": {
+            "type": "string",
+            "nullable": true
+          },
+          "transporterName": {
+            "type": "string"
+          },
+          "vehicleNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "dispatchedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "packageCount": {
+            "type": "number",
+            "nullable": true
+          },
+          "loadedPackageCount": {
+            "type": "number",
+            "nullable": true
+          },
+          "loadException": {
+            "type": "string",
+            "nullable": true
+          },
+          "delivery": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OrderFreightDeliveryDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "consignmentId",
+          "loadId",
+          "loadCode",
+          "consignmentRef",
+          "status",
+          "stopSeq",
+          "lrNumber",
+          "lrDate",
+          "freightTerms",
+          "transporterName",
+          "vehicleNumber",
+          "dispatchedAt",
+          "packageCount",
+          "loadedPackageCount",
+          "loadException",
+          "delivery"
+        ]
+      },
       "OrderShippingResponse": {
         "type": "object",
         "properties": {
@@ -60443,6 +62728,16 @@
           },
           "storageEnabled": {
             "type": "boolean"
+          },
+          "freight": {
+            "nullable": true,
+            "description": "Story 4-9a (A20) — the order’s live freight consignment (its truck, LR and delivery); null when none",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OrderFreightBlockDto"
+              }
+            ]
           }
         },
         "required": [
@@ -60467,7 +62762,8 @@
             "enum": [
               "shipping-label",
               "shipping-document",
-              "handover-sheet"
+              "handover-sheet",
+              "loading-sheet"
             ]
           },
           "docKind": {
@@ -60479,6 +62775,7 @@
               "eway-bill",
               "pod",
               "other",
+              "lr",
               null
             ]
           },
@@ -60813,6 +63110,7 @@
               "order-holds-recalled-batch",
               "package-count-mismatch",
               "carton-not-current",
+              "order-on-freight-load",
               "consignment-documents-missing",
               "eway-bill-required",
               "eway-bill-expired"
@@ -61426,6 +63724,1624 @@
         "required": [
           "items",
           "nextCursor"
+        ]
+      },
+      "FreightTransporterDto": {
+        "type": "object",
+        "properties": {
+          "transporterId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "A transporter partner (frozen at departure)"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true,
+            "description": "Or the typed name (1–100) — exactly one of the two"
+          }
+        }
+      },
+      "CreateFreightLoadDto": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "ftl",
+              "ltl"
+            ]
+          },
+          "transporter": {
+            "$ref": "#/components/schemas/FreightTransporterDto"
+          },
+          "vehicleType": {
+            "type": "string",
+            "enum": [
+              "tempo",
+              "lcv",
+              "mcv",
+              "hcv",
+              "trailer",
+              "container-20",
+              "container-40",
+              "other",
+              null
+            ],
+            "nullable": true
+          },
+          "vehicleNumber": {
+            "type": "string",
+            "nullable": true,
+            "description": "Spaces, dots and hyphens stripped, upper-cased; 4–15 letters or digits"
+          },
+          "containerNumber": {
+            "type": "string",
+            "nullable": true,
+            "description": "1–11 letters or digits"
+          },
+          "vehicleCapacityKg": {
+            "type": "number",
+            "nullable": true,
+            "description": "Kilograms, 1–60,000"
+          },
+          "driverName": {
+            "type": "string",
+            "nullable": true,
+            "description": "1–80 characters"
+          },
+          "driverPhone": {
+            "type": "string",
+            "nullable": true,
+            "description": "7–15 digits, optionally with a leading +"
+          },
+          "driverLicenceNumber": {
+            "type": "string",
+            "nullable": true,
+            "description": "Upper-cased, spaces and hyphens stripped; 6–20 letters or digits"
+          },
+          "dockDoor": {
+            "type": "string",
+            "nullable": true,
+            "description": "1–20 letters, digits or hyphens (2-3b’s door code, or typed)"
+          },
+          "vehicleReportedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the truck reported, within the last 7 days"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "description": "1–500 characters"
+          },
+          "orderIds": {
+            "description": "The orders to plan on it (≤ 100) — all-or-nothing (409 freight-orders-refused)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "mode",
+          "transporter"
+        ]
+      },
+      "FreightTransporterViewDto": {
+        "type": "object",
+        "properties": {
+          "partnerId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "snapshot": {
+            "type": "object",
+            "nullable": true,
+            "description": "TransporterSnapshotV1 (a partner), frozen at departure"
+          }
+        },
+        "required": [
+          "partnerId",
+          "name",
+          "snapshot"
+        ]
+      },
+      "FreightVehicleViewDto": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "tempo",
+              "lcv",
+              "mcv",
+              "hcv",
+              "trailer",
+              "container-20",
+              "container-40",
+              "other",
+              null
+            ]
+          },
+          "number": {
+            "type": "string",
+            "nullable": true
+          },
+          "containerNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "capacityKg": {
+            "type": "number",
+            "nullable": true
+          },
+          "reportedAt": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "type",
+          "number",
+          "containerNumber",
+          "capacityKg",
+          "reportedAt"
+        ]
+      },
+      "FreightDriverViewDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "phone": {
+            "type": "string",
+            "nullable": true,
+            "description": "Unmasked for a dispatch.execute holder, else masked"
+          },
+          "licenceNumber": {
+            "type": "string",
+            "nullable": true,
+            "description": "The same rule as the phone"
+          }
+        },
+        "required": [
+          "name",
+          "phone",
+          "licenceNumber"
+        ]
+      },
+      "FreightPartBDto": {
+        "type": "object",
+        "properties": {
+          "required": {
+            "type": "boolean"
+          },
+          "confirmedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "confirmedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "required",
+          "confirmedAt",
+          "confirmedBy"
+        ]
+      },
+      "FreightTotalsDto": {
+        "type": "object",
+        "properties": {
+          "consignments": {
+            "type": "number"
+          },
+          "packages": {
+            "type": "number"
+          },
+          "loaded": {
+            "type": "number"
+          },
+          "pallets": {
+            "type": "number"
+          },
+          "grossWeightGrams": {
+            "type": "number",
+            "nullable": true
+          },
+          "weightKnown": {
+            "type": "boolean"
+          },
+          "overCapacity": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "consignments",
+          "packages",
+          "loaded",
+          "pallets",
+          "grossWeightGrams",
+          "weightKnown",
+          "overCapacity"
+        ]
+      },
+      "FreightConsigneeDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "city": {
+            "type": "string",
+            "nullable": true
+          },
+          "state": {
+            "type": "string",
+            "nullable": true
+          },
+          "pincode": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "name",
+          "city",
+          "state",
+          "pincode"
+        ]
+      },
+      "FreightLrDto": {
+        "type": "object",
+        "properties": {
+          "number": {
+            "type": "string",
+            "nullable": true
+          },
+          "date": {
+            "type": "string",
+            "nullable": true
+          },
+          "terms": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "paid",
+              "to-pay",
+              "tbb",
+              null
+            ]
+          }
+        },
+        "required": [
+          "number",
+          "date",
+          "terms"
+        ]
+      },
+      "FreightPackagesDto": {
+        "type": "object",
+        "properties": {
+          "total": {
+            "type": "number"
+          },
+          "pallets": {
+            "type": "number"
+          },
+          "loaded": {
+            "type": "number"
+          },
+          "staleScans": {
+            "type": "number",
+            "description": "Scans of a superseded pack (re-packed after loading started — scan the new labels)"
+          },
+          "packed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "total",
+          "pallets",
+          "loaded",
+          "staleScans",
+          "packed"
+        ]
+      },
+      "FreightGateDto": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string"
+          },
+          "blocking": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "state",
+          "blocking"
+        ]
+      },
+      "FreightEwayDto": {
+        "type": "object",
+        "properties": {
+          "number": {
+            "type": "string",
+            "nullable": true
+          },
+          "validUntil": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "number",
+          "validUntil"
+        ]
+      },
+      "FreightInvoiceDto": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string"
+          },
+          "number": {
+            "type": "string"
+          },
+          "date": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "number",
+          "date"
+        ]
+      },
+      "FreightDeliveryDto": {
+        "type": "object",
+        "properties": {
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "delivered",
+              "delivered-with-exceptions",
+              "refused"
+            ]
+          },
+          "deliveredAt": {
+            "type": "string"
+          },
+          "receiverName": {
+            "type": "string",
+            "nullable": true
+          },
+          "short": {
+            "type": "number",
+            "nullable": true
+          },
+          "damaged": {
+            "type": "number",
+            "nullable": true
+          },
+          "note": {
+            "type": "string",
+            "nullable": true
+          },
+          "deliverySeq": {
+            "type": "number"
+          },
+          "recordedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "recordedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "outcome",
+          "deliveredAt",
+          "receiverName",
+          "short",
+          "damaged",
+          "note",
+          "deliverySeq",
+          "recordedAt",
+          "recordedBy"
+        ]
+      },
+      "FreightConsignmentViewDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLabel": {
+            "type": "string"
+          },
+          "orderStatus": {
+            "type": "string"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientCode": {
+            "type": "string"
+          },
+          "stopSeq": {
+            "type": "number"
+          },
+          "consignmentRef": {
+            "type": "string",
+            "description": "LD-0007/03"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "planned",
+              "removed",
+              "dispatched"
+            ]
+          },
+          "consignee": {
+            "$ref": "#/components/schemas/FreightConsigneeDto"
+          },
+          "lr": {
+            "$ref": "#/components/schemas/FreightLrDto"
+          },
+          "packages": {
+            "$ref": "#/components/schemas/FreightPackagesDto"
+          },
+          "loadedCodes": {
+            "description": "The live loaded package codes, sorted (≤ 200; empty once dispatched) — the expanded row’s per-package Load tick",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true
+          },
+          "gate": {
+            "description": "4-6a’s gate before departure; absent when not judged",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/FreightGateDto"
+              }
+            ]
+          },
+          "eway": {
+            "$ref": "#/components/schemas/FreightEwayDto"
+          },
+          "invoice": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/FreightInvoiceDto"
+              }
+            ]
+          },
+          "loadException": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "packages-unscanned",
+              "not-on-device-list",
+              null
+            ]
+          },
+          "complianceException": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "consignment-documents-missing",
+              "eway-bill-required",
+              "eway-bill-expired",
+              null
+            ]
+          },
+          "dispatchedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "delivery": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/FreightDeliveryDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "orderId",
+          "orderLabel",
+          "orderStatus",
+          "clientId",
+          "clientCode",
+          "stopSeq",
+          "consignmentRef",
+          "status",
+          "consignee",
+          "lr",
+          "packages",
+          "weightGrams",
+          "eway",
+          "invoice",
+          "loadException",
+          "complianceException",
+          "dispatchedAt",
+          "delivery"
+        ]
+      },
+      "FreightRemovedDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLabel": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "removedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "orderId",
+          "orderLabel",
+          "reason",
+          "removedAt"
+        ]
+      },
+      "FreightCancelDto": {
+        "type": "object",
+        "properties": {
+          "at": {
+            "type": "string"
+          },
+          "by": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "at",
+          "by",
+          "reason"
+        ]
+      },
+      "FreightLoadViewDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "dispatched",
+              "cancelled"
+            ]
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "ftl",
+              "ltl"
+            ]
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "transporter": {
+            "$ref": "#/components/schemas/FreightTransporterViewDto"
+          },
+          "vehicle": {
+            "$ref": "#/components/schemas/FreightVehicleViewDto"
+          },
+          "driver": {
+            "$ref": "#/components/schemas/FreightDriverViewDto"
+          },
+          "dockDoor": {
+            "type": "string",
+            "nullable": true
+          },
+          "seals": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "note": {
+            "type": "string",
+            "nullable": true
+          },
+          "loadingStartedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "dispatchedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "dispatchedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "dispatchSource": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "web",
+              "handheld",
+              null
+            ]
+          },
+          "partB": {
+            "$ref": "#/components/schemas/FreightPartBDto"
+          },
+          "capacityExceeded": {
+            "type": "boolean"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/FreightTotalsDto"
+          },
+          "consignments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FreightConsignmentViewDto"
+            }
+          },
+          "removed": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FreightRemovedDto"
+            }
+          },
+          "sheet": {
+            "description": "The signed loading-sheet pages (a command’s answer carries no link)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FileViewDto"
+            }
+          },
+          "cancel": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/FreightCancelDto"
+              }
+            ]
+          },
+          "createdBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "createdAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "status",
+          "mode",
+          "warehouseId",
+          "transporter",
+          "vehicle",
+          "driver",
+          "dockDoor",
+          "seals",
+          "note",
+          "loadingStartedAt",
+          "dispatchedAt",
+          "dispatchedBy",
+          "dispatchSource",
+          "partB",
+          "capacityExceeded",
+          "totals",
+          "consignments",
+          "removed",
+          "sheet",
+          "cancel",
+          "createdBy",
+          "createdAt"
+        ]
+      },
+      "FreightLoadResponse": {
+        "type": "object",
+        "properties": {
+          "load": {
+            "$ref": "#/components/schemas/FreightLoadViewDto"
+          }
+        },
+        "required": [
+          "load"
+        ]
+      },
+      "FreightLoadedTotalDto": {
+        "type": "object",
+        "properties": {
+          "loaded": {
+            "type": "number"
+          },
+          "total": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "loaded",
+          "total"
+        ]
+      },
+      "FreightLoadListRowDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "dispatched",
+              "cancelled"
+            ]
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "ftl",
+              "ltl"
+            ]
+          },
+          "transporterName": {
+            "type": "string"
+          },
+          "vehicleNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "dockDoor": {
+            "type": "string",
+            "nullable": true
+          },
+          "consignmentCount": {
+            "type": "number"
+          },
+          "clientCodes": {
+            "description": "At most 5",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "clientMore": {
+            "type": "number"
+          },
+          "packages": {
+            "$ref": "#/components/schemas/FreightLoadedTotalDto"
+          },
+          "palletCount": {
+            "type": "number"
+          },
+          "grossWeightGrams": {
+            "type": "number",
+            "nullable": true
+          },
+          "capacityKg": {
+            "type": "number",
+            "nullable": true
+          },
+          "dispatchedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "deliveredCount": {
+            "type": "number"
+          },
+          "createdAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "status",
+          "mode",
+          "transporterName",
+          "vehicleNumber",
+          "dockDoor",
+          "consignmentCount",
+          "clientCodes",
+          "clientMore",
+          "packages",
+          "palletCount",
+          "grossWeightGrams",
+          "capacityKg",
+          "dispatchedAt",
+          "deliveredCount",
+          "createdAt"
+        ]
+      },
+      "FreightLoadsResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FreightLoadListRowDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "FreightCandidatePackagesDto": {
+        "type": "object",
+        "properties": {
+          "cartons": {
+            "type": "number"
+          },
+          "pallets": {
+            "type": "number"
+          },
+          "packed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "cartons",
+          "pallets",
+          "packed"
+        ]
+      },
+      "FreightCandidateDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLabel": {
+            "type": "string"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientCode": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "accepted",
+              "ready_to_dispatch"
+            ]
+          },
+          "consignee": {
+            "$ref": "#/components/schemas/FreightConsigneeDto"
+          },
+          "packages": {
+            "$ref": "#/components/schemas/FreightCandidatePackagesDto"
+          },
+          "grossWeightGrams": {
+            "type": "number",
+            "nullable": true
+          },
+          "consignment": {
+            "$ref": "#/components/schemas/FreightGateDto"
+          }
+        },
+        "required": [
+          "orderId",
+          "orderLabel",
+          "clientId",
+          "clientCode",
+          "status",
+          "consignee",
+          "packages",
+          "grossWeightGrams"
+        ]
+      },
+      "FreightCandidatesResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FreightCandidateDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "More than 2,000 orders matched — narrow the filters"
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor",
+          "truncated"
+        ]
+      },
+      "FreightReasonDto": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "description": "1–200 characters"
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "FreightOrderIdsDto": {
+        "type": "object",
+        "properties": {
+          "orderIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "orderIds"
+        ]
+      },
+      "FreightScanDto": {
+        "type": "object",
+        "properties": {
+          "packageCode": {
+            "type": "string",
+            "description": "The package label scanned (carton or pallet code), or a one-package order’s parcel tag"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "load",
+              "unload"
+            ]
+          },
+          "occurredAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "The handheld’s scan time (required on the device; 400 on the web)"
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true,
+            "description": "Required for an unload (1–200)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "A55 — the device’s warehouse (from its snapshot; required on the device)"
+          }
+        },
+        "required": [
+          "packageCode",
+          "action"
+        ]
+      },
+      "FreightScanViewDto": {
+        "type": "object",
+        "properties": {
+          "packageCode": {
+            "type": "string"
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "loaded",
+              "unloaded"
+            ]
+          }
+        },
+        "required": [
+          "packageCode",
+          "orderId",
+          "status"
+        ]
+      },
+      "FreightProgressDto": {
+        "type": "object",
+        "properties": {
+          "consignmentId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "loaded": {
+            "type": "number"
+          },
+          "total": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "consignmentId",
+          "loaded",
+          "total"
+        ]
+      },
+      "FreightScanResponse": {
+        "type": "object",
+        "properties": {
+          "scan": {
+            "$ref": "#/components/schemas/FreightScanViewDto"
+          },
+          "alreadyLoaded": {
+            "type": "boolean",
+            "description": "A scan of a package already loaded (another device, or a re-scan): a no-op"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/FreightProgressDto"
+          }
+        },
+        "required": [
+          "scan",
+          "alreadyLoaded",
+          "progress"
+        ]
+      },
+      "FreightDispatchConsignmentDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "dispatch",
+              "leave"
+            ]
+          },
+          "lrNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "lrDate": {
+            "type": "string",
+            "nullable": true,
+            "format": "date"
+          },
+          "freightTerms": {
+            "type": "string",
+            "enum": [
+              "paid",
+              "to-pay",
+              "tbb",
+              null
+            ],
+            "nullable": true
+          },
+          "unscannedAcknowledged": {
+            "type": "boolean",
+            "nullable": true,
+            "description": "Web: send it with packages unscanned (recorded as a load exception)"
+          }
+        },
+        "required": [
+          "orderId",
+          "decision"
+        ]
+      },
+      "DispatchFreightLoadDto": {
+        "type": "object",
+        "properties": {
+          "vehicleNumber": {
+            "type": "string"
+          },
+          "vehicleType": {
+            "type": "string",
+            "enum": [
+              "tempo",
+              "lcv",
+              "mcv",
+              "hcv",
+              "trailer",
+              "container-20",
+              "container-40",
+              "other",
+              null
+            ],
+            "nullable": true
+          },
+          "containerNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "driverName": {
+            "type": "string"
+          },
+          "driverPhone": {
+            "type": "string",
+            "nullable": true
+          },
+          "driverLicenceNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "seals": {
+            "description": "≤ 5 seal numbers, unique",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "departedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "Web: when the truck left (default now; up to 7 days back, never before its loading)"
+          },
+          "occurredAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "Device: when the truck left (required on the device)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "A55 — the device’s warehouse (required on the device)"
+          },
+          "ewayPartBConfirmed": {
+            "type": "boolean",
+            "nullable": true,
+            "description": "The e-way bills were updated with this vehicle (Part B)"
+          },
+          "overCapacityAcknowledged": {
+            "type": "boolean",
+            "nullable": true,
+            "description": "A66 — web: send it over the stated capacity"
+          },
+          "consignments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FreightDispatchConsignmentDto"
+            }
+          },
+          "photoRefs": {
+            "description": "Device: the signed loading-sheet photos (≤ 10 ULIDs)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "note": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "vehicleNumber",
+          "driverName",
+          "consignments"
+        ]
+      },
+      "FreightDispatchedEntryDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "consignmentId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "lrNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "loadException": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "packages-unscanned",
+              "not-on-device-list",
+              null
+            ]
+          },
+          "complianceException": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "consignment-documents-missing",
+              "eway-bill-required",
+              "eway-bill-expired",
+              null
+            ]
+          },
+          "followOnOrderId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "orderId",
+          "consignmentId",
+          "lrNumber",
+          "loadException",
+          "complianceException",
+          "followOnOrderId"
+        ]
+      },
+      "FreightLeftEntryDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "orderId",
+          "reason"
+        ]
+      },
+      "FreightRefusedEntryDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "consignment-removed",
+              "order-not-ready",
+              "order-already-dispatched",
+              "client-departed",
+              "packages-not-loaded",
+              "order-holds-recalled-batch",
+              "consignment-documents-missing",
+              "eway-bill-required",
+              "eway-bill-expired",
+              "order-not-found",
+              "warehouse-mismatch",
+              "order-not-open",
+              "order-on-freight-load",
+              "order-has-courier-shipment"
+            ]
+          },
+          "detail": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "orderId",
+          "code",
+          "detail"
+        ]
+      },
+      "FreightDispatchResponse": {
+        "type": "object",
+        "properties": {
+          "load": {
+            "$ref": "#/components/schemas/FreightLoadViewDto"
+          },
+          "dispatched": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FreightDispatchedEntryDto"
+            }
+          },
+          "left": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FreightLeftEntryDto"
+            }
+          },
+          "refused": {
+            "description": "Device only: the orders that left but were not dispatched (one review row)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FreightRefusedEntryDto"
+            }
+          },
+          "rejectedOpId": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "load",
+          "dispatched",
+          "left",
+          "refused",
+          "rejectedOpId"
+        ]
+      },
+      "UpdateFreightLoadDto": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "ftl",
+              "ltl"
+            ]
+          },
+          "transporter": {
+            "$ref": "#/components/schemas/FreightTransporterDto"
+          },
+          "vehicleType": {
+            "type": "string",
+            "enum": [
+              "tempo",
+              "lcv",
+              "mcv",
+              "hcv",
+              "trailer",
+              "container-20",
+              "container-40",
+              "other",
+              null
+            ],
+            "nullable": true
+          },
+          "vehicleNumber": {
+            "type": "string",
+            "nullable": true,
+            "description": "Spaces, dots and hyphens stripped, upper-cased; 4–15 letters or digits"
+          },
+          "containerNumber": {
+            "type": "string",
+            "nullable": true,
+            "description": "1–11 letters or digits"
+          },
+          "vehicleCapacityKg": {
+            "type": "number",
+            "nullable": true,
+            "description": "Kilograms, 1–60,000"
+          },
+          "driverName": {
+            "type": "string",
+            "nullable": true,
+            "description": "1–80 characters"
+          },
+          "driverPhone": {
+            "type": "string",
+            "nullable": true,
+            "description": "7–15 digits, optionally with a leading +"
+          },
+          "driverLicenceNumber": {
+            "type": "string",
+            "nullable": true,
+            "description": "Upper-cased, spaces and hyphens stripped; 6–20 letters or digits"
+          },
+          "dockDoor": {
+            "type": "string",
+            "nullable": true,
+            "description": "1–20 letters, digits or hyphens (2-3b’s door code, or typed)"
+          },
+          "vehicleReportedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the truck reported, within the last 7 days"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "description": "1–500 characters"
+          }
+        },
+        "required": [
+          "mode",
+          "transporter"
+        ]
+      },
+      "RecordFreightLrDto": {
+        "type": "object",
+        "properties": {
+          "lrNumber": {
+            "type": "string"
+          },
+          "lrDate": {
+            "type": "string",
+            "nullable": true,
+            "format": "date"
+          },
+          "freightTerms": {
+            "type": "string",
+            "enum": [
+              "paid",
+              "to-pay",
+              "tbb",
+              null
+            ],
+            "nullable": true
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true,
+            "description": "Required to change the LR after departure"
+          }
+        },
+        "required": [
+          "lrNumber"
+        ]
+      },
+      "FreightConsignmentSnapshotDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "loadId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "planned",
+              "removed",
+              "dispatched"
+            ]
+          },
+          "consignmentRef": {
+            "type": "string"
+          },
+          "lr": {
+            "$ref": "#/components/schemas/FreightLrDto"
+          },
+          "delivery": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/FreightDeliveryDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "orderId",
+          "loadId",
+          "status",
+          "consignmentRef",
+          "lr",
+          "delivery"
+        ]
+      },
+      "FreightConsignmentResponse": {
+        "type": "object",
+        "properties": {
+          "consignment": {
+            "$ref": "#/components/schemas/FreightConsignmentSnapshotDto"
+          },
+          "unchanged": {
+            "type": "boolean",
+            "description": "Present (true) on the unchanged no-op (200)"
+          }
+        },
+        "required": [
+          "consignment"
+        ]
+      },
+      "RecordFreightDeliveryDto": {
+        "type": "object",
+        "properties": {
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "delivered",
+              "delivered-with-exceptions",
+              "refused"
+            ]
+          },
+          "deliveredAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "receiverName": {
+            "type": "string",
+            "nullable": true
+          },
+          "shortPackageCount": {
+            "type": "number",
+            "nullable": true
+          },
+          "damagedPackageCount": {
+            "type": "number",
+            "nullable": true
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "description": "Required with exceptions or a refusal (1–500)"
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true,
+            "description": "Required to amend a recorded delivery (orders.manage)"
+          }
+        },
+        "required": [
+          "outcome",
+          "deliveredAt"
         ]
       },
       "WithdrawConsignmentDto": {
@@ -62137,6 +66053,31 @@
           "packedAt"
         ]
       },
+      "ConsignmentExceptionFreightDto": {
+        "type": "object",
+        "properties": {
+          "consignmentId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "loadId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "loadCode": {
+            "type": "string"
+          },
+          "dispatchedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "consignmentId",
+          "loadId",
+          "loadCode",
+          "dispatchedAt"
+        ]
+      },
       "ConsignmentExceptionRowDto": {
         "type": "object",
         "properties": {
@@ -62156,7 +66097,9 @@
           },
           "shipmentId": {
             "type": "string",
-            "format": "uuid"
+            "nullable": true,
+            "format": "uuid",
+            "description": "The flagged handover shipment; null on a truck consignment’s row (4-9a)"
           },
           "handoverId": {
             "type": "string",
@@ -62191,6 +66134,14 @@
               "not-required"
             ],
             "description": "Re-judged on the handover day"
+          },
+          "freight": {
+            "description": "Story 4-9a (A20) — a truck consignment that left without the documents; absent on a handover row",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ConsignmentExceptionFreightDto"
+              }
+            ]
           }
         },
         "required": [
@@ -65072,6 +69023,128 @@
           "shipment"
         ]
       },
+      "CatalogFreightConsignmentDto": {
+        "type": "object",
+        "properties": {
+          "consignmentId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLabel": {
+            "type": "string"
+          },
+          "parcelTagCode": {
+            "type": "string",
+            "description": "The order’s parcel tag (O + 16 hex) — the prefix of every package code"
+          },
+          "packSeq": {
+            "type": "number",
+            "nullable": true,
+            "description": "The live pack’s number (1 for a pack recorded before 4-5a); null when not packed"
+          },
+          "packageCount": {
+            "type": "number",
+            "nullable": true,
+            "description": "Packages in the live pack; null when not packed"
+          },
+          "palletCount": {
+            "type": "number"
+          },
+          "stopSeq": {
+            "type": "number"
+          },
+          "lrNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "consignment": {
+            "description": "4-6a’s verdict today; absent when the national threshold is missing",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CatalogDispatchParcelConsignmentDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "consignmentId",
+          "orderId",
+          "clientId",
+          "orderLabel",
+          "parcelTagCode",
+          "packSeq",
+          "packageCount",
+          "palletCount",
+          "stopSeq",
+          "lrNumber"
+        ]
+      },
+      "CatalogFreightLoadDto": {
+        "type": "object",
+        "properties": {
+          "loadId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "ftl",
+              "ltl"
+            ]
+          },
+          "transporterName": {
+            "type": "string"
+          },
+          "vehicleNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "driverName": {
+            "type": "string",
+            "nullable": true
+          },
+          "dockDoor": {
+            "type": "string",
+            "nullable": true
+          },
+          "consignments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogFreightConsignmentDto"
+            }
+          },
+          "loadedCodes": {
+            "description": "The package codes loaded so far (live scans)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "loadId",
+          "code",
+          "mode",
+          "transporterName",
+          "vehicleNumber",
+          "driverName",
+          "dockDoor",
+          "consignments",
+          "loadedCodes"
+        ]
+      },
       "CatalogSnapshotResponse": {
         "type": "object",
         "properties": {
@@ -65266,6 +69339,17 @@
           "packCartons": {
             "type": "boolean",
             "description": "Story 4-5a (A32, additive): true when this server records cartons on a pack — the handheld offers New carton only then. Absent from an older server (which would drop `cartons` from a synced pack): one carton only"
+          },
+          "freightLoads": {
+            "description": "Story 4-9a (A23, A56, additive): the warehouse's open freight loads, newest first, at most 50 — the Truck loading task: each load's planned consignments (parcel tag, live pack number and package count, its 4-6a consignment verdict) and the package codes already loaded. An older server omits it (the device reads it as empty)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogFreightLoadDto"
+            }
+          },
+          "freightLoadsTruncated": {
+            "type": "boolean",
+            "description": "Story 4-9a (A56, additive): true when more than 50 loads are open or the loaded codes would pass 20,000 — load the others from the web"
           }
         },
         "required": [
@@ -75946,6 +80030,7 @@
               "batch_alert",
               "batch_recall",
               "courier_handover",
+              "freight_load",
               "bin",
               "bin_move",
               "carrier_connection",
@@ -76056,6 +80141,7 @@
               "batch_alert",
               "batch_recall",
               "courier_handover",
+              "freight_load",
               "bin",
               "bin_move",
               "carrier_connection",
@@ -76967,7 +81053,8 @@
                 "receipt.recorded",
                 "order.dispatched",
                 "shipment.documents",
-                "consignment.documents-needed"
+                "consignment.documents-needed",
+                "delivery.recorded"
               ]
             }
           },
@@ -77054,7 +81141,8 @@
                 "receipt.recorded",
                 "order.dispatched",
                 "shipment.documents",
-                "consignment.documents-needed"
+                "consignment.documents-needed",
+                "delivery.recorded"
               ]
             }
           }
@@ -77119,7 +81207,8 @@
                 "receipt.recorded",
                 "order.dispatched",
                 "shipment.documents",
-                "consignment.documents-needed"
+                "consignment.documents-needed",
+                "delivery.recorded"
               ]
             }
           }
@@ -77191,7 +81280,8 @@
                 "receipt.recorded",
                 "order.dispatched",
                 "shipment.documents",
-                "consignment.documents-needed"
+                "consignment.documents-needed",
+                "delivery.recorded"
               ]
             }
           }
@@ -77357,7 +81447,8 @@
               "type": "string",
               "enum": [
                 "receipt.recorded",
-                "order.dispatched"
+                "order.dispatched",
+                "order.delivered"
               ]
             }
           },
@@ -77497,7 +81588,8 @@
               "type": "string",
               "enum": [
                 "receipt.recorded",
-                "order.dispatched"
+                "order.dispatched",
+                "order.delivered"
               ]
             }
           }
@@ -77531,7 +81623,8 @@
               "type": "string",
               "enum": [
                 "receipt.recorded",
-                "order.dispatched"
+                "order.dispatched",
+                "order.delivered"
               ]
             }
           },
@@ -77673,7 +81766,8 @@
               "type": "string",
               "enum": [
                 "receipt.recorded",
-                "order.dispatched"
+                "order.dispatched",
+                "order.delivered"
               ]
             }
           },
@@ -77768,13 +81862,14 @@
             "type": "string",
             "enum": [
               "receipt.recorded",
-              "order.dispatched"
+              "order.dispatched",
+              "order.delivered"
             ]
           },
           "subjectId": {
             "type": "string",
             "format": "uuid",
-            "description": "The receipt (GRN) id or the order id"
+            "description": "The receipt (GRN) id, the order id, or (order.delivered) an id derived from the consignment id and its deliverySeq — stable per recorded version, stored on no row (the body’s orderId names the order)"
           },
           "status": {
             "type": "string",
@@ -77925,13 +82020,14 @@
             "type": "string",
             "enum": [
               "receipt.recorded",
-              "order.dispatched"
+              "order.dispatched",
+              "order.delivered"
             ]
           },
           "subjectId": {
             "type": "string",
             "format": "uuid",
-            "description": "The receipt (GRN) id or the order id"
+            "description": "The receipt (GRN) id, the order id, or (order.delivered) an id derived from the consignment id and its deliverySeq — stable per recorded version, stored on no row (the body’s orderId names the order)"
           },
           "status": {
             "type": "string",
@@ -81519,6 +85615,38 @@
           "nextCursor"
         ]
       },
+      "PortalOrderFreightDto": {
+        "type": "object",
+        "properties": {
+          "lrNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "transporterName": {
+            "type": "string"
+          },
+          "deliveredAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "outcome": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "delivered",
+              "delivered-with-exceptions",
+              "refused",
+              null
+            ]
+          }
+        },
+        "required": [
+          "lrNumber",
+          "transporterName",
+          "deliveredAt",
+          "outcome"
+        ]
+      },
       "PortalOrderRowDto": {
         "type": "object",
         "properties": {
@@ -81636,6 +85764,14 @@
           "courierName": {
             "type": "string",
             "description": "Story 4-4a — the courier of the order’s live shipment; absent when it has none"
+          },
+          "freight": {
+            "description": "Story 4-9a (A22) — the truck it left on: its LR, transporter and delivery; absent when none",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PortalOrderFreightDto"
+              }
+            ]
           }
         },
         "required": [
@@ -82129,6 +86265,14 @@
             "type": "string",
             "description": "Story 4-4a — the courier of the order’s live shipment; absent when it has none"
           },
+          "freight": {
+            "description": "Story 4-9a (A22) — the truck it left on: its LR, transporter and delivery; absent when none",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PortalOrderFreightDto"
+              }
+            ]
+          },
           "lines": {
             "type": "array",
             "items": {
@@ -82247,6 +86391,97 @@
           "totals"
         ]
       },
+      "PortalFreightBlockDto": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "planned",
+              "dispatched",
+              "delivered",
+              "delivered-with-exceptions",
+              "refused"
+            ]
+          },
+          "consignmentRef": {
+            "type": "string"
+          },
+          "transporterName": {
+            "type": "string"
+          },
+          "vehicleNumber": {
+            "type": "string"
+          },
+          "containerNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "seals": {
+            "nullable": true,
+            "description": "FTL only",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "driverName": {
+            "type": "string"
+          },
+          "lrNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "lrDate": {
+            "type": "string",
+            "nullable": true
+          },
+          "freightTerms": {
+            "type": "string",
+            "nullable": true
+          },
+          "packageCount": {
+            "type": "number"
+          },
+          "palletCount": {
+            "type": "number"
+          },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true
+          },
+          "dispatchedAt": {
+            "type": "string"
+          },
+          "deliveredAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "receiverName": {
+            "type": "string",
+            "nullable": true
+          },
+          "shortPackageCount": {
+            "type": "number",
+            "nullable": true
+          },
+          "damagedPackageCount": {
+            "type": "number",
+            "nullable": true
+          },
+          "deliveryNote": {
+            "type": "string",
+            "nullable": true
+          },
+          "noteAvailable": {
+            "type": "boolean",
+            "description": "The freight note downloads"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
       "PortalOrderShippingResponse": {
         "type": "object",
         "properties": {
@@ -82264,7 +86499,12 @@
               "ready-for-pickup",
               "handed-over",
               "shipped",
-              "shipped-no-courier-record"
+              "shipped-no-courier-record",
+              "freight-planned",
+              "freight-dispatched",
+              "delivered",
+              "delivered-with-exceptions",
+              "delivery-refused"
             ]
           },
           "courierName": {
@@ -82328,6 +86568,16 @@
           "packingSlipAvailable": {
             "type": "boolean",
             "description": "Story 4-5a — the packing slip can be downloaded (packed or dispatched)"
+          },
+          "freight": {
+            "nullable": true,
+            "description": "Story 4-9a (A22) — the order’s truck: only its status while planned; null when none",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PortalFreightBlockDto"
+              }
+            ]
           }
         },
         "required": [

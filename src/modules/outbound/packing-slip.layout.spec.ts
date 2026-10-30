@@ -228,6 +228,25 @@ describe('layoutPackingSlip (A17, A35)', () => {
     expect(allText(layoutPackingSlip(doc(), { audience: 'staff' }))).not.toContain(SLIP_PARTIES_LIVE);
   });
 
+  it('story 4-9a (A24) — a pallet reads "Pallet n of N — STC n cartons", the count line names pallets and cartons; a carton-only pack keeps 4-5a\'s words (golden)', () => {
+    const base = doc();
+    const mixed = doc({
+      cartons: [{ ...base.cartons[0]!, packageType: 'pallet', innerCount: 40, weightGrams: 400_000 }, { ...base.cartons[1]! }],
+      grossWeightGrams: 402_800,
+    });
+    const staff = textsOf(layoutPackingSlip(mixed, { audience: 'staff' })).flat();
+    expect(staff).toContain(`Pallet 1 of 2 — STC 40 cartons — 400.00 kg — 40 x 30 x 20 cm — ${TAG}.1.1`);
+    expect(staff).toContain(`Carton 2 of 2 — 2.80 kg — ${TAG}.1.2`);
+    expect(staff.find((text) => text.startsWith('Packages 2'))).toBe('Packages 2 (1 pallet, 1 carton) · Gross weight 402.80 kg · Packed 10 EA, 2.500 KG');
+    const client = textsOf(layoutPackingSlip(mixed, { audience: 'client' })).flat();
+    expect(client).toContain('Pallet 1 of 2 — STC 40 cartons — 400.00 kg — 40 x 30 x 20 cm');
+    expect(client.join('\n')).not.toMatch(/Carton 1 of 2/);
+    // A carton-only pack prints 4-5a's words, byte for byte.
+    const plain = textsOf(layoutPackingSlip(base, { audience: 'staff' })).flat();
+    expect(plain).toContain(`Carton 1 of 2 — 3.20 kg — 40 x 30 x 20 cm — ${TAG}.1.1`);
+    expect(plain.find((text) => text.startsWith('Cartons 2'))).toBe('Cartons 2 · Gross weight 6.00 kg · Packed 10 EA, 2.500 KG');
+  });
+
   it('a warehouse with no address prints "—" (A45)', () => {
     const base = doc();
     const text = allText(layoutPackingSlip(doc({ warehouse: { ...base.warehouse, address: null } }), { audience: 'client' }));

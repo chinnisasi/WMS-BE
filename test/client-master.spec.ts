@@ -428,6 +428,12 @@ describe('story 1-2a: the client master record', () => {
       // by design (`client-wind-down.ts` untouched).
       expect(opTypes.filter((type) => !(SKU_NAMING_OP_TYPES as readonly string[]).includes(type)).sort()).toEqual([
         'excursion.record',
+        // Story 4-9a — a truck's departure, a package scan and a sheet photo
+        // name orders, package codes and refs (several clients' on one load):
+        // no SKU.
+        'freight-photo.stage',
+        'freight.dispatch',
+        'freight.load-scan',
         'gate-in.unload',
         // Story 4-4a — a handover names orders and AWBs (one client's, in its
         // header), a sheet photo its ref, a label scan its order: no SKU.

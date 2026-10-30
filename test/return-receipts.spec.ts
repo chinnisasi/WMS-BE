@@ -917,7 +917,9 @@ describe('return receipts (e2e, story 13-2)', () => {
     // Story 4-7c adds the device-uploaded Discard-only `rtc.pick` (the rtv.pick shape).
     const discardOnly = new Set(['return.receive', 'grn.lines-refused', 'grn.inactive-sku-received', 'gate-in.unload', 'receipt-photo.stage', 'return.restock', 'rtv.pick', 'return.receive_blind', 'rtc.pick',
       // Story 4-4a — the label scan, the handover (server-raised or uploaded) and its sheet photo: Discard only.
-      'shipment.verify-label', 'handover.create', 'handover-photo.stage']);
+      'shipment.verify-label', 'handover.create', 'handover-photo.stage',
+      // Story 4-9a — a package scan, a departure and its sheet photo: Discard only.
+      'freight.load-scan', 'freight.dispatch', 'freight-photo.stage']);
     for (const type of REJECTED_OP_TYPES) {
       const expected =
         // Story 3-1 adds the device-uploaded `stock.move` — apply + discard (a

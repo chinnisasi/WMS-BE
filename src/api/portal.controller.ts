@@ -563,6 +563,38 @@ export class PortalController {
     res.end(file.body);
   }
 
+  @Get(':tenantId/portal/orders/:orderId/freight-note')
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Story 4-9a (A22, A26) — this order’s freight note as an A4 PDF, once its truck has left: the brand c/o the warehouse, the consignee, the transporter, the vehicle, the LR, the packages and the receipt block the consignee signs. Named `{consignment ref}-freight-note.pdf`',
+  })
+  @ApiProduces('application/pdf')
+  @ApiResponse({ status: 200, description: 'The PDF', content: { 'application/pdf': { schema: { type: 'string', format: 'binary' } } } })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed orderId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("No dispatched truck consignment of this client's order — unknown, another client's, or not left yet (not-found)") })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async orderFreightNote(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @CurrentPortalSession() session: PortalSession,
+    @Res() res: Response,
+  ): Promise<void> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const file = await this.outbound.portalFreightNote(tenantId, session.clientId, orderId);
+    res.status(200);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Length', String(file.body.length));
+    res.setHeader('Content-Disposition', `attachment; filename="${file.fileName}"`);
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(file.body);
+  }
+
   @Post(':tenantId/portal/orders/:orderId/shipment/client-label')
   @HttpCode(HttpStatus.CREATED)
   @UseGuards(PortalSessionGuard)

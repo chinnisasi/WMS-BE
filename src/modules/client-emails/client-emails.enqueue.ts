@@ -7,7 +7,7 @@ import { DATABASE } from '../../shared/shared.module';
 import { isTransientDbError } from '../../shared/db/transient-error';
 import { uuidv7TimestampMs } from '../../shared/primitives/ids';
 import { istDateOf } from '../../shared/primitives/time';
-import { decodeDispatch, decodeReceipt } from '../../shared/primitives/client-event-facts';
+import { decodeDelivery, decodeDispatch, decodeReceipt } from '../../shared/primitives/client-event-facts';
 import {
   CLIENT_EMAIL_EVENT_TEMPLATE,
   getClientInTx,
@@ -22,6 +22,7 @@ import { InboundFacade } from '../inbound/inbound.facade';
 import {
   clientEmailCountsTodayInTx,
   queueClientEmailInTx,
+  type ClientDeliveryUpdateEmailParams,
   type ClientDispatchEmailParams,
   type ClientDocumentsNeededEmailParams,
   type ClientReceiptEmailParams,
@@ -36,6 +37,7 @@ import {
   type ClientEmailSourceEvent,
 } from './client-email-rules';
 import {
+  buildDeliveryUpdateEmailParams,
   buildDispatchEmailParams,
   buildDocumentsNeededEmailParams,
   buildReceiptEmailParams,
@@ -43,8 +45,11 @@ import {
   clientEmailDedupeKey,
   decodeDocumentShared,
   decodePackedOrderId,
+  deliverySubjectId,
   qcHeldLinesOf,
 } from './client-email-params';
+// Story 4-9a (A27, A69) — the freight facts' free-function seam (guide §7h): the frozen carriage, the order's label and city.
+import { deliveryOrderFactsInTx, dispatchedFreightCarriageOfOrderInTx } from '../outbound/freight-carriage.read';
 // Story 4-6a (A12, A20) — the record's seam (guide §7h): never the invoicing module.
 import { dispatchedConsignmentRecordsOfOrdersInTx } from '../invoicing/consignment-seam';
 
@@ -65,7 +70,9 @@ export type ClientEmailSkipReason =
   // arrived), or the gate could not be read (a data fault — acked, never rethrown).
   | 'not-open'
   | 'not-blocking'
-  | 'gate-unreadable';
+  | 'gate-unreadable'
+  // Story 4-9a — the delivered consignment's order is gone.
+  | 'order-gone';
 
 /** What one delivery did (the suites read it). */
 export type ClientEmailOutcome =
@@ -175,20 +182,25 @@ export class ClientEmailsEnqueueHandler implements OnModuleInit {
     const document = publicEvent === 'shipment.documents' ? decodeDocumentShared(event.payload) : null;
     // Story 4-6a (A20) — a packed order: the reminder is judged at delivery.
     const packedOrderId = publicEvent === 'consignment.documents-needed' ? decodePackedOrderId(event.payload) : null;
-    if (receipt === null && dispatch === null && document === null && packedOrderId === null) {
+    // Story 4-9a (A27) — a freight consignment's delivery: the payload names its client and every fact.
+    const delivery = publicEvent === 'delivery.recorded' ? decodeDelivery(event.payload) : null;
+    if (receipt === null && dispatch === null && document === null && packedOrderId === null && delivery === null) {
       this.logger.error(`client-email.malformed type=${event.type} tenant=${tenantId} event=${event.eventId} — no mail, acking`);
       return { kind: 'malformed' };
     }
 
     // 1. The client: on the receipt; through the order for a dispatch.
     const orderSubject = packedOrderId ?? dispatch?.orderId ?? null;
-    const subjectId = receipt !== null ? receipt.grnId : document !== null ? document.attachmentId : orderSubject!;
+    const subjectId =
+      receipt !== null ? receipt.grnId : document !== null ? document.attachmentId : delivery !== null ? deliverySubjectId(delivery) : orderSubject!;
     const clientId =
       receipt !== null
         ? receipt.clientId
         : document !== null
           ? document.clientId
-          : ((await this.outbound.orderClientIdsInTx(tx, tenantId, [orderSubject!])).get(orderSubject!) ?? null);
+          : delivery !== null
+            ? delivery.clientId
+            : ((await this.outbound.orderClientIdsInTx(tx, tenantId, [orderSubject!])).get(orderSubject!) ?? null);
     if (clientId === null) return skip('no-client', null);
 
     // 2. Missing, the tenant's own `self`, or departed: no mail. Existence is
@@ -216,8 +228,17 @@ export class ClientEmailsEnqueueHandler implements OnModuleInit {
       clientName: client.name,
       replyTo: client.emailReplyTo ?? null,
     };
-    let params: ClientReceiptEmailParams | ClientDispatchEmailParams | ClientShipmentDocumentEmailParams | ClientDocumentsNeededEmailParams;
-    if (packedOrderId !== null) {
+    let params:
+      | ClientReceiptEmailParams
+      | ClientDispatchEmailParams
+      | ClientShipmentDocumentEmailParams
+      | ClientDocumentsNeededEmailParams
+      | ClientDeliveryUpdateEmailParams;
+    if (delivery !== null) {
+      const order = await deliveryOrderFactsInTx(tx, tenantId, delivery.orderId);
+      if (order === null) return skip('order-gone', clientId);
+      params = buildDeliveryUpdateEmailParams(delivery, order, names);
+    } else if (packedOrderId !== null) {
       // Story 4-6a (A20, A36, A47) — the gate read AT DELIVERY (a reminder
       // about something already recorded would be wrong — the deliberate
       // exception to "facts frozen at the event"). Contained: any
@@ -274,7 +295,9 @@ export class ClientEmailsEnqueueHandler implements OnModuleInit {
       const kitParentLineIds = await this.outbound.kitParentLineIdsInTx(tx, tenantId, fact.lines.map((line) => line.orderLineId));
       // Story 4-6a (A20) — the version the goods left under (stamped, immutable).
       const stamped = (await dispatchedConsignmentRecordsOfOrdersInTx(tx, tenantId, [fact.orderId], new Map([[fact.orderId, fact.dispatchedAt]]))).get(fact.orderId) ?? null;
-      params = buildDispatchEmailParams(fact, { ...names, warehouseName, skus, kitParentLineIds }, stamped);
+      // Story 4-9a (A27, A69) — the truck it left on (the carriage snapshot is written once, at departure).
+      const freight = await dispatchedFreightCarriageOfOrderInTx(tx, tenantId, fact.orderId);
+      params = buildDispatchEmailParams(fact, { ...names, warehouseName, skus, kitParentLineIds }, stamped, freight);
     }
 
     // 6. One row per recipient; a re-delivered event finds every key taken.
@@ -315,7 +338,16 @@ export class ClientEmailsEnqueueHandler implements OnModuleInit {
                   dedupeKey,
                   params: params as ClientDocumentsNeededEmailParams,
                 })
-              : await queueClientEmailInTx(tx, {
+              : template === 'client-delivery-update'
+                ? await queueClientEmailInTx(tx, {
+                    tenantId,
+                    clientId,
+                    template,
+                    to: recipient.email,
+                    dedupeKey,
+                    params: params as ClientDeliveryUpdateEmailParams,
+                  })
+                : await queueClientEmailInTx(tx, {
                 tenantId,
                 clientId,
                 template,

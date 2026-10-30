@@ -94,6 +94,15 @@ export interface CartonLabelInput {
   readonly extraLines?: readonly string[];
   /** 4-10a's seam (the UN number and hazard class). */
   readonly marks?: readonly string[];
+  /** Story 4-9a (A24) — `pallet` prints `PALLET` in the box; absent or `carton` prints `CARTON` (byte-identical). */
+  readonly packageType?: 'carton' | 'pallet';
+  /** Story 4-9a (A24) — a pallet's "said to contain" count: the order band prints `STC {n} CARTONS`. */
+  readonly innerCount?: number | null;
+}
+
+/** Story 4-9a (A24) — `STC 600 CARTONS` (`STC 1 CARTON`), or null when no inner count is set. */
+export function stcText(innerCount: number | null | undefined): string | null {
+  return innerCount === null || innerCount === undefined ? null : `STC ${innerCount} ${innerCount === 1 ? 'CARTON' : 'CARTONS'}`;
 }
 
 /** `125000` paise → `Rs 1,250.00` — Indian digit grouping (x,xx,xxx.xx), integer arithmetic. */
@@ -205,7 +214,7 @@ export function courierBand(courierName: string | null, awb: string | null, band
 /** Story 4-5a — the carton label. */
 export function cartonLabel(input: CartonLabelInput): ShippingLabel {
   const fields: ShippingField[] = [];
-  fields.push(...fromBand(input.shipper, 'CARTON', input.cartonNo, input.cartonCount));
+  fields.push(...fromBand(input.shipper, input.packageType === 'pallet' ? 'PALLET' : 'CARTON', input.cartonNo, input.cartonCount));
   fields.push(ruleField(165));
   fields.push(...toBand(input.consignee));
   fields.push(ruleField(570));
@@ -221,31 +230,39 @@ export function cartonLabel(input: CartonLabelInput): ShippingLabel {
   const showRef = input.clientOrderRef !== null && input.clientOrderRef.trim() !== '' && input.clientOrderRef !== input.orderLabel;
   // The order and its ref beside the payment; the dates and measurements
   // below it, across the full width (the payment box ends at 666).
-  const head = stack(
-    'order',
-    X,
-    586,
-    leftWidth,
-    [
-      { h: 40, lines: fitText(`ORDER ${input.orderLabel}`, 40, leftWidth, 1), bold: true },
-      { h: 28, lines: showRef ? fitText(`Ref ${input.clientOrderRef}`, 28, leftWidth, 1) : [] },
-    ],
-    GAP,
-  );
-  fields.push(...head.fields);
-  fields.push(
-    ...stack(
+  // Story 4-9a (A24) — a pallet's inner count: its own 28-dot line beside
+  // the payment when the band has room; otherwise (a Ref line too) it joins
+  // the measurements line, so the band never overflows (the stated drop order).
+  const stc = stcText(input.innerCount);
+  const build = (stcOwnLine: boolean) => {
+    const head = stack(
+      'order',
+      X,
+      586,
+      leftWidth,
+      [
+        { h: 40, lines: fitText(`ORDER ${input.orderLabel}`, 40, leftWidth, 1), bold: true },
+        { h: 28, lines: showRef ? fitText(`Ref ${input.clientOrderRef}`, 28, leftWidth, 1) : [] },
+        { h: 28, lines: stc !== null && stcOwnLine ? fitText(stc, 28, leftWidth, 1) : [] },
+      ],
+      GAP,
+    );
+    const measured = stc !== null && !stcOwnLine ? [measures, stc].filter((part) => part !== '').join(' | ') : measures;
+    const low = stack(
       'order',
       X,
       Math.max(head.bottom + GAP, 672),
       W,
       [
         { h: 28, lines: fitText(packed, 28, W, 1) },
-        { h: 32, lines: measures === '' ? [] : fitText(measures, 32, W, 1) },
+        { h: 32, lines: measured === '' ? [] : fitText(measured, 32, W, 1) },
       ],
       GAP,
-    ).fields,
-  );
+    );
+    return { fields: [...head.fields, ...low.fields], bottom: low.bottom };
+  };
+  const ownLine = build(true);
+  fields.push(...(stc === null || ownLine.bottom <= 754 ? ownLine : build(false)).fields);
   if (input.payment !== null) {
     if (input.payment.kind === 'prepaid') {
       const prepaid = singleText('order', payX, 596, 56, payW, 'PREPAID', true);

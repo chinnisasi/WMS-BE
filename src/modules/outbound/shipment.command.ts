@@ -1,3 +1,4 @@
+import { assertNotOnFreightLoadInTx } from './freight.read';
 import { Inject, Injectable } from '@nestjs/common';
 import { and, eq, ne } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
@@ -237,6 +238,8 @@ export class ShipmentCommandService {
           `Order "${order.id}" reads "${order.status}" — only a packed (ready_to_dispatch) order is labelled.`,
         );
       }
+      // Story 4-9a (A19) — an order planned on a truck takes no carrier label.
+      await assertNotOnFreightLoadInTx(tx, command.tenantId, order);
 
       // ── the shipment guard: one label per order, ever ───────────────────
       // Any existing row for the order refuses — `labelled` (no regeneration)

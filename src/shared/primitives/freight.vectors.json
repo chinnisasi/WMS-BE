@@ -1,0 +1,38 @@
+{
+  "comment": "Story 4-9a (A8, D9) — shared freight vectors. Copied byte for byte beside wms-be src/shared/primitives/freight.ts, wms-fe src/lib/freight-primitives.ts and wms-mobile src/lib/freight.ts; each spec pins this file's sha256. Seals trim and upper-case; a driver licence upper-cases and strips spaces and hyphens; an LR normalises as an AWB and is refused as a parcel tag, a package label or anything outside 4-50 of A-Z 0-9 /; parsePackageScan trims and upper-cases, reads a full package code as is, and resolves a bare parcel tag only for a one-package order.",
+  "seal": [
+    { "input": " s-991 ", "normalized": "S-991", "valid": true },
+    { "input": "ab/12", "normalized": "AB/12", "valid": true },
+    { "input": "seal 1", "normalized": "SEAL 1", "valid": false },
+    { "input": "", "normalized": "", "valid": false },
+    { "input": "1234567890123456789012345678901", "normalized": "1234567890123456789012345678901", "valid": false }
+  ],
+  "licence": [
+    { "input": "ka01 2019-0001234", "normalized": "KA0120190001234", "valid": true },
+    { "input": "DL-14", "normalized": "DL14", "valid": false },
+    { "input": "MH12 20110012345678901", "normalized": "MH1220110012345678901", "valid": false }
+  ],
+  "lr": [
+    { "input": " 4410 ", "normalized": "4410", "problem": false },
+    { "input": "vrl/blr-0042", "normalized": "VRL/BLR0042", "problem": false },
+    { "input": "lr-1234 5678", "normalized": "LR12345678", "problem": false },
+    { "input": "O0123456789ABCDEF", "normalized": "O0123456789ABCDEF", "problem": true },
+    { "input": "o0123456789abcdef.1.2", "normalized": "O0123456789ABCDEF.1.2", "problem": true },
+    { "input": "O0123456789ABCDEF/9", "normalized": "O0123456789ABCDEF/9", "problem": true },
+    { "input": "ab1", "normalized": "AB1", "problem": true },
+    { "input": "/1234", "normalized": "/1234", "problem": true }
+  ],
+  "consignmentRef": [
+    { "loadCode": "LD-0007", "stopSeq": 3, "ref": "LD-0007/03" },
+    { "loadCode": "LD-12345", "stopSeq": 100, "ref": "LD-12345/100" }
+  ],
+  "packageScan": [
+    { "input": "o8fe5145b99902272.1.3", "tags": {}, "result": { "kind": "package", "parcelTag": "O8FE5145B99902272", "packSeq": 1, "seq": 3, "code": "O8FE5145B99902272.1.3" } },
+    { "input": "O8FE5145B99902272", "tags": { "O8FE5145B99902272": { "packSeq": 2, "packageCount": 1 } }, "result": { "kind": "package", "parcelTag": "O8FE5145B99902272", "packSeq": 2, "seq": 1, "code": "O8FE5145B99902272.2.1" } },
+    { "input": "O8FE5145B99902272", "tags": { "O8FE5145B99902272": { "packSeq": 1, "packageCount": 6 } }, "result": { "kind": "ambiguous", "parcelTag": "O8FE5145B99902272", "packageCount": 6 } },
+    { "input": "O8FE5145B99902272", "tags": {}, "result": { "kind": "unknown-tag", "parcelTag": "O8FE5145B99902272" } },
+    { "input": "O8FE5145B99902272.1.201", "tags": {}, "result": { "kind": "invalid" } },
+    { "input": "O8FE5145B99902272.01.1", "tags": {}, "result": { "kind": "invalid" } },
+    { "input": "4410", "tags": {}, "result": { "kind": "invalid" } }
+  ]
+}

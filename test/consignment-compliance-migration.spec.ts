@@ -134,11 +134,13 @@ describe('migration 0118: consignment compliance', () => {
     expect(literals(`${T}_eway_exempt_pairing`)).toEqual(expect.arrayContaining(['exempt', ...EWAY_EXEMPTION_REASONS]));
     expect(literals('clients_consignment_document_rule_check')).toEqual([...CONSIGNMENT_DOCUMENT_RULES]);
     expect(literals('shipments_compliance_exception_check')).toEqual([...CONSIGNMENT_GATE_CODES]);
-    expect(literals('email_messages_template_check')).toEqual([...EMAIL_TEMPLATES]);
+    // 0118's sets: 4-9a's 0119 appends `client-delivery-update` and `delivery.recorded` (pinned by freight-dispatch-migration.spec.ts).
+    expect(literals('email_messages_template_check')).toEqual(EMAIL_TEMPLATES.filter((template) => template !== 'client-delivery-update'));
     // The client-shape CHECK lists the client templates twice (both arms, D9).
-    expect(literals('email_messages_client_shape_check')).toEqual([...CLIENT_EMAIL_TEMPLATES, ...CLIENT_EMAIL_TEMPLATES]);
+    const clientTemplates0118 = CLIENT_EMAIL_TEMPLATES.filter((template) => template !== 'client-delivery-update');
+    expect(literals('email_messages_client_shape_check')).toEqual([...clientTemplates0118, ...clientTemplates0118]);
     const events = /ARRAY\[([^\]]+)\]/.exec(def('client_contacts_email_events_check').def)![1]!;
-    expect([...events.matchAll(/'([a-z.-]+)'::text/g)].map((m) => m[1]!)).toEqual([...CLIENT_EMAIL_EVENTS]);
+    expect([...events.matchAll(/'([a-z.-]+)'::text/g)].map((m) => m[1]!)).toEqual(CLIENT_EMAIL_EVENTS.filter((event) => event !== 'delivery.recorded'));
     // D1 — every name later migrations drop or read by name.
     expect(
       checks

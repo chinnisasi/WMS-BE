@@ -2,7 +2,7 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { and, eq } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { auditEvents, courierHandovers, shipments, type CourierHandover } from '../../shared/db/schema';
+import { auditEvents, courierHandovers, freightLoads, shipments, type CourierHandover, type FreightLoad } from '../../shared/db/schema';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -92,6 +92,13 @@ export interface UploadHandoverSheetCommand {
   readonly tenantId: string;
   readonly actorUserId: string;
   readonly handoverId: string;
+  readonly bytes: Buffer | undefined;
+}
+
+export interface UploadLoadingSheetCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly loadId: string;
   readonly bytes: Buffer | undefined;
 }
 
@@ -287,6 +294,15 @@ export class ShippingFilesCommand {
   // ── A14, A35: the handheld's sheet photo (2-5a's twin) ────────────────────
 
   async stageHandoverPhoto(command: StageHandoverPhotoCommand, ref: string): Promise<StagedPhotoSnapshot> {
+    return this.stageDevicePhoto(command, ref, 'handover');
+  }
+
+  /** Story 4-9a (A18) — the handheld's signed loading-sheet photo (the handover twin, purpose `loading-sheet`, never shared). */
+  async stageFreightPhoto(command: StageHandoverPhotoCommand, ref: string): Promise<StagedPhotoSnapshot> {
+    return this.stageDevicePhoto(command, ref, 'freight');
+  }
+
+  private async stageDevicePhoto(command: StageHandoverPhotoCommand, ref: string, lane: 'handover' | 'freight'): Promise<StagedPhotoSnapshot> {
     const opOperator = command.opOperator?.trim() ?? '';
     if (!UUID_RE.test(opOperator)) {
       throw validation('The x-op-operator header must name the capturing operator (a user id).');
@@ -299,7 +315,7 @@ export class ShippingFilesCommand {
     const rawSha256 = sha256Hex(bytes);
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
-      surface: 'device-handover-photo',
+      surface: lane === 'handover' ? 'device-handover-photo' : 'device-freight-photo',
       deviceId: command.deviceId,
       opOperator,
       capturedAt: capturedAtRaw,
@@ -328,7 +344,7 @@ export class ShippingFilesCommand {
             `This device has ${staged} photos waiting for their receipt or handover (at most ${DEVICE_STAGED_PHOTO_CAP}) — sync first.`,
           );
         }
-        return { purpose: 'handover-sheet', docKind: null, clientId: null, warehouseId: null };
+        return { purpose: lane === 'handover' ? 'handover-sheet' : 'loading-sheet', docKind: null, clientId: null, warehouseId: null };
       },
       sanitize: async () => {
         const image = sanitizeImage(bytes);
@@ -341,7 +357,7 @@ export class ShippingFilesCommand {
           id: uuidv7(),
           tenantId: command.tenantId,
           actorUserId: opOperator,
-          action: 'handover_photo.uploaded',
+          action: lane === 'handover' ? 'handover_photo.uploaded' : 'freight_photo.uploaded',
           targetType: 'attachment',
           targetId: result.row.id,
           reference: ref,
@@ -366,6 +382,60 @@ export class ShippingFilesCommand {
         await touchDeviceInTx(tx, command.deviceId);
         const status = result.row.status === 'staged' ? 'staged' : result.row.status === 'removed' ? 'removed' : 'attached';
         return { ref, status };
+      },
+    });
+  }
+
+  // ── Story 4-9a (A18, A57): a freight load's signed loading sheet (web) ────
+
+  async uploadLoadingSheet(command: UploadLoadingSheetCommand, key: string): Promise<ShippingFileCommandSnapshot> {
+    const bytes = requireFile(command.bytes);
+    const rawSha256 = sha256Hex(bytes);
+    const loadId = command.loadId.toLowerCase();
+    const payloadHash = hashCommandPayload({ arm: 'loading-sheet', tenantId: command.tenantId, loadId, rawSha256 });
+    const writer: Writer = { surface: 'staff', actorUserId: command.actorUserId };
+    return runUpload({
+      open: (fn) => withTenantTransaction(this.db, command.tenantId, fn),
+      attachments: this.attachments,
+      logger: this.logger,
+      tenantId: command.tenantId,
+      key,
+      payloadHash,
+      authorize: (tx) => authorizeWriterInTx(tx, command.tenantId, writer, 'dispatch.execute'),
+      what: 'signed loading sheet',
+      origin: { source: 'web', deviceId: null, createdBy: command.actorUserId, capturedAt: null, rawSha256 },
+      scope: async (tx) => {
+        const load = await readFreightLoadForSheetInTx(tx, command.tenantId, loadId, false);
+        await assertLoadingSheetCap(tx, command.tenantId, load.id);
+        return { purpose: 'loading-sheet', docKind: null, clientId: null, warehouseId: load.warehouseId };
+      },
+      sanitize: () => sanitizeShippingFile(bytes),
+      body: async (tx, reservation) => {
+        // A46's rule — the load FOR UPDATE before counting.
+        const load = await readFreightLoadForSheetInTx(tx, command.tenantId, loadId, true);
+        await assertLoadingSheetCap(tx, command.tenantId, load.id);
+        const row = await finalizeOwnedUploadInTx(tx, {
+          reservation,
+          ownerType: 'freight_load',
+          ownerId: load.id,
+          ownerParentId: load.id,
+          clientId: null,
+          warehouseId: load.warehouseId,
+        });
+        const now = nowIso();
+        // No shipment.document-shared: a multi-client document is never shared (A18).
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'freight_load.sheet_attached',
+          targetType: 'freight_load',
+          targetId: load.id,
+          reference: key,
+          changes: { attachmentId: row.id, code: load.code },
+          occurredAt: now,
+        });
+        return { file: shippingFileSnapshotOf(row) };
       },
     });
   }
@@ -460,6 +530,42 @@ async function assertSheetCap(tx: TenantTx, tenantId: string, handoverId: string
       `This handover already holds ${live} signed-sheet pages — at most ${HANDOVER_SHEET_MAX_PAGES}. Remove one first.`,
     );
   }
+}
+
+/** Story 4-9a (A18) — live signed loading-sheet pages per load. */
+export const LOADING_SHEET_MAX_PAGES = 10;
+
+async function assertLoadingSheetCap(tx: TenantTx, tenantId: string, loadId: string): Promise<void> {
+  const live = await countLiveByOwnerInTx(tx, { tenantId, ownerType: 'freight_load', ownerId: loadId, purpose: 'loading-sheet' });
+  if (live >= LOADING_SHEET_MAX_PAGES) {
+    throw new ProblemException(
+      'loading-sheet-limit',
+      409,
+      'Signed sheet page limit reached',
+      `This load already holds ${live} signed loading-sheet pages — at most ${LOADING_SHEET_MAX_PAGES}. Remove one first.`,
+    );
+  }
+}
+
+/** Story 4-9a (A18, A57) — the load (404 when unknown; a cancelled load takes no sheet), optionally `FOR UPDATE`. */
+async function readFreightLoadForSheetInTx(tx: TenantTx, tenantId: string, loadId: string, lock: boolean): Promise<FreightLoad> {
+  if (!UUID_RE.test(loadId)) throw freightLoadNotFound(loadId);
+  const query = tx
+    .select()
+    .from(freightLoads)
+    .where(and(eq(freightLoads.tenantId, tenantId), eq(freightLoads.id, loadId)))
+    .limit(1);
+  const rows = lock ? await query.for('update') : await query;
+  const load = rows[0];
+  if (load === undefined) throw freightLoadNotFound(loadId);
+  if (load.status === 'cancelled') {
+    throw new ProblemException('load-cancelled', 409, 'The load was cancelled', `${load.code} was cancelled — it takes no signed sheet.`, { loadCode: load.code });
+  }
+  return load;
+}
+
+function freightLoadNotFound(id: string): ProblemException {
+  return new ProblemException('not-found', 404, 'Freight load not found', `No freight load with id "${id}" exists in this tenant.`);
 }
 
 /** The handover (404 when unknown), optionally `FOR UPDATE` (A46: the sheet cap under its lock). */

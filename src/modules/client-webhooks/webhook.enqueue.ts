@@ -23,8 +23,11 @@ import {
 } from './webhook-rules';
 import {
   buildWebhookBody,
+  decodeDelivery,
   decodeDispatch,
   decodeReceipt,
+  deliveryData,
+  deliverySubjectUuid,
   dispatchData,
   receiptData,
   type WebhookEnvelopeHead,
@@ -102,6 +105,23 @@ export class WebhookEnqueue {
           skus,
           qcHeldLineIds: qcHeld,
         });
+        return buildWebhookBody({ ...head, clientCode }, built);
+      };
+    } else if (type === 'order.delivered') {
+      // Story 4-9a (A28) — the payload names its client (the receipt arm's
+      // shape, never through the order); one event per recorded version.
+      const fact = decodeDelivery(source.payload);
+      if (fact === null) return this.malformed(source);
+      subjectId = deliverySubjectUuid(fact.consignmentId, fact.deliverySeq);
+      clientId = fact.clientId;
+      build = async (clientCode, head) => {
+        const warehouseCode = await getWarehouseCodeInTx(tx, tenantId, fact.warehouseId);
+        const ref = (await this.outbound.orderRefsInTx(tx, tenantId, [fact.orderId])).get(fact.orderId);
+        const built = deliveryData(
+          fact,
+          { warehouseCode, clientOrderRef: ref?.clientOrderRef ?? null, channelOrderRef: ref?.externalEventId ?? null },
+          head.occurredAt,
+        );
         return buildWebhookBody({ ...head, clientCode }, built);
       };
     } else {

@@ -1,3 +1,4 @@
+import { PortalOrderFreightDto } from './freight.dto';
 import { ApiProperty } from '@nestjs/swagger';
 import { Transform, Type } from 'class-transformer';
 import {
@@ -240,6 +241,9 @@ export class PortalOrderRowDto {
 
   @ApiProperty({ required: false, description: 'Story 4-4a — the courier of the order’s live shipment; absent when it has none' })
   courierName?: string;
+
+  @ApiProperty({ required: false, type: () => PortalOrderFreightDto, description: 'Story 4-9a (A22) — the truck it left on: its LR, transporter and delivery; absent when none' })
+  freight?: PortalOrderFreightDto;
 }
 
 export class PortalOrderPageResponse {

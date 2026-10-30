@@ -1838,6 +1838,33 @@ export class CatalogDispatchParcelConsignmentDto {
   @ApiProperty({ type: String, nullable: true, description: 'YYYY-MM-DD — the last valid day' }) ewayValidUntil!: string | null;
 }
 
+export class CatalogFreightConsignmentDto {
+  @ApiProperty({ format: 'uuid' }) consignmentId!: string;
+  @ApiProperty({ format: 'uuid' }) orderId!: string;
+  @ApiProperty({ format: 'uuid' }) clientId!: string;
+  @ApiProperty() orderLabel!: string;
+  @ApiProperty({ description: 'The order’s parcel tag (O + 16 hex) — the prefix of every package code' }) parcelTagCode!: string;
+  @ApiProperty({ type: Number, nullable: true, description: 'The live pack’s number (1 for a pack recorded before 4-5a); null when not packed' }) packSeq!: number | null;
+  @ApiProperty({ type: Number, nullable: true, description: 'Packages in the live pack; null when not packed' }) packageCount!: number | null;
+  @ApiProperty() palletCount!: number;
+  @ApiProperty() stopSeq!: number;
+  @ApiProperty({ type: String, nullable: true }) lrNumber!: string | null;
+  @ApiProperty({ required: false, type: CatalogDispatchParcelConsignmentDto, description: '4-6a’s verdict today; absent when the national threshold is missing' })
+  consignment?: CatalogDispatchParcelConsignmentDto;
+}
+
+export class CatalogFreightLoadDto {
+  @ApiProperty({ format: 'uuid' }) loadId!: string;
+  @ApiProperty() code!: string;
+  @ApiProperty({ enum: ['ftl', 'ltl'] }) mode!: string;
+  @ApiProperty() transporterName!: string;
+  @ApiProperty({ type: String, nullable: true }) vehicleNumber!: string | null;
+  @ApiProperty({ type: String, nullable: true }) driverName!: string | null;
+  @ApiProperty({ type: String, nullable: true }) dockDoor!: string | null;
+  @ApiProperty({ type: [CatalogFreightConsignmentDto] }) consignments!: CatalogFreightConsignmentDto[];
+  @ApiProperty({ type: [String], description: 'The package codes loaded so far (live scans)' }) loadedCodes!: string[];
+}
+
 /** Story 4-4a — one parcel awaiting a courier. */
 export class CatalogDispatchParcelDto {
   @ApiProperty({ format: 'uuid' }) orderId!: string;
@@ -2003,6 +2030,17 @@ export class CatalogSnapshotResponse {
       'Story 4-5a (A32, additive): true when this server records cartons on a pack — the handheld offers New carton only then. Absent from an older server (which would drop `cartons` from a synced pack): one carton only',
   })
   packCartons?: boolean;
+
+  @ApiProperty({
+    type: [CatalogFreightLoadDto],
+    required: false,
+    description:
+      "Story 4-9a (A23, A56, additive): the warehouse's open freight loads, newest first, at most 50 — the Truck loading task: each load's planned consignments (parcel tag, live pack number and package count, its 4-6a consignment verdict) and the package codes already loaded. An older server omits it (the device reads it as empty)",
+  })
+  freightLoads?: readonly CatalogFreightLoadDto[];
+
+  @ApiProperty({ required: false, description: 'Story 4-9a (A56, additive): true when more than 50 loads are open or the loaded codes would pass 20,000 — load the others from the web' })
+  freightLoadsTruncated?: boolean;
 }
 
 // ── story 2-9a: the GRN document ────────────────────────────────────────────

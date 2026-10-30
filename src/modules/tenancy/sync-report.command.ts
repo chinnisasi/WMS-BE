@@ -186,7 +186,20 @@ export type RejectedOpType =
   | 'handover.create'
   // Story 4-4a (A30) — a signed-sheet photo of a handover, refused on replay
   // (2-5a's photo fate table). DEVICE-UPLOADED; Discard ONLY.
-  | 'handover-photo.stage';
+  | 'handover-photo.stage'
+  // Story 4-9a (A29) — one package scanned onto a freight load, refused on
+  // replay (another truck's package, a stale label, a dispatched or cancelled
+  // load). DEVICE-UPLOADED; Discard ONLY: the guidance names the package and
+  // the load ("check where that package is").
+  | 'freight.load-scan'
+  // Story 4-9a (A14, A29) — a truck's departure: the orders refused at
+  // departure (server-raised — they physically left on the truck; the
+  // guidance names the consequence) or a whole-op refusal (device-uploaded).
+  // Discard ONLY.
+  | 'freight.dispatch'
+  // Story 4-9a (A18, A29) — a signed loading-sheet photo, refused on replay
+  // (2-5a's photo fate table). DEVICE-UPLOADED; Discard ONLY.
+  | 'freight-photo.stage';
 
 export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'grn.submit',
@@ -212,6 +225,9 @@ export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'shipment.verify-label',
   'handover.create',
   'handover-photo.stage',
+  'freight.load-scan',
+  'freight.dispatch',
+  'freight-photo.stage',
 ];
 
 /**
@@ -300,6 +316,10 @@ export const REJECTED_OP_DECISIONS_BY_TYPE: Readonly<Record<RejectedOpType, read
   'shipment.verify-label': ['discard'],
   'handover.create': ['discard'],
   'handover-photo.stage': ['discard'],
+  // Story 4-9a — Discard only, each (see the types' comments).
+  'freight.load-scan': ['discard'],
+  'freight.dispatch': ['discard'],
+  'freight-photo.stage': ['discard'],
 };
 
 /** Story 1-6d — the 403 an Apply on a `grn.licence-refused` row answers without `licences.manage`. */
@@ -323,6 +343,9 @@ type ApplicableOpType = Exclude<
   | 'shipment.verify-label'
   | 'handover.create'
   | 'handover-photo.stage'
+  | 'freight.load-scan'
+  | 'freight.dispatch'
+  | 'freight-photo.stage'
 >;
 
 function isApplicableOpType(opType: RejectedOpType): opType is ApplicableOpType {
@@ -655,6 +678,27 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
     ['ref', 'string'],
     ['capturedAt', 'string'],
     ['handoverOpId', 'string'],
+  ],
+  // Story 4-9a (A29) — one scan as the device enqueued it. Any strings: a
+  // malformed one must still reach the queue to be discarded.
+  'freight.load-scan': [
+    ['loadId', 'string'],
+    ['packageCode', 'string'],
+    ['action', 'string'],
+  ],
+  // Story 4-9a (A14) — a departure: the device's whole op (device-uploaded),
+  // or the ORIGINAL op's header plus only the refused consignments beside
+  // `refusals` (server-raised). `seals` and `photoRefs` are string arrays.
+  'freight.dispatch': [
+    ['loadId', 'uuid-or-null'],
+    ['consignments', 'array'],
+    ['refusals', 'array-or-absent'],
+  ],
+  // Story 4-9a — the sheet photo op as it enqueued it (the departure op it belongs to).
+  'freight-photo.stage': [
+    ['ref', 'string'],
+    ['capturedAt', 'string'],
+    ['dispatchOpId', 'string'],
   ],
 };
 
