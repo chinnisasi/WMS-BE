@@ -7760,7 +7760,8 @@
                   "return.restocked",
                   "return.scrapped",
                   "return.reversed",
-                  "rtv.dispatched"
+                  "rtv.dispatched",
+                  "rtc.dispatched"
                 ]
               }
             }
@@ -28421,6 +28422,7 @@
                 "client_invoice",
                 "client_invoice_note",
                 "client_invoice_note_policy",
+                "client_return",
                 "count_task",
                 "count_variance",
                 "count_variance_policy",
@@ -29379,7 +29381,7 @@
             }
           },
           "409": {
-            "description": "A departed client asked to be suspended — it can only be reactivated (client-not-active); a departure while work remains (client-not-wound-down — `blockers: [{kind, count, codes?}]` lists every blocker: stock, open-purchase-orders, open-asns, pending-over-receipts, open-orders, open-rmas, open-vendor-returns — story 2-8b, open-recalls — story 3-7a, pending-adjustments, open-counts, open-review-items, unsettled-invoices, unbilled-charges — story 5-5a, channel-mappings); or a concurrent request with the same Idempotency-Key (conflict)",
+            "description": "A departed client asked to be suspended — it can only be reactivated (client-not-active); a departure while work remains (client-not-wound-down — `blockers: [{kind, count, codes?}]` lists every blocker: stock, open-purchase-orders, open-asns, pending-over-receipts, open-orders, open-rmas, open-vendor-returns — story 2-8b, open-client-returns — story 4-7c, open-recalls — story 3-7a, pending-adjustments, open-counts, open-review-items, unsettled-invoices, unbilled-charges — story 5-5a, channel-mappings); or a concurrent request with the same Idempotency-Key (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -38576,6 +38578,181 @@
         ]
       }
     },
+    "/tenants/{tenantId}/portal/client-returns": {
+      "get": {
+        "operationId": "PortalController_portalClientReturns",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from a previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalClientReturnPageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed cursor (invalid-cursor), a limit outside 1–100 or a status outside its vocabulary (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-7c — this client's returns to client (shipments of its returned and damaged goods back to it), newest first (keyset), each with status, carrier, AWB and packages",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/client-returns/{clientReturnId}": {
+      "get": {
+        "operationId": "PortalController_portalClientReturn",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientReturnId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalClientReturnDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed clientReturnId path parameter (validation-failed — it must be a uuid)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such return to client of this client — unknown, or another client's (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-7c — one of this client's returns to client: status, the address it goes to, the brand document, carrier, AWB, packages and every line (what was sent and what left)",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
     "/tenants/{tenantId}/portal/recalls": {
       "get": {
         "operationId": "PortalController_portalRecalls",
@@ -42891,6 +43068,815 @@
         "summary": "One client's DAMAGED stock in a warehouse that can go back to a vendor: per arm (SKU, batch) the on-hand, the open return claims and what is available, and the GRN lines the units came from with what each can still claim (newest first) — open to any member",
         "tags": [
           "vendor-returns"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-returns": {
+      "post": {
+        "operationId": "ClientReturnsController_create",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateClientReturnDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The return to client, draft (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientReturnDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an invalid body — no lines or over 200, a repeated receipt line or (SKU, batch), a returns line without its receipt line or with a SKU, a damaged line without a SKU, a quantity not above 0 or finer than its unit, a serial line not 1, an unknown reason, \"other\" without a note, a note over 500, a batch-tracked damaged line without its batch or a batch on an untracked one (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks returns.manage (role-denied), or a client-portal session (role-denied — operators only)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse, a receipt line, a SKU, a batch or the client does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A blind return still awaiting review or rejected (review-pending, review-rejected); a receipt line of another warehouse (document-warehouse-mismatch); a catch-weight, kit, returned-case or (from DAMAGED) serial-tracked SKU — member skuCode (rtc-sku-unsupported); SKUs of two clients (mixed-client); the client has no address of the chosen kind — members addressKind, clientId (client-address-missing); more than awaits disposition — member awaitingQty (exceeds-awaiting); more than DAMAGED holds after the open RTV and RTC claims — members onHandQty, claimedQty, availableQty, requestedQty (rtc-exceeds-damaged); or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Creates a return to client (returns.manage) — one client's returned units awaiting disposition (RETURNS) and damaged units (DAMAGED) in one warehouse going back to the brand: the brand and its chosen address frozen. A returns line claims its receipt line's open quantity; a damaged line claims the DAMAGED pool (no stock moves until dispatch)",
+        "tags": [
+          "client-returns"
+        ]
+      },
+      "get": {
+        "operationId": "ClientReturnsController_list",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "draft",
+                "picked",
+                "dispatched",
+                "cancelled"
+              ]
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque cursor from a previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientReturnListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed filter or limit (validation-failed), or a malformed cursor (invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists returns to client, newest first (keyset cursor), filterable by warehouse, client and status — open to any member",
+        "tags": [
+          "client-returns"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-returns/{clientReturnId}": {
+      "get": {
+        "operationId": "ClientReturnsController_get",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientReturnId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientReturnDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed id (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such return to client in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One return to client — its frozen brand and address, lines, pick, dispatch capture and cancellation (the printable note reads it) — open to any member",
+        "tags": [
+          "client-returns"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-returns/{clientReturnId}/pick": {
+      "post": {
+        "operationId": "ClientReturnsController_pick",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the device token)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientReturnId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PickClientReturnDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The return to client, picked (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientReturnDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an invalid body — a malformed id, no lines or a repeated line, a negative or too-fine quantity, a non-UTC occurredAt (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Unknown or revoked device (device-revoked), or the operator is not a floor role or lacks picks.execute (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such return to client in this tenant, or it is another warehouse's (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The return to client is not a draft — picked, dispatched or cancelled — member rtcStatus (rtc-not-draft); or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The lines are not exactly the return's, a line is picked above its quantity, or a serial line other than 0 or 1 (rtc-pick-mismatch); every line picked 0 (rtc-pick-empty); or the Idempotency-Key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "rtc.pick — records the handheld's scan-verified pick of a draft return to client exactly once (badge-in session, picks.execute): every line with its picked quantity (a short pick is allowed and returns the rest of a returns line to awaiting disposition; an empty one is refused). Moves no stock — the dispatch does",
+        "tags": [
+          "client-returns"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-returns/{clientReturnId}/dispatch": {
+      "post": {
+        "operationId": "ClientReturnsController_dispatch",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientReturnId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DispatchClientReturnDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The return to client, dispatched (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientReturnDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an invalid capture — no brand document, an unknown document type, a number over 40, a malformed date or one after today or more than 30 days before the return was created, a malformed or wrong-state consignor or consignee GSTIN, a declared value that is not a whole number of paise 0–10¹², an e-way bill number that is not 12 digits or has no date, a validity before the date, none of transporter / carrier name / vehicle, a malformed vehicle, a tracking ref over 50, a package count outside 1–9999, or a debit note (an RTV field) (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks dispatch.execute (role-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such return to client, or no such transporter, in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The return to client is not picked — member rtcStatus (rtc-not-picked); the partner is not a transporter or is inactive (partner-not-transporter, transporter-inactive); a reconcile quarantine on RETURNS or DAMAGED (disposition-scope-quarantined); DAMAGED no longer holds the picked units — members onHandQty, pickedQty (rtc-damaged-short); a user location occupies the RETURNS or DAMAGED code (returns-bin-conflict, damaged-bin-conflict); or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Dispatches a picked return to client (dispatch.execute): records the brand's challan or invoice, the GSTINs, the declared value, the e-way bill, the carrier and the packages, freezes the transporter and the warehouse, and writes one rtc.dispatched draw out of RETURNS or DAMAGED per picked line (per serial unit) — the units leave stock",
+        "tags": [
+          "client-returns"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-returns/{clientReturnId}/cancel": {
+      "post": {
+        "operationId": "ClientReturnsController_cancel",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientReturnId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelClientReturnDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The return to client, cancelled (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientReturnDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a blank reason or one over 500 characters (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks returns.manage (role-denied), or a client-portal session (role-denied — operators only)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such return to client in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The return to client is dispatched or already cancelled — member rtcStatus (rtc-closed); or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Cancels a draft or picked return to client with a reason (returns.manage) — its claims are released: a returns line goes back to awaiting disposition, a damaged line frees the DAMAGED pool; nothing moved, so nothing moves back",
+        "tags": [
+          "client-returns"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/client-returns/returnable": {
+      "get": {
+        "operationId": "ClientReturnsController_returnable",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "query",
+            "description": "The client whose returned and damaged units are listed (a return to client is one client's)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReturnableToClientResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed warehouseId or clientId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One client's units in a warehouse that can go back to it: the receipt lines awaiting disposition (4-7a's queue) and the DAMAGED arms with on-hand, the open RTV and RTC claims and what is available — open to any member",
+        "tags": [
+          "client-returns"
         ]
       }
     },
@@ -47356,7 +48342,8 @@
               "receipt-photo.stage",
               "return.restock",
               "rtv.pick",
-              "return.receive_blind"
+              "return.receive_blind",
+              "rtc.pick"
             ]
           },
           "classification": {
@@ -47515,7 +48502,8 @@
               "receipt-photo.stage",
               "return.restock",
               "rtv.pick",
-              "return.receive_blind"
+              "return.receive_blind",
+              "rtc.pick"
             ]
           },
           "classification": {
@@ -48355,6 +49343,21 @@
             "type": "string",
             "format": "uuid",
             "description": "Story 2-8b — the return-to-vendor line dispatched (vendor-return arm only)"
+          },
+          "clientReturnId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 4-7c — the return-to-client document the units left under (client-return arm: rtc.dispatched). On a line drawn from RETURNS the arm also carries `returnReceiptLineId` and `rmaId` (absent on a DAMAGED line)"
+          },
+          "clientReturnLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 4-7c — the return-to-client line dispatched (client-return arm only)"
+          },
+          "returnReceiptLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The return receipt line the units were received on — (story 4-7a) on the return-disposition arm, and (story 4-7c) on the client-return arm of a line drawn from RETURNS"
           }
         },
         "required": [
@@ -56169,6 +57172,119 @@
           "lines"
         ]
       },
+      "CatalogOpenClientReturnLineDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "lineNo": {
+            "type": "number",
+            "description": "1-based, the document order"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "returns",
+              "damaged"
+            ],
+            "description": "Where the units are picked from — the Returns area or the Damaged area"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The batch the pick must scan (null on an untracked SKU)"
+          },
+          "serialNumber": {
+            "type": "string",
+            "nullable": true,
+            "description": "A serial line: the serial the pick must scan (picked 0 or 1)"
+          },
+          "uom": {
+            "type": "string"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units to pick (base units) — the pick takes at most this"
+          },
+          "rmaCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The RMA the returned units came back on (returns lines)"
+          }
+        },
+        "required": [
+          "id",
+          "lineNo",
+          "source",
+          "skuId",
+          "skuCode",
+          "skuName",
+          "batchCode",
+          "serialNumber",
+          "uom",
+          "qty",
+          "rmaCode"
+        ]
+      },
+      "CatalogOpenClientReturnDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "client"
+            ],
+            "description": "The return shipment's kind"
+          },
+          "code": {
+            "type": "string",
+            "description": "RTC-0001"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientName": {
+            "type": "string",
+            "description": "The brand's frozen name (the consignee)"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogOpenClientReturnLineDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "code",
+          "clientId",
+          "clientName",
+          "createdAt",
+          "lines"
+        ]
+      },
       "CatalogClientReceivingPolicyDto": {
         "type": "object",
         "properties": {
@@ -56638,6 +57754,13 @@
               "$ref": "#/components/schemas/CatalogOpenVendorReturnDto"
             }
           },
+          "openClientReturns": {
+            "description": "Story 4-7c (additive): the warehouse's DRAFT returns to client, oldest first — the handheld's Returns out tab picks them scan-verified (rtc.pick) beside the returns to vendor. An older server omits it",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogOpenClientReturnDto"
+            }
+          },
           "clients": {
             "description": "Story 1-1 (additive): every client referenced by a SKU or an open document of the snapshot — the names the device shows when a scan belongs to another client, and the blind receipt's client picker. A snapshot WITHOUT this field (an older server) puts the device in legacy mode: no picker, no clientId sent",
             "type": "array",
@@ -56727,6 +57850,7 @@
           "stockTakes",
           "openReturns",
           "openVendorReturns",
+          "openClientReturns",
           "clients",
           "openGateIns",
           "dockAppointments",
@@ -66807,6 +67931,7 @@
               "client_invoice",
               "client_invoice_note",
               "client_invoice_note_policy",
+              "client_return",
               "count_task",
               "count_variance",
               "count_variance_policy",
@@ -66915,6 +68040,7 @@
               "client_invoice",
               "client_invoice_note",
               "client_invoice_note_policy",
+              "client_return",
               "count_task",
               "count_variance",
               "count_variance_policy",
@@ -73398,6 +74524,14 @@
           },
           "openTotal": {
             "type": "number"
+          },
+          "returningToClientTotal": {
+            "type": "number",
+            "description": "Story 4-7c — units on a return to the client being prepared (base units)"
+          },
+          "returnedToClientTotal": {
+            "type": "number",
+            "description": "Story 4-7c — units shipped back to the client (base units)"
           }
         },
         "required": [
@@ -73416,7 +74550,9 @@
           "onHoldTotal",
           "failedInspectionTotal",
           "scrappedTotal",
-          "openTotal"
+          "openTotal",
+          "returningToClientTotal",
+          "returnedToClientTotal"
         ]
       },
       "PortalReturnPageResponse": {
@@ -73480,6 +74616,14 @@
           },
           "openQty": {
             "type": "number"
+          },
+          "returningToClientQty": {
+            "type": "number",
+            "description": "Story 4-7c — on a return to the client being prepared"
+          },
+          "returnedToClientQty": {
+            "type": "number",
+            "description": "Story 4-7c — shipped back to the client"
           }
         },
         "required": [
@@ -73492,7 +74636,9 @@
           "onHoldQty",
           "failedInspectionQty",
           "scrappedQty",
-          "openQty"
+          "openQty",
+          "returningToClientQty",
+          "returnedToClientQty"
         ]
       },
       "PortalReturnDispositionDto": {
@@ -73614,6 +74760,14 @@
           "openTotal": {
             "type": "number"
           },
+          "returningToClientTotal": {
+            "type": "number",
+            "description": "Story 4-7c — units on a return to the client being prepared (base units)"
+          },
+          "returnedToClientTotal": {
+            "type": "number",
+            "description": "Story 4-7c — units shipped back to the client (base units)"
+          },
           "lines": {
             "type": "array",
             "items": {
@@ -73645,8 +74799,356 @@
           "failedInspectionTotal",
           "scrappedTotal",
           "openTotal",
+          "returningToClientTotal",
+          "returnedToClientTotal",
           "lines",
           "dispositions"
+        ]
+      },
+      "PortalClientReturnRowDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "example": "RTC-0001"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "picked",
+              "dispatched",
+              "cancelled"
+            ],
+            "description": "draft and picked read \"Being prepared\", dispatched \"Shipped\" (A14)"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "dispatchedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "lineCount": {
+            "type": "number"
+          },
+          "totalQuantity": {
+            "type": "number",
+            "description": "Σ line quantities (base units)"
+          },
+          "shippedQuantity": {
+            "type": "number",
+            "nullable": true,
+            "description": "What left, once dispatched"
+          },
+          "carrierName": {
+            "type": "string",
+            "nullable": true
+          },
+          "transporterName": {
+            "type": "string",
+            "nullable": true
+          },
+          "trackingRef": {
+            "type": "string",
+            "nullable": true,
+            "description": "The AWB or LR number"
+          },
+          "packageCount": {
+            "type": "number",
+            "nullable": true
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "status",
+          "createdAt",
+          "dispatchedAt",
+          "lineCount",
+          "totalQuantity",
+          "shippedQuantity",
+          "carrierName",
+          "transporterName",
+          "trackingRef",
+          "packageCount"
+        ]
+      },
+      "PortalClientReturnPageResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalClientReturnRowDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "ConsigneeAddressDto": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "return",
+              "registered"
+            ]
+          },
+          "contactName": {
+            "type": "string",
+            "nullable": true,
+            "description": "The return address's contact (null from the registered address)"
+          },
+          "phone": {
+            "type": "string",
+            "nullable": true
+          },
+          "line1": {
+            "type": "string"
+          },
+          "line2": {
+            "type": "string",
+            "nullable": true
+          },
+          "city": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "nullable": true,
+            "description": "The return address's state as typed (free text); null from the registered address"
+          },
+          "stateCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The registered address's GST state code; null from the return address (it stores the state as free text)"
+          },
+          "pincode": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "contactName",
+          "phone",
+          "line1",
+          "line2",
+          "city",
+          "state",
+          "stateCode",
+          "pincode"
+        ]
+      },
+      "PortalBrandDocumentDto": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "challan",
+              "invoice"
+            ]
+          },
+          "number": {
+            "type": "string"
+          },
+          "date": {
+            "type": "string",
+            "description": "YYYY-MM-DD"
+          }
+        },
+        "required": [
+          "type",
+          "number",
+          "date"
+        ]
+      },
+      "PortalClientReturnLineDto": {
+        "type": "object",
+        "properties": {
+          "lineNo": {
+            "type": "number"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "damaged",
+              "returns"
+            ]
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "uom": {
+            "type": "string"
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "serialNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "rmaCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "condition": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "resaleable",
+              "opened",
+              "damaged",
+              "missing-parts",
+              null
+            ]
+          },
+          "quantity": {
+            "type": "number"
+          },
+          "shippedQuantity": {
+            "type": "number",
+            "nullable": true,
+            "description": "What left on the line, once dispatched"
+          }
+        },
+        "required": [
+          "lineNo",
+          "source",
+          "skuCode",
+          "skuName",
+          "uom",
+          "batchCode",
+          "serialNumber",
+          "rmaCode",
+          "condition",
+          "quantity",
+          "shippedQuantity"
+        ]
+      },
+      "PortalClientReturnDetailResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "example": "RTC-0001"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "picked",
+              "dispatched",
+              "cancelled"
+            ],
+            "description": "draft and picked read \"Being prepared\", dispatched \"Shipped\" (A14)"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "dispatchedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "lineCount": {
+            "type": "number"
+          },
+          "totalQuantity": {
+            "type": "number",
+            "description": "Σ line quantities (base units)"
+          },
+          "shippedQuantity": {
+            "type": "number",
+            "nullable": true,
+            "description": "What left, once dispatched"
+          },
+          "carrierName": {
+            "type": "string",
+            "nullable": true
+          },
+          "transporterName": {
+            "type": "string",
+            "nullable": true
+          },
+          "trackingRef": {
+            "type": "string",
+            "nullable": true,
+            "description": "The AWB or LR number"
+          },
+          "packageCount": {
+            "type": "number",
+            "nullable": true
+          },
+          "consigneeAddress": {
+            "$ref": "#/components/schemas/ConsigneeAddressDto"
+          },
+          "vehicleNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "brandDocument": {
+            "nullable": true,
+            "description": "Once dispatched",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PortalBrandDocumentDto"
+              }
+            ]
+          },
+          "ewayBillNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalClientReturnLineDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "status",
+          "createdAt",
+          "dispatchedAt",
+          "lineCount",
+          "totalQuantity",
+          "shippedQuantity",
+          "carrierName",
+          "transporterName",
+          "trackingRef",
+          "packageCount",
+          "consigneeAddress",
+          "vehicleNumber",
+          "brandDocument",
+          "ewayBillNumber",
+          "lines"
         ]
       },
       "PortalRecallListEntryDto": {
@@ -77274,6 +78776,16 @@
             "type": "number",
             "minimum": 0,
             "description": "Story 4-7b — an unannounced return's line: units reversed at review (qty once rejected, else 0); absent on an authorized return"
+          },
+          "returningToClientQty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 4-7c — units on a draft or picked return to client, base UoM; present (with returnedToClientQty) only when either is above 0"
+          },
+          "returnedToClientQty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 4-7c — units shipped back to the client, base UoM; present (with returningToClientQty) only when either is above 0"
           }
         },
         "required": [
@@ -79842,6 +81354,827 @@
           "clientId",
           "truncated",
           "arms"
+        ]
+      },
+      "CreateClientReturnLineDto": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string",
+            "enum": [
+              "damaged",
+              "returns"
+            ],
+            "description": "`returns` — a receipt line awaiting disposition (RETURNS); `damaged` — a DAMAGED arm of the client"
+          },
+          "returnReceiptLineId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "A returns line: the 4-7a receipt line (its SKU, batch, serial and RMA come from it). Absent on a damaged line"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "A damaged line: the SKU. Absent on a returns line"
+          },
+          "batchId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "A damaged line: the batch — required for a batch-tracked SKU, absent otherwise"
+          },
+          "quantity": {
+            "type": "number",
+            "description": "Units to return (> 0; a serial line is 1). A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded.",
+            "minimum": 0.001,
+            "maximum": 9007199254740
+          },
+          "reasonCode": {
+            "type": "string",
+            "enum": [
+              "damaged",
+              "defective",
+              "expired",
+              "missing-parts",
+              "contaminated",
+              "needs-inspection",
+              "client-instruction",
+              "other"
+            ],
+            "description": "Why the units go back — defaults to `client-instruction` (`other` needs the note)"
+          }
+        },
+        "required": [
+          "source",
+          "quantity"
+        ]
+      },
+      "CreateClientReturnDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The warehouse the goods leave from"
+          },
+          "consigneeAddress": {
+            "type": "string",
+            "enum": [
+              "return",
+              "registered"
+            ],
+            "default": "return",
+            "description": "Which of the client's addresses the goods go to — frozen at create; refused (409 client-address-missing) when the client has none of that kind"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 500,
+            "description": "A note printed on the dispatch note (trimmed; required when a line's reason is `other`)"
+          },
+          "lines": {
+            "minItems": 1,
+            "maxItems": 200,
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CreateClientReturnLineDto"
+            }
+          }
+        },
+        "required": [
+          "warehouseId",
+          "lines"
+        ]
+      },
+      "ClientReturnDispatchDto": {
+        "type": "object",
+        "properties": {
+          "by": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "byName": {
+            "type": "string",
+            "nullable": true,
+            "description": "The member's display name; null when no longer a member"
+          },
+          "at": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "brandDocument": {
+            "$ref": "#/components/schemas/RtvBrandDocumentDto"
+          },
+          "consignorGstin": {
+            "type": "string",
+            "nullable": true,
+            "description": "As entered at dispatch, else the brand's frozen GSTIN; null when neither"
+          },
+          "consigneeGstin": {
+            "type": "string",
+            "nullable": true,
+            "description": "A2 — as entered at dispatch, else the brand's frozen GSTIN; null when neither (the note prints \"Unregistered\")"
+          },
+          "declaredValuePaise": {
+            "type": "number",
+            "nullable": true,
+            "description": "The declared value in paise, as entered"
+          },
+          "ewayBill": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RtvEwayBillDto"
+              }
+            ]
+          },
+          "transporterId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "transporter": {
+            "nullable": true,
+            "description": "The transporter partner as frozen at dispatch",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/VendorSnapshotDto"
+              }
+            ]
+          },
+          "carrierName": {
+            "type": "string",
+            "nullable": true
+          },
+          "vehicleNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "trackingRef": {
+            "type": "string",
+            "nullable": true,
+            "description": "The AWB or LR number"
+          },
+          "packageCount": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "by",
+          "byName",
+          "at",
+          "brandDocument",
+          "consignorGstin",
+          "consigneeGstin",
+          "declaredValuePaise",
+          "ewayBill",
+          "transporterId",
+          "transporter",
+          "carrierName",
+          "vehicleNumber",
+          "trackingRef",
+          "packageCount"
+        ]
+      },
+      "ClientReturnLineDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "lineNo": {
+            "type": "number",
+            "description": "1-based, in the document's canonical order"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "damaged",
+              "returns"
+            ]
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string",
+            "description": "Frozen at create"
+          },
+          "skuName": {
+            "type": "string",
+            "description": "Frozen at create"
+          },
+          "hsn": {
+            "type": "string",
+            "nullable": true,
+            "description": "Frozen at create"
+          },
+          "uom": {
+            "type": "string",
+            "description": "The base unit, frozen at create"
+          },
+          "batchId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "batchExpiry": {
+            "type": "string",
+            "nullable": true,
+            "description": "ISO-8601 UTC"
+          },
+          "serialId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "A serial line (returns only): the unit"
+          },
+          "serialNumber": {
+            "type": "string",
+            "nullable": true,
+            "description": "The serial the pick must scan"
+          },
+          "returnReceiptLineId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "A returns line: the receipt line it claims"
+          },
+          "rmaId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "rmaCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "RMA-0001 (returns lines)"
+          },
+          "orderReference": {
+            "type": "string",
+            "nullable": true,
+            "description": "The RMA's order reference (returns lines)"
+          },
+          "condition": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "resaleable",
+              "opened",
+              "damaged",
+              "missing-parts",
+              null
+            ],
+            "description": "The receipt grade (returns lines); null on a damaged line"
+          },
+          "reasonCode": {
+            "type": "string",
+            "enum": [
+              "damaged",
+              "defective",
+              "expired",
+              "missing-parts",
+              "contaminated",
+              "needs-inspection",
+              "client-instruction",
+              "other"
+            ]
+          },
+          "quantity": {
+            "type": "number",
+            "description": "Units to return. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded."
+          },
+          "pickedQuantity": {
+            "type": "number",
+            "nullable": true,
+            "description": "Units picked on the handheld (null until the pick)"
+          }
+        },
+        "required": [
+          "id",
+          "lineNo",
+          "source",
+          "skuId",
+          "skuCode",
+          "skuName",
+          "hsn",
+          "uom",
+          "batchId",
+          "batchCode",
+          "batchExpiry",
+          "serialId",
+          "serialNumber",
+          "returnReceiptLineId",
+          "rmaId",
+          "rmaCode",
+          "orderReference",
+          "condition",
+          "reasonCode",
+          "quantity",
+          "pickedQuantity"
+        ]
+      },
+      "ClientReturnDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "example": "RTC-0001"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "picked",
+              "dispatched",
+              "cancelled"
+            ]
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouse": {
+            "description": "Dispatched from — frozen at dispatch, live before",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RtvWarehousePartyDto"
+              }
+            ]
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "client": {
+            "description": "The brand (consignor and consignee), frozen at create",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ClientPartySnapshotDto"
+              }
+            ]
+          },
+          "consigneeAddressKind": {
+            "type": "string",
+            "enum": [
+              "return",
+              "registered"
+            ]
+          },
+          "consigneeAddress": {
+            "description": "The client's frozen address the goods go to",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ConsigneeAddressDto"
+              }
+            ]
+          },
+          "note": {
+            "type": "string",
+            "nullable": true
+          },
+          "created": {
+            "$ref": "#/components/schemas/RtvActorStampDto"
+          },
+          "picked": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RtvPickStampDto"
+              }
+            ]
+          },
+          "dispatch": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ClientReturnDispatchDto"
+              }
+            ]
+          },
+          "cancellation": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RtvCancelDto"
+              }
+            ]
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientReturnLineDto"
+            }
+          },
+          "totalQuantity": {
+            "type": "number",
+            "description": "Σ line quantities (base units)"
+          },
+          "totalPickedQuantity": {
+            "type": "number",
+            "nullable": true,
+            "description": "Σ picked quantities (null until the pick)"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "status",
+          "warehouseId",
+          "warehouse",
+          "clientId",
+          "client",
+          "consigneeAddressKind",
+          "consigneeAddress",
+          "note",
+          "created",
+          "picked",
+          "dispatch",
+          "cancellation",
+          "lines",
+          "totalQuantity",
+          "totalPickedQuantity"
+        ]
+      },
+      "ClientReturnSummaryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "picked",
+              "dispatched",
+              "cancelled"
+            ]
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientCode": {
+            "type": "string",
+            "description": "The brand's frozen code"
+          },
+          "clientName": {
+            "type": "string",
+            "description": "The brand's frozen name"
+          },
+          "consigneeAddressKind": {
+            "type": "string",
+            "enum": [
+              "return",
+              "registered"
+            ]
+          },
+          "lineCount": {
+            "type": "number"
+          },
+          "totalQuantity": {
+            "type": "number",
+            "description": "Σ line quantities (base units)"
+          },
+          "totalPickedQuantity": {
+            "type": "number",
+            "nullable": true
+          },
+          "trackingRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "brandDocumentNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC (the keyset field)"
+          },
+          "pickedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "dispatchedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "cancelledAt": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "status",
+          "warehouseId",
+          "clientId",
+          "clientCode",
+          "clientName",
+          "consigneeAddressKind",
+          "lineCount",
+          "totalQuantity",
+          "totalPickedQuantity",
+          "trackingRef",
+          "brandDocumentNumber",
+          "createdAt",
+          "pickedAt",
+          "dispatchedAt",
+          "cancelledAt"
+        ]
+      },
+      "ClientReturnListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientReturnSummaryDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "PickClientReturnLineDto": {
+        "type": "object",
+        "properties": {
+          "lineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The RTC line"
+          },
+          "pickedQty": {
+            "type": "number",
+            "description": "Units picked (0 up to the line's quantity; a serial line 0 or 1). A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded.",
+            "minimum": 0,
+            "maximum": 9007199254740
+          }
+        },
+        "required": [
+          "lineId",
+          "pickedQty"
+        ]
+      },
+      "PickClientReturnDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The device's warehouse — an RTC of another warehouse answers 404"
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "When the operator confirmed the pick on the device (ISO-8601 UTC)"
+          },
+          "lines": {
+            "minItems": 1,
+            "maxItems": 200,
+            "description": "Every line of the RTC, exactly once",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PickClientReturnLineDto"
+            }
+          }
+        },
+        "required": [
+          "warehouseId",
+          "occurredAt",
+          "lines"
+        ]
+      },
+      "DispatchClientReturnDto": {
+        "type": "object",
+        "properties": {
+          "brandDocument": {
+            "description": "Required — the brand's delivery challan (same state) or its stock-transfer invoice (another state)",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/BrandDocumentDto"
+              }
+            ]
+          },
+          "consignorGstin": {
+            "type": "string",
+            "nullable": true,
+            "description": "The brand registration the challan names at the warehouse's state; defaults to the brand's frozen GSTIN"
+          },
+          "consigneeGstin": {
+            "type": "string",
+            "nullable": true,
+            "description": "A2 — the brand registration that receives the goods; defaults to the brand's frozen GSTIN ('Unregistered' when it has none)"
+          },
+          "declaredValuePaise": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 0,
+            "maximum": 1000000000000,
+            "description": "A9 — the consignor's declared value in paise, printed \"declared by the consignor\" and never judged"
+          },
+          "ewayBillNumber": {
+            "type": "string",
+            "nullable": true,
+            "description": "The e-way bill number (12 digits) — recorded, never generated; its date is required with it"
+          },
+          "ewayBillDate": {
+            "type": "string",
+            "nullable": true,
+            "description": "The e-way bill date (YYYY-MM-DD)"
+          },
+          "ewayValidUntil": {
+            "type": "string",
+            "nullable": true,
+            "description": "The e-way bill validity (YYYY-MM-DD, on or after its date)"
+          },
+          "transporterId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "A transporter partner (frozen at dispatch). At least one of transporterId, carrierName, vehicleNumber"
+          },
+          "carrierName": {
+            "type": "string",
+            "nullable": true,
+            "description": "The carrier, typed (≤ 100)"
+          },
+          "vehicleNumber": {
+            "type": "string",
+            "nullable": true,
+            "description": "The vehicle registration (spaces, dots and hyphens ignored; 4–15 letters and digits)"
+          },
+          "trackingRef": {
+            "type": "string",
+            "nullable": true,
+            "description": "The AWB or LR number (≤ 50)"
+          },
+          "packageCount": {
+            "type": "number",
+            "description": "Required — the number of packages (1–9999)",
+            "minimum": 1,
+            "maximum": 9999
+          }
+        },
+        "required": [
+          "brandDocument"
+        ]
+      },
+      "CancelClientReturnDto": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "description": "Why the return is cancelled (1–500 characters, trimmed)",
+            "maxLength": 500
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "ReturnableToClientArmDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "uom": {
+            "type": "string"
+          },
+          "uomPrecision": {
+            "type": "number",
+            "description": "The decimal places the unit admits"
+          },
+          "batchId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "batchExpiry": {
+            "type": "string",
+            "nullable": true
+          },
+          "onHand": {
+            "type": "number",
+            "description": "On hand in DAMAGED"
+          },
+          "claimedRtv": {
+            "type": "number",
+            "description": "Claimed by open returns to vendor"
+          },
+          "claimedRtc": {
+            "type": "number",
+            "description": "Claimed by open returns to client"
+          },
+          "claimedBy": {
+            "description": "The open RTVs and RTCs claiming it",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "available": {
+            "type": "number",
+            "description": "onHand − both claims (never below 0)"
+          }
+        },
+        "required": [
+          "skuId",
+          "skuCode",
+          "skuName",
+          "uom",
+          "uomPrecision",
+          "batchId",
+          "batchCode",
+          "batchExpiry",
+          "onHand",
+          "claimedRtv",
+          "claimedRtc",
+          "claimedBy",
+          "available"
+        ]
+      },
+      "ReturnableToClientResponse": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "True when a list hit its cap (500)"
+          },
+          "awaiting": {
+            "description": "The client's receipt lines awaiting disposition in the warehouse, oldest first (returned cases left out)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AwaitingDispositionDto"
+            }
+          },
+          "damaged": {
+            "description": "The client's DAMAGED arms an RTC can carry (no serial, catch-weight or kit SKU)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReturnableToClientArmDto"
+            }
+          }
+        },
+        "required": [
+          "warehouseId",
+          "clientId",
+          "truncated",
+          "awaiting",
+          "damaged"
         ]
       },
       "ChannelWebhookOrderResponse": {

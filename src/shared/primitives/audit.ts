@@ -77,6 +77,9 @@ export const AUDIT_TARGET_TYPES = [
   // (`client_invoice_note_policy.updated`).
   'client_invoice_note',
   'client_invoice_note_policy',
+  // Story 4-7c — a return-to-client document (`client_return.created |
+  // picked | dispatched | cancelled`).
+  'client_return',
   'count_task',
   'count_variance',
   'count_variance_policy',
@@ -243,6 +246,11 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'vendor_return.picked', targetType: 'vendor_return' },
   { action: 'vendor_return.dispatched', targetType: 'vendor_return' },
   { action: 'vendor_return.cancelled', targetType: 'vendor_return' },
+  // Story 4-7c — the return-to-client document's four transitions.
+  { action: 'client_return.created', targetType: 'client_return' },
+  { action: 'client_return.picked', targetType: 'client_return' },
+  { action: 'client_return.dispatched', targetType: 'client_return' },
+  { action: 'client_return.cancelled', targetType: 'client_return' },
   // Story 5-6a — credit and debit notes (`ClientInvoiceNoteService`); a void
   // of the invoice discards its draft notes under the void's key.
   { action: 'client_invoice_note.drafted', targetType: 'client_invoice_note' },

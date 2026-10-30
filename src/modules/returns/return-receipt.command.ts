@@ -233,6 +233,13 @@ export interface ReturnReceiptLineView {
    */
   readonly pendingReviewQty?: number;
   readonly reversedQty?: number;
+  /**
+   * Story 4-7c (A6, D6) — the line's units on a draft or picked return to
+   * client, and those shipped back. Optional and emitted ONLY when either is
+   * above 0, so every pre-4-7c read and stored snapshot keeps its bytes.
+   */
+  readonly returningToClientQty?: number;
+  readonly returnedToClientQty?: number;
 }
 
 /** One receipt as the detail read shows it. */
@@ -806,6 +813,9 @@ export async function receiptsOfRmaInTx(
               pendingReviewQty: reviewStatus === 'pending' ? fromMilli(Number(line.qty)) : 0,
               reversedQty: reviewStatus === 'rejected' ? fromMilli(Number(line.qty)) : 0,
             }),
+        ...(split.returningToClient > 0 || split.returnedToClient > 0
+          ? { returningToClientQty: fromMilli(split.returningToClient), returnedToClientQty: fromMilli(split.returnedToClient) }
+          : {}),
         };
       }),
   }));

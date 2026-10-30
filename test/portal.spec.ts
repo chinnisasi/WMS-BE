@@ -734,8 +734,8 @@ describe('client portal (e2e, story 21-7)', () => {
       // 21-8's service report, plus 4-1a's order, plus 2-5a's two goods-receipt reads,
       // plus 4-7a's two returns reads, plus 5-6a's two credit/debit note reads,
       // plus 3-7a's three recall reads (the list, one recall, its report),
-      // plus 4-1c's order import.
-      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(25);
+      // plus 4-1c's order import, plus 4-7c's two return-to-client reads.
+      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(27);
     });
 
     it('a portal token is refused on EVERY operator route — reads and writes — with the exact fence detail', async () => {
@@ -1203,6 +1203,8 @@ describe('client portal (e2e, story 21-7)', () => {
       const paths = Object.keys(doc.body.paths as Record<string, unknown>).filter((path) => path.includes('/portal/'));
       expect(paths.sort()).toEqual(
         [
+          '/tenants/{tenantId}/portal/client-returns',
+          '/tenants/{tenantId}/portal/client-returns/{clientReturnId}',
           '/tenants/{tenantId}/portal/inbound/asns',
           '/tenants/{tenantId}/portal/inbound/asns/{asnId}',
           // Story 2-5a — the client's goods receipts.

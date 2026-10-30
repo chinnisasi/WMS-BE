@@ -126,3 +126,29 @@ export interface ReturnBlindReviewedPayload {
   readonly orderId: string | null;
   readonly lineCount: number;
 }
+
+/**
+ * Story 4-7c (A13) — the return-to-client document's four transitions, one
+ * string each: the outbox type and the audit action alike. Nothing
+ * subscribes yet (4-7e — the brand's notifications — consumes them).
+ */
+export const CLIENT_RETURN_EVENTS = {
+  created: 'client_return.created',
+  picked: 'client_return.picked',
+  dispatched: 'client_return.dispatched',
+  cancelled: 'client_return.cancelled',
+} as const;
+
+/** The RTC events' payload (A13) — flat ids and counts, no PII. */
+export interface ClientReturnEventPayload {
+  readonly clientReturnId: string;
+  readonly code: string;
+  readonly clientId: string;
+  readonly warehouseId: string;
+  readonly status: string;
+  readonly lineCount: number;
+  /** Base units as a decimal string (the outbox's exact-quantity convention): the picked total once picked, else the total. */
+  readonly qty: string;
+  /** The AWB or LR number — present only once dispatched with one. */
+  readonly trackingRef?: string;
+}

@@ -352,6 +352,19 @@ export type LedgerReferenceDoc =
       readonly vendorReturnId: string;
       readonly vendorReturnLineId: string;
       readonly grnLineId?: string;
+    }
+  // Story 4-7c — the client-return arm: every `rtc.dispatched` event names the
+  // return-to-client document it left under and the exact line dispatched
+  // (`clientReturnLineId`) and, only on a line drawn from RETURNS, the 4-7a
+  // receipt line and its RMA (`returnReceiptLineId`, `rmaId`). Both are
+  // OMITTED on a DAMAGED line, never `null` (the 9-3a rule). NEW union arm —
+  // the earlier kinds are never reshaped.
+  | {
+      readonly kind: 'client-return';
+      readonly clientReturnId: string;
+      readonly clientReturnLineId: string;
+      readonly returnReceiptLineId?: string;
+      readonly rmaId?: string;
     };
 // Later stories extend this union with NEW kinds — never by reshaping an
 // existing arm.
@@ -822,6 +835,29 @@ registerLedgerEventType({
   referenceKinds: ['vendor-return'],
   allowsBatchArm: true,
   allowsSerialArm: false,
+});
+
+/**
+ * Grammar v1, Story 4-7c — the return to client: a pure DRAW out of the
+ * warehouse's system RETURNS bin (a 4-7a receipt line's units — the fourth
+ * disposition outcome) or DAMAGED bin (the pool shared with 2-8b's RTVs),
+ * `toBinId` null, written at the RTC's dispatch — the one moment the units
+ * leave the building (the handheld pick moves nothing). One event per
+ * dispatched quantity line with its batch arm; one per serial unit with its
+ * serial arm (a RETURNS line only — DAMAGED holds no serials; the 4-7a
+ * `return.scrapped` serial precedent). The reference is the client-return
+ * arm. ATP-neutral: `returnsAwaitingUnits` / `damagedUnits` and on-hand drop
+ * together. It meters `['from']` (storage stops the day the units leave).
+ * Reconcile and replay fold it by its bin arms unchanged. It joins no recall
+ * trace section (the units go to their owner — PENDING). Registers
+ * sinceVersion 1 — no new grammar version.
+ */
+registerLedgerEventType({
+  type: 'rtc.dispatched',
+  sinceVersion: 1,
+  referenceKinds: ['client-return'],
+  allowsBatchArm: true,
+  allowsSerialArm: true,
 });
 
 /** The registered definition — `undefined` for an unregistered type. */

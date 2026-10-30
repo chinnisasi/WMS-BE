@@ -1197,6 +1197,9 @@ describe('returns disposition (e2e, story 4-7a)', () => {
       'parcelReference',
       'receivedTotal',
       'restockedTotal',
+      // Story 4-7c (D6) — the allowlist grows by exactly these two.
+      'returnedToClientTotal',
+      'returningToClientTotal',
       'scrappedTotal',
       'status',
     ];
@@ -1208,6 +1211,9 @@ describe('returns disposition (e2e, story 4-7a)', () => {
       'receivedQty',
       'restockedQty',
       'returnReasonCode',
+      // Story 4-7c (D6) — the allowlist grows by exactly these two.
+      'returnedToClientQty',
+      'returningToClientQty',
       'scrappedQty',
       'skuCode',
       'skuName',

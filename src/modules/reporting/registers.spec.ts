@@ -9,6 +9,8 @@ describe('referenceSummary (story 5-3a)', () => {
   const codes = new Map([[GRN, 'GRN-0042']]);
   const RTV = '0192f1a2-0000-7000-8000-000000000002';
   const rtvCodes = new Map([[RTV, 'RTV-0007']]);
+  const RTC = '0192f1a2-0000-7000-8000-000000000003';
+  const rtcCodes = new Map([[RTC, 'RTC-0003']]);
   const cases: [LedgerReferenceDoc, string][] = [
     [{ kind: 'manual-adjustment', reasonCode: 'damage', note: 'crushed' }, 'adjustment damage — crushed'],
     [{ kind: 'manual-adjustment', reasonCode: 'stock-count', note: '' }, 'adjustment stock-count'],
@@ -32,14 +34,19 @@ describe('referenceSummary (story 5-3a)', () => {
     // Story 2-8b — the RTV's code from the lookup; an id the lookup lacks prints itself.
     [{ kind: 'vendor-return', vendorReturnId: RTV, vendorReturnLineId: 'vl', grnLineId: 'g' }, 'return to vendor RTV-0007'],
     [{ kind: 'vendor-return', vendorReturnId: 'unknown-rtv', vendorReturnLineId: 'vl' }, 'return to vendor unknown-rtv'],
+    // Story 4-7c — the RTC's code from the lookup (a RETURNS line and a DAMAGED line); an id the lookup lacks prints itself.
+    [{ kind: 'client-return', clientReturnId: RTC, clientReturnLineId: 'cl', returnReceiptLineId: 'rl', rmaId: 'rma1' }, 'return to client RTC-0003'],
+    [{ kind: 'client-return', clientReturnId: RTC, clientReturnLineId: 'cl' }, 'return to client RTC-0003'],
+    [{ kind: 'client-return', clientReturnId: 'unknown-rtc', clientReturnLineId: 'cl' }, 'return to client unknown-rtc'],
   ];
 
   it.each(cases)('%j → %s', (doc, expected) => {
-    expect(referenceSummary(doc, codes, rtvCodes)).toBe(expected);
+    expect(referenceSummary(doc, codes, rtvCodes, rtcCodes)).toBe(expected);
   });
 
   it('covers every kind of the union', () => {
-    expect(new Set(cases.map(([doc]) => doc.kind)).size).toBe(15);
+    // Story 4-7c — sixteen with `client-return`.
+    expect(new Set(cases.map(([doc]) => doc.kind)).size).toBe(16);
   });
 
   it('a kind this build does not know prints its kind; a non-object prints unknown', () => {

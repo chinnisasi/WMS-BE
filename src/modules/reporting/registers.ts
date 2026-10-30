@@ -8,6 +8,7 @@ import type { CatalogFacade } from '../catalog/catalog.facade';
 import type { InboundFacade } from '../inbound/inbound.facade';
 import type { InventoryFacade, LedgerReferenceDoc } from '../inventory/inventory.facade';
 import type { OutboundFacade } from '../outbound/outbound.facade';
+import type { ReturnsFacade } from '../returns/returns.facade';
 import { memberDisplayNamesInTx } from '../tenancy/tenancy.service';
 
 /**
@@ -50,6 +51,8 @@ export interface RegisterSources {
   readonly inbound: InboundFacade;
   readonly outbound: OutboundFacade;
   readonly catalog: CatalogFacade;
+  /** Story 4-7c — the RTC codes the ledger register prints. */
+  readonly returns: ReturnsFacade;
 }
 
 export interface RegisterContext {
@@ -383,6 +386,8 @@ export function referenceSummary(
   grnCodes: ReadonlyMap<string, string>,
   // Story 2-8b (A11) — RTV codes by id, read like the GRN codes; an id the map lacks prints itself.
   vendorReturnCodes: ReadonlyMap<string, string> = new Map(),
+  // Story 4-7c — RTC codes by id, read the same way; an id the map lacks prints itself.
+  clientReturnCodes: ReadonlyMap<string, string> = new Map(),
 ): string {
   if (typeof doc !== 'object' || doc === null) return 'unknown';
   const grn = (id: string): string => `GRN ${grnCodes.get(id) ?? id}`;
@@ -427,6 +432,9 @@ export function referenceSummary(
     // Story 2-8b — damaged units sent back to their vendor.
     case 'vendor-return':
       return `return to vendor ${vendorReturnCodes.get(doc.vendorReturnId) ?? doc.vendorReturnId}`;
+    // Story 4-7c — returned and damaged units shipped back to their brand.
+    case 'client-return':
+      return `return to client ${clientReturnCodes.get(doc.clientReturnId) ?? doc.clientReturnId}`;
     default: {
       const unknown: never = doc;
       const kind = (unknown as { kind?: unknown }).kind;
@@ -457,6 +465,10 @@ const ledger: RegisterDefinition = {
       row.referenceDoc !== null && typeof row.referenceDoc === 'object' && row.referenceDoc.kind === 'vendor-return' ? [row.referenceDoc.vendorReturnId] : [],
     );
     const vendorReturnCodes = await ctx.sources.inbound.vendorReturnCodesByIdsInTx(ctx.tx, ctx.tenantId, vendorReturnIds);
+    const clientReturnIds = rows.flatMap((row) =>
+      row.referenceDoc !== null && typeof row.referenceDoc === 'object' && row.referenceDoc.kind === 'client-return' ? [row.referenceDoc.clientReturnId] : [],
+    );
+    const clientReturnCodes = clientReturnIds.length === 0 ? new Map<string, string>() : await ctx.sources.returns.clientReturnCodesByIdsInTx(ctx.tx, ctx.tenantId, clientReturnIds);
     const batches = await ctx.sources.catalog.batchFactsByIdsInTx(
       ctx.tx,
       ctx.tenantId,
@@ -476,7 +488,7 @@ const ledger: RegisterDefinition = {
       row.toBinCode,
       row.batchId === null ? null : (batches.get(row.batchId)?.code ?? row.batchId),
       row.quantity,
-      referenceSummary(row.referenceDoc, grnCodes, vendorReturnCodes),
+      referenceSummary(row.referenceDoc, grnCodes, vendorReturnCodes, clientReturnCodes),
       names.get(row.actorUserId) ?? null,
     ]);
   },

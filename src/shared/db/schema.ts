@@ -7193,6 +7193,143 @@ export const returnHoldSettlements = pgTable(
 export type ReturnHoldSettlementRow = typeof returnHoldSettlements.$inferSelect;
 
 /**
+ * Story 4-7c — the return-to-client (RTC) document: returned units awaiting
+ * disposition (RETURNS — the fourth disposition outcome) and damaged units
+ * (DAMAGED — the pool shared with 2-8b's RTVs) shipped back to the brand at
+ * its own return or registered address. One warehouse, one client; code
+ * `RTC-NNNN` per tenant. Owned by the returns module.
+ *
+ * Lifecycle `draft` → `picked` (the handheld's scan-verified `rtc.pick`, no
+ * stock movement) → `dispatched` (the web; the ONE moment stock leaves,
+ * through `rtc.dispatched`), plus `draft | picked` → `cancelled`.
+ *
+ * Every party the note prints is FROZEN on the row: the brand
+ * (`client_snapshot`, `ClientPartySnapshotV1`) and the consignee address
+ * (`consignee_address`, `ConsigneeAddressV1`) at create, the transporter and
+ * the warehouse at dispatch. The vocabularies, the pairing CHECKs and the
+ * client-scoped RLS (the 0097 `client_id` shape) live ONLY in 0113. No FK.
+ */
+export const clientReturns = pgTable(
+  'client_returns',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    code: text('code').notNull(),
+    status: text('status').notNull().default('draft'),
+    clientSnapshot: jsonb('client_snapshot').notNull(),
+    /** Which client address is the consignee: `return` | `registered` (decision 7). */
+    consigneeAddressKind: text('consignee_address_kind').notNull(),
+    /** The chosen address, frozen (`ConsigneeAddressV1`, A2). */
+    consigneeAddress: jsonb('consignee_address').notNull(),
+    note: text('note'),
+    createdBy: uuid('created_by').notNull(),
+    // ── the pick (the handheld) ──────────────────────────────────────────
+    pickedBy: uuid('picked_by'),
+    pickedAt: timestamp('picked_at', { withTimezone: true, mode: 'string' }),
+    pickedDeviceId: uuid('picked_device_id'),
+    // ── the dispatch (the web) ───────────────────────────────────────────
+    dispatchedBy: uuid('dispatched_by'),
+    dispatchedAt: timestamp('dispatched_at', { withTimezone: true, mode: 'string' }),
+    brandDocumentType: text('brand_document_type'),
+    brandDocumentNumber: text('brand_document_number'),
+    brandDocumentDate: date('brand_document_date', { mode: 'string' }),
+    /** The brand registration the challan names at the warehouse's state (as sent; null = the frozen client GSTIN). */
+    consignorGstin: text('consignor_gstin'),
+    /** A2 — the brand registration that receives the goods (as sent; null = the frozen client GSTIN). */
+    consigneeGstin: text('consignee_gstin'),
+    /** A9 — the consignor's declared value, integer paise (printed, never judged). */
+    declaredValuePaise: bigint('declared_value_paise', { mode: 'number' }),
+    ewayBillNumber: text('eway_bill_number'),
+    ewayBillDate: date('eway_bill_date', { mode: 'string' }),
+    ewayValidUntil: date('eway_valid_until', { mode: 'string' }),
+    transporterId: uuid('transporter_id'),
+    transporterSnapshot: jsonb('transporter_snapshot'),
+    carrierName: text('carrier_name'),
+    trackingRef: text('tracking_ref'),
+    vehicleNumber: text('vehicle_number'),
+    packageCount: integer('package_count'),
+    warehouseSnapshot: jsonb('warehouse_snapshot'),
+    // ── the cancel ───────────────────────────────────────────────────────
+    cancelledBy: uuid('cancelled_by'),
+    cancelledAt: timestamp('cancelled_at', { withTimezone: true, mode: 'string' }),
+    cancelReason: text('cancel_reason'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('client_returns_tenant_code_unique').on(table.tenantId, table.code),
+    // The list's keyset, and its client filter (§7b, the 0081 model).
+    index('client_returns_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
+    index('client_returns_tenant_client_created_at_id_idx').on(table.tenantId, table.clientId, table.createdAt, table.id),
+    // The open claims on the DAMAGED pool and the device snapshot.
+    index('client_returns_tenant_warehouse_status_idx').on(table.tenantId, table.warehouseId, table.status),
+  ],
+);
+
+export type ClientReturnRow = typeof clientReturns.$inferSelect;
+
+/**
+ * Story 4-7c — one line of an RTC. `source = 'returns'`: a 4-7a receipt line
+ * still awaiting disposition (`return_receipt_line_id`, `rma_id`; its claim
+ * lowered the line's `open_qty` at create). `source = 'damaged'`: a DAMAGED
+ * arm `(sku, batch | null)` of the client (a claim on the pool shared with
+ * RTVs). While the RTC is open a line claims a draft `qty` or a picked
+ * `picked_qty` (NULL until the pick; `0 ≤ picked ≤ qty`). `item_snapshot`
+ * freezes what the note prints. CHECKs only in 0113.
+ */
+export const clientReturnLines = pgTable(
+  'client_return_lines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientReturnId: uuid('client_return_id').notNull(),
+    lineNo: integer('line_no').notNull(),
+    source: text('source').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    batchId: uuid('batch_id'),
+    serialId: uuid('serial_id'),
+    returnReceiptLineId: uuid('return_receipt_line_id'),
+    rmaId: uuid('rma_id'),
+    /** Milli-units, > 0. */
+    qty: bigint('qty', { mode: 'number' }).notNull(),
+    /** Milli-units; NULL until the pick. */
+    pickedQty: bigint('picked_qty', { mode: 'number' }),
+    reasonCode: text('reason_code').notNull(),
+    itemSnapshot: jsonb('item_snapshot').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('client_return_lines_line_no_unique').on(table.clientReturnId, table.lineNo),
+    // One line per source key: a receipt line once, a DAMAGED arm once.
+    unique('client_return_lines_arm_unique')
+      .on(table.clientReturnId, table.source, table.returnReceiptLineId, table.skuId, table.batchId)
+      .nullsNotDistinct(),
+    uniqueIndex('client_return_lines_receipt_line_unique')
+      .on(table.clientReturnId, table.returnReceiptLineId)
+      .where(sql`return_receipt_line_id IS NOT NULL`),
+    // Conservation and the split: every RTC line naming one receipt line.
+    index('client_return_lines_tenant_receipt_line_idx')
+      .on(table.tenantId, table.returnReceiptLineId)
+      .where(sql`return_receipt_line_id IS NOT NULL`),
+    // The portal's per-RMA reads (the awaiting predicate, the RMA line totals).
+    index('client_return_lines_tenant_rma_idx')
+      .on(table.tenantId, table.rmaId)
+      .where(sql`rma_id IS NOT NULL`),
+    // The DAMAGED pool claims.
+    index('client_return_lines_tenant_damaged_arm_idx')
+      .on(table.tenantId, table.skuId, table.batchId)
+      .where(sql`source = 'damaged'`),
+  ],
+);
+
+export type ClientReturnLineRow = typeof clientReturnLines.$inferSelect;
+
+/**
  * Story 2-5a — the attachments foundation: one row per stored (or awaited)
  * file, owned by the `attachments` module (written only through
  * `modules/attachments/attachment-records.ts` and the sweep facade). Its first

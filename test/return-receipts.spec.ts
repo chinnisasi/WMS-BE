@@ -914,7 +914,8 @@ describe('return receipts (e2e, story 13-2)', () => {
     // moved nothing — there is nothing to re-apply).
     // Story 4-7b adds `return.receive_blind` (an unannounced parcel's refused
     // entries, server-raised, or a whole-op refusal) — Discard only.
-    const discardOnly = new Set(['return.receive', 'grn.lines-refused', 'grn.inactive-sku-received', 'gate-in.unload', 'receipt-photo.stage', 'return.restock', 'rtv.pick', 'return.receive_blind']);
+    // Story 4-7c adds the device-uploaded Discard-only `rtc.pick` (the rtv.pick shape).
+    const discardOnly = new Set(['return.receive', 'grn.lines-refused', 'grn.inactive-sku-received', 'gate-in.unload', 'receipt-photo.stage', 'return.restock', 'rtv.pick', 'return.receive_blind', 'rtc.pick']);
     for (const type of REJECTED_OP_TYPES) {
       const expected =
         // Story 3-1 adds the device-uploaded `stock.move` — apply + discard (a

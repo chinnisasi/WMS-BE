@@ -42,6 +42,7 @@ import { finishRecallReport, recallReportSink } from './recall-report-sink';
 // Bound to @Query() — a value import (the query class is read by the ValidationPipe).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { PortalReturnDetailResponse, PortalReturnPageResponse, PortalReturnsQuery } from '../modules/returns/returns.dto';
+import { PortalClientReturnDetailResponse, PortalClientReturnPageResponse } from './client-returns.dto';
 import { ServiceReportDto, toServiceReportDto } from './reporting.dto';
 // Bound to @Query() — a value import (see the portal.dto import below).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
@@ -747,6 +748,63 @@ export class PortalController {
     };
   }
 
+  /**
+   * Story 4-7c (decision 15) — the client's returns to client ("Shipments
+   * back to you"): read only, the list and detail, an exact allowlist —
+   * status, carrier, AWB, packages and lines; never a user, device, bin,
+   * note or cancel reason. No portal print, no portal write.
+   */
+  @Get(':tenantId/portal/client-returns')
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: "Story 4-7c — this client's returns to client (shipments of its returned and damaged goods back to it), newest first (keyset), each with status, carrier, AWB and packages",
+  })
+  @ApiOkResponse({ type: PortalClientReturnPageResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse(PORTAL_PAGE_400) })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async portalClientReturns(
+    @Param('tenantId') tenantId: string,
+    @CurrentPortalSession() session: PortalSession,
+    @Query() query: PortalPageQuery,
+  ): Promise<PortalClientReturnPageResponse> {
+    assertOwnTenant(session, tenantId);
+    const page = await this.returns.portalClientReturns(tenantId, session.clientId, pageQuery(query));
+    return { items: page.items.map((item) => ({ ...item })), nextCursor: page.nextCursor };
+  }
+
+  @Get(':tenantId/portal/client-returns/:clientReturnId')
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: "Story 4-7c — one of this client's returns to client: status, the address it goes to, the brand document, carrier, AWB, packages and every line (what was sent and what left)",
+  })
+  @ApiOkResponse({ type: PortalClientReturnDetailResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed clientReturnId path parameter (validation-failed — it must be a uuid)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("No such return to client of this client — unknown, or another client's (not-found)") })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'clientReturnId', format: 'uuid' })
+  async portalClientReturn(
+    @Param('tenantId') tenantId: string,
+    @Param('clientReturnId') clientReturnId: string,
+    @CurrentPortalSession() session: PortalSession,
+  ): Promise<PortalClientReturnDetailResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(clientReturnId, 'clientReturnId');
+    const rtc = await this.returns.portalClientReturn(tenantId, session.clientId, clientReturnId);
+    if (rtc === null) throw notFound('Return to client', clientReturnId);
+    return {
+      ...rtc,
+      consigneeAddress: { ...rtc.consigneeAddress },
+      brandDocument: rtc.brandDocument === null ? null : { ...rtc.brandDocument },
+      lines: rtc.lines.map((line) => ({ ...line })),
+    };
+  }
+
   // ── story 3-7a: the client's batch recalls (A11) ──────────────────────────
   // Read only: the list, one recall (lots, figures, per-warehouse on hand —
   // never a bin, never another client's order, never an actor) and its
@@ -945,7 +1003,7 @@ function assertOwnTenant(session: PortalSession, tenantId: string): void {
   }
 }
 
-function assertUuidParam(value: string, name: 'orderId' | 'asnId' | 'poId' | 'grnId' | 'rmaId' | 'recallId'): void {
+function assertUuidParam(value: string, name: 'orderId' | 'asnId' | 'poId' | 'grnId' | 'rmaId' | 'recallId' | 'clientReturnId'): void {
   if (!UUID_RE.test(value)) {
     throw new ProblemException(
       'validation-failed',

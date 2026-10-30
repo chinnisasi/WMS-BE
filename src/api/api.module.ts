@@ -50,6 +50,7 @@ import { NotificationsController } from './notifications.controller';
 import { NotificationsModule } from '../modules/notifications/notifications.module';
 import { ReturnsController } from './returns.controller';
 import { VendorReturnsController } from './vendor-returns.controller';
+import { ClientReturnsController } from './client-returns.controller';
 import { ReturnsModule } from '../modules/returns/returns.module';
 import { SharedModule } from '../shared/shared.module';
 import { ValkeyModule } from '../shared/valkey/valkey.module';
@@ -185,6 +186,9 @@ import { RecallsModule } from '../modules/recalls/recalls.module';
     // Story 2-8b — the return to vendor (create, pick, dispatch, cancel, the
     // reads): `InboundModule` exports `VendorReturnFacade`.
     VendorReturnsController,
+    // Story 4-7c — the return to client (create, pick, dispatch, cancel, the
+    // reads): `ReturnsModule` exports `ReturnsFacade`.
+    ClientReturnsController,
     // Story 7-2 — the channel webhook surface (guardless by construction:
     // the provider's AUTHORITY is its signature, not a session). The
     // last-siblings convention keeps NotFoundController LAST (registered
