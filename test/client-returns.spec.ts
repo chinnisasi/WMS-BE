@@ -186,6 +186,7 @@ describe('story 4-7c: the return to client (e2e)', () => {
       'CM,Short M,pcs,,1800,,false,false,false,,,',
       'CN,Race N,pcs,,1800,,false,false,false,,,',
       'CQ,Quarantine Q,pcs,,1800,,false,false,false,,,',
+      'CP,Pend P,pcs,,1800,,false,false,false,,,',
       'CX,Kit X,pcs,,1800,,false,false,false,,,',
     ]);
     await asOwner('post', `/catalog/skus/${sku('CX')}/kit`).send({ components: [{ skuId: sku('CA'), quantity: 1 }] }).expect(201);
@@ -420,11 +421,11 @@ describe('story 4-7c: the return to client (e2e)', () => {
     return http().post(`${API}/${tenantId}/client-returns/${rtc.id}/cancel`).set('Authorization', `Bearer ${token}`).set(KEY_HEADER, key).send({ reason });
   }
 
-  async function writeOff(skuCode: string, quantity: number, status: number, key = ulid()): Promise<request.Response> {
+  async function writeOff(skuCode: string, quantity: number, status: number, key = ulid(), token = ownerToken): Promise<request.Response> {
     const binId = await systemBin('DAMAGED');
     return http()
       .post(`${API}/${tenantId}/inventory/adjustments`)
-      .set('Authorization', `Bearer ${ownerToken}`)
+      .set('Authorization', `Bearer ${token}`)
       .set(KEY_HEADER, key)
       .send({ warehouseId: wh, binId, skuId: sku(skuCode), quantityDelta: -quantity, reasonCode: 'damaged', note: 'write-off' })
       .expect(status);
@@ -787,6 +788,27 @@ describe('story 4-7c: the return to client (e2e)', () => {
     expect(refused.body).toMatchObject({ code: 'damaged-claimed-by-rtc', clientReturnCodes: [rtc.code], vendorReturnCodes: [rtv.code], claimedQty: 4, onHandQty: 6 });
     await cancel(rtc).expect(200);
     await http().post(`${API}/${tenantId}/vendor-returns/${rtv.id}/cancel`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({ reason: 'test over' }).expect(200);
+  });
+
+  it('A12 — a write-off pend raised before an RTC claimed the units is refused at its approval: 409 damaged-claimed-by-rtc naming the RTC', async () => {
+    await receiveDamaged('CP', 3);
+    const policy = (path: string, threshold: number) =>
+      http().put(`${API}/${tenantId}${path}`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid()).send({ quantityThreshold: threshold }).expect(200);
+    await policy('/inventory/adjustment-policies', 0);
+    try {
+      const pend = await writeOff('CP', 3, 202, ulid(), opsToken);
+      const rtc = await createOk([damagedLine('CP', 2)]);
+      const approve = await http()
+        .post(`${API}/${tenantId}/inventory/adjustment-pendings/${pend.body.pendingAdjustment.id as string}/approve`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({});
+      expect(approve.status).toBe(409);
+      expect(approve.body).toMatchObject({ code: 'damaged-claimed-by-rtc', clientReturnCodes: [rtc.code], vendorReturnCodes: [], claimedQty: 2, onHandQty: 3 });
+      await cancel(rtc).expect(200);
+    } finally {
+      await policy('/inventory/adjustment-policies', 1_000_000);
+    }
   });
 
   it('a short pick on a DAMAGED line (2 of 4, on-hand 6): the returnable shows claimedRtc 2 and a write-off of 4 passes', async () => {
