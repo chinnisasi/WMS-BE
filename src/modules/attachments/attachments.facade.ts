@@ -94,6 +94,35 @@ export class AttachmentsFacade {
   }
 
   /**
+   * Story 4-4a (A23, D8) — one shareable shipping file for the mail renderer,
+   * on the registry's read-only transaction stamped with the row's client:
+   * the row must be `attached`, the client's (an explicit predicate beside
+   * the stamp), and a shipping document or a signed-sheet page — else null
+   * (the email goes without the file and says where to find it). The bytes
+   * come from `FileStore.get`, which throws on a missing object, a transport
+   * error or its 15 s timeout (the sender's transient `attachment-failed`).
+   */
+  async readForMail(tx: TenantTx, tenantId: string, clientId: string, attachmentId: string): Promise<{ row: AttachmentRow; content: Uint8Array } | null> {
+    const rows = await tx
+      .select()
+      .from(attachments)
+      .where(
+        and(
+          eq(attachments.tenantId, tenantId),
+          eq(attachments.id, attachmentId),
+          eq(attachments.clientId, clientId),
+          eq(attachments.status, 'attached'),
+          inArray(attachments.purpose, ['shipping-document', 'handover-sheet']),
+        ),
+      )
+      .limit(1);
+    const row = rows[0];
+    if (row === undefined || row.objectKey === null) return null;
+    const content = await this.fileStore.get(row.objectKey);
+    return { row, content };
+  }
+
+  /**
    * One tenant's retention sweep (A10). Per arm: claim ≤ 100 rows `FOR UPDATE
    * SKIP LOCKED`, re-check status and age, move them to their terminal state
    * and COMMIT; then delete the bytes outside any transaction; then set

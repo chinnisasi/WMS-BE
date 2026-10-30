@@ -24,6 +24,7 @@ import {
   queueClientEmailInTx,
   type ClientDispatchEmailParams,
   type ClientReceiptEmailParams,
+  type ClientShipmentDocumentEmailParams,
 } from '../mail/mail.facade';
 import {
   CLIENT_EMAIL_DAILY_CAP,
@@ -36,7 +37,9 @@ import {
 import {
   buildDispatchEmailParams,
   buildReceiptEmailParams,
+  buildShipmentDocumentEmailParams,
   clientEmailDedupeKey,
+  decodeDocumentShared,
   qcHeldLinesOf,
 } from './client-email-params';
 
@@ -49,7 +52,9 @@ export type ClientEmailSkipReason =
   | 'self-client'
   | 'client-departed'
   | 'no-subscriber'
-  | 'over-cap';
+  | 'over-cap'
+  // Story 4-4a — the shared file (or its order or handover) is gone, or not the event's client's.
+  | 'document-gone';
 
 /** What one delivery did (the suites read it). */
 export type ClientEmailOutcome =
@@ -155,17 +160,21 @@ export class ClientEmailsEnqueueHandler implements OnModuleInit {
 
     const receipt = publicEvent === 'receipt.recorded' ? decodeReceipt(event.payload) : null;
     const dispatch = publicEvent === 'order.dispatched' ? decodeDispatch(event.payload) : null;
-    if (receipt === null && dispatch === null) {
+    // Story 4-4a (D6) — a shared shipping document: the payload names its client.
+    const document = publicEvent === 'shipment.documents' ? decodeDocumentShared(event.payload) : null;
+    if (receipt === null && dispatch === null && document === null) {
       this.logger.error(`client-email.malformed type=${event.type} tenant=${tenantId} event=${event.eventId} — no mail, acking`);
       return { kind: 'malformed' };
     }
 
     // 1. The client: on the receipt; through the order for a dispatch.
-    const subjectId = receipt !== null ? receipt.grnId : dispatch!.orderId;
+    const subjectId = receipt !== null ? receipt.grnId : document !== null ? document.attachmentId : dispatch!.orderId;
     const clientId =
       receipt !== null
         ? receipt.clientId
-        : ((await this.outbound.orderClientIdsInTx(tx, tenantId, [dispatch!.orderId])).get(dispatch!.orderId) ?? null);
+        : document !== null
+          ? document.clientId
+          : ((await this.outbound.orderClientIdsInTx(tx, tenantId, [dispatch!.orderId])).get(dispatch!.orderId) ?? null);
     if (clientId === null) return skip('no-client', null);
 
     // 2. Missing, the tenant's own `self`, or departed: no mail. Existence is
@@ -193,8 +202,12 @@ export class ClientEmailsEnqueueHandler implements OnModuleInit {
       clientName: client.name,
       replyTo: client.emailReplyTo ?? null,
     };
-    let params: ClientReceiptEmailParams | ClientDispatchEmailParams;
-    if (receipt !== null) {
+    let params: ClientReceiptEmailParams | ClientDispatchEmailParams | ClientShipmentDocumentEmailParams;
+    if (document !== null) {
+      const facts = await this.outbound.shipmentDocumentEmailFactsInTx(tx, tenantId, document);
+      if (facts === null) return skip('document-gone', clientId);
+      params = buildShipmentDocumentEmailParams(document, facts, names);
+    } else if (receipt !== null) {
       const warehouseName = await getWarehouseNameInTx(tx, tenantId, receipt.warehouseId);
       const poCodes = receipt.poId === null ? new Map<string, string>() : await this.inbound.poCodesByIdsInTx(tx, tenantId, [receipt.poId]);
       const skus = await this.catalog.skuLabelsInTx(tx, tenantId, receipt.lines.map((line) => line.skuId));
@@ -231,7 +244,18 @@ export class ClientEmailsEnqueueHandler implements OnModuleInit {
               // rendered at send time (no per-client switch).
               attachment: { kind: 'grn-pdf', ref: subjectId },
             })
-          : await queueClientEmailInTx(tx, { tenantId, clientId, template, to: recipient.email, dedupeKey, params: params as ClientDispatchEmailParams });
+          : template === 'client-shipment-document'
+            ? await queueClientEmailInTx(tx, {
+                tenantId,
+                clientId,
+                template,
+                to: recipient.email,
+                dedupeKey,
+                params: params as ClientShipmentDocumentEmailParams,
+                // Story 4-4a (D3) — the stored file, read and attached at send time.
+                attachment: { kind: 'stored-file', ref: subjectId },
+              })
+            : await queueClientEmailInTx(tx, { tenantId, clientId, template, to: recipient.email, dedupeKey, params: params as ClientDispatchEmailParams });
       if (row === null) {
         deduped += 1;
       } else {

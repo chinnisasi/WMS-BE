@@ -8,7 +8,7 @@
  * `email_messages_template_check` (0089; story 6-1c re-added it in 0103 with
  * the reset link and the password-changed notice).
  */
-export const EMAIL_TEMPLATES = ['user-invite', 'password-reset', 'password-changed', 'client-receipt', 'client-dispatch'] as const;
+export const EMAIL_TEMPLATES = ['user-invite', 'password-reset', 'password-changed', 'client-receipt', 'client-dispatch', 'client-shipment-document'] as const;
 export type EmailTemplate = (typeof EMAIL_TEMPLATES)[number];
 
 /**
@@ -17,7 +17,7 @@ export type EmailTemplate = (typeof EMAIL_TEMPLATES)[number];
  * through `queueClientEmailInTx` (each row carries `client_id` and a
  * `dedupe_key` — the 0114 `email_messages_client_shape_check`).
  */
-export const CLIENT_EMAIL_TEMPLATES = ['client-receipt', 'client-dispatch'] as const satisfies readonly EmailTemplate[];
+export const CLIENT_EMAIL_TEMPLATES = ['client-receipt', 'client-dispatch', 'client-shipment-document'] as const satisfies readonly EmailTemplate[];
 export type ClientEmailTemplate = (typeof CLIENT_EMAIL_TEMPLATES)[number];
 
 /**
@@ -33,6 +33,8 @@ export const EMAIL_TEMPLATE_PRIORITY = {
   'password-changed': 0,
   'client-receipt': 1,
   'client-dispatch': 1,
+  // Story 4-4a — a client notice: after account mail.
+  'client-shipment-document': 1,
 } as const satisfies Record<EmailTemplate, 0 | 1>;
 
 /**
@@ -180,7 +182,7 @@ export function boundedEmailCode(code: string): string {
  * (`MailAttachmentRegistry`). Mirrored by 0115
  * `email_messages_attachment_kind_check` (pinned by test/mail.spec.ts).
  */
-export const EMAIL_ATTACHMENT_KINDS = ['grn-pdf'] as const;
+export const EMAIL_ATTACHMENT_KINDS = ['grn-pdf', 'stored-file'] as const;
 export type EmailAttachmentKind = (typeof EMAIL_ATTACHMENT_KINDS)[number];
 
 /** Above this an email is sent WITHOUT its file (the body says so — A16). The sender's default; a test lowers it. */

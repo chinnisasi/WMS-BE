@@ -683,7 +683,7 @@ export class ClientsController {
       nextCursor: log.nextCursor,
       mailEnabled: log.mailEnabled,
       clientMailEnabled: log.clientMailEnabled,
-      capReachedToday: { receipt: log.capReachedToday.receipt, dispatch: log.capReachedToday.dispatch },
+      capReachedToday: { receipt: log.capReachedToday.receipt, dispatch: log.capReachedToday.dispatch, shipmentDocument: log.capReachedToday.shipmentDocument },
     };
   }
 }

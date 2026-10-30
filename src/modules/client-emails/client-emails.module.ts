@@ -6,6 +6,9 @@ import { InboundModule } from '../inbound/inbound.module';
 import { InboundFacade } from '../inbound/inbound.facade';
 import { MailModule } from '../mail/mail.module';
 import { MailAttachmentRegistry } from '../mail/mail.facade';
+import { AttachmentsModule } from '../attachments/attachments.module';
+import { AttachmentsFacade } from '../attachments/attachments.facade';
+import { OutboundFacade } from '../outbound/outbound.facade';
 import { ClientEmailsEnqueueHandler } from './client-emails.enqueue';
 import { ClientEmailsFacade } from './client-emails.facade';
 
@@ -28,7 +31,8 @@ import { ClientEmailsFacade } from './client-emails.facade';
 @Module({
   // Story 2-9a (D13) — MailModule for its attachment registry (the singleton
   // the sender holds).
-  imports: [SharedModule, OutboundModule, CatalogModule, InboundModule, MailModule],
+  // Story 4-4a (D8) — AttachmentsModule for the stored-file renderer.
+  imports: [SharedModule, OutboundModule, CatalogModule, InboundModule, MailModule, AttachmentsModule],
   providers: [ClientEmailsEnqueueHandler, ClientEmailsFacade],
   exports: [ClientEmailsFacade],
 })
@@ -36,6 +40,8 @@ export class ClientEmailsModule implements OnModuleInit {
   constructor(
     @Inject(MailAttachmentRegistry) private readonly attachments: MailAttachmentRegistry,
     @Inject(InboundFacade) private readonly inbound: InboundFacade,
+    @Inject(AttachmentsFacade) private readonly files: AttachmentsFacade,
+    @Inject(OutboundFacade) private readonly outbound: OutboundFacade,
   ) {}
 
   /**
@@ -46,5 +52,15 @@ export class ClientEmailsModule implements OnModuleInit {
    */
   onModuleInit(): void {
     this.attachments.register('grn-pdf', (tx, tenantId, clientId, grnId) => this.inbound.grnDocumentPdfInTx(tx, tenantId, clientId, grnId));
+    // Story 4-4a (D8) — a shipping document or a signed-sheet page: the stored
+    // bytes (attachments) under the derived file name (outbound), both read on
+    // the registry's client-stamped, read-only transaction.
+    this.attachments.register('stored-file', async (tx, tenantId, clientId, attachmentId) => {
+      const file = await this.files.readForMail(tx, tenantId, clientId, attachmentId);
+      if (file === null) return null;
+      const filename = await this.outbound.shippingFileNameInTx(tx, tenantId, clientId, file.row);
+      if (filename === null) return null;
+      return { filename, contentType: file.row.contentType ?? 'application/octet-stream', content: file.content };
+    });
   }
 }

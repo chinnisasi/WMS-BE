@@ -19,6 +19,7 @@ import {
 import type {
   ClientDispatchEmailParams,
   ClientReceiptEmailParams,
+  ClientShipmentDocumentEmailParams,
   InviteEmailParams,
   PasswordChangedEmailParams,
   PasswordResetEmailParams,
@@ -59,13 +60,16 @@ export type { ClientEmailTemplate, EmailStatus, EmailTemplate } from './mail-rul
 export type {
   ClientDispatchEmailParams,
   ClientDispatchLineParams,
+  ClientShipmentDocumentEmailParams,
+  ClientShipmentDocumentParcelParams,
+  ShipmentDocumentKind,
   ClientReceiptEmailParams,
   ClientReceiptLineParams,
   InviteEmailParams,
   PasswordChangedEmailParams,
   PasswordResetEmailParams,
 } from './templates';
-export { CLIENT_EMAIL_MAX_LINES } from './templates';
+export { CLIENT_EMAIL_MAX_LINES, SHIPMENT_DOCUMENT_KINDS, SHEET_PARCELS_SHOWN } from './templates';
 export type { MailSendSummary, SendDueOptions } from './mail.sender';
 
 /**
@@ -144,6 +148,15 @@ export type QueueClientEmailInput = {
       readonly attachment?: { readonly kind: EmailAttachmentKind; readonly ref: string };
     }
   | { readonly template: 'client-dispatch'; readonly params: ClientDispatchEmailParams }
+  | {
+      readonly template: 'client-shipment-document';
+      readonly params: ClientShipmentDocumentEmailParams;
+      /**
+       * Story 4-4a (D3) — REQUIRED on this arm: the stored file, read and
+       * attached at send time (`email_messages_shipment_document_attachment`).
+       */
+      readonly attachment: { readonly kind: 'stored-file'; readonly ref: string };
+    }
 );
 
 /**
@@ -176,8 +189,9 @@ export async function queueClientEmailInTx(tx: TenantTx, input: QueueClientEmail
       status,
       nextAttemptAt: sql`now()`,
       errorCode: skipCode,
-      attachmentKind: input.template === 'client-receipt' ? (input.attachment?.kind ?? null) : null,
-      attachmentRef: input.template === 'client-receipt' ? (input.attachment?.ref ?? null) : null,
+      // Story 4-4a (D3) — either attachment-carrying template writes the columns.
+      attachmentKind: input.template === 'client-dispatch' ? null : (input.attachment?.kind ?? null),
+      attachmentRef: input.template === 'client-dispatch' ? null : (input.attachment?.ref ?? null),
     })
     .onConflictDoNothing({ target: [emailMessages.tenantId, emailMessages.dedupeKey], where: sql`dedupe_key IS NOT NULL` })
     .returning({ id: emailMessages.id });
@@ -237,7 +251,8 @@ export const CLIENT_EMAIL_PROBLEM_SQL = sql`(${emailMessages.status} in ('failed
 
 function subjectLabelOf(template: string, params: unknown): string {
   const value = typeof params === 'object' && params !== null ? (params as Record<string, unknown>) : {};
-  const label = template === 'client-receipt' ? value.grnCode : value.orderRef;
+  // Story 4-4a (D5) — a shipping document's label is its stored subject label.
+  const label = template === 'client-receipt' ? value.grnCode : template === 'client-shipment-document' ? value.subjectLabel : value.orderRef;
   return typeof label === 'string' && label !== '' ? label : '—';
 }
 
@@ -357,7 +372,11 @@ export async function clientEmailCountsTodayInTx(
      group by template
   `)) as unknown as { template: string; n: number }[];
   const count = (template: ClientEmailTemplate) => Number(rows.find((row) => row.template === template)?.n ?? 0);
-  return { 'client-receipt': count('client-receipt'), 'client-dispatch': count('client-dispatch') };
+  return {
+    'client-receipt': count('client-receipt'),
+    'client-dispatch': count('client-dispatch'),
+    'client-shipment-document': count('client-shipment-document'),
+  };
 }
 
 /** Story 5-2b (D9) — `EMAIL_PROVIDER ≠ off`: is mail sent (or logged) on this server at all? */

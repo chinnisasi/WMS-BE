@@ -3,14 +3,17 @@ import { acceptInviteLinkFrom, resetPasswordLinkFrom, webLinkFrom } from '../lin
 import { decodeInviteParams, renderInviteEmail, type RenderedEmail } from './invite';
 import { decodePasswordResetParams, renderPasswordResetEmail } from './password-reset';
 import { decodePasswordChangedParams, renderPasswordChangedEmail } from './password-changed';
-import { decodeClientReceiptParams, renderClientReceiptEmail, type ClientReceiptAttachmentState } from './client-receipt';
+import { decodeClientReceiptParams, renderClientReceiptEmail, type ClientAttachmentState } from './client-receipt';
+import { decodeClientShipmentDocumentParams, renderClientShipmentDocumentEmail } from './client-shipment-document';
 import { decodeClientDispatchParams, renderClientDispatchEmail } from './client-dispatch';
 
 export type { RenderedEmail } from './invite';
 export type { InviteEmailParams } from './invite';
 export type { PasswordResetEmailParams } from './password-reset';
 export type { PasswordChangedEmailParams } from './password-changed';
-export type { ClientReceiptAttachmentState, ClientReceiptEmailParams, ClientReceiptLineParams } from './client-receipt';
+export type { ClientAttachmentState, ClientReceiptAttachmentState, ClientReceiptEmailParams, ClientReceiptLineParams } from './client-receipt';
+export type { ClientShipmentDocumentEmailParams, ClientShipmentDocumentParcelParams, ShipmentDocumentKind } from './client-shipment-document';
+export { SHIPMENT_DOCUMENT_KINDS, SHEET_PARCELS_SHOWN } from './client-shipment-document';
 export type { ClientDispatchEmailParams, ClientDispatchLineParams } from './client-dispatch';
 export { CLIENT_EMAIL_MAX_LINES } from './client-notice';
 
@@ -33,7 +36,7 @@ export interface RenderContext {
    * Story 2-9a (D5) — the receipt notice's file: what the sender attached
    * (`client-receipt` only; absent = `none`, 5-2b's bytes).
    */
-  readonly attachment?: ClientReceiptAttachmentState;
+  readonly attachment?: ClientAttachmentState;
 }
 
 /**
@@ -68,6 +71,16 @@ export function renderEmail(template: EmailTemplate, params: unknown, context: R
       return renderClientReceiptEmail(
         receipt,
         webLinkFrom(context.webBaseUrl, '/portal/inbound', receipt.grnId === undefined ? {} : { grn: receipt.grnId }),
+        context.fallbackReplyTo ?? null,
+        context.attachment ?? 'none',
+      );
+    }
+    // Story 4-4a — a shipping document or a signed sheet page; the link opens the order.
+    case 'client-shipment-document': {
+      const document = decodeClientShipmentDocumentParams(params);
+      return renderClientShipmentDocumentEmail(
+        document,
+        webLinkFrom(context.webBaseUrl, '/portal/orders', document.orderId === null ? {} : { order: document.orderId }),
         context.fallbackReplyTo ?? null,
         context.attachment ?? 'none',
       );
