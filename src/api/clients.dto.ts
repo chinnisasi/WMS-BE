@@ -10,13 +10,16 @@ import {
   IsString,
   Length,
   Matches,
+  Max,
   MaxLength,
+  Min,
   ValidateIf,
   ValidateNested,
 } from 'class-validator';
 import {
   CLIENT_CONTACT_NAME_MAX,
   CLIENT_CONTACT_ROLES,
+  CLIENT_EMAIL_EVENTS,
   CLIENT_NAME_MAX,
   CLIENT_STATUSES,
   ALLOCATION_RULES,
@@ -27,8 +30,11 @@ import {
   RECEIVING_TOLERANCE_BPS_MAX,
   type AllocationRule,
   type ClientContactRole,
+  type ClientEmailEvent,
   type ClientStatus,
 } from '../modules/clients/clients.schema';
+import { CLIENT_EMAIL_LOG_PAGE_MAX } from '../modules/client-emails/client-email-rules';
+import { EMAIL_STATUSES, type EmailStatus } from '../modules/mail/mail.facade';
 import { CLIENT_STATUS_TARGETS, type ClientStatusTarget } from '../modules/clients/clients.command';
 import { ADDRESS_FIELD_LENGTHS } from '../shared/primitives/address';
 import { EMAIL_MAX_LENGTH, IsEmailAddress } from '../shared/primitives/email';
@@ -279,6 +285,19 @@ export class CreateClientContactDto {
   @ArrayMaxSize(CLIENT_CONTACT_ROLES.length)
   @IsIn(CLIENT_CONTACT_ROLES, { each: true })
   roles?: ClientContactRole[];
+
+  @ApiProperty({
+    required: false,
+    enum: [...CLIENT_EMAIL_EVENTS],
+    isArray: true,
+    description:
+      'Story 5-2b — the client emails this contact receives: receipt.recorded (each GRN), order.dispatched (each order). Omitted = none. No event twice; refused on the warehouse’s own (self) client',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(CLIENT_EMAIL_EVENTS.length)
+  @IsIn(CLIENT_EMAIL_EVENTS, { each: true })
+  emailEvents?: ClientEmailEvent[];
 }
 
 /** Story 1-2a — edit a contact: an absent field is unchanged; `isPrimary: true` makes it the primary. */
@@ -315,6 +334,18 @@ export class UpdateClientContactDto {
   @IsOptional()
   @IsBoolean()
   isPrimary?: boolean;
+
+  @ApiProperty({
+    required: false,
+    enum: [...CLIENT_EMAIL_EVENTS],
+    isArray: true,
+    description: 'Story 5-2b — omitted = unchanged; [] = none. Dropping an event cancels its still-queued emails to this contact',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(CLIENT_EMAIL_EVENTS.length)
+  @IsIn(CLIENT_EMAIL_EVENTS, { each: true })
+  emailEvents?: ClientEmailEvent[];
 }
 
 /** Story 1-2a — one client contact. */
@@ -345,6 +376,35 @@ export class ClientContactDto {
 
   @ApiProperty({ description: 'ISO-8601 UTC last update' })
   updatedAt!: string;
+
+  @ApiProperty({
+    enum: [...CLIENT_EMAIL_EVENTS],
+    isArray: true,
+    description: 'Story 5-2b — the client emails this contact receives, in vocabulary order; empty = none',
+  })
+  emailEvents!: ClientEmailEvent[];
+}
+
+/** Story 5-2b — the latest client email to a contact's address (the contacts list's badge). */
+export class ClientContactLastEmailDto {
+  @ApiProperty({ enum: [...EMAIL_STATUSES] })
+  status!: EmailStatus;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description: 'Why it was not sent (a provider code such as suppressed, or a local one such as expired or allowlist); null when sent or queued',
+  })
+  errorCode!: string | null;
+
+  @ApiProperty({ description: 'ISO-8601 UTC — when its status last changed' })
+  at!: string;
+}
+
+/** Story 5-2b — a contact as the LIST returns it: plus its latest client email (list-only). */
+export class ClientContactListItemDto extends ClientContactDto {
+  @ApiProperty({ type: ClientContactLastEmailDto, nullable: true, description: 'The latest receipt or dispatch email to this address for this client; null when none' })
+  lastEmail!: ClientContactLastEmailDto | null;
 }
 
 export class ClientContactResponse {
@@ -353,8 +413,71 @@ export class ClientContactResponse {
 }
 
 export class ClientContactListResponse {
-  @ApiProperty({ type: [ClientContactDto], description: 'The primary first, then by name, then by id (at most 20)' })
-  items!: readonly ClientContactDto[];
+  @ApiProperty({ type: [ClientContactListItemDto], description: 'The primary first, then by name, then by id (at most 20)' })
+  items!: readonly ClientContactListItemDto[];
+}
+
+/** Story 5-2b — `PATCH …/clients/{c}/email-settings`. */
+export class UpdateClientEmailSettingsDto {
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    maxLength: EMAIL_MAX_LENGTH,
+    example: 'accounts@3pl.example.in',
+    description: 'The Reply-To of the client’s receipt and dispatch emails (stored trimmed and lower-cased); null or blank clears it — the server’s default Reply-To then applies. Required',
+  })
+  @ValidateIf((_, value) => value !== null)
+  @IsString()
+  @MaxLength(EMAIL_MAX_LENGTH + 64)
+  replyTo!: string | null;
+}
+
+/** Story 5-2b — `GET …/clients/{c}/emails` query. */
+export class ClientEmailLogQuery {
+  @ApiProperty({ required: false, enum: ['true', 'false'], description: '`true`: only problems — not sent (failed, expired) or refused by the allowlist' })
+  @IsOptional()
+  @IsIn(['true', 'false'])
+  problems?: 'true' | 'false';
+
+  @ApiProperty({ required: false, description: 'The previous page’s nextCursor' })
+  @IsOptional()
+  @IsString()
+  cursor?: string;
+
+  @ApiProperty({ required: false, minimum: 1, maximum: CLIENT_EMAIL_LOG_PAGE_MAX, default: 50 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(CLIENT_EMAIL_LOG_PAGE_MAX)
+  limit?: number;
+}
+
+/** Story 5-2b — one client email. */
+export class ClientEmailLogItemDto {
+  @ApiProperty({ format: 'uuid' }) id!: string;
+  @ApiProperty({ enum: ['receipt', 'dispatch'] }) kind!: 'receipt' | 'dispatch';
+  @ApiProperty({ description: 'The GRN code (a receipt) or the order reference (a dispatch)' }) subjectLabel!: string;
+  @ApiProperty({ description: 'The recipient' }) to!: string;
+  @ApiProperty({ enum: [...EMAIL_STATUSES] }) status!: EmailStatus;
+  @ApiProperty({ type: String, nullable: true, description: 'Why it was not sent, skipped or cancelled (e.g. suppressed, expired, allowlist, provider-off, unsubscribed)' })
+  errorCode!: string | null;
+  @ApiProperty({ minimum: 0 }) attempts!: number;
+  @ApiProperty({ description: 'ISO-8601 UTC — when it was queued' }) createdAt!: string;
+  @ApiProperty({ description: 'ISO-8601 UTC — when its status last changed' }) updatedAt!: string;
+}
+
+export class ClientEmailCapDto {
+  @ApiProperty({ description: 'Today’s receipt emails reached the daily limit (500) — later receipts today were not emailed' }) receipt!: boolean;
+  @ApiProperty({ description: 'Today’s dispatch emails reached the daily limit (500) — later dispatches today were not emailed' }) dispatch!: boolean;
+}
+
+export class ClientEmailLogResponse {
+  @ApiProperty({ type: [ClientEmailLogItemDto], description: 'Newest first' }) items!: ClientEmailLogItemDto[];
+  @ApiProperty({ type: String, nullable: true }) nextCursor!: string | null;
+  @ApiProperty({ description: 'Mail is sent on this server at all (EMAIL_PROVIDER is not off)' }) mailEnabled!: boolean;
+  @ApiProperty({ description: 'Client emails are switched on on this server (CLIENT_EMAIL_ENABLED)' }) clientMailEnabled!: boolean;
+  @ApiProperty({ type: ClientEmailCapDto }) capReachedToday!: ClientEmailCapDto;
 }
 
 /**
@@ -577,6 +700,13 @@ export class ClientDto {
       'Story 4-3a — the outbound allocation policy. Optional: a mutation answer stored before 4-3a replays without it; every fresh read carries it',
   })
   allocationPolicy?: ClientAllocationPolicyDto;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description: 'Story 5-2b — the Reply-To of the client’s receipt and dispatch emails; null = the server’s default',
+  })
+  emailReplyTo!: string | null;
 }
 
 export class ClientResponse {

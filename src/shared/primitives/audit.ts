@@ -323,6 +323,9 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'client.receiving_policy_updated', targetType: 'client' },
   // Story 4-3a — the outbound allocation policy (`ClientsCommand.updateAllocationPolicy`).
   { action: 'client.allocation_policy_updated', targetType: 'client' },
+  // Story 5-2b — the client's email settings (`ClientsCommand.updateEmailSettings`):
+  // the Reply-To of its receipt and dispatch emails; `changes` carries before/after.
+  { action: 'client.email_settings_updated', targetType: 'client' },
   { action: 'goods_receipt.shelf_life_waived', targetType: 'goods_receipt' },
   { action: 'qc_hold.receipt_placed', targetType: 'goods_receipt' },
   { action: 'qc_hold.receipt_released', targetType: 'goods_receipt' },

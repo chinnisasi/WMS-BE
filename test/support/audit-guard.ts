@@ -85,6 +85,8 @@ export const AUDIT_NO_OP_ARMS = {
   'clients.receivingPolicy:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'client'),
   /** Story 4-3a — `ClientsCommand.updateAllocationPolicy` with the policy already in place (stores the key). */
   'clients.allocationPolicy:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'client'),
+  /** Story 5-2b — `ClientsCommand.updateEmailSettings` with the Reply-To already in place (stores the key). */
+  'clients.emailSettings:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'client'),
   /** Story 1-3 — `PartnersCommand.update` with nothing changed (stores the key). */
   'partners.update:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'partner'),
   /** Story 1-3 — `PartnersCommand.updateStatus` to the status (and reason) already in place (stores the key). */

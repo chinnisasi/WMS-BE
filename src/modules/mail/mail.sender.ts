@@ -24,9 +24,41 @@ import {
 } from './mail-rules';
 import { renderEmail } from './templates';
 
+/** Story 5-2b (A7, D7) — the worker's per-call options. */
+export interface SendDueOptions {
+  /**
+   * Priority-0 (account) rows this call may claim even when `limit` is spent
+   * (`EMAIL_PRIORITY_RESERVE`, passed only by the worker): an invite or a
+   * reset never waits behind another tenant's client backlog.
+   */
+  readonly priorityReserve?: number;
+}
+
+/**
+ * Story 5-2b (A7) — the claim of one priority's due rows, oldest due first:
+ * `(tenant_id, status, priority, next_attempt_at)` is
+ * `email_messages_claim_idx`. Exported so the suite EXPLAINs the REAL query.
+ */
+export function dueClaimQuery(tx: TenantTx, tenantId: string, priority: 0 | 1, take: number) {
+  return tx
+    .select()
+    .from(emailMessages)
+    .where(
+      and(
+        eq(emailMessages.tenantId, tenantId),
+        eq(emailMessages.status, 'pending'),
+        eq(emailMessages.priority, priority),
+        lte(emailMessages.nextAttemptAt, sql`now()`),
+      ),
+    )
+    .orderBy(asc(emailMessages.nextAttemptAt), asc(emailMessages.createdAt), asc(emailMessages.id))
+    .limit(take)
+    .for('update', { skipLocked: true });
+}
+
 /** What one `sendDue` call did (the worker logs config codes; the suites assert the rest). */
 export interface MailSendSummary {
-  /** Rows claimed this call (≤ the limit). */
+  /** Rows claimed this call (≤ the limit, plus up to `priorityReserve` account rows past it — story 5-2b). */
   readonly claimed: number;
   /** Rows handed to the gateway. */
   readonly attempted: number;
@@ -62,7 +94,10 @@ const secs = (ms: number) => sql`make_interval(secs => ${ms / 1000}::double prec
  *     have gone out, so they are never re-sent: AT-MOST-ONCE, SES has no
  *     idempotency key). `pending` rows older than 24 hours → `expired`.
  *     Final rows older than 90 days are deleted (≤ 1,000 per call). Then up
- *     to `limit` due `pending` rows are taken `FOR UPDATE SKIP LOCKED`. Each
+ *     to `limit` due `pending` rows are taken `FOR UPDATE SKIP LOCKED` —
+ *     account mail (priority 0) before client notices (priority 1, story
+ *     5-2b), and up to the worker's `priorityReserve` account rows even when
+ *     the limit is spent. Each
  *     is re-checked and rendered: provider `off` → `skipped`; an address now
  *     outside the allowlist → `skipped`; a secret that no longer opens →
  *     `failed 'unsealable'`; parameters that no longer render →
@@ -94,9 +129,10 @@ export class MailSender {
     @Inject(EMAIL_GATEWAY) private readonly gateway: EmailGateway,
   ) {}
 
-  async sendDue(tenantId: string, limit?: number): Promise<MailSendSummary> {
+  async sendDue(tenantId: string, limit?: number, options: SendDueOptions = {}): Promise<MailSendSummary> {
     const config = mailConfigFromEnv();
     const take = Math.max(0, Math.min(limit ?? config.maxPerTick, config.maxPerTick));
+    const reserve = Math.max(0, Math.trunc(options.priorityReserve ?? 0));
 
     const claim = await withTenantTransaction(this.db, tenantId, async (tx) => {
       const stale = await tx
@@ -135,22 +171,15 @@ export class MailSender {
         returning id
       `)) as unknown as { id: string }[];
 
-      const due =
-        take === 0
-          ? []
-          : await tx
-              .select()
-              .from(emailMessages)
-              .where(
-                and(
-                  eq(emailMessages.tenantId, tenantId),
-                  eq(emailMessages.status, 'pending'),
-                  lte(emailMessages.nextAttemptAt, sql`now()`),
-                ),
-              )
-              .orderBy(asc(emailMessages.nextAttemptAt), asc(emailMessages.createdAt), asc(emailMessages.id))
-              .limit(take)
-              .for('update', { skipLocked: true });
+      // Story 5-2b (A7, D7) — account mail (priority 0) first, up to the
+      // limit or the worker's per-tenant reserve, whichever is larger; then
+      // client notices (priority 1) with what the limit has left. One
+      // transaction, both FOR UPDATE SKIP LOCKED (two senders never claim one row).
+      const accountTake = Math.max(take, reserve);
+      const accountDue = accountTake === 0 ? [] : await dueClaimQuery(tx, tenantId, 0, accountTake);
+      const clientTake = Math.max(0, take - accountDue.length);
+      const clientDue = clientTake === 0 ? [] : await dueClaimQuery(tx, tenantId, 1, clientTake);
+      const due = [...accountDue, ...clientDue];
 
       const inFlight: Claimed[] = [];
       let skipped = 0;
@@ -189,6 +218,7 @@ export class MailSender {
             to: row.toEmail,
             webBaseUrl: config.webBaseUrl,
             secret,
+            fallbackReplyTo: config.replyTo,
           });
           email = {
             id: row.id,

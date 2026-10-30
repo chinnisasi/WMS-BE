@@ -1,3 +1,5 @@
+import type { ClientEmailTemplate } from '../mail/mail.facade';
+
 /**
  * The clients module's schema face (story 21-1, AD-6): the table's
  * definition lives in the shared schema file like every other table; this
@@ -61,3 +63,20 @@ export {
   isAllocationRule,
   type AllocationRule,
 } from '../../shared/primitives/batch-allocation';
+
+/**
+ * Story 5-2b (D10) — the client emails a contact may opt into: 5-2a's public
+ * event names, mirrored by the 0114 `client_contacts_email_events_check` CHECK
+ * (no NULL, no duplicate), the DTO's `@IsIn` and the web. Owned here (not in
+ * `client-emails`) because the contact commands cancel by template and
+ * `client-emails` imports `clients.facade` — the map there would cycle.
+ * Pinned against the CHECK by `test/client-master.spec.ts`.
+ */
+export const CLIENT_EMAIL_EVENTS = ['receipt.recorded', 'order.dispatched'] as const;
+export type ClientEmailEvent = (typeof CLIENT_EMAIL_EVENTS)[number];
+
+/** Story 5-2b — the email template each event is sent with (`mail-rules.ts` `EMAIL_TEMPLATES`). */
+export const CLIENT_EMAIL_EVENT_TEMPLATE = {
+  'receipt.recorded': 'client-receipt',
+  'order.dispatched': 'client-dispatch',
+} as const satisfies Record<ClientEmailEvent, ClientEmailTemplate>;

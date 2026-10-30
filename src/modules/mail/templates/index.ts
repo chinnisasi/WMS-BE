@@ -1,13 +1,18 @@
 import type { EmailTemplate } from '../mail-rules';
-import { acceptInviteLinkFrom, resetPasswordLinkFrom } from '../links';
+import { acceptInviteLinkFrom, resetPasswordLinkFrom, webLinkFrom } from '../links';
 import { decodeInviteParams, renderInviteEmail, type RenderedEmail } from './invite';
 import { decodePasswordResetParams, renderPasswordResetEmail } from './password-reset';
 import { decodePasswordChangedParams, renderPasswordChangedEmail } from './password-changed';
+import { decodeClientReceiptParams, renderClientReceiptEmail } from './client-receipt';
+import { decodeClientDispatchParams, renderClientDispatchEmail } from './client-dispatch';
 
 export type { RenderedEmail } from './invite';
 export type { InviteEmailParams } from './invite';
 export type { PasswordResetEmailParams } from './password-reset';
 export type { PasswordChangedEmailParams } from './password-changed';
+export type { ClientReceiptEmailParams, ClientReceiptLineParams } from './client-receipt';
+export type { ClientDispatchEmailParams, ClientDispatchLineParams } from './client-dispatch';
+export { CLIENT_EMAIL_MAX_LINES } from './client-notice';
 
 /** What a template may use besides its stored parameters: the row's tenant, its recipient, the base URL and the opened secret. */
 export interface RenderContext {
@@ -17,6 +22,13 @@ export interface RenderContext {
   readonly webBaseUrl: string;
   /** The opened sealed secret (null when the row stored none). */
   readonly secret: string | null;
+  /**
+   * Story 5-2b (A10) — the deployment's `EMAIL_REPLY_TO` (null when unset):
+   * a client notice's footer offers "reply to this email" only when some
+   * Reply-To exists. Optional so a caller that renders account mail only
+   * needs none.
+   */
+  readonly fallbackReplyTo?: string | null;
 }
 
 /**
@@ -44,6 +56,19 @@ export function renderEmail(template: EmailTemplate, params: unknown, context: R
     }
     case 'password-changed':
       return renderPasswordChangedEmail(decodePasswordChangedParams(params), context.to);
+    // Story 5-2b — the client notices: no secret; a link to the portal list.
+    case 'client-receipt':
+      return renderClientReceiptEmail(
+        decodeClientReceiptParams(params),
+        webLinkFrom(context.webBaseUrl, '/portal/inbound', {}),
+        context.fallbackReplyTo ?? null,
+      );
+    case 'client-dispatch':
+      return renderClientDispatchEmail(
+        decodeClientDispatchParams(params),
+        webLinkFrom(context.webBaseUrl, '/portal/orders', {}),
+        context.fallbackReplyTo ?? null,
+      );
     default: {
       const unreachable: never = template;
       throw new Error(`unknown email template ${String(unreachable)}`);

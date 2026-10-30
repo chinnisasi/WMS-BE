@@ -1,0 +1,178 @@
+import {
+  formatBaseQuantity,
+  formatQuantity,
+  type DispatchFact,
+  type ReceiptFact,
+  type SkuLabel,
+} from '../../shared/primitives/client-event-facts';
+import { orderLabelOf } from '../../shared/primitives/order-label';
+import { toMilli } from '../../shared/primitives/quantity';
+import {
+  CLIENT_EMAIL_MAX_LINES,
+  type ClientDispatchEmailParams,
+  type ClientDispatchLineParams,
+  type ClientEmailTemplate,
+  type ClientReceiptEmailParams,
+  type ClientReceiptLineParams,
+} from '../mail/mail.facade';
+
+/**
+ * Story 5-2b — the client notices' stored parameters, built KEY BY KEY from
+ * an allowlist (never a spread of an outbox payload). Pure: the caller has
+ * read every label. Every body fact comes from the frozen payload (A1) —
+ * lines, quantities, batch codes, carrier, tracking, times; only labels
+ * (SKU code / name / UoM, the PO code, the client, warehouse and tenant
+ * names) are looked up. Quantities are decimal strings at the SKU UoM's
+ * precision, from milli-units (A2: `toMilli` of the payload's base-unit
+ * number, then integer formatting — a 12.5 kg line reads `"12.500"`).
+ */
+
+/** The names a notice carries besides its payload facts. */
+export interface ClientEmailNames {
+  readonly tenantName: string;
+  readonly clientName: string;
+  readonly warehouseName: string;
+  /** The client's own Reply-To (null → the deployment's). */
+  readonly replyTo: string | null;
+}
+
+/** `{template}:{subjectId}:{email}` — one row per (event, recipient), however often the relay re-delivers. */
+export function clientEmailDedupeKey(template: ClientEmailTemplate, subjectId: string, email: string): string {
+  return `${template}:${subjectId}:${email}`;
+}
+
+function labelOf(skus: ReadonlyMap<string, SkuLabel>, skuId: string): SkuLabel {
+  const label = skus.get(skuId);
+  if (label === undefined) throw new Error(`client email: SKU ${skuId} has no catalog row`);
+  return label;
+}
+
+function unitOf(skus: ReadonlyMap<string, SkuLabel>, skuId: string): { uom: string; precision: number } {
+  const label = labelOf(skus, skuId);
+  return { uom: label.uom, precision: label.uomPrecision };
+}
+
+/**
+ * Sums base-unit quantities PER UoM (never kg and pcs into one number), each
+ * group in milli-units formatted at its own unit's precision with integer
+ * maths, in order of first appearance: `"16.500 kg, 4 pcs"`. No lines → `"0"`.
+ */
+export function totalsByUom(entries: readonly { readonly uom: string; readonly precision: number; readonly qty: number }[]): string {
+  const groups = new Map<string, { precision: number; milli: number }>();
+  for (const entry of entries) {
+    const group = groups.get(entry.uom) ?? { precision: entry.precision, milli: 0 };
+    group.milli += toMilli(entry.qty);
+    groups.set(entry.uom, group);
+  }
+  if (groups.size === 0) return '0';
+  return [...groups.entries()].map(([uom, group]) => `${formatQuantity(group.milli, group.precision)} ${uom}`).join(', ');
+}
+
+/**
+ * `qcHeldLines` of a `grn.recorded` payload (2-8a; present only when > 0,
+ * `receiving.command.ts`) — read beside the shared `decodeReceipt`, so the
+ * shared decoder keeps its shape (D2, D6). Absent or malformed reads 0.
+ */
+export function qcHeldLinesOf(payload: unknown): number {
+  const receipt =
+    typeof payload === 'object' && payload !== null ? (payload as { goodsReceipt?: unknown }).goodsReceipt : undefined;
+  const value = typeof receipt === 'object' && receipt !== null ? (receipt as { qcHeldLines?: unknown }).qcHeldLines : undefined;
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+/** The `client-receipt` params. "Received" is the line's `qty` (the good units); damaged and short read 0 when absent. */
+export function buildReceiptEmailParams(
+  fact: ReceiptFact,
+  names: ClientEmailNames & {
+    readonly poCode: string | null;
+    readonly skus: ReadonlyMap<string, SkuLabel>;
+    readonly qcHeldLines: number;
+  },
+): ClientReceiptEmailParams {
+  const lines: ClientReceiptLineParams[] = fact.lines.map((line) => {
+    const sku = labelOf(names.skus, line.skuId);
+    const p = sku.uomPrecision;
+    return {
+      skuCode: sku.code,
+      skuName: sku.name,
+      uom: sku.uom,
+      batchCode: line.batchCode,
+      received: formatBaseQuantity(line.qty, p),
+      damaged: formatBaseQuantity(line.damagedQty ?? 0, p),
+      short: formatBaseQuantity(line.shortQty ?? 0, p),
+    };
+  });
+  return {
+    tenantName: names.tenantName,
+    clientName: names.clientName,
+    warehouseName: names.warehouseName,
+    grnCode: fact.grnCode,
+    poCode: names.poCode,
+    asnCode: fact.asnCode,
+    recordedAt: fact.recordedAt,
+    replyTo: names.replyTo,
+    lines: lines.slice(0, CLIENT_EMAIL_MAX_LINES),
+    moreLines: Math.max(0, lines.length - CLIENT_EMAIL_MAX_LINES),
+    totals: {
+      received: totalsByUom(fact.lines.map((line) => ({ ...unitOf(names.skus, line.skuId), qty: line.qty }))),
+      damaged: totalsByUom(fact.lines.map((line) => ({ ...unitOf(names.skus, line.skuId), qty: line.damagedQty ?? 0 }))),
+      short: totalsByUom(fact.lines.map((line) => ({ ...unitOf(names.skus, line.skuId), qty: line.shortQty ?? 0 }))),
+    },
+    qcHeldLines: names.qcHeldLines,
+  };
+}
+
+/**
+ * The order's label — the ONE order label rule (`shared/primitives/order-label.ts`,
+ * the web's `orderLabel`): `clientOrderRef ?? channel reference ?? the short
+ * id`, then `-BO{seq}` on a backorder follow-on. From the payload.
+ */
+export function dispatchOrderRefOf(fact: DispatchFact): string {
+  return orderLabelOf({
+    id: fact.orderId,
+    clientOrderRef: fact.clientOrderRef,
+    externalEventId: fact.channelOrderRef,
+    followOnSeq: fact.followOnSeq,
+    // The chain's ROOT names an unnamed follow-on; a pre-root payload falls back to the parent.
+    followOnRootOrderId: fact.followOnRootOrderId ?? fact.followOnOfOrderId,
+  });
+}
+
+/** The `client-dispatch` params. Kit parent lines are dropped (their components remain). */
+export function buildDispatchEmailParams(
+  fact: DispatchFact,
+  names: ClientEmailNames & {
+    readonly skus: ReadonlyMap<string, SkuLabel>;
+    readonly kitParentLineIds: ReadonlySet<string>;
+  },
+): ClientDispatchEmailParams {
+  const kept = fact.lines.filter((line) => !names.kitParentLineIds.has(line.orderLineId));
+  const lines: ClientDispatchLineParams[] = kept.map((line) => {
+    const sku = labelOf(names.skus, line.skuId);
+    const p = sku.uomPrecision;
+    return {
+      skuCode: sku.code,
+      skuName: sku.name,
+      uom: sku.uom,
+      ordered: formatBaseQuantity(line.orderedQty, p),
+      dispatched: formatBaseQuantity(line.dispatchedQty, p),
+      short: formatBaseQuantity(line.shortfallQty, p),
+    };
+  });
+  return {
+    tenantName: names.tenantName,
+    clientName: names.clientName,
+    warehouseName: names.warehouseName,
+    orderRef: dispatchOrderRefOf(fact),
+    // Shown only when it is not already the label (both references exist).
+    channelRef: fact.clientOrderRef !== null && fact.channelOrderRef !== null ? fact.channelOrderRef : null,
+    dispatchedAt: fact.dispatchedAt,
+    carrierName: fact.carrierName,
+    trackingNumber: fact.trackingNumber,
+    totalUnits: totalsByUom(kept.map((line) => ({ ...unitOf(names.skus, line.skuId), qty: line.dispatchedQty }))),
+    replyTo: names.replyTo,
+    lines: lines.slice(0, CLIENT_EMAIL_MAX_LINES),
+    moreLines: Math.max(0, lines.length - CLIENT_EMAIL_MAX_LINES),
+    shortShipped: kept.some((line) => toMilli(line.shortfallQty) > 0),
+  };
+}

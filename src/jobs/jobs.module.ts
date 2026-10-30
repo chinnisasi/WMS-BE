@@ -38,6 +38,7 @@ import {
   EMAIL_FINAL_STATUSES,
   EMAIL_PENDING_EXPIRY_MS,
   EMAIL_RETENTION_DAYS,
+  EMAIL_PRIORITY_RESERVE,
   EMAIL_SENDING_STALE_MS,
   MailFacade,
 } from '../modules/mail/mail.facade';
@@ -1302,6 +1303,12 @@ export class EmailSenderWorker implements OnApplicationBootstrap, BeforeApplicat
   /** Ticks run so far — rotates where each tick's tenant walk starts. */
   private tickCount = 0;
   private readonly ticks = new InFlightTick();
+  /**
+   * Story 5-2b (A7, D7) — account rows (priority 0) each tenant may still
+   * claim once the shared budget is spent. A plain field so a suite can
+   * isolate the budget's rotation from the reserve.
+   */
+  priorityReserve = EMAIL_PRIORITY_RESERVE;
 
   constructor(
     @Inject(AUTH_DATABASE) private readonly authDb: Database,
@@ -1357,6 +1364,10 @@ export class EmailSenderWorker implements OnApplicationBootstrap, BeforeApplicat
         order by tenant_id asc
       `)) as unknown as { tenantId: string }[];
       let remaining = this.mail.maxPerTick();
+      // Story 5-2b (A7) — ONE reserve budget per tick, equal to the cap: the
+      // account rows sent past the spent limit, across every tenant, never
+      // exceed it (a tick's worst case is 2 × EMAIL_MAX_PER_TICK sends).
+      let reserveLeft = this.mail.maxPerTick();
       const driven: string[] = [];
       const configCodes = new Set<string>();
       // Code review — the shared budget would let the first tenant's backlog
@@ -1370,7 +1381,11 @@ export class EmailSenderWorker implements OnApplicationBootstrap, BeforeApplicat
         try {
           // Every tenant is still visited once the budget is spent: its
           // sweeps (stale, expiry, purge) run with a zero send limit.
-          const summary = await this.mail.sendDue(tenantId, remaining);
+          // Story 5-2b (A7, D7) — with the budget spent, a tenant's account
+          // mail (invites, resets) still takes up to the reserve.
+          const limit = remaining;
+          const summary = await this.mail.sendDue(tenantId, limit, { priorityReserve: Math.min(this.priorityReserve, reserveLeft) });
+          reserveLeft = Math.max(0, reserveLeft - Math.max(0, summary.attempted - limit));
           remaining = Math.max(0, remaining - summary.attempted);
           for (const code of summary.configCodes) configCodes.add(code);
           driven.push(tenantId);

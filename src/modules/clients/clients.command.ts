@@ -21,6 +21,8 @@ import {
   CLIENT_CODE_RE,
   CLIENT_CONTACT_NAME_MAX,
   CLIENT_CONTACT_ROLES,
+  CLIENT_EMAIL_EVENTS,
+  CLIENT_EMAIL_EVENT_TEMPLATE,
   CLIENT_NAME_MAX,
   MAX_CLIENT_CONTACTS,
   MIN_SHELF_LIFE_DAYS_MAX,
@@ -30,8 +32,10 @@ import {
   clientContacts,
   clients,
   type ClientContactRole,
+  type ClientEmailEvent,
   type ClientStatus,
 } from './clients.schema';
+import { CLIENT_EMAIL_TEMPLATES, cancelClientEmailsToInTx, type ClientEmailTemplate } from '../mail/mail.facade';
 import {
   clientNotFound,
   toClientContactSnapshot,
@@ -250,6 +254,8 @@ export interface AddClientContactCommand {
   readonly email: string;
   readonly phone?: string | null | undefined;
   readonly roles?: readonly string[] | undefined;
+  /** Story 5-2b (A11) — absent means none (stored `[]`), and is not hashed. */
+  readonly emailEvents?: readonly string[] | undefined;
 }
 
 /** Story 1-2a — a contact patch: an ABSENT field is unchanged; `phone: null` clears it. */
@@ -263,6 +269,8 @@ export interface EditClientContactCommand {
   readonly phone?: string | null | undefined;
   readonly roles?: readonly string[] | undefined;
   readonly isPrimary?: boolean | undefined;
+  /** Story 5-2b (A11) — absent means unchanged (not hashed); `[]` clears. */
+  readonly emailEvents?: readonly string[] | undefined;
 }
 
 export interface RemoveClientContactCommand {
@@ -270,6 +278,18 @@ export interface RemoveClientContactCommand {
   readonly actorUserId: string;
   readonly clientId: string;
   readonly contactId: string;
+}
+
+/**
+ * Story 5-2b — the client's email settings: the Reply-To of its receipt and
+ * dispatch emails (null clears it — the deployment's `EMAIL_REPLY_TO` then
+ * applies).
+ */
+export interface UpdateClientEmailSettingsCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly clientId: string;
+  readonly replyTo: string | null;
 }
 
 /** Story 1-2a — the response body of a contact write (the idempotency snapshot). */
@@ -834,6 +854,60 @@ export class ClientsCommand {
   }
 
   /**
+   * Story 5-2b — the client's email settings (`clients.manage`): the Reply-To
+   * of its receipt and dispatch emails. The `updateAllocationPolicy`
+   * skeleton: normalise (trim, lower-case; blank = null) + hash
+   * (`arm: 'email-settings'`) → authority → replay → `lockClientForEdit`
+   * (`FOR NO KEY UPDATE`, 404) → replay again → the shape (400 naming
+   * `replyTo`, behind the replay) → unchanged: a declared no-op that STORES
+   * the key (`clients.emailSettings:unchanged` — a late retry after another
+   * edit replays this answer rather than reverting it) → the update → audit
+   * `client.email_settings_updated` → key. Allowed on any client: the `self`
+   * client sends no client emails, but a Reply-To on it is harmless.
+   */
+  async updateEmailSettings(command: UpdateClientEmailSettingsCommand, idempotencyKey: string): Promise<ClientMutationSnapshot> {
+    const replyTo = normalizeReplyTo(command.replyTo);
+    const payloadHash = hashCommandPayload({
+      arm: 'email-settings',
+      tenantId: command.tenantId,
+      clientId: command.clientId,
+      replyTo,
+    });
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'clients.manage');
+      const replayed = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) {
+        return replayed;
+      }
+      const current = await this.lockClientForEdit(tx, command.tenantId, command.clientId);
+      const replayedUnderLock = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) {
+        return replayedUnderLock;
+      }
+      const valid = assertReplyTo(replyTo);
+      if (valid === current.emailReplyTo) {
+        // A declared no-op (`clients.emailSettings:unchanged`): nothing
+        // written or audited, the key stored.
+        const unchanged: ClientMutationSnapshot = { client: toClientSnapshot(current) };
+        await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, unchanged);
+        return unchanged;
+      }
+      const rows = await tx
+        .update(clients)
+        .set({ emailReplyTo: valid, updatedAt: nowIso() })
+        .where(and(eq(clients.tenantId, command.tenantId), eq(clients.id, current.id)))
+        .returning();
+      const snapshot: ClientMutationSnapshot = { client: toClientSnapshot(rows[0]!) };
+      await this.audit(tx, command.tenantId, command.actorUserId, 'client.email_settings_updated', current.id, idempotencyKey, {
+        replyTo: { before: current.emailReplyTo, after: valid },
+      });
+      await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+      return snapshot;
+    });
+  }
+
+  /**
    * Story 1-2a — add a contact to a client (`clients.manage`). The house
    * skeleton: normalize + hash (`arm: 'contact-add'`) → authority → replay →
    * lock the client `FOR NO KEY UPDATE` (404) → replay again → the shape
@@ -852,6 +926,9 @@ export class ClientsCommand {
       email: fields.email,
       phone: fields.phone ?? null,
       roles: fields.roles ?? [],
+      // Story 5-2b (A11) — hashed only when present: every pre-5-2b request
+      // shape hashes byte for byte as before.
+      ...(command.emailEvents === undefined ? {} : { emailEvents: sortEmailEvents(command.emailEvents) }),
     });
 
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
@@ -871,6 +948,7 @@ export class ClientsCommand {
         phone: fields.phone ?? null,
         roles: fields.roles ?? [],
       });
+      const emailEvents = assertEmailEvents(command.emailEvents ?? [], client.systemOwned);
       const existing = await tx
         .select({ id: clientContacts.id, email: clientContacts.email })
         .from(clientContacts)
@@ -899,6 +977,7 @@ export class ClientsCommand {
             phone: valid.phone,
             roles: [...valid.roles],
             isPrimary: existing.length === 0,
+            emailEvents: [...emailEvents],
           })
           .returning();
         inserted = rows[0]!;
@@ -945,6 +1024,8 @@ export class ClientsCommand {
       ...(fields.phone === undefined ? {} : { phone: fields.phone }),
       ...(fields.roles === undefined ? {} : { roles: fields.roles }),
       ...(command.isPrimary === undefined ? {} : { isPrimary: command.isPrimary }),
+      // Story 5-2b (A11) — hashed only when present (absent = unchanged).
+      ...(command.emailEvents === undefined ? {} : { emailEvents: sortEmailEvents(command.emailEvents) }),
     });
 
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
@@ -965,13 +1046,17 @@ export class ClientsCommand {
         phone: fields.phone === undefined ? current.phone : fields.phone,
         roles: fields.roles ?? (current.roles as ClientContactRole[]),
       });
+      const currentEvents = current.emailEvents as ClientEmailEvent[];
+      const emailEvents =
+        command.emailEvents === undefined ? currentEvents : assertEmailEvents(command.emailEvents, client.systemOwned);
       const makePrimary = command.isPrimary === true && !current.isPrimary;
       const unchanged =
         !makePrimary &&
         valid.name === current.name &&
         valid.email === current.email &&
         valid.phone === current.phone &&
-        sameRoles(valid.roles, current.roles);
+        sameRoles(valid.roles, current.roles) &&
+        sameRoles(emailEvents, currentEvents);
       if (unchanged) {
         const snapshot: ClientContactMutationSnapshot = { contact: toClientContactSnapshot(current) };
         await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
@@ -1016,6 +1101,7 @@ export class ClientsCommand {
             email: valid.email,
             phone: valid.phone,
             roles: [...valid.roles],
+            emailEvents: [...emailEvents],
             ...(makePrimary ? { isPrimary: true } : {}),
             updatedAt: nowIso(),
           })
@@ -1028,6 +1114,15 @@ export class ClientsCommand {
         }
         throw err;
       }
+      // Story 5-2b — a queued email the contact no longer wants is never sent:
+      // a changed address cancels every live client email to the old one (no
+      // contact of this client holds it any more — the email is unique per
+      // client); otherwise each dropped event cancels its template.
+      const dropped: ClientEmailTemplate[] =
+        valid.email !== current.email
+          ? [...CLIENT_EMAIL_TEMPLATES]
+          : currentEvents.filter((event) => !emailEvents.includes(event)).map((event) => CLIENT_EMAIL_EVENT_TEMPLATE[event]);
+      await cancelClientEmailsToInTx(tx, command.tenantId, client.id, current.email, dropped, 'unsubscribed');
       const snapshot: ClientContactMutationSnapshot = { contact: toClientContactSnapshot(updated) };
       await this.audit(tx, command.tenantId, command.actorUserId, 'client.contact_edited', client.id, idempotencyKey);
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
@@ -1085,6 +1180,8 @@ export class ClientsCommand {
       await tx
         .delete(clientContacts)
         .where(and(eq(clientContacts.tenantId, command.tenantId), eq(clientContacts.id, current.id)));
+      // Story 5-2b — a removed contact's queued client emails are never sent.
+      await cancelClientEmailsToInTx(tx, command.tenantId, client.id, current.email, [...CLIENT_EMAIL_TEMPLATES], 'unsubscribed');
       const snapshot: ClientContactMutationSnapshot = { contact: toClientContactSnapshot(current) };
       await this.audit(tx, command.tenantId, command.actorUserId, 'client.contact_removed', client.id, idempotencyKey);
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
@@ -1184,7 +1281,8 @@ export class ClientsCommand {
       | 'client.allocation_policy_updated'
       | 'client.contact_added'
       | 'client.contact_edited'
-      | 'client.contact_removed',
+      | 'client.contact_removed'
+      | 'client.email_settings_updated',
     clientId: string,
     reference: string,
     /** Story 2-4b — `{field: {before, after}}`, written only when given (the receiving policy edit). */
@@ -1378,6 +1476,65 @@ export function assertContactFields(fields: {
     throw invalid('roles must not repeat a role.');
   }
   return { name: fields.name, email: fields.email, phone, roles: roles as ClientContactRole[] };
+}
+
+/**
+ * Story 5-2b — a contact's email events in vocabulary order (an unknown value
+ * kept, sorted last, for the validator to refuse by name). The hashed and
+ * stored form.
+ */
+export function sortEmailEvents(events: readonly string[]): string[] {
+  if (!Array.isArray(events)) return events as unknown as string[];
+  const rank = (event: string): number => {
+    const index = (CLIENT_EMAIL_EVENTS as readonly string[]).indexOf(event);
+    return index === -1 ? CLIENT_EMAIL_EVENTS.length : index;
+  };
+  return [...events].sort((a, b) => rank(a) - rank(b) || (a < b ? -1 : a > b ? 1 : 0));
+}
+
+/**
+ * Story 5-2b (A11) — a contact's email events, judged on the request AS
+ * SENT (the vocabulary, then no duplicate), then the self-client rule; the
+ * sorted list on success. 400 `validation-failed` naming `emailEvents`.
+ */
+export function assertEmailEvents(raw: unknown, systemOwned: boolean): ClientEmailEvent[] {
+  const invalid = (detail: string): ProblemException =>
+    new ProblemException('validation-failed', 400, 'Invalid client contact', detail);
+  if (!Array.isArray(raw)) throw invalid('emailEvents must be a list.');
+  for (const event of raw as unknown[]) {
+    if (typeof event !== 'string' || !(CLIENT_EMAIL_EVENTS as readonly string[]).includes(event)) {
+      throw invalid(`emailEvents must each be one of ${JSON.stringify(CLIENT_EMAIL_EVENTS)} (got ${JSON.stringify(event)}).`);
+    }
+  }
+  if (new Set(raw).size !== raw.length) {
+    throw invalid('emailEvents must not repeat an event.');
+  }
+  if (systemOwned && raw.length > 0) {
+    throw invalid("emailEvents: the warehouse's own client gets no client emails.");
+  }
+  return sortEmailEvents(raw as string[]) as ClientEmailEvent[];
+}
+
+/** Story 5-2b — the Reply-To's stored form: trimmed and lower-cased; blank = null. */
+export function normalizeReplyTo(raw: string | null | undefined): string | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw !== 'string') return raw;
+  const normalized = normalizeEmailAddress(raw);
+  return normalized === '' ? null : normalized;
+}
+
+/** Story 5-2b — the Reply-To's shape (the contact email rule; the 0114 CHECK), 400 naming `replyTo`. */
+export function assertReplyTo(value: unknown): string | null {
+  if (value === null) return null;
+  if (typeof value !== 'string' || !isEmailAddress(value)) {
+    throw new ProblemException(
+      'validation-failed',
+      400,
+      'Invalid email settings',
+      `replyTo must be an ASCII email address of at most ${EMAIL_MAX_LENGTH} characters, or null (got ${JSON.stringify(value)}).`,
+    );
+  }
+  return value;
 }
 
 function sameRoles(a: readonly string[], b: readonly string[]): boolean {
