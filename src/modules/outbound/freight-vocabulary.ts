@@ -1,3 +1,5 @@
+import { DELIVERY_OUTCOMES } from '../../shared/primitives/freight';
+
 /**
  * Story 4-9a — the freight load's vocabularies (guide §4: the TS tuple beside
  * its owner, the 0119 CHECK, the DTO enum over the same tuple). A pure file:
@@ -46,6 +48,10 @@ export const FREIGHT_DISPATCH_REFUSALS = [
   'eway-bill-expired',
 ] as const;
 export type FreightDispatchRefusal = (typeof FREIGHT_DISPATCH_REFUSALS)[number];
+
+/** A22 — the portal truck block's status: planned, dispatched, or the delivery's outcome. */
+export const PORTAL_FREIGHT_STATUSES = ['planned', 'dispatched', ...DELIVERY_OUTCOMES] as const;
+export type PortalFreightStatus = (typeof PORTAL_FREIGHT_STATUSES)[number];
 
 export const FREIGHT_LIST_VIEWS = ['open', 'dispatched', 'pod-pending', 'delivery-exceptions', 'cancelled'] as const;
 export type FreightListView = (typeof FREIGHT_LIST_VIEWS)[number];

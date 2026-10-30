@@ -250,7 +250,7 @@ export function cartonHeading(
   const pallet = carton.packageType === 'pallet';
   return [
     `${pallet ? 'Pallet' : 'Carton'} ${carton.seq} of ${count}`,
-    pallet && carton.innerCount !== undefined ? `STC ${carton.innerCount} cartons` : null,
+    pallet && carton.innerCount !== undefined ? `STC ${carton.innerCount} ${carton.innerCount === 1 ? 'carton' : 'cartons'}` : null,
     carton.weightGrams === null ? null : kgText(carton.weightGrams),
     carton.dimensionsMm === null ? null : cmText(carton.dimensionsMm).replace(/x/g, ' x '),
     audience === 'staff' ? carton.code : null,

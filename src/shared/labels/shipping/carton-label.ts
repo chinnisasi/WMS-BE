@@ -100,9 +100,9 @@ export interface CartonLabelInput {
   readonly innerCount?: number | null;
 }
 
-/** Story 4-9a (A24) — `STC 600 CARTONS`, or null when no inner count is set. */
+/** Story 4-9a (A24) — `STC 600 CARTONS` (`STC 1 CARTON`), or null when no inner count is set. */
 export function stcText(innerCount: number | null | undefined): string | null {
-  return innerCount === null || innerCount === undefined ? null : `STC ${innerCount} CARTONS`;
+  return innerCount === null || innerCount === undefined ? null : `STC ${innerCount} ${innerCount === 1 ? 'CARTON' : 'CARTONS'}`;
 }
 
 /** `125000` paise → `Rs 1,250.00` — Indian digit grouping (x,xx,xxx.xx), integer arithmetic. */

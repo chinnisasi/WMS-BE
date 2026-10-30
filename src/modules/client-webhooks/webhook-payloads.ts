@@ -188,8 +188,9 @@ export function deliveryData(fact: DeliveryFact, labels: DeliveryLabels, occurre
       lrNumber: fact.lrNumber,
       vehicleNumber: fact.vehicleNumber,
       receiverName: fact.receiverName,
-      shortPackages: fact.shortPackageCount ?? 0,
-      damagedPackages: fact.damagedPackageCount ?? 0,
+      // Null when the delivery recorded none (a refusal, a clean delivery) — never a made-up 0.
+      shortPackages: fact.shortPackageCount,
+      damagedPackages: fact.damagedPackageCount,
       note: fact.note,
       amended: fact.amended,
       deliverySeq: fact.deliverySeq,
@@ -203,9 +204,11 @@ export function deliveryData(fact: DeliveryFact, labels: DeliveryLabels, occurre
  * Story 4-9a (A28) — the `order.delivered` event's SUBJECT: one per recorded
  * version of a consignment, so an amendment is a new event while a relay
  * redelivery of the same version dedupes on `webhook_events_subject_unique`
- * (an order-id subject would drop every amendment). A deterministic uuid
- * (version 5 layout) over `order.delivered:{consignmentId}:{deliverySeq}`;
- * the body's `orderId` names the order.
+ * (an order-id subject would drop every amendment). It is DERIVED, not
+ * stored: the first 128 bits of sha256(`order.delivered:{consignmentId}:{deliverySeq}`)
+ * shaped as a uuid (the version and variant nibbles set so it parses as
+ * one) — stable per recorded version, but no row carries this id. The
+ * body's `orderId` names the order.
  */
 export function deliverySubjectUuid(consignmentId: string, deliverySeq: number): string {
   const hex = createHash('sha256').update(`order.delivered:${consignmentId}:${deliverySeq}`).digest('hex').slice(0, 32).split('');

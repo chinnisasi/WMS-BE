@@ -90,6 +90,8 @@ export const DOC_KIND_FILE_WORD: Readonly<Record<string, string>> = {
   'eway-bill': 'eway-bill',
   pod: 'pod',
   other: 'document',
+  // Story 4-9a (D10) — a scanned lorry receipt.
+  lr: 'lr',
 };
 
 /**

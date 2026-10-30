@@ -224,13 +224,13 @@ describe('webhook payloads (story 5-2a)', () => {
       expect(body).not.toContain(CLIENT);
     });
 
-    it('an older payload without recordedAt dates the record by the event; absent counts read 0', () => {
+    it('an older payload without recordedAt dates the record by the event; absent counts read null (never a made-up 0)', () => {
       const older: Record<string, unknown> = { ...deliveryPayload };
       for (const key of ['recordedAt', 'shortPackageCount', 'damagedPackageCount']) delete older[key];
       const built = deliveryData(decodeDelivery({ ...older, outcome: 'delivered', amended: false, deliverySeq: 1 })!, { warehouseCode: 'BLR-1', clientOrderRef: null, channelOrderRef: null }, head.occurredAt);
       expect(built.data.recordedAt).toBe(head.occurredAt);
-      expect(built.data.shortPackages).toBe(0);
-      expect(built.data.damagedPackages).toBe(0);
+      expect(built.data.shortPackages).toBeNull();
+      expect(built.data.damagedPackages).toBeNull();
       expect(built.lines).toEqual([]);
     });
 
@@ -246,6 +246,8 @@ describe('webhook payloads (story 5-2a)', () => {
       const a = deliverySubjectUuid(CONS, 1);
       expect(a).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
       expect(deliverySubjectUuid(CONS, 1)).toBe(a);
+      // A literal golden: the derivation is the contract a stored event's subject was written by.
+      expect(a).toBe('817d71a1-83ef-5dd4-b6a4-32eed0bdc4a4');
       expect(deliverySubjectUuid(CONS, 2)).not.toBe(a);
       expect(deliverySubjectUuid(ORDER, 1)).not.toBe(a);
     });

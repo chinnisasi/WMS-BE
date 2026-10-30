@@ -14,6 +14,7 @@ import { AnySessionGuard, CurrentAnySession, type AnySession } from '../modules/
 import type { DeviceSession, TenantSession } from '../modules/tenancy/jwt-session';
 import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/idempotency-guard';
 import { OutboundFacade } from '../modules/outbound/outbound.facade';
+import { sendDocumentFile } from './outbound.controller';
 // Bound to @Body() / @Query() — value imports (the ValidationPipe reads the classes).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import {
@@ -586,12 +587,9 @@ function plain<T>(value: unknown): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
+/** The staff PDFs go out through 4-5a's document sender (no-store, the length, the attachment name). */
 function sendPdf(res: Response, file: { body: Buffer; fileName: string }): void {
-  res.status(200);
-  res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `attachment; filename="${file.fileName}"`);
-  res.setHeader('Content-Length', String(file.body.byteLength));
-  res.end(file.body);
+  sendDocumentFile(res, { filename: file.fileName, contentType: 'application/pdf', body: file.body });
 }
 
 function assertOwnTenant(sessionTenantId: string, tenantId: string): void {

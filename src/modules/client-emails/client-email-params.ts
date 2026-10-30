@@ -295,7 +295,8 @@ export function buildDocumentsNeededEmailParams(
 // ── story 4-4a: a shared shipping document ─────────────────────────────────
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const DOC_KINDS = ['invoice', 'challan', 'eway-bill', 'pod', 'other'] as const;
+// Story 4-9a — `lr` (a scanned lorry receipt) joined SHIPPING_DOC_KINDS.
+const DOC_KINDS = ['invoice', 'challan', 'eway-bill', 'pod', 'other', 'lr'] as const;
 
 /** D6 — the `shipment.document-shared` payload, decoded key by key; null when malformed. */
 export function decodeDocumentShared(payload: unknown): ShipmentDocumentFactInput | null {

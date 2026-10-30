@@ -1,4 +1,5 @@
 import { UUID_RE } from './ids';
+import { DELIVERY_OUTCOMES, type DeliveryOutcome } from './freight';
 import { QUANTITY_DECIMALS, QUANTITY_SCALE, toMilli } from './quantity';
 
 /**
@@ -200,8 +201,8 @@ export function decodeDispatch(payload: unknown): DispatchFact | null {
 // ── story 4-9a: a freight consignment's proof of delivery ─────────────────
 
 /** The outcomes a delivery records (`DELIVERY_OUTCOMES`, shared/primitives/freight.ts). */
-const DELIVERY_OUTCOME_VALUES = ['delivered', 'delivered-with-exceptions', 'refused'] as const;
-export type DeliveryOutcomeFact = (typeof DELIVERY_OUTCOME_VALUES)[number];
+const DELIVERY_OUTCOME_VALUES = DELIVERY_OUTCOMES;
+export type DeliveryOutcomeFact = DeliveryOutcome;
 
 /**
  * Story 4-9a (A17, A27, A28) — the `freight_consignment.delivered` payload:

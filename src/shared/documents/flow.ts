@@ -201,6 +201,11 @@ export class DocumentFlow {
 }
 
 /** `2026-10-30 16:05 IST`. */
+/** A file-name stem: every character outside `A-Za-z0-9._-` becomes `-` (the loading sheet and the freight note alike). */
+export function documentFileStem(text: string): string {
+  return text.replace(/[^A-Za-z0-9._-]/g, '-');
+}
+
 export function istLabel(instant: string): string {
   return `${istWallClock(instant).slice(0, 16)} IST`;
 }

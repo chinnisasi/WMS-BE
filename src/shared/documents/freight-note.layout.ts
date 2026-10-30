@@ -1,5 +1,5 @@
 import { drawDocumentPdf, type DocumentPage } from './a4-pdf';
-import { DocumentFlow, LEADING, countGrouped, istLabel, kgGrouped, type FlowColumn } from './flow';
+import { DocumentFlow, LEADING, countGrouped, documentFileStem, fontOf, istLabel, kgGrouped, type FlowColumn } from './flow';
 import { DOCUMENT_FONTS, documentText } from './text';
 import { wrapText } from './wrap';
 import { encodeCode128B } from '../labels/code128';
@@ -56,6 +56,8 @@ export interface FreightNoteModel {
   readonly transporter: { readonly name: string; readonly gstin: string | null };
   readonly vehicle: { readonly number: string; readonly type: string | null; readonly containerNumber: string | null };
   readonly driverName: string | null;
+  /** FTL or LTL (the carriage snapshot's) — the client copy prints seals for FTL only. */
+  readonly mode?: 'ftl' | 'ltl' | undefined;
   readonly seals: readonly string[];
   readonly orderLabel: string;
   readonly clientOrderRef: string | null;
@@ -168,7 +170,8 @@ export function layoutFreightNote(model: FreightNoteModel, options: { readonly a
           `Vehicle ${model.vehicle.number}${model.vehicle.type === null ? '' : ` (${model.vehicle.type})`}`,
           model.vehicle.containerNumber === null ? null : `Container ${model.vehicle.containerNumber}`,
           model.driverName === null ? null : `Driver ${model.driverName}`,
-          model.seals.length === 0 ? null : `Seals ${model.seals.join(', ')}`,
+          // The client copy prints seals for a full truck only (an LTL truck's seals are the load's, shared with other brands — the portal rule).
+          model.seals.length === 0 || (!staff && model.mode !== 'ftl') ? null : `Seals ${model.seals.join(', ')}`,
         ]),
       },
     ],
@@ -269,10 +272,6 @@ export function layoutFreightNote(model: FreightNoteModel, options: { readonly a
   return flow.finish();
 }
 
-function fontOf(name: 'regular' | 'bold') {
-  return name === 'bold' ? bold : regular;
-}
-
 /** The note's PDF for one audience at its print instant (same instant → same bytes). */
 export async function renderFreightNotePdf(model: FreightNoteModel, audience: FreightNoteAudience): Promise<Buffer> {
   return drawDocumentPdf(layoutFreightNote(model, { audience }), { title: `Freight note ${model.consignmentRef}`, creationDate: model.printedAt });
@@ -280,5 +279,5 @@ export async function renderFreightNotePdf(model: FreightNoteModel, audience: Fr
 
 /** `LD-0007-03-freight-note.pdf`. */
 export function freightNoteFileName(consignmentRef: string): string {
-  return `${consignmentRef.replace(/[^A-Za-z0-9._-]/g, '-')}-freight-note.pdf`;
+  return `${documentFileStem(consignmentRef)}-freight-note.pdf`;
 }

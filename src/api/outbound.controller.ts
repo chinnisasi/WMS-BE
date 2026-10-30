@@ -1538,7 +1538,7 @@ function orderNotFound(orderId: string): ProblemException {
 }
 
 /** Story 4-5a — a document file: every refusal was thrown before the first header (problem+json), then the headers and the bytes. */
-function sendDocumentFile(res: Response, file: { readonly filename: string; readonly contentType: string; readonly body: Buffer }): void {
+export function sendDocumentFile(res: Response, file: { readonly filename: string; readonly contentType: string; readonly body: Buffer }): void {
   res.status(200);
   res.setHeader('Content-Type', file.contentType);
   res.setHeader('Content-Length', String(file.body.length));

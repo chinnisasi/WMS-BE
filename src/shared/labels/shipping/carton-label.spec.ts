@@ -114,6 +114,7 @@ describe('story 4-5a — the carton label (A16, A42, decision 6)', () => {
     expect(cartonLabel(cartonInput({ packageType: 'carton' }))).toEqual(base);
     expect(cartonLabel(cartonInput({ innerCount: null }))).toEqual(base);
     expect(stcText(600)).toBe('STC 600 CARTONS');
+    expect(stcText(1)).toBe('STC 1 CARTON');
     expect(stcText(null)).toBeNull();
     const pallet = cartonLabel(cartonInput({ packageType: 'pallet', innerCount: 600, clientOrderRef: 'SO-1' }));
     expect(() => assertLabelBands(pallet)).not.toThrow();

@@ -1,3 +1,4 @@
+import { DELIVERY_OUTCOMES, type DeliveryOutcome } from '../../../shared/primitives/freight';
 import { headerText, html, plainText } from './escape';
 import { istLongDateTime, type RenderedEmail } from './invite';
 import { asRecord, clientFooter, clientFromName, clientHtml, instantField, nullableText, textField } from './client-notice';
@@ -12,8 +13,9 @@ import { asRecord, clientFooter, clientFromName, clientHtml, instantField, nulla
  * no consignee name or address — only the city. The POD file reaches the
  * contact through 4-4a's document email, never this one (no attachment).
  */
-export const DELIVERY_UPDATE_OUTCOMES = ['delivered', 'delivered-with-exceptions', 'refused'] as const;
-export type DeliveryUpdateOutcome = (typeof DELIVERY_UPDATE_OUTCOMES)[number];
+/** The delivery outcomes (`DELIVERY_OUTCOMES`, shared/primitives/freight.ts — one vocabulary). */
+export const DELIVERY_UPDATE_OUTCOMES = DELIVERY_OUTCOMES;
+export type DeliveryUpdateOutcome = DeliveryOutcome;
 
 export interface ClientDeliveryUpdateEmailParams {
   readonly tenantName: string;

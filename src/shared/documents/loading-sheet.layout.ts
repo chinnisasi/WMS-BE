@@ -1,5 +1,5 @@
 import { drawDocumentPdf, type DocumentPage } from './a4-pdf';
-import { DocumentFlow, LEADING, countGrouped, istLabel, kgGrouped, type FlowColumn } from './flow';
+import { DocumentFlow, LEADING, countGrouped, documentFileStem, istLabel, kgGrouped, type FlowColumn } from './flow';
 import { DOCUMENT_FONTS, documentText } from './text';
 import { wrapText } from './wrap';
 import { encodeCode128B } from '../labels/code128';
@@ -276,5 +276,5 @@ export async function renderLoadingSheetPdf(model: LoadingSheetModel): Promise<B
 
 /** `LD-0007-loading-sheet.pdf`. */
 export function loadingSheetFileName(loadCode: string): string {
-  return `${loadCode.replace(/[^A-Za-z0-9._-]/g, '_')}-loading-sheet.pdf`;
+  return `${documentFileStem(loadCode)}-loading-sheet.pdf`;
 }

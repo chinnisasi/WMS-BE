@@ -1,5 +1,6 @@
 import { pdfPagesText } from '../../../test/support/pdf-text';
 import { readPdfLabels } from '../../../test/support/labels';
+import { loadingSheetFileName } from './loading-sheet.layout';
 import { A4_WIDTH_PT } from './a4-pdf';
 import {
   FREIGHT_NOTE_DISCLAIMER,
@@ -132,6 +133,20 @@ describe('story 4-9a — the freight note (A26)', () => {
     expect(allTexts(client)).toContain('Packages: 15 pallets (STC 600 cartons), 2 cartons — 9,420 kg');
     const staff = layoutFreightNote(model(), { audience: 'staff' });
     expect(allTexts(staff).filter((text) => text.startsWith(TAG))).toHaveLength(17);
+  });
+
+  it('seals: the staff copy always prints them; the client copy only for an FTL truck (the portal rule — an LTL truck\'s seals are shared with other brands)', () => {
+    for (const mode of [undefined, 'ltl', 'ftl'] as const) {
+      const staff = allTexts(layoutFreightNote(model({ mode }), { audience: 'staff' }));
+      expect(staff).toContain('Seals S-991');
+      const client = allTexts(layoutFreightNote(model({ mode }), { audience: 'client' }));
+      expect(client.includes('Seals S-991')).toBe(mode === 'ftl');
+    }
+  });
+
+  it('the file name: every unsafe character becomes "-" (the loading sheet\'s rule too)', () => {
+    expect(freightNoteFileName('LD-0007/03')).toBe('LD-0007-03-freight-note.pdf');
+    expect(loadingSheetFileName('LD 0007')).toBe('LD-0007-loading-sheet.pdf');
   });
 
   it('never prints a phone', () => {

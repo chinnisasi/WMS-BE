@@ -13,6 +13,7 @@ import {
   FREIGHT_LOAD_EXCEPTIONS,
   FREIGHT_LOAD_STATUSES,
   FREIGHT_SCAN_ACTIONS,
+  PORTAL_FREIGHT_STATUSES,
 } from '../modules/outbound/freight-vocabulary';
 import { FileViewDto } from './shipping.dto';
 
@@ -612,6 +613,11 @@ export class FreightConsignmentResponse {
   @ApiProperty({ required: false, description: 'Present (true) on the unchanged no-op (200)' }) unchanged?: boolean;
 }
 
+export class FreightLoadedTotalDto {
+  @ApiProperty() loaded!: number;
+  @ApiProperty() total!: number;
+}
+
 export class FreightLoadListRowDto {
   @ApiProperty({ format: 'uuid' }) id!: string;
   @ApiProperty() code!: string;
@@ -623,7 +629,7 @@ export class FreightLoadListRowDto {
   @ApiProperty() consignmentCount!: number;
   @ApiProperty({ type: [String], description: 'At most 5' }) clientCodes!: string[];
   @ApiProperty() clientMore!: number;
-  @ApiProperty({ type: FreightProgressDto }) packages!: { loaded: number; total: number };
+  @ApiProperty({ type: () => FreightLoadedTotalDto }) packages!: FreightLoadedTotalDto;
   @ApiProperty() palletCount!: number;
   @ApiProperty({ type: Number, nullable: true }) grossWeightGrams!: number | null;
   @ApiProperty({ type: Number, nullable: true }) capacityKg!: number | null;
@@ -693,7 +699,7 @@ export class OrderFreightBlockDto {
 
 /** A22 — the portal's truck block: only `status` while planned. */
 export class PortalFreightBlockDto {
-  @ApiProperty({ enum: ['planned', 'dispatched', 'delivered', 'delivered-with-exceptions', 'refused'] }) status!: string;
+  @ApiProperty({ enum: [...PORTAL_FREIGHT_STATUSES] }) status!: string;
   @ApiProperty({ required: false }) consignmentRef?: string;
   @ApiProperty({ required: false }) transporterName?: string;
   @ApiProperty({ required: false }) vehicleNumber?: string;

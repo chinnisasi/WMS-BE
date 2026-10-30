@@ -252,7 +252,7 @@ export class CreateHandoverDto {
 
 /** A14 — a document upload's multipart text field. */
 export class OrderDocumentFieldsDto {
-  @ApiProperty({ enum: [...SHIPPING_DOC_KINDS], description: 'invoice, challan, eway-bill, pod or other (the portal: never pod)' })
+  @ApiProperty({ enum: [...SHIPPING_DOC_KINDS], description: 'invoice, challan, eway-bill, pod, other or lr (the portal: never pod)' })
   @IsString()
   kind!: string;
 }
@@ -322,7 +322,7 @@ export class PortalShipmentResponse {
 
 export class ShippingFileSnapshotDto {
   @ApiProperty({ format: 'uuid' }) id!: string;
-  @ApiProperty({ enum: ['shipping-label', 'shipping-document', 'handover-sheet'] }) purpose!: string;
+  @ApiProperty({ enum: ['shipping-label', 'shipping-document', 'handover-sheet', 'loading-sheet'] }) purpose!: string;
   @ApiProperty({ type: String, nullable: true, enum: [...SHIPPING_DOC_KINDS, null] }) docKind!: string | null;
   @ApiProperty({ type: String, nullable: true }) contentType!: string | null;
   @ApiProperty({ type: Number, nullable: true }) byteSize!: number | null;
@@ -390,7 +390,7 @@ export class HandoverResponse {
 
 export class FileViewDto {
   @ApiProperty({ format: 'uuid' }) id!: string;
-  @ApiProperty({ enum: ['shipping-label', 'shipping-document', 'handover-sheet'] }) purpose!: string;
+  @ApiProperty({ enum: ['shipping-label', 'shipping-document', 'handover-sheet', 'loading-sheet'] }) purpose!: string;
   @ApiProperty({ type: String, nullable: true, enum: [...SHIPPING_DOC_KINDS, null] }) docKind!: string | null;
   @ApiProperty({ description: 'The server-built name (never the uploader’s)' }) fileName!: string;
   @ApiProperty({ type: String, nullable: true }) contentType!: string | null;

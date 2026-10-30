@@ -40,7 +40,7 @@ import {
   type FreightLoadView,
   type PackMeasurementsReader,
 } from './freight.read';
-import type { FreightCandidateStatus, FreightListView } from './freight-vocabulary';
+import type { FreightCandidateStatus, FreightListView, PortalFreightStatus } from './freight-vocabulary';
 
 /**
  * Story 4-9a — the freight service the outbound facade delegates to: the
@@ -134,7 +134,7 @@ export interface OrderFreightBlock {
 
 /** A22 — the portal's freight block: an exact key allowlist; while planned, only the status. */
 export interface PortalFreightBlock {
-  readonly status: 'planned' | 'dispatched' | 'delivered' | 'delivered-with-exceptions' | 'refused';
+  readonly status: PortalFreightStatus;
   readonly consignmentRef?: string;
   readonly transporterName?: string;
   readonly vehicleNumber?: string;
@@ -673,6 +673,7 @@ export class FreightService {
       vehicle: { number: carriage.vehicleNumber, type: carriage.vehicleType, containerNumber: carriage.containerNumber },
       driverName: carriage.driverName,
       seals: [...carriage.seals],
+      mode: carriage.mode === 'ftl' ? 'ftl' : 'ltl',
       orderLabel: orderLabelOf(order),
       clientOrderRef: order.clientOrderRef,
       lr: { number: row.lrNumber, date: row.lrDate, terms: row.freightTerms },

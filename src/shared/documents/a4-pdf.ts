@@ -24,7 +24,7 @@ export interface DocumentRun {
   readonly color?: 'white';
 }
 
-/** Story 4-9a (A25) — a filled black rectangle (a reversed band's ground), drawn before the runs. */
+/** Story 4-9a (A25) — a filled black rectangle (a reversed band's ground), drawn first: the rules and the runs draw over it. */
 export interface DocumentFill {
   readonly x: number;
   readonly y: number;
@@ -86,11 +86,12 @@ export async function drawDocumentPdf(
   };
   for (const layout of pages) {
     const page = doc.addPage(layout.landscape === true ? [A4_HEIGHT_PT, A4_WIDTH_PT] : [A4_WIDTH_PT, A4_HEIGHT_PT]);
-    for (const rule of layout.rules) {
-      page.drawLine({ start: { x: rule.x1, y: rule.y1 }, end: { x: rule.x2, y: rule.y2 }, thickness: rule.width, color: BLACK });
-    }
+    // Fills first: a reversed band is a ground, so the rules and the runs draw over it (never hidden by it).
     for (const fill of layout.fills ?? []) {
       page.drawRectangle({ x: fill.x, y: fill.y, width: fill.w, height: fill.h, color: BLACK, borderWidth: 0 });
+    }
+    for (const rule of layout.rules) {
+      page.drawLine({ start: { x: rule.x1, y: rule.y1 }, end: { x: rule.x2, y: rule.y2 }, thickness: rule.width, color: BLACK });
     }
     for (const run of layout.runs) {
       if (run.text.length === 0) continue;
