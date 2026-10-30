@@ -18,6 +18,11 @@ import { OrderImportCommand } from './order-import.command';
 import { CancelRestockCommandService } from './cancel-restock.command';
 import { OrderShelfLifeReader } from './order-shelf-life';
 import { ValkeyModule } from '../../shared/valkey/valkey.module';
+import { AttachmentsModule } from '../attachments/attachments.module';
+import { ClientLabelCommand } from './client-label.command';
+import { ShippingFilesCommand } from './shipping-files.command';
+import { HandoverCommand } from './handover.command';
+import { ShippingService } from './shipping.service';
 
 /**
  * Outbound module (Story 4.1): the order aggregate and its state machine —
@@ -94,7 +99,7 @@ import { ValkeyModule } from '../../shared/valkey/valkey.module';
 // Story 4-1c — `ValkeyModule` for the order import's per-key lease (the one
 // shared atomic-decision client; outbound carries no counter of its own).
 @Module({
-  imports: [SharedModule, InventoryModule, forwardRef(() => CatalogModule), CarriersModule, ValkeyModule],
+  imports: [SharedModule, InventoryModule, forwardRef(() => CatalogModule), CarriersModule, ValkeyModule, AttachmentsModule],
   providers: [
     OrderCommandService,
     WaveCommandService,
@@ -111,6 +116,12 @@ import { ValkeyModule } from '../../shared/valkey/valkey.module';
     // Story 4-2c — the backorder allocation (the verb, the sweep, the
     // after-dispatch attempt).
     AllocationCommandService,
+    // Story 4-4a — client-arranged shipping: the label and AWB, the files,
+    // the courier handover, and the reads (AttachmentsModule for the store).
+    ClientLabelCommand,
+    ShippingFilesCommand,
+    HandoverCommand,
+    ShippingService,
     { provide: WAVE_CLOCK, useClass: SystemWaveClock },
     OutboundFacade,
   ],

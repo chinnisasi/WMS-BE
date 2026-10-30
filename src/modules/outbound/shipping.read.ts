@@ -1,0 +1,451 @@
+import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
+import type { AttachmentRow, CourierHandover, Order, Shipment } from '../../shared/db/schema';
+import { courierHandovers, orders, shipments } from '../../shared/db/schema';
+import type { TenantTx } from '../../shared/db/tenant-scope';
+import { UUID_RE } from '../../shared/primitives/ids';
+import { orderLabelOf } from '../../shared/primitives/order-label';
+import { parcelTagCode } from '../../shared/primitives/parcel-tag';
+import { maskPhone } from '../../shared/primitives/phone';
+import { addIsoDays, canonicalInstant, fullPrecisionInstant, isIsoDate, istMidnightOf } from '../../shared/primitives/time';
+import { decodeCursor, encodeCursor } from '../../shared/primitives/pagination';
+import { ProblemException } from '../../shared/problem-details/problem.exception';
+import { listByOwnerInTx } from '../attachments/attachment-records';
+import { extensionOf, fileNamePart } from './shipping-support';
+import type { ShipmentKind, ShipmentStatus } from './shipment.command';
+
+/**
+ * Story 4-4a (A16–A18, A39, A44, A45, A50) — the client-arranged shipping
+ * reads, as free functions over the caller's transaction (the facade opens
+ * the transaction — stamped for the portal — and presigns AFTER it). Never
+ * capability-gated, except the handover phone (unmasked for a
+ * `dispatch.execute` holder only — the gate-in DPDP rule).
+ */
+
+// ── the portal status (A44) ─────────────────────────────────────────────────
+
+export const PORTAL_SHIPPING_STATUSES = [
+  'cancelled',
+  'no-label-yet',
+  'label-received',
+  'awb-received',
+  'ready-for-pickup',
+  'handed-over',
+  'shipped',
+  'shipped-no-courier-record',
+] as const;
+export type PortalShippingStatus = (typeof PORTAL_SHIPPING_STATUSES)[number];
+
+/**
+ * A44 — the ONE derivation of the portal's shipping status, shared by the
+ * allowlist builder and mirrored in wms-fe `lib/portal.ts`. Pure.
+ */
+export function portalShippingStatus(
+  orderStatus: string,
+  live: { readonly kind: string; readonly status: string; readonly labelVerified: boolean } | null,
+  hasDispatchRecord: boolean,
+): PortalShippingStatus {
+  if (orderStatus === 'cancelled') return 'cancelled';
+  if (orderStatus === 'dispatched') {
+    if (live === null) return hasDispatchRecord ? 'shipped-no-courier-record' : 'shipped-no-courier-record';
+    if (live.status === 'handed_over') return 'handed-over';
+    return 'shipped';
+  }
+  if (live === null) return 'no-label-yet';
+  if (live.kind === 'courier-label') return 'awb-received';
+  if (live.kind === 'client-label' && live.labelVerified && orderStatus === 'ready_to_dispatch') return 'ready-for-pickup';
+  return 'label-received';
+}
+
+// ── files (A50 D33: derived names) ──────────────────────────────────────────
+
+/** A file view before its URL is minted (the facade presigns after the transaction). */
+export interface UnsignedFile {
+  readonly row: AttachmentRow;
+  readonly fileName: string;
+}
+
+export const DOC_KIND_FILE_WORD: Readonly<Record<string, string>> = {
+  invoice: 'invoice',
+  challan: 'challan',
+  'eway-bill': 'eway-bill',
+  pod: 'pod',
+  other: 'document',
+};
+
+/** `{order}-label.pdf`, `{order}-{kind}-{n}.{ext}`, `{HO}-sheet-{n}.{ext}` — n counts per kind in creation order. */
+export function shippingFileNames(ownerLabel: string, rows: readonly AttachmentRow[]): Map<string, string> {
+  const out = new Map<string, string>();
+  const counters = new Map<string, number>();
+  const sorted = [...rows].sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : 1));
+  const base = fileNamePart(ownerLabel);
+  for (const row of sorted) {
+    if (row.purpose === 'shipping-label') {
+      out.set(row.id, `${base}-label.pdf`);
+      continue;
+    }
+    const word = row.purpose === 'handover-sheet' ? 'sheet' : (DOC_KIND_FILE_WORD[row.docKind ?? 'other'] ?? 'document');
+    const n = (counters.get(word) ?? 0) + 1;
+    counters.set(word, n);
+    out.set(row.id, `${base}-${word}-${n}.${extensionOf(row.contentType)}`);
+  }
+  return out;
+}
+
+// ── the staff order read (A16) ──────────────────────────────────────────────
+
+export interface OrderShippingRead {
+  readonly order: Order;
+  readonly live: Shipment | null;
+  readonly history: readonly Shipment[];
+  readonly label: UnsignedFile | null;
+  readonly documents: readonly UnsignedFile[];
+  readonly handover: CourierHandover | null;
+  readonly sheet: readonly UnsignedFile[];
+}
+
+/** The order's shipments (live first, then voided newest first), files and handover. Null for an unknown order. */
+export async function orderShippingInTx(tx: TenantTx, tenantId: string, orderId: string, clientId?: string): Promise<OrderShippingRead | null> {
+  if (!UUID_RE.test(orderId)) return null;
+  const orderRows = await tx
+    .select()
+    .from(orders)
+    .where(and(eq(orders.tenantId, tenantId), eq(orders.id, orderId), ...(clientId === undefined ? [] : [eq(orders.clientId, clientId)])))
+    .limit(1);
+  const order = orderRows[0];
+  if (order === undefined) return null;
+  const rows = await tx
+    .select()
+    .from(shipments)
+    .where(and(eq(shipments.tenantId, tenantId), eq(shipments.orderId, order.id), ...(clientId === undefined ? [] : [eq(shipments.clientId, clientId)])))
+    .orderBy(desc(shipments.createdAt), desc(shipments.id));
+  const live = rows.find((row) => row.status !== 'voided') ?? null;
+  const history = rows.filter((row) => row.status === 'voided');
+  const files = await listByOwnerInTx(tx, {
+    tenantId,
+    ownerType: 'order',
+    ownerIds: [order.id],
+    purposes: ['shipping-label', 'shipping-document'],
+    ...(clientId === undefined ? {} : { clientId }),
+  });
+  const label = orderLabelOf(order);
+  const names = shippingFileNames(label, files);
+  const labelRow = live?.labelAttachmentId == null ? null : (files.find((row) => row.id === live.labelAttachmentId) ?? null);
+  const documents = files.filter((row) => row.purpose === 'shipping-document' && row.status === 'attached');
+  let handover: CourierHandover | null = null;
+  let sheet: UnsignedFile[] = [];
+  if (live?.handoverId != null) {
+    const handoverRows = await tx
+      .select()
+      .from(courierHandovers)
+      .where(and(eq(courierHandovers.tenantId, tenantId), eq(courierHandovers.id, live.handoverId), ...(clientId === undefined ? [] : [eq(courierHandovers.clientId, clientId)])))
+      .limit(1);
+    handover = handoverRows[0] ?? null;
+    if (handover !== null) {
+      const pages = (
+        await listByOwnerInTx(tx, {
+          tenantId,
+          ownerType: 'courier_handover',
+          ownerIds: [handover.id],
+          purposes: ['handover-sheet'],
+          ...(clientId === undefined ? {} : { clientId }),
+        })
+      ).filter((row) => row.status === 'attached');
+      const sheetNames = shippingFileNames(handover.code, pages);
+      sheet = pages.map((row) => ({ row, fileName: sheetNames.get(row.id)! }));
+    }
+  }
+  return {
+    order,
+    live,
+    history,
+    label: labelRow === null || labelRow.status !== 'attached' ? null : { row: labelRow, fileName: names.get(labelRow.id)! },
+    documents: documents.map((row) => ({ row, fileName: names.get(row.id)! })),
+    handover,
+    sheet,
+  };
+}
+
+// ── the handover candidates (A16, A49) ─────────────────────────────────────
+
+export interface HandoverCandidate {
+  readonly orderId: string;
+  readonly orderLabel: string;
+  readonly clientOrderRef: string | null;
+  readonly externalEventId: string | null;
+  readonly followOnSeq: number | null;
+  readonly parcelTagCode: string;
+  readonly destinationCity: string | null;
+  readonly codAmountPaise: number | null;
+  readonly packedAt: string | null;
+  readonly shipment: {
+    readonly kind: ShipmentKind;
+    readonly awb: string;
+    readonly courierName: string;
+    readonly packageCount: number | null;
+    readonly labelVerified: boolean;
+  } | null;
+}
+
+export const HANDOVER_CANDIDATES_DEFAULT_LIMIT = 100;
+export const HANDOVER_CANDIDATES_MAX_LIMIT = 200;
+
+/** A warehouse's packed orders of one client, oldest first (`orders_ready_to_dispatch_idx`), keyset on `(updated_at, id)`. */
+export async function handoverCandidateRowsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  clientId: string,
+  after: { readonly at: string; readonly id: string } | null,
+  limit: number,
+): Promise<{ rows: { order: Order; shipment: Shipment | null; cursorAt: string }[] }> {
+  const rows = await tx
+    .select({ order: orders, cursorAt: sql<string>`${orders.updatedAt}::text` })
+    .from(orders)
+    .where(
+      and(
+        eq(orders.tenantId, tenantId),
+        eq(orders.warehouseId, warehouseId),
+        eq(orders.status, 'ready_to_dispatch'),
+        eq(orders.clientId, clientId),
+        after === null ? undefined : sql`(${orders.updatedAt}, ${orders.id}) > (${after.at}::timestamptz, ${after.id}::uuid)`,
+      ),
+    )
+    .orderBy(asc(orders.updatedAt), asc(orders.id))
+    .limit(limit + 1);
+  const ids = rows.map((row) => row.order.id);
+  const shipmentRows =
+    ids.length === 0
+      ? []
+      : await tx
+          .select()
+          .from(shipments)
+          .where(and(eq(shipments.tenantId, tenantId), inArray(shipments.orderId, ids), ne(shipments.status, 'voided')));
+  const byOrder = new Map(shipmentRows.map((row) => [row.orderId, row]));
+  return { rows: rows.map((row) => ({ order: row.order, shipment: byOrder.get(row.order.id) ?? null, cursorAt: fullPrecisionInstant(row.cursorAt) })) };
+}
+
+export function candidateOf(order: Order, shipment: Shipment | null, packedAt: string | null): HandoverCandidate {
+  return {
+    orderId: order.id,
+    orderLabel: orderLabelOf(order),
+    clientOrderRef: order.clientOrderRef,
+    externalEventId: order.externalEventId,
+    followOnSeq: order.followOnSeq,
+    parcelTagCode: parcelTagCode(order.id),
+    destinationCity: order.destinationCity,
+    codAmountPaise: order.codAmountPaise,
+    packedAt,
+    shipment:
+      shipment === null
+        ? null
+        : {
+            kind: shipment.kind as ShipmentKind,
+            awb: shipment.trackingNumber,
+            courierName: shipment.carrierName,
+            packageCount: shipment.packageCount,
+            labelVerified: shipment.labelVerifiedAt !== null,
+          },
+  };
+}
+
+export function encodeKeyset(at: string, id: string): string {
+  return encodeCursor({ createdAt: at, id });
+}
+
+export function decodeKeyset(cursor: string | undefined): { at: string; id: string } | null {
+  if (cursor === undefined || cursor === '') return null;
+  try {
+    const parsed = decodeCursor(cursor);
+    if (!UUID_RE.test(parsed.id) || Number.isNaN(Date.parse(parsed.createdAt))) throw new Error('bad');
+    return { at: parsed.createdAt, id: parsed.id };
+  } catch {
+    throw new ProblemException('invalid-cursor', 400, 'Malformed pagination cursor', 'The cursor parameter is not a valid opaque page cursor.');
+  }
+}
+
+// ── the handovers list and detail (A16, A40) ────────────────────────────────
+
+export interface HandoverListItem {
+  readonly id: string;
+  readonly code: string;
+  readonly clientId: string;
+  readonly clientCode: string | null;
+  readonly courierName: string;
+  readonly shipmentCount: number;
+  readonly packageCount: number;
+  readonly handedOverAt: string;
+  readonly sheetPageCount: number;
+  readonly source: string;
+}
+
+/** A40 — `from` / `to` are IST dates, half-open `[istMidnightOf(from), istMidnightOf(to + 1))` over `handed_over_at`. */
+export function handoverWindow(from: string | undefined, to: string | undefined): { from: string | null; to: string | null } {
+  for (const [name, value] of [['from', from], ['to', to]] as const) {
+    if (value !== undefined && value !== '' && !isIsoDate(value)) {
+      throw new ProblemException('validation-failed', 400, 'Invalid date', `${name} must be a YYYY-MM-DD date (IST).`);
+    }
+  }
+  return {
+    from: from === undefined || from === '' ? null : istMidnightOf(from),
+    to: to === undefined || to === '' ? null : istMidnightOf(addIsoDays(to, 1)),
+  };
+}
+
+export async function listHandoversInTx(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  query: { readonly clientId: string | null; readonly from: string | null; readonly to: string | null; readonly after: { at: string; id: string } | null; readonly limit: number },
+): Promise<{ items: HandoverListItem[]; nextCursor: string | null }> {
+  const rows = await tx
+    .select({
+      handover: courierHandovers,
+      cursorAt: sql<string>`${courierHandovers.handedOverAt}::text`,
+      sheetPageCount: sql<number>`(select count(*)::int from attachments a
+        where a.tenant_id = ${courierHandovers.tenantId} and a.owner_type = 'courier_handover'
+          and a.owner_id = "courier_handovers"."id" and a.purpose = 'handover-sheet' and a.status = 'attached')`,
+    })
+    .from(courierHandovers)
+    .where(
+      and(
+        eq(courierHandovers.tenantId, tenantId),
+        eq(courierHandovers.warehouseId, warehouseId),
+        query.clientId === null ? undefined : eq(courierHandovers.clientId, query.clientId),
+        query.from === null ? undefined : sql`${courierHandovers.handedOverAt} >= ${query.from}::timestamptz`,
+        query.to === null ? undefined : sql`${courierHandovers.handedOverAt} < ${query.to}::timestamptz`,
+        query.after === null ? undefined : sql`(${courierHandovers.handedOverAt}, ${courierHandovers.id}) < (${query.after.at}::timestamptz, ${query.after.id}::uuid)`,
+      ),
+    )
+    .orderBy(desc(courierHandovers.handedOverAt), desc(courierHandovers.id))
+    .limit(query.limit + 1);
+  const page = rows.slice(0, query.limit);
+  const last = page.at(-1);
+  return {
+    items: page.map(({ handover, sheetPageCount }) => ({
+      id: handover.id,
+      code: handover.code,
+      clientId: handover.clientId,
+      clientCode: typeof (handover.clientSnapshot as { code?: unknown } | null)?.code === 'string' ? (handover.clientSnapshot as { code: string }).code : null,
+      courierName: handover.courierName,
+      shipmentCount: handover.shipmentCount,
+      packageCount: handover.packageCount,
+      handedOverAt: canonicalInstant(handover.handedOverAt),
+      sheetPageCount: Number(sheetPageCount),
+      source: handover.source,
+    })),
+    nextCursor: rows.length > query.limit && last !== undefined ? encodeKeyset(fullPrecisionInstant(last.cursorAt), last.handover.id) : null,
+  };
+}
+
+export interface HandoverDetailRead {
+  readonly handover: CourierHandover;
+  readonly parcels: readonly { shipment: Shipment; order: Order }[];
+  readonly sheet: readonly UnsignedFile[];
+}
+
+export async function handoverDetailInTx(tx: TenantTx, tenantId: string, handoverId: string): Promise<HandoverDetailRead | null> {
+  if (!UUID_RE.test(handoverId)) return null;
+  const rows = await tx
+    .select()
+    .from(courierHandovers)
+    .where(and(eq(courierHandovers.tenantId, tenantId), eq(courierHandovers.id, handoverId)))
+    .limit(1);
+  const handover = rows[0];
+  if (handover === undefined) return null;
+  const parcels = await tx
+    .select({ shipment: shipments, order: orders })
+    .from(shipments)
+    .innerJoin(orders, and(eq(orders.tenantId, shipments.tenantId), eq(orders.id, shipments.orderId)))
+    .where(and(eq(shipments.tenantId, tenantId), eq(shipments.handoverId, handover.id)))
+    .orderBy(asc(shipments.id));
+  const pages = (
+    await listByOwnerInTx(tx, { tenantId, ownerType: 'courier_handover', ownerIds: [handover.id], purposes: ['handover-sheet'] })
+  ).filter((row) => row.status === 'attached');
+  const names = shippingFileNames(handover.code, pages);
+  return { handover, parcels, sheet: pages.map((row) => ({ row, fileName: names.get(row.id)! })) };
+}
+
+export function maskedPhoneOf(handover: CourierHandover, unmasked: boolean): string | null {
+  return unmasked ? handover.pickupPersonPhone : maskPhone(handover.pickupPersonPhone);
+}
+
+// ── the device snapshot's parcels (A18, A39) ────────────────────────────────
+
+export const DISPATCH_PARCELS_MAX = 2000;
+
+export interface DispatchParcel {
+  readonly orderId: string;
+  readonly clientId: string;
+  readonly orderLabel: string;
+  readonly parcelTagCode: string;
+  readonly status: string;
+  readonly shipment: {
+    readonly shipmentId: string;
+    readonly kind: ShipmentKind;
+    readonly awb: string;
+    readonly courierName: string;
+    readonly labelVerified: boolean;
+  } | null;
+}
+
+/**
+ * The warehouse's packed orders, plus its accepted orders holding a live
+ * client-arranged shipment (a label verified right after a pack that has not
+ * refreshed the snapshot), never one with a carrier shipment; at most 2000,
+ * oldest first, with `truncated`.
+ */
+export async function dispatchParcelsInTx(tx: TenantTx, tenantId: string, warehouseId: string): Promise<{ parcels: DispatchParcel[]; truncated: boolean }> {
+  const rows = (await tx.execute(sql`
+    select o.id as "orderId", o.client_id as "clientId", o.status as "status",
+           o.client_order_ref as "clientOrderRef", o.external_event_id as "externalEventId",
+           o.follow_on_seq as "followOnSeq", o.follow_on_root_order_id as "followOnRootOrderId",
+           s.id as "shipmentId", s.kind as "kind", s.tracking_number as "awb", s.carrier_name as "courierName",
+           (s.label_verified_at is not null) as "labelVerified"
+    from orders o
+    left join shipments s on s.tenant_id = o.tenant_id and s.order_id = o.id and s.status <> 'voided'
+    where o.tenant_id = ${tenantId}::uuid and o.warehouse_id = ${warehouseId}::uuid
+      and (
+        o.status = 'ready_to_dispatch'
+        or (o.status = 'accepted' and s.id is not null and s.kind <> 'carrier' and s.status = 'labelled')
+      )
+      and (s.id is null or s.kind <> 'carrier')
+    order by o.updated_at, o.id
+    limit ${DISPATCH_PARCELS_MAX + 1}
+  `)) as unknown as {
+    orderId: string;
+    clientId: string;
+    status: string;
+    clientOrderRef: string | null;
+    externalEventId: string | null;
+    followOnSeq: number | null;
+    followOnRootOrderId: string | null;
+    shipmentId: string | null;
+    kind: string | null;
+    awb: string | null;
+    courierName: string | null;
+    labelVerified: boolean | null;
+  }[];
+  const truncated = rows.length > DISPATCH_PARCELS_MAX;
+  return {
+    truncated,
+    parcels: rows.slice(0, DISPATCH_PARCELS_MAX).map((row) => ({
+      orderId: row.orderId,
+      clientId: row.clientId,
+      orderLabel: orderLabelOf({
+        id: row.orderId,
+        clientOrderRef: row.clientOrderRef,
+        externalEventId: row.externalEventId,
+        followOnSeq: row.followOnSeq,
+        followOnRootOrderId: row.followOnRootOrderId,
+      }),
+      parcelTagCode: parcelTagCode(row.orderId),
+      status: row.status,
+      shipment:
+        row.shipmentId === null
+          ? null
+          : { shipmentId: row.shipmentId, kind: row.kind as ShipmentKind, awb: row.awb!, courierName: row.courierName!, labelVerified: row.labelVerified === true },
+    })),
+  };
+}
+
+export type { ShipmentStatus };

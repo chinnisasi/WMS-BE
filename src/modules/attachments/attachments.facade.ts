@@ -12,6 +12,8 @@ import { UploadGate } from './upload-gate';
 export { FILE_STORE, attachmentObjectKey, type FileStore, type FileStoreMode, type PresignedUrl } from './file-store';
 export { sanitizeImage, sniffImageType, MAX_IMAGE_BYTES, ATTACHMENT_IMAGE_TYPES, type SanitizedImage } from './image-sanitize';
 export { UploadGate } from './upload-gate';
+// Story 4-4a — the PDF arm and the shipping-file sanitiser.
+export { sanitizePdf, sanitizeShippingFile, PDF_CONTENT_TYPE, MAX_PDF_PAGES, type SanitizedFile, type SanitizedPdf } from './pdf-sanitize';
 
 /** The default bytes-retention after removal, and the age of an unbound or awaited photo (A10). */
 export const DEFAULT_ATTACHMENT_PURGE_DAYS = 30;

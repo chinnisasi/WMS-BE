@@ -110,6 +110,67 @@ import type { CreateShipmentLabelCommand, ShipmentKind, ShipmentSnapshot, Shipme
 import { ManifestCommandService } from './manifest.command';
 import type { CreateManifestCommand, ManifestSnapshot } from './manifest.command';
 import { RateService } from './rate.service';
+import { ClientLabelCommand } from './client-label.command';
+import type {
+  PortalAwbAdviceCommand,
+  PortalClientLabelCommand,
+  PortalShipmentCommandSnapshot,
+  ShipmentCommandSnapshot,
+  StaffAwbAdviceCommand,
+  StaffClientLabelCommand,
+  VerifyLabelCommand,
+  VerifyLabelSnapshot,
+  VoidShipmentCommand,
+} from './client-label.command';
+import { ShippingFilesCommand } from './shipping-files.command';
+import type {
+  PortalOrderDocumentCommand,
+  RemoveShippingFileCommand,
+  ShippingFileCommandSnapshot,
+  StagedPhotoSnapshot,
+  StageHandoverPhotoCommand,
+  StaffOrderDocumentCommand,
+  UploadHandoverSheetCommand,
+} from './shipping-files.command';
+import { ShippingService } from './shipping.service';
+import type { HandoverDetailView, OrderShippingView, PortalOrderShippingView } from './shipping.service';
+import type { HandOverCommand, HandoverSnapshot } from './handover.command';
+import type { DispatchParcel, HandoverCandidate, HandoverListItem } from './shipping.read';
+import { shipmentDocumentEmailFactsInTx, type ShipmentDocumentEmailFacts, type ShipmentDocumentFactInput } from './shipping-mail';
+import type { AttachmentRow } from '../../shared/db/schema';
+// Story 4-4a — the client-arranged shipping vocabularies and views ride the facade seam.
+export type {
+  PortalAwbAdviceCommand,
+  PortalClientLabelCommand,
+  PortalShipmentCommandSnapshot,
+  ShipmentCommandSnapshot,
+  StaffAwbAdviceCommand,
+  StaffClientLabelCommand,
+  VerifyLabelCommand,
+  VerifyLabelSnapshot,
+  VoidShipmentCommand,
+} from './client-label.command';
+export type {
+  PortalOrderDocumentCommand,
+  RemoveShippingFileCommand,
+  ShippingFileCommandSnapshot,
+  StagedPhotoSnapshot,
+  StageHandoverPhotoCommand,
+  StaffOrderDocumentCommand,
+  UploadHandoverSheetCommand,
+} from './shipping-files.command';
+export type { FileView, HandoverDetailView, OrderShippingView, PortalFile, PortalOrderShippingView } from './shipping.service';
+export type { HandOverCommand, HandoverParcelInput, HandoverRefusedParcel, HandoverSnapshot, HandoverView } from './handover.command';
+export { HANDOVER_PARCEL_REFUSALS, MAX_HANDOVER_PARCELS, handoverHashInput } from './handover.command';
+export type { DispatchParcel, HandoverCandidate, HandoverListItem, PortalShippingStatus } from './shipping.read';
+export { PORTAL_SHIPPING_STATUSES, portalShippingStatus, DISPATCH_PARCELS_MAX } from './shipping.read';
+export type { ShipmentDocumentEmailFacts, ShipmentDocumentFactInput } from './shipping-mail';
+export { SHIPMENT_DOCUMENT_SHARED_EVENT } from './client-arranged';
+export type { ShipmentDocumentSharedPayload } from './client-arranged';
+export { SHIPMENT_KINDS, SHIPMENT_STATUSES } from './shipment.command';
+export { LABEL_VERIFY_METHODS } from './client-label.command';
+export { SHIPPING_DOC_KINDS } from '../attachments/attachment-records';
+export { PORTAL_DOC_KINDS } from './shipping-files.command';
 import { orderReferenceMatch } from './order-reference';
 import type { OrderRatesSnapshot } from './rate.service';
 import type {
@@ -561,7 +622,129 @@ export class OutboundFacade {
     @Inject(AllocationCommandService) private readonly allocation: AllocationCommandService,
     // Story 4-3b — the order's customer shelf life read.
     @Inject(OrderShelfLifeReader) private readonly orderShelfLife: OrderShelfLifeReader,
+    // Story 4-4a — client-arranged shipping: the label and AWB commands, the
+    // shipping files, and the handover and the reads.
+    @Inject(ClientLabelCommand) private readonly clientLabels: ClientLabelCommand,
+    @Inject(ShippingFilesCommand) private readonly shippingFiles: ShippingFilesCommand,
+    @Inject(ShippingService) private readonly shipping: ShippingService,
   ) {}
+
+  // ── story 4-4a: client-arranged shipping ──────────────────────────────────
+
+  /** A8 — staff record the client's label PDF and AWB (`labels.execute`). */
+  async recordClientLabel(command: StaffClientLabelCommand, idempotencyKey: string): Promise<ShipmentCommandSnapshot> {
+    return this.clientLabels.recordClientLabel(command, idempotencyKey);
+  }
+
+  /** A8 — the portal twin (the stamp lives in the command). */
+  async recordPortalClientLabel(command: PortalClientLabelCommand, idempotencyKey: string): Promise<PortalShipmentCommandSnapshot> {
+    return this.clientLabels.portalRecordClientLabel(command, idempotencyKey);
+  }
+
+  /** A9 — staff pre-advise the AWB (the courier brings the label). */
+  async recordAwbAdvice(command: StaffAwbAdviceCommand, idempotencyKey: string): Promise<ShipmentCommandSnapshot> {
+    return this.clientLabels.recordAwbAdvice(command, idempotencyKey);
+  }
+
+  /** A9 — the portal twin (the stamp lives in the command). */
+  async recordPortalAwbAdvice(command: PortalAwbAdviceCommand, idempotencyKey: string): Promise<PortalShipmentCommandSnapshot> {
+    return this.clientLabels.portalRecordAwbAdvice(command, idempotencyKey);
+  }
+
+  /** A10 — void a client-arranged shipment (staff). */
+  async voidClientArrangedShipment(command: VoidShipmentCommand, idempotencyKey: string): Promise<ShipmentCommandSnapshot> {
+    return this.clientLabels.voidShipment(command, idempotencyKey);
+  }
+
+  /** A11 — verify the client label on the parcel (web or handheld). */
+  async verifyClientLabel(command: VerifyLabelCommand, idempotencyKey: string): Promise<VerifyLabelSnapshot> {
+    return this.clientLabels.verifyLabel(command, idempotencyKey);
+  }
+
+  /** A14 — an order's shipping document (staff). */
+  async uploadOrderDocument(command: StaffOrderDocumentCommand, idempotencyKey: string): Promise<ShippingFileCommandSnapshot> {
+    return this.shippingFiles.uploadOrderDocument(command, idempotencyKey);
+  }
+
+  /** A14 — the client's own document (the stamp lives in the command). */
+  async uploadPortalOrderDocument(command: PortalOrderDocumentCommand, idempotencyKey: string): Promise<ShippingFileCommandSnapshot> {
+    return this.shippingFiles.portalUploadOrderDocument(command, idempotencyKey);
+  }
+
+  /** A14 — a handover's signed sheet (web). */
+  async uploadHandoverSheet(command: UploadHandoverSheetCommand, idempotencyKey: string): Promise<ShippingFileCommandSnapshot> {
+    return this.shippingFiles.uploadHandoverSheet(command, idempotencyKey);
+  }
+
+  /** A14 — the handheld's signed-sheet photo (the photo's ULID is its key). */
+  async stageHandoverPhoto(command: StageHandoverPhotoCommand, ref: string): Promise<StagedPhotoSnapshot> {
+    return this.shippingFiles.stageHandoverPhoto(command, ref);
+  }
+
+  /** A14 — remove a shipping file (`orders.manage`). */
+  async removeShippingFile(command: RemoveShippingFileCommand, idempotencyKey: string): Promise<ShippingFileCommandSnapshot> {
+    return this.shippingFiles.removeFile(command, idempotencyKey);
+  }
+
+  /** A12 — the courier handover (it dispatches its orders); after-commit work never thrown. */
+  async handOver(command: HandOverCommand, idempotencyKey: string): Promise<HandoverSnapshot> {
+    return this.shipping.handOver(command, idempotencyKey);
+  }
+
+  /** A16 — the order's shipping (staff). Null for an unknown order. */
+  async getOrderShipping(tenantId: string, orderId: string): Promise<OrderShippingView | null> {
+    return this.shipping.orderShipping(tenantId, orderId);
+  }
+
+  /** A16, A49 — a client's packed orders in a warehouse (the handover builder). */
+  async getHandoverCandidates(
+    tenantId: string,
+    warehouseId: string,
+    clientId: string,
+    query: { cursor?: string | undefined; limit?: number | undefined },
+  ): Promise<{ items: HandoverCandidate[]; nextCursor: string | null }> {
+    return this.shipping.handoverCandidates(tenantId, warehouseId, clientId, query);
+  }
+
+  /** A16, A40 — a warehouse's handovers, newest first. */
+  async listHandovers(
+    tenantId: string,
+    warehouseId: string,
+    query: { clientId?: string | undefined; from?: string | undefined; to?: string | undefined; cursor?: string | undefined; limit?: number | undefined },
+  ): Promise<{ items: HandoverListItem[]; nextCursor: string | null }> {
+    return this.shipping.listHandovers(tenantId, warehouseId, query);
+  }
+
+  /** A16 — one handover (the phone unmasked for a `dispatch.execute` holder). Null when unknown. */
+  async getHandover(tenantId: string, handoverId: string, actorUserId: string): Promise<HandoverDetailView | null> {
+    return this.shipping.handoverDetail(tenantId, handoverId, actorUserId);
+  }
+
+  /** A16 — the parcel tag file (ZPL or PDF, 4×2). */
+  async renderParcelTag(tenantId: string, orderId: string, format: 'zpl' | 'pdf'): Promise<{ body: Buffer; contentType: string; fileName: string }> {
+    return this.shipping.parcelTag(tenantId, orderId, format);
+  }
+
+  /** A17 — the portal order's Shipping section (two layers: the stamp here, the predicates in the read). */
+  async portalOrderShipping(tenantId: string, clientId: string, orderId: string): Promise<PortalOrderShippingView | null> {
+    const read = await withTenantTransaction(this.db, tenantId, (tx) => this.shipping.portalOrderShippingReadInTx(tx, tenantId, clientId, orderId), { clientId });
+    return read === null ? null : this.shipping.portalOrderShippingView(read);
+  }
+
+  /** A18, A39 — the device snapshot's dispatch parcels (in-tx ONLY — the `getPickTasksInTx` rule). */
+  async dispatchParcelsInTx(tx: TenantTx, tenantId: string, warehouseId: string): Promise<{ parcels: DispatchParcel[]; truncated: boolean }> {
+    return this.shipping.dispatchParcelsInTx(tx, tenantId, warehouseId);
+  }
+
+  /** D8 — the derived file name of a shareable shipping file (the mail renderer, in its stamped transaction). */
+  async shippingFileNameInTx(tx: TenantTx, tenantId: string, clientId: string, row: AttachmentRow): Promise<string | null> {
+    return this.shipping.shippingFileNameInTx(tx, tenantId, clientId, row);
+  }
+
+  /** D6 — what a shipping-document email names (read at enqueue). */
+  async shipmentDocumentEmailFactsInTx(tx: TenantTx, tenantId: string, fact: ShipmentDocumentFactInput): Promise<ShipmentDocumentEmailFacts | null> {
+    return shipmentDocumentEmailFactsInTx(tx, tenantId, fact);
+  }
 
   /**
    * Story 4-2c — `POST …/orders/{orderId}/allocate` ("Allocate now"):
