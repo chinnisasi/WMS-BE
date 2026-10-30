@@ -13,6 +13,14 @@ import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
 import { expectAuditRow, noOpIdempotencyKey } from './support/audit-guard';
+import { OUTBOX_RELAY, type OutboxRelay } from '../src/shared/events/outbox.seam';
+import { MailFacade } from '../src/modules/mail/mail.facade';
+import { EMAIL_GATEWAY, type LogEmailGateway } from '../src/modules/mail/email.gateway';
+import { OutboundFacade } from '../src/modules/outbound/outbound.facade';
+import { DISPATCH_SLIP_FAILED } from '../src/modules/mail/templates/client-dispatch';
+import { dispatchedOrderFixtures, type Picklist } from './support/dispatched-order';
+import { pdfPagesText } from './support/pdf-text';
+import { parseZplLabels, readPdfLabels, zplTexts } from './support/labels';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -22,6 +30,16 @@ process.env.CARRIER_ENCRYPTION_KEY ??= 'e2e-only-carrier-encryption-key-01234567
 delete process.env.OUTBOX_RELAY_POLL_MS;
 delete process.env.OUTBOX_RECONCILE_POLL_MS;
 delete process.env.RESERVATION_REAPER_POLL_MS;
+// The documents block (below) sends the dispatch email through the log gateway.
+delete process.env.EMAIL_SEND_POLL_MS;
+delete process.env.EMAIL_ALLOWLIST_DOMAINS;
+delete process.env.EMAIL_REPLY_TO;
+delete process.env.WEBHOOK_SEND_POLL_MS;
+process.env.EMAIL_PROVIDER = 'log';
+process.env.EMAIL_FROM = 'no-reply@mail.wms.test';
+process.env.WEB_BASE_URL = 'https://app.wms.test/';
+process.env.EMAIL_SEAL_KEY = 'e2e-only-email-seal-key-0123456789abcdef';
+process.env.CLIENT_EMAIL_ENABLED = 'true';
 
 const API = '/api/v1/tenants';
 const KEY_HEADER = 'Idempotency-Key';
@@ -779,5 +797,341 @@ describe('packing documents: cartons at pack and re-carton (e2e, story 4-5a)', (
     expect(label.body.shipment.trackingNumber).toMatch(/^SBX-/);
     const row = (await sql`select package_count from shipments where order_id = ${orderId} and kind = 'carrier'`) as unknown as { package_count: number }[];
     expect(row[0]!.package_count).toBe(2);
+  });
+});
+
+/**
+ * Story 4-5a — the packing documents: the carton labels (A14, A16, decision
+ * 6), the packing slip in both forms (A13, A17, A18, A35, A36, A48), the
+ * frozen parties (A6, A45, AC3), the legacy note (A9), the portal (A19, AC6)
+ * and the dispatch email's attachment (A20, AC6).
+ */
+describe('packing documents: labels, slips, portal and email (e2e, story 4-5a)', () => {
+  const PASSWORD = 'correct-horse-battery';
+  let app: INestApplication;
+  let sql: postgres.Sql;
+  let suiteDb: SuiteDatabase;
+  let relay: OutboxRelay;
+  let mail: MailFacade;
+  let captured: LogEmailGateway;
+  let tenantId: string;
+  let ownerToken: string;
+  let opsToken: string;
+  let accountantToken: string;
+  let operatorToken: string;
+  let warehouseId: string;
+  let binId: string;
+  let acme: string;
+  let beta: string;
+  let acmePortal: string;
+  let betaPortal: string;
+  const sku = new Map<string, string>();
+  const http = () => request(app.getHttpServer());
+  const fixtures = dispatchedOrderFixtures(() => ({ app, tenantId, warehouseId, opsToken, ownerToken, operatorToken }));
+
+  beforeAll(async () => {
+    suiteDb = await useSuiteDatabase('packing_docs_files');
+    app = await createApp(false);
+    await app.init();
+    sql = postgres(process.env.DATABASE_URL!, { max: 2, onnotice: () => undefined });
+    relay = app.get<unknown>(OUTBOX_RELAY) as OutboxRelay;
+    mail = app.get(MailFacade);
+    captured = app.get<LogEmailGateway>(EMAIL_GATEWAY);
+
+    const ownerEmail = `owner-${ulid().toLowerCase()}@example.com`;
+    const registered = await http().post(API).set(KEY_HEADER, ulid()).send({ name: `Docs Co ${ulid()}`, ownerEmail, password: PASSWORD }).expect(201);
+    tenantId = registered.body.tenant.id as string;
+    ownerToken = (await mintSignIn(app, { email: ownerEmail, password: PASSWORD })).body.accessToken as string;
+    opsToken = (await member('ops_manager')).token;
+    accountantToken = (await member('accountant')).token;
+    const floor = await member('operator');
+
+    // A45 — the warehouse's origin carries a contact name and a phone; neither may print.
+    warehouseId = (
+      await http().post(`${API}/${tenantId}/warehouses`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid())
+        .send({ origin: testAddress({ contactName: 'Dock Supervisor Meena', phone: '+91 90000 11111' }), code: `DW-${ulid().slice(20)}`, name: 'Docs DC' }).expect(201)
+    ).body.id as string;
+    const zone = (
+      await http().post(`${API}/${tenantId}/warehouses/${warehouseId}/zones`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid())
+        .send({ code: 'A', name: 'Zone A' }).expect(201)
+    ).body.id as string;
+    binId = (
+      await http().post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zone}/bins`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid())
+        .send({ capacity: 10_000_000, type: 'shelf', code: 'A-01-01' }).expect(201)
+    ).body.id as string;
+
+    acme = (await http().post(`${API}/${tenantId}/clients`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid()).send({ code: 'ACME', name: 'ACME Brand' }).expect(201)).body.client.id as string;
+    beta = (await http().post(`${API}/${tenantId}/clients`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid()).send({ code: 'BETA', name: 'Beta Brand' }).expect(201)).body.client.id as string;
+    await http().patch(`${API}/${tenantId}/clients/${acme}/tax-details`).set('Authorization', `Bearer ${accountantToken}`).set(KEY_HEADER, ulid()).send({ legalName: 'Acme Brand Private Limited' }).expect(200);
+    const csv = (rows: string[]) => ['sku_code,name,uom,gst_rate,barcode,batch_tracked,serial_tracked', ...rows].join('\n');
+    for (const [clientId, rows] of [
+      [acme, ['A-TEE,Acme tee,pcs,1800,,false,false', 'A-CAP,Acme cap,pcs,1800,,false,false', 'A-LOT,Acme lot tee,pcs,1800,,true,false']],
+      [beta, ['B-TEE,Beta tee,pcs,1800,,false,false']],
+    ] as const) {
+      await http().post(`${API}/${tenantId}/catalog/imports`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid())
+        .field('mode', 'initial').field('clientId', clientId)
+        .attach('file', Buffer.from(csv([...rows]), 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' }).expect(201);
+    }
+    const listed = await http().get(`${API}/${tenantId}/catalog/skus?limit=200`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
+    for (const item of listed.body.items as { code: string; id: string }[]) sku.set(item.code, item.id);
+    for (const code of ['A-TEE', 'A-CAP', 'B-TEE']) {
+      await http().post(`${API}/${tenantId}/inventory/adjustments`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid())
+        .send({ warehouseId, skuId: sku.get(code), binId, quantityDelta: 100_000, reasonCode: 'stock-count', note: 'seed' }).expect(201);
+    }
+    await fixtures.seedBatchStock(sku.get('A-LOT')!, binId, 1_000, 'LOT-2026-A');
+    await app.get(InventoryFacade).rebuildReservationCounters(tenantId, warehouseId);
+
+    const minted = await http().post(`${API}/${tenantId}/devices/enrollment-codes`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid()).expect(201);
+    const enrolled = await http().post(`${API}/${tenantId}/devices/enroll`).set(KEY_HEADER, ulid()).send({ code: minted.body.code, label: 'Docs scanner', pin: '2468' }).expect(201);
+    operatorToken = (
+      await http().post(`${API}/${tenantId}/devices/badge-in`).set('Authorization', `Bearer ${enrolled.body.deviceToken as string}`).send({ operatorEmail: floor.email, pin: '2468' }).expect(200)
+    ).body.accessToken as string;
+
+    acmePortal = await portalUser(acme);
+    betaPortal = await portalUser(beta);
+    await http().post(`${API}/${tenantId}/clients/${acme}/contacts`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid())
+      .send({ name: 'Asha', email: 'asha@acme.example', emailEvents: ['order.dispatched'] }).expect(201);
+  });
+
+  afterAll(async () => {
+    try {
+      await sql?.end();
+      const main = app.get<unknown>(DATABASE) as { $client?: { end(): Promise<void> } };
+      await main.$client?.end();
+      const authDb = app.get<unknown>(AUTH_DATABASE) as { $client?: { end(): Promise<void> } };
+      await authDb.$client?.end();
+      await app.close();
+    } finally {
+      await suiteDb.drop();
+    }
+  });
+
+  async function member(role: string): Promise<{ token: string; email: string }> {
+    const email = `${role}-${ulid().toLowerCase()}@example.com`;
+    const invited = await http().post(`${API}/${tenantId}/users`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid()).send({ email, role }).expect(201);
+    await http().post(`${API}/${tenantId}/accept-invite`).set(KEY_HEADER, ulid()).send({ token: invited.body.inviteToken as string, password: PASSWORD }).expect(200);
+    return { token: (await mintSignIn(app, { email, password: PASSWORD })).body.accessToken as string, email };
+  }
+
+  async function portalUser(clientId: string): Promise<string> {
+    const email = `portal-${ulid().toLowerCase()}@brand.example`;
+    const invited = await http().post(`${API}/${tenantId}/users`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid()).send({ email, role: 'client', clientId }).expect(201);
+    await http().post(`${API}/${tenantId}/accept-invite`).set(KEY_HEADER, ulid()).send({ token: invited.body.inviteToken as string, password: PASSWORD }).expect(200);
+    return (await mintSignIn(app, { email, password: PASSWORD })).body.accessToken as string;
+  }
+
+  function scannedOf(picklist: Picklist): { skuId: string; qty: number }[] {
+    const by = new Map<string, number>();
+    for (const line of picklist.lines) by.set(line.skuId, (by.get(line.skuId) ?? 0) + line.qty);
+    return [...by.entries()].map(([skuId, qty]) => ({ skuId, qty }));
+  }
+
+  /** A picked order (not yet packed) of `lines` by SKU code. */
+  async function pickedOrder(lines: [string, number][], extra: Record<string, unknown> = {}): Promise<{ orderId: string; label: string; scanned: { skuId: string; qty: number }[] }> {
+    const label = `SO-${ulid().slice(18)}`;
+    const ready = await fixtures.releasedWave(lines.map(([code, quantity]) => ({ skuId: sku.get(code)!, quantity })), { clientOrderRef: label, ...extra });
+    await fixtures.pickAllLines(ready.picklist);
+    return { orderId: ready.orderId, label, scanned: scannedOf(ready.picklist) };
+  }
+
+  function pack(orderId: string, body: Record<string, unknown>) {
+    return http().post(`${API}/${tenantId}/outbound/orders/${orderId}/pack`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send(body);
+  }
+
+  /** AC1's shape: A × 10 and B × 4 in two weighed cartons — A × 6 / A × 4 + B × 4. */
+  async function twoCartonOrder(extra: Record<string, unknown> = {}): Promise<{ orderId: string; label: string }> {
+    const { orderId, label, scanned } = await pickedOrder([['A-TEE', 10], ['A-CAP', 4]], extra);
+    await pack(orderId, {
+      scanned,
+      cartons: [
+        { scanned: [{ skuId: sku.get('A-TEE')!, qty: 6 }], weightGrams: 3200 },
+        { scanned: [{ skuId: sku.get('A-TEE')!, qty: 4 }, { skuId: sku.get('A-CAP')!, qty: 4 }], weightGrams: 2800 },
+      ],
+    }).expect(201);
+    return { orderId, label };
+  }
+
+  function file(path: string, token = opsToken) {
+    return http().get(`${API}/${tenantId}${path}`).set('Authorization', `Bearer ${token}`).buffer(true).parse((res, callback) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => callback(null, Buffer.concat(chunks)));
+    });
+  }
+
+  const text = async (pdf: Buffer) => (await pdfPagesText(pdf)).flat().join('\n');
+  const problem = (res: request.Response) => JSON.parse((res.body as Buffer).toString('utf8')) as { code: string; detail: string };
+
+  it('AC2 — carton labels: ZPL first, CARTON n/N, COD on carton 1 only, the AWB and carton barcodes decode; PDF 4×6 and A4; a subset; the refusals', async () => {
+    const { orderId, label } = await pickedOrder([['A-TEE', 3]], { codAmountPaise: 125_000 });
+    await pack(orderId, {
+      scanned: [{ skuId: sku.get('A-TEE')!, qty: 3 }],
+      cartons: [1, 2, 3].map(() => ({ scanned: [{ skuId: sku.get('A-TEE')!, qty: 1 }], weightGrams: 500 })),
+    }).expect(201);
+    await http().post(`${API}/${tenantId}/outbound/orders/${orderId}/shipment/awb`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+      .send({ awb: '123456789012', courierName: 'Delhivery', packageCount: 3 }).expect(201);
+
+    const zpl = await file(`/outbound/orders/${orderId}/carton-labels`).expect(200);
+    expect(zpl.headers['content-type']).toBe('text/plain; charset=us-ascii');
+    expect(zpl.headers['content-disposition']).toBe(`attachment; filename="${label}-carton-labels.zpl"`);
+    const labels = parseZplLabels((zpl.body as Buffer).toString('ascii'));
+    expect(labels).toHaveLength(3);
+    expect(labels.map((one) => one.barcodes.map((barcode) => barcode.payload))).toEqual([1, 2, 3].map((n) => ['123456789012', cartonCode(orderId, 1, n)]));
+    const texts = labels.map((one) => zplTexts(one.raw).join('|'));
+    expect(texts[0]).toContain('COD Rs 1,250.00');
+    expect(texts[0]).toContain('1/3');
+    for (const later of texts.slice(1)) {
+      expect(later).toContain('COD ON CARTON 1');
+      expect(later).not.toContain('COD Rs');
+    }
+    // A45 — the warehouse's contact and phone never print.
+    expect(texts.join('|')).not.toContain('Meena');
+    expect(texts.join('|')).not.toContain('90000');
+
+    const pdf = await file(`/outbound/orders/${orderId}/carton-labels?format=pdf`).expect(200);
+    expect(pdf.headers['content-type']).toBe('application/pdf');
+    expect((await readPdfLabels(pdf.body as Buffer)).map((page) => page.payloads)).toEqual([1, 2, 3].map((n) => ['123456789012', cartonCode(orderId, 1, n)]));
+    const sheet = await file(`/outbound/orders/${orderId}/carton-labels?format=pdf&layout=a4&cartons=3,1`).expect(200);
+    const sheetPages = await readPdfLabels(sheet.body as Buffer);
+    expect(sheetPages).toHaveLength(1);
+    expect(sheetPages[0]!.payloads.sort()).toEqual(['123456789012', '123456789012', cartonCode(orderId, 1, 1), cartonCode(orderId, 1, 3)].sort());
+
+    expect(problem(await file(`/outbound/orders/${orderId}/carton-labels?format=zpl&layout=a4`).expect(400)).code).toBe('validation-failed');
+    expect(problem(await file(`/outbound/orders/${orderId}/carton-labels?cartons=0`).expect(400)).code).toBe('validation-failed');
+    expect(problem(await file(`/outbound/orders/${orderId}/carton-labels?cartons=2,2`).expect(400)).code).toBe('validation-failed');
+    expect(problem(await file(`/outbound/orders/${orderId}/carton-labels?cartons=4`).expect(404)).code).toBe('not-found');
+    // 403 whatever was sent: the accountant lacks labels.execute.
+    expect(problem(await file(`/outbound/orders/${orderId}/carton-labels?format=nonsense`, accountantToken).expect(403)).code).toBe('role-denied');
+  });
+
+  it('labels refuse an order that is not packed (409 order-not-packed) and an unknown order (404); the slip of an accepted order is 409 too', async () => {
+    const accepted = await fixtures.createOrder([{ skuId: sku.get('A-TEE')!, quantity: 1 }], undefined, { clientOrderRef: `SO-${ulid().slice(18)}` });
+    const refused = problem(await file(`/outbound/orders/${accepted}/carton-labels`).expect(409));
+    expect(refused.code).toBe('order-not-packed');
+    expect(problem(await file(`/outbound/orders/${accepted}/packing-slip`).expect(409)).code).toBe('order-not-packed');
+    expect(problem(await file(`/outbound/orders/${uuidv7()}/packing-slip`).expect(404)).code).toBe('not-found');
+  });
+
+  it('AC3 — the A4 slip: frozen brand and warehouse (a later legal-name edit leaves it), batches, both cartons with contents, the carton codes for staff, not a tax invoice; zpl+a4 400', async () => {
+    const { orderId, label, scanned } = await pickedOrder([['A-LOT', 4], ['A-TEE', 2]]);
+    await pack(orderId, {
+      scanned,
+      cartons: [
+        { scanned: [{ skuId: sku.get('A-LOT')!, qty: 4 }], weightGrams: 4200, dimensionsMm: { lengthMm: 400, widthMm: 300, heightMm: 200 } },
+        { scanned: [{ skuId: sku.get('A-TEE')!, qty: 2 }] },
+      ],
+    }).expect(201);
+    await http().patch(`${API}/${tenantId}/clients/${acme}/tax-details`).set('Authorization', `Bearer ${accountantToken}`).set(KEY_HEADER, ulid()).send({ legalName: 'Renamed Brand Limited' }).expect(200);
+    try {
+      const res = await file(`/outbound/orders/${orderId}/packing-slip`).expect(200);
+      expect(res.headers['content-type']).toBe('application/pdf');
+      expect(res.headers['content-disposition']).toBe(`attachment; filename="${label}-packing-slip.pdf"`);
+      const body = await text(res.body as Buffer);
+      expect(body).toContain('Acme Brand Private Limited');
+      expect(body).not.toContain('Renamed Brand Limited');
+      expect(body).toContain('Docs DC');
+      expect(body).toContain('Batch LOT-2026-A');
+      expect(body).toContain('Carton 1 of 2 — 4.20 kg — 40 x 30 x 20 cm');
+      expect(body).toContain('Carton 2 of 2');
+      expect(body).toContain(cartonCode(orderId, 1, 2));
+      expect(body).toContain('This is not a tax invoice. Tax documents are issued by Acme Brand Private Limited.');
+      expect(body).not.toContain('Meena');
+      expect(body).not.toContain('90000');
+      expect((await readPdfLabels(res.body as Buffer))[0]!.payloads).toEqual([parcelTagCode(orderId)]);
+      // The document parties never hold the warehouse contact or phone.
+      const parties = (await sql`select document_parties from order_packs where order_id = ${orderId}`)[0]!.document_parties as Record<string, unknown>;
+      expect(JSON.stringify(parties)).not.toMatch(/Meena|90000/);
+      expect(problem(await file(`/outbound/orders/${orderId}/packing-slip?format=zpl&layout=a4`).expect(400)).code).toBe('validation-failed');
+      // The thermal slips: one per carton (each under 12 SKUs), ZPL text.
+      const slips = await file(`/outbound/orders/${orderId}/packing-slip?format=zpl&layout=label`).expect(200);
+      expect(slips.headers['content-disposition']).toBe(`attachment; filename="${label}-carton-slips.zpl"`);
+      const raw = (slips.body as Buffer).toString('ascii');
+      expect(raw.match(/\^XA/g)).toHaveLength(2);
+      expect(raw).toContain('PACKING SLIP');
+      expect(problem(await file(`/outbound/orders/${orderId}/packing-slip?layout=label&cartons=3`).expect(404)).code).toBe('not-found');
+    } finally {
+      await http().patch(`${API}/${tenantId}/clients/${acme}/tax-details`).set('Authorization', `Bearer ${accountantToken}`).set(KEY_HEADER, ulid()).send({ legalName: 'Acme Brand Private Limited' }).expect(200);
+    }
+  });
+
+  it('a legacy order (no stored pack) prints the live parties with the note', async () => {
+    const { orderId, scanned } = await pickedOrder([['A-TEE', 1]]);
+    await pack(orderId, { scanned, weightGrams: 400 }).expect(201);
+    await sql`delete from order_carton_lines where order_id = ${orderId}`;
+    await sql`delete from order_cartons where order_id = ${orderId}`;
+    await sql`delete from order_packs where order_id = ${orderId}`;
+    const body = await text((await file(`/outbound/orders/${orderId}/packing-slip`).expect(200)).body as Buffer);
+    expect(body).toContain('Party details are current, not as at packing');
+    expect(body).toContain('Carton 1 of 1 — 0.40 kg');
+  });
+
+  it('AC6 — the portal: client A sees the cartons (no code) and downloads the client slip (no carton code, no parcel tag); client B gets 404 for both; before packing, no slip', async () => {
+    const { orderId, label } = await twoCartonOrder();
+    const shipping = await http().get(`${API}/${tenantId}/portal/orders/${orderId}/shipping`).set('Authorization', `Bearer ${acmePortal}`).expect(200);
+    expect(shipping.body.packingSlipAvailable).toBe(true);
+    expect(shipping.body.cartons).toEqual([
+      { seq: 1, weightGrams: 3200, totals: [{ uom: 'each', qty: 6 }] },
+      { seq: 2, weightGrams: 2800, totals: [{ uom: 'each', qty: 8 }] },
+    ]);
+    expect(JSON.stringify(shipping.body)).not.toContain(cartonCode(orderId, 1, 1));
+    const slip = await file(`/portal/orders/${orderId}/packing-slip`, acmePortal).expect(200);
+    expect(slip.headers['content-disposition']).toBe(`attachment; filename="${label}-packing-slip.pdf"`);
+    const body = await text(slip.body as Buffer);
+    expect(body).toContain('Carton 2 of 2 — 2.80 kg');
+    expect(body).not.toContain(parcelTagCode(orderId));
+    expect(body).not.toContain('Packed by');
+    expect(body).not.toMatch(/Meena|90000/);
+    expect((await readPdfLabels(slip.body as Buffer))[0]!.payloads).toEqual([]);
+    expect(problem(await file(`/portal/orders/${orderId}/packing-slip`, betaPortal).expect(404)).code).toBe('not-found');
+    expect((await http().get(`${API}/${tenantId}/portal/orders/${orderId}/shipping`).set('Authorization', `Bearer ${betaPortal}`).expect(404)).body.code).toBe('not-found');
+    const open = await fixtures.createOrder([{ skuId: sku.get('A-TEE')!, quantity: 1 }], undefined, { clientOrderRef: `SO-${ulid().slice(18)}` });
+    const before = await http().get(`${API}/${tenantId}/portal/orders/${open}/shipping`).set('Authorization', `Bearer ${acmePortal}`).expect(200);
+    expect(before.body).toMatchObject({ cartons: null, packingSlipAvailable: false });
+    await file(`/portal/orders/${open}/packing-slip`, acmePortal).expect(404);
+  });
+
+  async function sendUntil(subject: string, rounds = 20): Promise<{ subject: string; text: string; attachments?: { filename: string; content: Uint8Array }[] } | undefined> {
+    for (let round = 0; round < rounds; round += 1) {
+      await sql`update email_messages set next_attempt_at = now() where tenant_id = ${tenantId} and status = 'pending'`;
+      await mail.sendDue(tenantId, 50);
+      const found = captured.captured.find((email) => email.subject === subject);
+      if (found !== undefined) return found as never;
+    }
+    return undefined;
+  }
+
+  it('AC6 — the dispatch email carries {order label}-packing-slip.pdf, the client copy (no carton code), and says so', async () => {
+    const { orderId, label } = await twoCartonOrder();
+    await http().post(`${API}/${tenantId}/outbound/orders/${orderId}/dispatch`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({}).expect(201);
+    await relay.drain(500);
+    const rows = (await sql`select attachment_kind, attachment_ref from email_messages where tenant_id = ${tenantId} and template = 'client-dispatch' and attachment_ref = ${orderId}`) as unknown as { attachment_kind: string }[];
+    expect(rows.map((row) => row.attachment_kind)).toEqual(['packing-slip-pdf']);
+    const sent = await sendUntil(`ACME Brand: order ${label} dispatched`);
+    expect(sent).toBeDefined();
+    expect(sent!.attachments).toHaveLength(1);
+    expect(sent!.attachments![0]!.filename).toBe(`${label}-packing-slip.pdf`);
+    const pdf = Buffer.from(sent!.attachments![0]!.content);
+    expect(pdf.subarray(0, 5).toString('latin1')).toBe('%PDF-');
+    const body = await text(pdf);
+    expect(body).toContain('Carton 1 of 2');
+    expect(body).not.toContain(cartonCode(orderId, 1, 1));
+    expect(sent!.text).toContain(`The packing slip is attached (${label}-packing-slip.pdf).`);
+  });
+
+  it('a render that throws on every attempt sends the dispatch email without the file on the last one, saying so', async () => {
+    const outbound = app.get(OutboundFacade);
+    const spy = jest.spyOn(outbound, 'packingSlipPdfInTx').mockRejectedValue(new Error('render exploded'));
+    try {
+      const { orderId, label } = await twoCartonOrder();
+      await http().post(`${API}/${tenantId}/outbound/orders/${orderId}/dispatch`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({}).expect(201);
+      await relay.drain(500);
+      const sent = await sendUntil(`ACME Brand: order ${label} dispatched`, 40);
+      expect(sent).toBeDefined();
+      expect(sent!.attachments ?? []).toHaveLength(0);
+      expect(sent!.text).toContain(DISPATCH_SLIP_FAILED);
+      expect(spy).toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

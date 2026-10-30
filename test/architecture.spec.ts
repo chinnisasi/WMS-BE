@@ -3826,9 +3826,9 @@ describe('architecture: the mail module (story 5-1a)', () => {
     expect(facadeImporters).toBeGreaterThanOrEqual(3);
   });
 
-  it('story 2-9a: the mail module imports nothing from inbound or client-emails — the attachment registry is the port', () => {
+  it('story 2-9a: the mail module imports nothing from inbound, outbound or client-emails — the attachment registry is the port', () => {
     const offenders = mailFiles
-      .filter((file) => /from\s+['"][^'"]*(?:modules\/(?:inbound|client-emails)|\.\.\/(?:inbound|client-emails))\//.test(file.source))
+      .filter((file) => /from\s+['"][^'"]*(?:modules\/(?:inbound|outbound|client-emails)|\.\.\/(?:inbound|outbound|client-emails))\//.test(file.source))
       .map((file) => file.path);
     expect(offenders).toEqual([]);
   });
@@ -3839,6 +3839,16 @@ describe('architecture: the mail module (story 5-1a)', () => {
     expect(render).toMatch(/withTenantTransaction\(/);
     expect(render).toMatch(/\{\s*accessMode:\s*'read only',\s*clientId\s*\}/);
     expect(render).toMatch(/statement_timeout/);
+  });
+
+  it('story 4-5a (A20, A30): packing-slip-pdf renders through OutboundFacade.packingSlipPdfInTx on the registry transaction, which opens none of its own', () => {
+    const module = readFileSync(join(SRC_ROOT, 'modules', 'client-emails', 'client-emails.module.ts'), 'utf8');
+    expect(module).toMatch(/register\('packing-slip-pdf',\s*\(tx, tenantId, clientId, orderId\) => this\.outbound\.packingSlipPdfInTx\(tx, tenantId, clientId, orderId\)\)/);
+    const service = readFileSync(join(SRC_ROOT, 'modules', 'outbound', 'pack-documents.service.ts'), 'utf8');
+    const body = service.slice(service.indexOf('async packingSlipPdfInTx('));
+    const end = body.indexOf('\n  }\n');
+    expect(body.slice(0, end)).not.toMatch(/withTenantTransaction/);
+    expect(body.slice(0, end)).toMatch(/eq\(orders\.clientId, clientId\)/);
   });
 
   it('the mail module imports nothing from tenancy', () => {
