@@ -180,6 +180,24 @@ export const AUDIT_NO_OP_ARMS = {
     snapshot.consignment.status === 'live',
   /** Story 4-6a (A11) — `ClientsCommand.updateConsignmentPolicy` with the rule already in place. */
   'clients.consignmentPolicy:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'client'),
+  /** Story 4-9a (A9) — `FreightLoadCommand.updateLoad` with the header unchanged: the key stored with `{load}`, nothing written or audited. */
+  'freight.load-update:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'load', 'open'),
+  /** Story 4-9a (A12) — `FreightLoadCommand.reorderStops` in the stops' current order. */
+  'freight.stops:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'load', 'open'),
+  /** Story 4-9a (A13) — a `load` scan of a package already loaded (another device, or a re-scan): `{scan, alreadyLoaded: true, progress}`. */
+  'freight.scan:already-loaded': (snapshot: unknown) =>
+    isRecord(snapshot) && sameKeys(snapshot, ['alreadyLoaded', 'progress', 'scan']) && snapshot.alreadyLoaded === true,
+  /** Story 4-9a (A13) — an `unload` of a package not loaded: `{scan, alreadyLoaded: false, progress}` with the scan `unloaded`. */
+  'freight.scan:not-loaded': (snapshot: unknown) =>
+    isRecord(snapshot) &&
+    sameKeys(snapshot, ['alreadyLoaded', 'progress', 'scan']) &&
+    snapshot.alreadyLoaded === false &&
+    isRecord(snapshot.scan) &&
+    snapshot.scan.status === 'unloaded',
+  /** Story 4-9a (A16) — `FreightConsignmentCommand.recordLr` with the LR, date and terms unchanged. */
+  'freight.lr:unchanged': (snapshot: unknown) => isRecord(snapshot) && sameKeys(snapshot, ['consignment', 'unchanged']) && snapshot.unchanged === true,
+  /** Story 4-9a (A17) — `FreightConsignmentCommand.recordDelivery` with every delivery column unchanged. */
+  'freight.delivery:unchanged': (snapshot: unknown) => isRecord(snapshot) && sameKeys(snapshot, ['consignment', 'unchanged']) && snapshot.unchanged === true,
   /** Story 6-1b — `SecondFactorCommand.reset` of a user with no two-factor sign-in and no enrolment code. */
   'users.resetSecondFactor:not-enrolled': (snapshot: unknown) =>
     isRecord(snapshot) &&
