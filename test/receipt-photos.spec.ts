@@ -1314,7 +1314,8 @@ describe('story 2-5a: damage photos on a receipt line (e2e)', () => {
         explain select a.id, exists (
           select 1 from rejected_ops r
           where r.tenant_id = a.tenant_id and r.status = 'open'
-            and jsonb_path_exists(r.payload, '$.lines[*].photoRefs[*] ? (@ == $ref)', jsonb_build_object('ref', a.client_ref))
+            and (jsonb_path_exists(r.payload, '$.lines[*].photoRefs[*] ? (@ == $ref)', jsonb_build_object('ref', a.client_ref))
+              or jsonb_path_exists(r.payload, '$.photoRefs[*] ? (@ == $ref)', jsonb_build_object('ref', a.client_ref)))
         ) as referenced
         from attachments a
         where a.tenant_id = '${tenantId}' and a.status = 'staged' and a.created_at < now()
@@ -1323,6 +1324,8 @@ describe('story 2-5a: damage photos on a receipt line (e2e)', () => {
         for update of a skip locked`)) as unknown as { 'QUERY PLAN': string }[];
       const text = plan.map((row) => row['QUERY PLAN']).join('\n');
       expect(text).toContain('jsonb_path_exists');
+      // Story 4-4a (A29) — re-taken with the second arm: a handover's top-level photoRefs.
+      expect(text).toContain('$."photoRefs"[*]');
       expect(text).toMatch(/attachments/);
     });
   });

@@ -3,7 +3,7 @@ import type { ExecutionContext } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import type {} from 'multer';
 import type { Response } from 'express';
-import { ApiBearerAuth, ApiBody, ApiConsumes, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiProduces, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiBody, ApiConsumes, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiProduces, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
 import { ProblemException } from '../shared/problem-details/problem.exception';
 import { UUID_RE } from '../shared/primitives/ids';
@@ -20,10 +20,12 @@ import {
   ClientLabelUploadFieldsDto,
   ClientShipmentResponse,
   CreateHandoverDto,
+  HandoverCandidatesQueryDto,
   HandoverCandidatesResponse,
   HandoverDetailResponse,
   HandoverPhotoFieldsDto,
   HandoverResponse,
+  HandoversQueryDto,
   HandoversResponse,
   OrderDocumentFieldsDto,
   OrderShippingResponse,
@@ -264,7 +266,6 @@ export class ShippingController {
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Story 4-4a — the parcel tag (4×2 only): ZPL or PDF. The barcode is the tag code (`O` + the order id’s last 16 hex digits). A file read: no key, no audit' })
-  @ApiQuery({ name: 'format', required: false, enum: ['zpl', 'pdf'] })
   @ApiProduces('application/pdf', 'text/plain')
   @ApiResponse({ status: 200, description: 'The tag file', content: { 'application/pdf': { schema: { type: 'string', format: 'binary' } }, 'text/plain': { schema: { type: 'string', format: 'binary' } } } })
   @ApiResponse({ status: 404, ...problemJsonResponse('Unknown order (not-found)') })
@@ -497,9 +498,6 @@ export class ShippingController {
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Story 4-4a — the handover builder’s list: one client’s packed orders in the warehouse, oldest first (keyset), with each parcel’s shipment and tag code' })
-  @ApiQuery({ name: 'clientId', required: true, schema: { type: 'string', format: 'uuid' } })
-  @ApiQuery({ name: 'cursor', required: false })
-  @ApiQuery({ name: 'limit', required: false, schema: { type: 'integer', minimum: 1, maximum: 200 } })
   @ApiOkResponse({ type: HandoverCandidatesResponse })
   @ApiResponse({ status: 400, ...problemJsonResponse('A missing clientId or a malformed cursor (validation-failed, invalid-cursor)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Unknown warehouse (not-found)') })
@@ -508,11 +506,10 @@ export class ShippingController {
   async handoverCandidates(
     @Param('tenantId') tenantId: string,
     @Param('warehouseId') warehouseId: string,
-    @Query('clientId') clientId: string | undefined,
-    @Query('cursor') cursor: string | undefined,
-    @Query('limit') limit: string | undefined,
+    @Query() query: HandoverCandidatesQueryDto,
     @CurrentSession() session: TenantSession,
   ): Promise<HandoverCandidatesResponse> {
+    const { clientId, cursor, limit } = query;
     assertOwnTenant(session.tenantId, tenantId);
     assertUuid(warehouseId, 'warehouseId');
     const page = await this.outbound.getHandoverCandidates(tenantId, warehouseId, clientId ?? '', { cursor, limit: parseLimit(limit) });
@@ -523,11 +520,6 @@ export class ShippingController {
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Story 4-4a — the warehouse’s courier handovers, newest first (keyset); from/to are IST dates, inclusive' })
-  @ApiQuery({ name: 'clientId', required: false, schema: { type: 'string', format: 'uuid' } })
-  @ApiQuery({ name: 'from', required: false, schema: { type: 'string', format: 'date' } })
-  @ApiQuery({ name: 'to', required: false, schema: { type: 'string', format: 'date' } })
-  @ApiQuery({ name: 'cursor', required: false })
-  @ApiQuery({ name: 'limit', required: false, schema: { type: 'integer', minimum: 1, maximum: 100 } })
   @ApiOkResponse({ type: HandoversResponse })
   @ApiResponse({ status: 400, ...problemJsonResponse('A malformed date, client or cursor (validation-failed, invalid-cursor)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Unknown warehouse (not-found)') })
@@ -536,13 +528,10 @@ export class ShippingController {
   async handovers(
     @Param('tenantId') tenantId: string,
     @Param('warehouseId') warehouseId: string,
-    @Query('clientId') clientId: string | undefined,
-    @Query('from') from: string | undefined,
-    @Query('to') to: string | undefined,
-    @Query('cursor') cursor: string | undefined,
-    @Query('limit') limit: string | undefined,
+    @Query() query: HandoversQueryDto,
     @CurrentSession() session: TenantSession,
   ): Promise<HandoversResponse> {
+    const { clientId, from, to, cursor, limit } = query;
     assertOwnTenant(session.tenantId, tenantId);
     assertUuid(warehouseId, 'warehouseId');
     const page = await this.outbound.listHandovers(tenantId, warehouseId, { clientId, from, to, cursor, limit: parseLimit(limit) });

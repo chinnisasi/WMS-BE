@@ -1209,7 +1209,14 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // Story 4-7c: + two (0113) — client_returns client-bound on both arms
       // (the 0097 shape — the portal reads an RTC), client_return_lines riding
       // its parent (the 0073 EXISTS shape). Retargeted 155 → 157.
-      expect(policies).toHaveLength(157);
+      // Story 4-4a (0116) — courier_handovers (the tenant arm plus the client
+      // clause); shipments re-created with the client clause. 157 → 158.
+      expect(policies).toHaveLength(158);
+      for (const table of ['shipments', 'courier_handovers']) {
+        const row = policies.find((candidate) => candidate.tablename === table)!;
+        expect(row.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+        expect(row.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+      }
       {
         const rtc = policies.find((row) => row.policyname === 'client_returns_tenant_isolation')!;
         expect(rtc.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");

@@ -508,3 +508,49 @@ export class ParcelTagQueryDto {
   @IsIn([...PARCEL_TAG_FORMATS])
   format?: 'zpl' | 'pdf';
 }
+
+/** The handover builder's candidates query (clientId required; validated by the service). */
+export class HandoverCandidatesQueryDto {
+  @ApiProperty({ format: 'uuid', description: 'The client whose packed orders are listed' })
+  @IsOptional()
+  @IsString()
+  clientId?: string;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @IsString()
+  cursor?: string;
+
+  @ApiProperty({ required: false, description: '1–200 (default 100)' })
+  @IsOptional()
+  @IsString()
+  limit?: string;
+}
+
+/** The handovers list query; from / to are IST dates, inclusive. */
+export class HandoversQueryDto {
+  @ApiProperty({ required: false, format: 'uuid' })
+  @IsOptional()
+  @IsString()
+  clientId?: string;
+
+  @ApiProperty({ required: false, format: 'date' })
+  @IsOptional()
+  @IsString()
+  from?: string;
+
+  @ApiProperty({ required: false, format: 'date' })
+  @IsOptional()
+  @IsString()
+  to?: string;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @IsString()
+  cursor?: string;
+
+  @ApiProperty({ required: false, description: '1–100 (default 50)' })
+  @IsOptional()
+  @IsString()
+  limit?: string;
+}

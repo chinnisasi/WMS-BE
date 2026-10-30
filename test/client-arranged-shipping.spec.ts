@@ -158,8 +158,8 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
 
     acme = await createClient('ACME', 'ACME Brand');
     beta = await createClient('BETA', 'Beta Brand');
-    await importCsv(['A-TEE,Acme tee,pcs,1800,,,'], acme);
-    await importCsv(['B-TEE,Beta tee,pcs,1800,,,'], beta);
+    await importCsv(['A-TEE,Acme tee,pcs,1800,,false,false', 'A-LOT,Acme lot tee,pcs,1800,,true,false'], acme);
+    await importCsv(['B-TEE,Beta tee,pcs,1800,,false,false'], beta);
     const listed = await http().get(`${API}/${tenantId}/catalog/skus?limit=200`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
     for (const item of listed.body.items as { code: string; id: string }[]) sku.set(item.code, item.id);
     for (const code of ['A-TEE', 'B-TEE']) {
@@ -224,7 +224,7 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
   }
 
   async function importCsv(rows: string[], clientId: string): Promise<void> {
-    const csv = ['sku_code,name,uom,gst_rate,product,variant_values,kit_components', ...rows].join('\n');
+    const csv = ['sku_code,name,uom,gst_rate,barcode,batch_tracked,serial_tracked', ...rows].join('\n');
     await http().post(`${API}/${tenantId}/catalog/imports`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid())
       .field('mode', 'initial').field('clientId', clientId)
       .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' }).expect(201);
@@ -567,6 +567,22 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
     expect(two.body.parcels.map((p: { code: string }) => p.code)).toEqual(['awb-mismatch', 'awb-required']);
   });
 
+  it('a recalled lot: the web refuses the whole handover (order-holds-recalled-batch); the handheld hands over the rest and refuses that parcel', async () => {
+    await http().post(`${API}/${tenantId}/inventory/adjustments`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid())
+      .send({ warehouseId, skuId: sku.get('A-LOT'), binId, quantityDelta: 5, reasonCode: 'stock-count', note: 'lot seed', batch: { code: 'LOT-RCL-1' } }).expect(201);
+    await app.get(InventoryFacade).rebuildReservationCounters(tenantId, warehouseId);
+    const recalledOrder = await packedOrder('A-LOT');
+    const clean = await packedOrder();
+    const lot = (await sql`select id from batches where tenant_id = ${tenantId} and sku_id = ${sku.get('A-LOT')!} and code = 'LOT-RCL-1'`)[0]!.id as string;
+    await http().post(`${API}/${tenantId}/inventory/recalls`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({ batchIds: [lot], reasonNote: 'handover suite', mode: 'live' }).expect(201);
+    const web = await handOver({ parcels: [{ orderId: clean, awb: 'AWBRCL0001' }, { orderId: recalledOrder, awb: 'AWBRCL0002' }] }).expect(409);
+    expect(web.body.parcels).toEqual([{ orderId: recalledOrder, code: 'order-holds-recalled-batch', detail: expect.stringContaining('recall') }]);
+    const device = await handOver({ occurredAt: new Date().toISOString(), parcels: [{ orderId: clean, awb: 'AWBRCL0001' }, { orderId: recalledOrder, awb: 'AWBRCL0002' }] }, operatorToken).expect(201);
+    expect(device.body.parcels.map((p: { orderId: string }) => p.orderId)).toEqual([clean]);
+    expect(device.body.refused.map((r: { code: string }) => r.code)).toEqual(['order-holds-recalled-batch']);
+    expect(await orderStatus(recalledOrder)).toBe('ready_to_dispatch');
+  });
+
   it('mixed clients are 409 handover-client-mismatch on both surfaces; duplicates and photoRefs on the web are 400; the 7-day window', async () => {
     const a = await packedOrder();
     const b = await packedOrder('B-TEE');
@@ -778,6 +794,52 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
       const found = await withTenantTransaction(app.get(DATABASE), tenantId, (tx) => outbound.ordersByParcelReferenceInTx(tx, tenantId, acme, warehouseId, typed));
       expect(found).toEqual([{ orderId, matchKind: 'awb' }]);
     }
+  });
+
+  it('same-key races (parked waiters): two handovers and two AWB advices under one key, parked on the order lock — both answer the winner’s snapshot, one effect', async () => {
+    async function race(orderId: string, fire: () => Promise<request.Response>): Promise<request.Response[]> {
+      const holder = postgres(process.env.DATABASE_URL!.replace(/\/[^/]+$/, `/${(await sql`select current_database() as db`)[0]!.db as string}`), { max: 1, onnotice: () => undefined });
+      try {
+        let releaseHolder!: () => void;
+        const held = new Promise<void>((resolve) => (releaseHolder = resolve));
+        let holderPid = 0;
+        const locked = new Promise<void>((resolve) => {
+          void holder.begin(async (tx) => {
+            holderPid = Number((await tx`select pg_backend_pid() as pid`)[0]!.pid);
+            await tx`select id from orders where id = ${orderId} for update`;
+            resolve();
+            await held;
+          });
+        });
+        await locked;
+        const first = fire();
+        const second = fire();
+        const deadline = Date.now() + 10_000;
+        for (;;) {
+          const waiting = (await sql`select count(*)::int as n from pg_stat_activity where wait_event_type = 'Lock' and ${holderPid} = any(pg_blocking_pids(pid))`)[0]!.n as number;
+          const chained = (await sql`select count(*)::int as n from pg_stat_activity where wait_event_type = 'Lock' and state = 'active' and query ilike '%"orders"%'`)[0]!.n as number;
+          if (waiting >= 1 && chained >= 2) break;
+          if (Date.now() > deadline) throw new Error('the duplicates never parked');
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        releaseHolder();
+        return await Promise.all([first, second]);
+      } finally {
+        await holder.end();
+      }
+    }
+    const handoverOrder = await packedOrder();
+    const key = ulid();
+    const answers = await race(handoverOrder, () => handOver({ parcels: [{ orderId: handoverOrder, awb: 'AWBRACE001' }] }, opsToken, key).then((res) => res));
+    expect(answers.map((res) => res.status)).toEqual([201, 201]);
+    expect(answers[1]!.body).toEqual(answers[0]!.body);
+    expect((await sql`select count(*)::int as n from shipments where order_id = ${handoverOrder}`)[0]!.n).toBe(1);
+    const adviceOrder = await acceptedOrder();
+    const adviceKey = ulid();
+    const advices = await race(adviceOrder, () => awbAdvice(adviceOrder, { awb: 'AWBRACE002', courierName: 'VRL' }, opsToken, adviceKey).then((res) => res));
+    expect(advices.map((res) => res.status)).toEqual([201, 201]);
+    expect(advices[1]!.body).toEqual(advices[0]!.body);
+    expect((await sql`select count(*)::int as n from shipments where order_id = ${adviceOrder}`)[0]!.n).toBe(1);
   });
 
   it('A44 — the portal status derivation', () => {

@@ -122,6 +122,9 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
     'LBL-WH2', // the second-warehouse manifest refusal
     'LBL-SEAL', // the unreadable-sealed-credential 503
     'LBL-GOLD', // story 4-4a (A31) — the label and manifest literal goldens
+    'LBL-CA1', // story 4-4a (A50) — a client-arranged shipment in a manifest set…
+    'LBL-CA2', // …a second one (the all-client-arranged set)
+    'LBL-CA3', // …and a carrier label beside one (the mixed set)
   ] as const;
 
   beforeAll(async () => {
@@ -1054,6 +1057,31 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
       'updatedAt',
       'warehouseId',
     ]);
+  });
+
+  it('story 4-4a (A24, A50): an all-client-arranged set and a mixed set are both 409 naming client-arranged — no manifest row; the new label rows carry the order’s client', async () => {
+    const advise = async (orderId: string, awb: string): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/outbound/orders/${orderId}/shipment/awb`)
+          .set('Authorization', `Bearer ${opsToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ awb, courierName: 'VRL' })
+          .expect(201)
+      ).body.shipment.id as string;
+    const one = await advise((await packedOrder('LBL-CA1', 1, 'ca1')).orderId, 'LRCA0001');
+    const two = await advise((await packedOrder('LBL-CA2', 1, 'ca2')).orderId, 'LRCA0002');
+    const carrierOrder = await packedOrder('LBL-CA3', 1, 'ca3');
+    const carrier = (await labelOrder(carrierOrder.orderId, sandboxConnectionId).expect(201)).body.shipment.id as string;
+    const before = await manifestCount();
+    for (const set of [[one, two], [carrier, one]]) {
+      const refused = await createManifest(set).expect(409);
+      expect(refused.body.code).toBe('conflict');
+      expect(refused.body.detail).toContain('client-arranged');
+    }
+    expect(await manifestCount()).toBe(before);
+    const clientIds = (await sql`select s.client_id, o.client_id as order_client from shipments s join orders o on o.id = s.order_id where s.id = ${carrier}`) as unknown as { client_id: string; order_client: string }[];
+    expect(clientIds[0]!.client_id).toBe(clientIds[0]!.order_client);
   });
 
   it('refuses a manifest naming a MISSING or FOREIGN shipment id — the foreign row reads as ABSENT through RLS', async () => {

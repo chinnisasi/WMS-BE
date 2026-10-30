@@ -14718,11 +14718,11 @@
             "required": false,
             "in": "query",
             "schema": {
+              "type": "string",
               "enum": [
                 "zpl",
                 "pdf"
-              ],
-              "type": "string"
+              ]
             }
           }
         ],
@@ -15478,9 +15478,10 @@
             "name": "clientId",
             "required": true,
             "in": "query",
+            "description": "The client whose packed orders are listed",
             "schema": {
-              "type": "string",
-              "format": "uuid"
+              "format": "uuid",
+              "type": "string"
             }
           },
           {
@@ -15495,10 +15496,9 @@
             "name": "limit",
             "required": false,
             "in": "query",
+            "description": "1–200 (default 100)",
             "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 200
+              "type": "string"
             }
           }
         ],
@@ -15573,8 +15573,8 @@
             "required": false,
             "in": "query",
             "schema": {
-              "type": "string",
-              "format": "uuid"
+              "format": "uuid",
+              "type": "string"
             }
           },
           {
@@ -15582,8 +15582,8 @@
             "required": false,
             "in": "query",
             "schema": {
-              "type": "string",
-              "format": "date"
+              "format": "date",
+              "type": "string"
             }
           },
           {
@@ -15591,8 +15591,8 @@
             "required": false,
             "in": "query",
             "schema": {
-              "type": "string",
-              "format": "date"
+              "format": "date",
+              "type": "string"
             }
           },
           {
@@ -15607,10 +15607,9 @@
             "name": "limit",
             "required": false,
             "in": "query",
+            "description": "1–100 (default 50)",
             "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 100
+              "type": "string"
             }
           }
         ],
