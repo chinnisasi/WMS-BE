@@ -20,6 +20,7 @@ import {
   vendorReturnClock,
 } from '../src/modules/inbound/vendor-return.command';
 import { REJECTED_OP_DECISIONS_BY_TYPE } from '../src/modules/tenancy/sync-report.command';
+import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
@@ -737,6 +738,30 @@ describe('story 2-8b: the return to vendor (e2e)', () => {
       } finally {
         vendorReturnClock.now = () => Date.now();
       }
+      // Story 4-6a (A22, D12) — the dispatch golden, written green on 4-5a's
+      // code before the value joined the hash: a body without
+      // declaredValuePaise must keep hashing byte for byte as below.
+      const stored = (await sql`select payload_hash from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`) as unknown as { payload_hash: string }[];
+      expect(stored[0]!.payload_hash).toBe(
+        hashCommandPayload({
+          tenantId,
+          arm: 'dispatch',
+          vendorReturnId: rtv.id,
+          brandDocumentType: 'challan',
+          brandDocumentNumber: 'CH-77',
+          brandDocumentDate: (body.brandDocument as { date: string }).date,
+          consignorGstin: null,
+          debitNoteNumber: null,
+          ewayBillNumber: null,
+          ewayBillDate: null,
+          ewayValidUntil: null,
+          transporterId: transporter,
+          carrierName: null,
+          vehicleNumber: null,
+          trackingRef: 'AWB1234',
+          packageCount: 1,
+        }),
+      );
     });
 
     it('A7 — the vendor is not re-checked at dispatch: a picked RTV of a vendor deactivated meanwhile dispatches and prints the frozen vendor', async () => {
