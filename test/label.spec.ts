@@ -13,6 +13,7 @@ import {
 import { SHIPMENT_STATUSES } from '../src/modules/outbound/shipment.command';
 import { sealCredential } from '../src/modules/carriers/carrier-credentials';
 import { CAPABILITIES, ROLE_CAPABILITIES } from '../src/modules/tenancy/permissions';
+import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
@@ -120,6 +121,10 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
     'LBL-AUTH', // the authority arms
     'LBL-WH2', // the second-warehouse manifest refusal
     'LBL-SEAL', // the unreadable-sealed-credential 503
+    'LBL-GOLD', // story 4-4a (A31) — the label and manifest literal goldens
+    'LBL-CA1', // story 4-4a (A50) — a client-arranged shipment in a manifest set…
+    'LBL-CA2', // …a second one (the all-client-arranged set)
+    'LBL-CA3', // …and a carrier label beside one (the mixed set)
   ] as const;
 
   beforeAll(async () => {
@@ -608,7 +613,8 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
   // ── the grammar, the capability and the drift guards ──────────────────────
 
   it('the shipment lifecycle, the DB CHECK, the partial unique index and the capability are registered (the drift guards)', async () => {
-    expect([...SHIPMENT_STATUSES]).toEqual(['labelled', 'manifested', 'voided']);
+    // Story 4-4a (A38) — `handed_over`: a client-arranged shipment closed by a courier handover.
+    expect([...SHIPMENT_STATUSES]).toEqual(['labelled', 'manifested', 'voided', 'handed_over']);
 
     // The DB CHECK is the additive backstop to the TS constant (0024).
     const defs = await sql`
@@ -948,21 +954,26 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
     expect(reManifested.body.detail).toContain('manifested');
     expect(reManifested.body.detail).toContain('not in the labelled state');
 
-    // The auto-stamp reads only a `labelled` shipment (4.6c): dispatching the
-    // manifested order with NO free text carries NEITHER carrier arm — the
-    // manifest closure took the shipment out of the auto-stamp's read.
+    // Story 4-4a (A13) — the OLD behaviour here was a defect, now fixed: the
+    // auto-stamp read only a `labelled` shipment, so an order dispatched after
+    // its manifest lost its tracking number. It reads the LIVE (non-voided)
+    // shipment now, so the manifested order's dispatch with NO free text
+    // carries the label's carrier and tracking.
     const dispatched = await dispatchOrder(first.orderId).expect(201);
-    expect(dispatched.body.dispatch.carrierName).toBeNull();
-    expect(dispatched.body.dispatch.trackingNumber).toBeNull();
+    expect(dispatched.body.dispatch.carrierName).toBe('Sandbox');
+    expect(dispatched.body.dispatch.trackingNumber).toBe(firstLabel.body.shipment.trackingNumber);
     const events = (await sql`
       select reference_doc from ledger_events
       where tenant_id = ${tenantId} and type = 'dispatch.dispatched'
         and reference_doc->>'orderId' = ${first.orderId}
     `) as unknown as { reference_doc: Record<string, unknown> }[];
     expect(events).toHaveLength(1);
-    expect(events[0]!.reference_doc).toMatchObject({ kind: 'dispatch', orderId: first.orderId });
-    expect(events[0]!.reference_doc.carrierName).toBeUndefined();
-    expect(events[0]!.reference_doc.trackingNumber).toBeUndefined();
+    expect(events[0]!.reference_doc).toMatchObject({
+      kind: 'dispatch',
+      orderId: first.orderId,
+      carrierName: 'Sandbox',
+      trackingNumber: firstLabel.body.shipment.trackingNumber,
+    });
 
     // The writeback event and the audit row ride the same transaction.
     const outbox = await sql`
@@ -981,6 +992,96 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
       where tenant_id = ${tenantId} and target_id = ${manifest.id as string} and action = 'manifest.created'
     `;
     expect(audit).toHaveLength(1);
+  });
+
+  // ── story 4-4a (A31): literal goldens, pinned BEFORE the extraction ────────
+
+  async function storedKey(key: string): Promise<{ payloadHash: string; snapshot: Record<string, unknown> }> {
+    const rows = (await sql`
+      select payload_hash, response_snapshot from idempotency_keys where tenant_id = ${tenantId} and key = ${key}
+    `) as unknown as { payload_hash: string; response_snapshot: unknown }[];
+    const raw = rows[0]!.response_snapshot;
+    return {
+      payloadHash: rows[0]!.payload_hash,
+      snapshot: (typeof raw === 'string' ? JSON.parse(raw) : raw) as Record<string, unknown>,
+    };
+  }
+
+  it('A31 goldens: createShipmentLabel and createManifest hash and store exactly these keys', async () => {
+    const { orderId } = await packedOrder('LBL-GOLD', 1, 'gold');
+    const labelKey = ulid();
+    const labelled = await labelOrder(orderId, sandboxConnectionId, { weightGrams: 750 }, operatorWebToken, labelKey).expect(201);
+    const label = await storedKey(labelKey);
+    expect(label.payloadHash).toBe(
+      hashCommandPayload({ command: 'outbound.label', tenantId, orderId, carrierConnectionId: sandboxConnectionId, weightGrams: 750 }),
+    );
+    expect(Object.keys(label.snapshot)).toEqual(['shipment']);
+    expect(Object.keys(label.snapshot.shipment as object).sort()).toEqual([
+      'carrierCode',
+      'carrierConnectionId',
+      'carrierName',
+      'codAmountPaise',
+      'dimensionsMm',
+      'id',
+      'labelDocumentRef',
+      'labelledAt',
+      'labelledBy',
+      'manifestId',
+      'orderId',
+      'status',
+      'tenantId',
+      'trackingNumber',
+      'warehouseId',
+      'weightGrams',
+    ]);
+
+    const shipmentId = labelled.body.shipment.id as string;
+    const manifestKey = ulid();
+    await createManifest([shipmentId], operatorWebToken, manifestKey).expect(201);
+    const manifest = await storedKey(manifestKey);
+    expect(manifest.payloadHash).toBe(
+      hashCommandPayload({ command: 'outbound.manifest', tenantId, warehouseId, shipmentIds: [shipmentId] }),
+    );
+    expect(Object.keys(manifest.snapshot)).toEqual(['manifest']);
+    expect(Object.keys(manifest.snapshot.manifest as object).sort()).toEqual([
+      'carrierCode',
+      'carrierConnectionId',
+      'codShipmentCount',
+      'codTotalPaise',
+      'createdAt',
+      'createdBy',
+      'id',
+      'shipmentCount',
+      'shipmentIds',
+      'tenantId',
+      'updatedAt',
+      'warehouseId',
+    ]);
+  });
+
+  it('story 4-4a (A24, A50): an all-client-arranged set and a mixed set are both 409 naming client-arranged — no manifest row; the new label rows carry the order’s client', async () => {
+    const advise = async (orderId: string, awb: string): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/outbound/orders/${orderId}/shipment/awb`)
+          .set('Authorization', `Bearer ${opsToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ awb, courierName: 'VRL' })
+          .expect(201)
+      ).body.shipment.id as string;
+    const one = await advise((await packedOrder('LBL-CA1', 1, 'ca1')).orderId, 'LRCA0001');
+    const two = await advise((await packedOrder('LBL-CA2', 1, 'ca2')).orderId, 'LRCA0002');
+    const carrierOrder = await packedOrder('LBL-CA3', 1, 'ca3');
+    const carrier = (await labelOrder(carrierOrder.orderId, sandboxConnectionId).expect(201)).body.shipment.id as string;
+    const before = await manifestCount();
+    for (const set of [[one, two], [carrier, one]]) {
+      const refused = await createManifest(set).expect(409);
+      expect(refused.body.code).toBe('conflict');
+      expect(refused.body.detail).toContain('client-arranged');
+    }
+    expect(await manifestCount()).toBe(before);
+    const clientIds = (await sql`select s.client_id, o.client_id as order_client from shipments s join orders o on o.id = s.order_id where s.id = ${carrier}`) as unknown as { client_id: string; order_client: string }[];
+    expect(clientIds[0]!.client_id).toBe(clientIds[0]!.order_client);
   });
 
   it('refuses a manifest naming a MISSING or FOREIGN shipment id — the foreign row reads as ABSENT through RLS', async () => {

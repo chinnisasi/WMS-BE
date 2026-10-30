@@ -1,3 +1,4 @@
+import { SHEET_PARCELS_SHOWN } from './client-shipment-document';
 import { renderEmail } from './index';
 import { decodeClientReceiptParams, type ClientReceiptEmailParams } from './client-receipt';
 import { decodeClientDispatchParams, type ClientDispatchEmailParams } from './client-dispatch';
@@ -46,15 +47,16 @@ const dispatch: ClientDispatchEmailParams = {
 const context = { tenantId: 't', to: 'a@acme.example', webBaseUrl: 'https://app.wms.test', secret: null };
 
 describe('client notices (story 5-2b)', () => {
-  it('the vocabulary: five templates, the two client ones at priority 1, account mail at 0', () => {
-    expect([...EMAIL_TEMPLATES]).toEqual(['user-invite', 'password-reset', 'password-changed', 'client-receipt', 'client-dispatch']);
-    expect([...CLIENT_EMAIL_TEMPLATES]).toEqual(['client-receipt', 'client-dispatch']);
+  it('the vocabulary: six templates (story 4-4a added the shipping document), the three client ones at priority 1, account mail at 0', () => {
+    expect([...EMAIL_TEMPLATES]).toEqual(['user-invite', 'password-reset', 'password-changed', 'client-receipt', 'client-dispatch', 'client-shipment-document']);
+    expect([...CLIENT_EMAIL_TEMPLATES]).toEqual(['client-receipt', 'client-dispatch', 'client-shipment-document']);
     expect(EMAIL_TEMPLATE_PRIORITY).toEqual({
       'user-invite': 0,
       'password-reset': 0,
       'password-changed': 0,
       'client-receipt': 1,
       'client-dispatch': 1,
+      'client-shipment-document': 1,
     });
   });
 
@@ -126,5 +128,44 @@ describe('client notices (story 5-2b)', () => {
     expect(() => decodeClientDispatchParams({ ...dispatch, shortShipped: 'yes' })).toThrow();
     expect(() => decodeClientDispatchParams({ ...dispatch, lines: Array.from({ length: 101 }, () => dispatch.lines[0]) })).toThrow();
     expect(() => renderEmail('client-receipt', { nonsense: true }, context)).toThrow();
+  });
+
+  describe('story 4-4a — the shipping-document notice', () => {
+    const base = {
+      tenantName: 'Acme 3PL',
+      clientName: 'ACME Brand',
+      replyTo: null,
+      documentKind: 'pod' as const,
+      subjectLabel: 'SO-1',
+      orderId: '01a18ba8-4743-79dd-8fe5-145b99902272',
+      orderRef: 'SO-1',
+      handoverCode: 'HO-0007',
+      handedOverAt: '2026-10-30T10:35:00.000Z',
+      courierName: 'Delhivery',
+      awb: '123456789012',
+      fileName: 'SO-1-pod-1.jpg',
+      page: null,
+      parcels: [],
+      moreParcels: 0,
+    };
+    it('the subject, and the failed and too-large notes name the file', () => {
+      const failed = renderEmail('client-shipment-document', base, { ...context, attachment: 'failed' });
+      expect(failed.subject).toBe('ACME Brand: Proof of delivery for order SO-1');
+      expect(failed.text).toContain('The file (SO-1-pod-1.jpg) could not be attached — download it from the client portal.');
+      const large = renderEmail('client-shipment-document', base, { ...context, attachment: 'too-large' });
+      expect(large.text).toContain('The file (SO-1-pod-1.jpg) is too large to attach — download it from the client portal.');
+      expect(renderEmail('client-shipment-document', base, { ...context, attachment: 'attached' }).text).toContain('The file is attached (SO-1-pod-1.jpg).');
+    });
+    it('a sheet over SHEET_PARCELS_SHOWN lists the first ones and says "…and N more"', () => {
+      const parcels = Array.from({ length: SHEET_PARCELS_SHOWN }, (_, i) => ({ orderRef: `SO-${i}`, awb: `AWB${i}` }));
+      const sheet = renderEmail(
+        'client-shipment-document',
+        { ...base, documentKind: 'handover-sheet', subjectLabel: 'HO-0007 (page 2)', orderId: null, orderRef: null, awb: null, fileName: 'HO-0007-sheet-2.pdf', page: 2, parcels, moreParcels: 3 },
+        context,
+      );
+      expect(sheet.subject).toBe('ACME Brand: signed handover sheet HO-0007 (page 2)');
+      expect(sheet.text).toContain('- SO-0: AWB AWB0');
+      expect(sheet.text).toContain('…and 3 more');
+    });
   });
 });

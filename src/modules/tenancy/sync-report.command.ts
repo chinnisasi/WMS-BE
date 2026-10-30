@@ -171,7 +171,22 @@ export type RejectedOpType =
   // re-applying the stored entries would be refused again; the remedy is to
   // fix the catalog entry and receive the units again as a new parcel.
   // Excluded from `ApplicableOpType`, so tenancy never imports returns.
-  | 'return.receive_blind';
+  | 'return.receive_blind'
+  // Story 4-4a (A19, A30) — the pack bench's client-label scan, refused on
+  // replay (the label reads another AWB, the label was voided or replaced,
+  // the order is no longer open). DEVICE-UPLOADED; Discard ONLY: re-print the
+  // client label and scan it again (on the web, or at the handover). Excluded
+  // from `ApplicableOpType`, so tenancy never imports outbound's command.
+  | 'shipment.verify-label'
+  // Story 4-4a (A12, A32) — a courier handover: the parcels refused per
+  // parcel (server-raised — the parcel has physically left; the guidance
+  // names the consequence) or a whole-op refusal (device-uploaded). Discard
+  // ONLY: the remedy is a web handover with the same courier and time, or
+  // the per-code guidance.
+  | 'handover.create'
+  // Story 4-4a (A30) — a signed-sheet photo of a handover, refused on replay
+  // (2-5a's photo fate table). DEVICE-UPLOADED; Discard ONLY.
+  | 'handover-photo.stage';
 
 export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'grn.submit',
@@ -194,6 +209,9 @@ export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'rtv.pick',
   'return.receive_blind',
   'rtc.pick',
+  'shipment.verify-label',
+  'handover.create',
+  'handover-photo.stage',
 ];
 
 /**
@@ -278,6 +296,10 @@ export const REJECTED_OP_DECISIONS_BY_TYPE: Readonly<Record<RejectedOpType, read
   'rtc.pick': ['discard'],
   // Story 4-7b — an unannounced parcel's refused entries: Discard only.
   'return.receive_blind': ['discard'],
+  // Story 4-4a — Discard only, each (see the types' comments).
+  'shipment.verify-label': ['discard'],
+  'handover.create': ['discard'],
+  'handover-photo.stage': ['discard'],
 };
 
 /** Story 1-6d — the 403 an Apply on a `grn.licence-refused` row answers without `licences.manage`. */
@@ -298,6 +320,9 @@ type ApplicableOpType = Exclude<
   | 'rtv.pick'
   | 'return.receive_blind'
   | 'rtc.pick'
+  | 'shipment.verify-label'
+  | 'handover.create'
+  | 'handover-photo.stage'
 >;
 
 function isApplicableOpType(opType: RejectedOpType): opType is ApplicableOpType {
@@ -382,6 +407,12 @@ export interface RejectedOpEntry {
    * before 13-2 replays without it.
    */
   readonly decisions?: readonly RejectedOpDecision[];
+  /**
+   * FA29 (story 4-4a, A29) — a `handover.create` row's sheet photos still
+   * staged or attached, each with a short-lived link (null when unsigned).
+   * Only on the list read of such a row.
+   */
+  readonly photos?: readonly { readonly ref: string; readonly url: string | null; readonly urlExpiresAt: string | null }[];
 }
 
 /** The resolve command (story 5-6, `review.decide`): the per-row decision. */
@@ -596,6 +627,31 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
     ['capturedAt', 'string'],
     ['grnOpId', 'string'],
     ['lineIndex', 'number'],
+  ],
+  // Story 4-4a — the bench's label scan as the device enqueued it. Any
+  // strings: a malformed one must still reach the queue to be discarded.
+  'shipment.verify-label': [
+    ['orderId', 'string'],
+    ['scannedCode', 'string'],
+    ['method', 'string'],
+  ],
+  // Story 4-4a — a handover: the device's whole op (device-uploaded), or the
+  // ORIGINAL op's header plus only the refused parcels beside `refusals`
+  // (server-raised). `courier` (an object) and `photoRefs` (strings) are
+  // not object arrays — the web reads them as they are.
+  'handover.create': [
+    ['warehouseId', 'uuid-or-null'],
+    ['clientId', 'uuid-or-null'],
+    ['pickupPersonName', 'string-or-null'],
+    ['parcels', 'array'],
+    ['refusals', 'array-or-absent'],
+  ],
+  // Story 4-4a — the sheet photo op as it enqueued it (2-5a's shape, the
+  // handover op it belongs to instead of the receipt op).
+  'handover-photo.stage': [
+    ['ref', 'string'],
+    ['capturedAt', 'string'],
+    ['handoverOpId', 'string'],
   ],
 };
 
@@ -1138,7 +1194,16 @@ export class SyncReportCommand {
         .orderBy(desc(rejectedOps.createdAt), desc(rejectedOps.id))
         .limit(pageSize + 1);
     });
-    return buildPage(rows.map(rejectedOpEntry), pageSize);
+    const page = buildPage(rows.map(rejectedOpEntry), pageSize);
+    // FA29 — the handover rows' kept sheet photos, presigned after the read.
+    const items = await Promise.all(
+      page.items.map(async (entry) => {
+        const refs = entry.opType === 'handover.create' && Array.isArray(entry.payload.photoRefs) ? (entry.payload.photoRefs as unknown[]).filter((ref): ref is string => typeof ref === 'string') : [];
+        if (refs.length === 0) return entry;
+        return { ...entry, photos: await this.outbound.handoverPhotoLinks(tenantId, refs) };
+      }),
+    );
+    return { ...page, items };
   }
 
   // ── resolveRejectedOp (review.decide — owner + ops_manager) ─────────────

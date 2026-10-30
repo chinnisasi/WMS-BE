@@ -340,6 +340,79 @@ export async function pickedBatchRefsOfOrderInTx(tx: TenantTx, tenantId: string,
   return rows.map((row) => row.batchId);
 }
 
+/**
+ * Story 4-4a (A12 lock 7) — the distinct batches EVERY named order's picks
+ * drew, as ONE sorted set: a handover locks them `FOR KEY SHARE` together,
+ * never order by order (which would interleave against a recall's sorted
+ * `FOR UPDATE` and deadlock). On 0039's `reference_doc ? 'orderId'` index.
+ */
+export async function pickedBatchRefsOfOrdersInTx(tx: TenantTx, tenantId: string, orderIds: readonly string[]): Promise<Map<string, string[]>> {
+  const ids = [...new Set(orderIds)].filter((id) => UUID_RE.test(id)).map((id) => id.toLowerCase());
+  const out = new Map<string, string[]>();
+  if (ids.length === 0) return out;
+  const rows = (await tx.execute(sql`
+    select distinct le.reference_doc ->> 'orderId' as "orderId", le.batch_ref as "batchId"
+    from ledger_events le
+    where le.reference_doc ? 'orderId'
+      and (le.reference_doc ->> 'orderId') = any(${sql.param(ids)}::text[])
+      and le.tenant_id = ${tenantId}::uuid
+      and le.type = any(${sql.param([...PICK_NETTING_TYPES])}::text[])
+      and le.batch_ref is not null
+    order by 1, 2
+  `)) as unknown as { orderId: string; batchId: string }[];
+  for (const row of rows) out.set(row.orderId, [...(out.get(row.orderId) ?? []), row.batchId]);
+  return out;
+}
+
+/** Story 4-4a (A12, A40) — each order's LAST `pack.packed` measurement and its business time. */
+export interface PackMeasurement {
+  readonly orderId: string;
+  /** The last pack's `occurredAt` (the dispatch is never dated before it). */
+  readonly packedAt: string;
+  readonly weightGrams: number | null;
+  readonly lengthMm: number | null;
+  readonly widthMm: number | null;
+  readonly heightMm: number | null;
+}
+
+/**
+ * Story 4-4a (A12 step 2, A40) — per order, the newest `pack.packed` event's
+ * measurement arms and occurredAt (one order's pack writes one event per line,
+ * all carrying the same arms). On 0039's `reference_doc ? 'orderId'` index.
+ */
+export async function packMeasurementsOfOrdersInTx(tx: TenantTx, tenantId: string, orderIds: readonly string[]): Promise<Map<string, PackMeasurement>> {
+  const ids = [...new Set(orderIds)].filter((id) => UUID_RE.test(id)).map((id) => id.toLowerCase());
+  if (ids.length === 0) return new Map();
+  const rows = (await tx.execute(sql`
+    select distinct on (le.reference_doc ->> 'orderId')
+           le.reference_doc ->> 'orderId' as "orderId",
+           to_char(le.occurred_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "packedAt",
+           (le.reference_doc ->> 'weightGrams')::int as "weightGrams",
+           (le.reference_doc ->> 'lengthMm')::int as "lengthMm",
+           (le.reference_doc ->> 'widthMm')::int as "widthMm",
+           (le.reference_doc ->> 'heightMm')::int as "heightMm"
+    from ledger_events le
+    where le.reference_doc ? 'orderId'
+      and (le.reference_doc ->> 'orderId') = any(${sql.param(ids)}::text[])
+      and le.tenant_id = ${tenantId}::uuid
+      and le.type = 'pack.packed'
+    order by le.reference_doc ->> 'orderId', le.occurred_at desc, le.id desc
+  `)) as unknown as PackMeasurement[];
+  return new Map(
+    rows.map((row) => [
+      row.orderId,
+      {
+        orderId: row.orderId,
+        packedAt: row.packedAt,
+        weightGrams: row.weightGrams === null ? null : Number(row.weightGrams),
+        lengthMm: row.lengthMm === null ? null : Number(row.lengthMm),
+        widthMm: row.widthMm === null ? null : Number(row.widthMm),
+        heightMm: row.heightMm === null ? null : Number(row.heightMm),
+      },
+    ]),
+  );
+}
+
 export function pickedBatchRefsQuery(tenantId: string, orderId: string): SQL {
   return sql`
     select distinct le.batch_ref as "batchId"

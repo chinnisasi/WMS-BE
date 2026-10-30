@@ -9,7 +9,7 @@ import { EMAIL_GATEWAY, type EmailGateway, type EmailSendResult, type OutgoingEm
 import { addressAllowed, mailConfigFromEnv } from './mail.config';
 import { openEmailSecret } from './mail-secrets';
 import { MailAttachmentRegistry, type EmailAttachment } from './mail-attachments';
-import type { ClientReceiptAttachmentState } from './templates';
+import type { ClientAttachmentState } from './templates';
 import {
   EMAIL_ATTACHMENT_MAX_BYTES,
   EMAIL_ATTACHMENT_RENDER_BUDGET_MS,
@@ -437,7 +437,7 @@ export class MailSender {
       // Exactly once on every path that reaches here (the retry path added its own above).
       budget.spentMs += Date.now() - started;
     }
-    let state: ClientReceiptAttachmentState;
+    let state: ClientAttachmentState;
     if (file === null) {
       if (!threw) this.logger.error(`client-email.attachment-missing message=${row.id} — sent without the file`);
       state = 'failed';

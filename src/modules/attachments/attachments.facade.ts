@@ -12,6 +12,8 @@ import { UploadGate } from './upload-gate';
 export { FILE_STORE, attachmentObjectKey, type FileStore, type FileStoreMode, type PresignedUrl } from './file-store';
 export { sanitizeImage, sniffImageType, MAX_IMAGE_BYTES, ATTACHMENT_IMAGE_TYPES, type SanitizedImage } from './image-sanitize';
 export { UploadGate } from './upload-gate';
+// Story 4-4a — the PDF arm and the shipping-file sanitiser.
+export { sanitizePdf, sanitizeShippingFile, PDF_CONTENT_TYPE, MAX_PDF_PAGES, type SanitizedFile, type SanitizedPdf } from './pdf-sanitize';
 
 /** The default bytes-retention after removal, and the age of an unbound or awaited photo (A10). */
 export const DEFAULT_ATTACHMENT_PURGE_DAYS = 30;
@@ -89,6 +91,35 @@ export class AttachmentsFacade {
       this.logger.error(`presign of attachment ${row.id} failed (${s3ErrorCode(err)})`);
       return null;
     }
+  }
+
+  /**
+   * Story 4-4a (A23, D8) — one shareable shipping file for the mail renderer,
+   * on the registry's read-only transaction stamped with the row's client:
+   * the row must be `attached`, the client's (an explicit predicate beside
+   * the stamp), and a shipping document or a signed-sheet page — else null
+   * (the email goes without the file and says where to find it). The bytes
+   * come from `FileStore.get`, which throws on a missing object, a transport
+   * error or its 15 s timeout (the sender's transient `attachment-failed`).
+   */
+  async readForMail(tx: TenantTx, tenantId: string, clientId: string, attachmentId: string): Promise<{ row: AttachmentRow; content: Uint8Array } | null> {
+    const rows = await tx
+      .select()
+      .from(attachments)
+      .where(
+        and(
+          eq(attachments.tenantId, tenantId),
+          eq(attachments.id, attachmentId),
+          eq(attachments.clientId, clientId),
+          eq(attachments.status, 'attached'),
+          inArray(attachments.purpose, ['shipping-document', 'handover-sheet']),
+        ),
+      )
+      .limit(1);
+    const row = rows[0];
+    if (row === undefined || row.objectKey === null) return null;
+    const content = await this.fileStore.get(row.objectKey);
+    return { row, content };
   }
 
   /**
@@ -227,10 +258,14 @@ export class AttachmentsFacade {
   private async discardStagedInTx(tx: TenantTx, tenantId: string, cutoff: string, nowText: string): Promise<{ discarded: number; kept: number }> {
     // The referenced rows are excluded BEFORE the limit, so a backlog of
     // kept photos can never starve the newer unbound ones.
+    // Story 4-4a (A29) — a device handover's sheet photos ride its payload at
+    // the top level (`$.photoRefs`), so a `handover.create` review row keeps
+    // them too.
     const referenced = sql`exists (
         select 1 from rejected_ops r
         where r.tenant_id = a.tenant_id and r.status = 'open'
-          and jsonb_path_exists(r.payload, '$.lines[*].photoRefs[*] ? (@ == $ref)', jsonb_build_object('ref', a.client_ref))
+          and (jsonb_path_exists(r.payload, '$.lines[*].photoRefs[*] ? (@ == $ref)', jsonb_build_object('ref', a.client_ref))
+            or jsonb_path_exists(r.payload, '$.photoRefs[*] ? (@ == $ref)', jsonb_build_object('ref', a.client_ref)))
       )`;
     const candidates = (await tx.execute(sql`
       select a.id

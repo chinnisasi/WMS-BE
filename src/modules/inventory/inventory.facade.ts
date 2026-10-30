@@ -88,6 +88,9 @@ import {
   batchTraceEventsPageInTx as batchTraceEventsPageInTxImpl,
   ledgerPickEventsByOrderRefsInTx as ledgerPickEventsByOrderRefsInTxImpl,
   pickedBatchRefsOfOrderInTx as pickedBatchRefsOfOrderInTxImpl,
+  pickedBatchRefsOfOrdersInTx as pickedBatchRefsOfOrdersInTxImpl,
+  packMeasurementsOfOrdersInTx as packMeasurementsOfOrdersInTxImpl,
+  type PackMeasurement,
   type BatchLedgerFigures,
   type BatchOrderPickTotal,
   type BatchTraceCursor,
@@ -95,7 +98,7 @@ import {
   type OrderPickEvent,
   type RecallOnHandRow,
 } from './recall-trace';
-export type { BatchLedgerFigures, BatchOrderPickTotal, BatchTraceCursor, BatchTraceEvent, OrderPickEvent, RecallOnHandRow } from './recall-trace';
+export type { BatchLedgerFigures, BatchOrderPickTotal, BatchTraceCursor, BatchTraceEvent, OrderPickEvent, PackMeasurement, RecallOnHandRow } from './recall-trace';
 export { PICK_NETTING_TYPES } from './recall-trace';
 // Story 21-4 — the metering scope shapes and the shared dispatched-order
 // predicate (21-5's dispute drill-down reuses it) cross the seam here.
@@ -1918,6 +1921,16 @@ export class InventoryFacade {
   /** The distinct batches one order's picks drew (the dispatch guard's lock set). */
   async pickedBatchRefsOfOrderInTx(tx: TenantTx, tenantId: string, orderId: string): Promise<string[]> {
     return pickedBatchRefsOfOrderInTxImpl(tx, tenantId, orderId);
+  }
+
+  /** Story 4-4a (A12 lock 7) — the batches every named order's picks drew, per order (one sorted read). */
+  async pickedBatchRefsOfOrdersInTx(tx: TenantTx, tenantId: string, orderIds: readonly string[]): Promise<Map<string, string[]>> {
+    return pickedBatchRefsOfOrdersInTxImpl(tx, tenantId, orderIds);
+  }
+
+  /** Story 4-4a (A12, A40) — each order's last pack measurement and its business time. */
+  async packMeasurementsOfOrdersInTx(tx: TenantTx, tenantId: string, orderIds: readonly string[]): Promise<Map<string, PackMeasurement>> {
+    return packMeasurementsOfOrdersInTxImpl(tx, tenantId, orderIds);
   }
 
   /** Each order's FIRST `dispatch.dispatched` event (carries `reference_doc ? 'orderId'` — 0039's partial index). */

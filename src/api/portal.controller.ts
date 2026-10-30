@@ -18,6 +18,18 @@ import {
 } from '@nestjs/swagger';
 import { MAX_SHEET_UPLOAD_BYTES } from '../shared/import/sheet-reader';
 import { SheetUploadFilter } from '../shared/import/upload-filter';
+import { ATTACHMENT_UPLOAD_LIMITS, AttachmentUploadFilter, CLIENT_LABEL_UPLOAD_LIMITS } from '../shared/import/attachment-upload-filter';
+import { parseCountField, parseReplaceField } from './shipping.controller';
+// Story 4-4a — the portal Shipping section's bodies and responses.
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import {
+  OrderDocumentFieldsDto,
+  PortalAwbAdviceDto,
+  PortalClientLabelUploadFieldsDto,
+  PortalOrderShippingResponse,
+  PortalShipmentResponse,
+  ShippingFileResponse,
+} from './shipping.dto';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
 import { ProblemException } from '../shared/problem-details/problem.exception';
@@ -411,6 +423,173 @@ export class PortalController {
     const order = await this.outbound.portalOrder(tenantId, session.clientId, orderId);
     if (order === null) throw notFound('Order', orderId);
     return { ...order, lines: order.lines.map((line) => ({ ...line, components: [...line.components] })) };
+  }
+
+  // ── story 4-4a: the order's Shipping section and the client's uploads ───
+
+  @Get(':tenantId/portal/orders/:orderId/shipping')
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Story 4-4a — this order’s Shipping: the status in client words, the courier and AWB, the handover time and pickup, the label, the documents and the signed sheet (short-lived download links)' })
+  @ApiOkResponse({ type: PortalOrderShippingResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed orderId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("No such order of this client — unknown, or another client's (not-found)") })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async orderShipping(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @CurrentPortalSession() session: PortalSession,
+  ): Promise<PortalOrderShippingResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const shipping = await this.outbound.portalOrderShipping(tenantId, session.clientId, orderId);
+    if (shipping === null) throw notFound('Order', orderId);
+    return JSON.parse(JSON.stringify(shipping)) as PortalOrderShippingResponse;
+  }
+
+  @Post(':tenantId/portal/orders/:orderId/shipment/client-label')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(PortalSessionGuard)
+  @UseFilters(AttachmentUploadFilter)
+  @UseInterceptors(FileInterceptor('file', { limits: CLIENT_LABEL_UPLOAD_LIMITS }))
+  @ApiBearerAuth()
+  @ApiConsumes('multipart/form-data')
+  @ApiOperation({ summary: 'Story 4-4a — orders.place: upload your own courier label (a PDF) with its AWB and courier for an open order; replace=true replaces your label before the handover' })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        file: { type: 'string', format: 'binary' },
+        awb: { type: 'string' },
+        courierName: { type: 'string' },
+        packageCount: { type: 'string' },
+        replace: { type: 'string', enum: ['true'] },
+      },
+      required: ['file', 'awb', 'courierName'],
+    },
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: PortalShipmentResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed AWB, courier name, count, key or part (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("No such order of this client (not-found)") })
+  @ApiResponse({ status: 409, ...problemJsonResponse('order-not-open, shipment-exists (naming the AWB), shipment-handed-over, awb-in-use (naming your own order)') })
+  @ApiResponse({ status: 415, ...problemJsonResponse('Not a PDF (attachment-type-unsupported)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('pdf-unreadable, pdf-too-many-pages, attachment-too-large, idempotency-key-reuse') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('file-storage-unavailable, file-storage-failed, file-storage-busy') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async uploadClientLabel(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentPortalSession() session: PortalSession,
+    @Body() fields: PortalClientLabelUploadFieldsDto,
+    @UploadedFile() file: Express.Multer.File | undefined,
+  ): Promise<PortalShipmentResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.outbound.recordPortalClientLabel(
+      {
+        tenantId,
+        clientId: session.clientId,
+        actorUserId: session.userId,
+        orderId,
+        awb: fields.awb,
+        courierName: fields.courierName,
+        packageCount: parseCountField(fields.packageCount),
+        replace: parseReplaceField(fields.replace),
+        bytes: file?.buffer,
+      },
+      key,
+    );
+    return { shipment: { ...snapshot.shipment } };
+  }
+
+  @Post(':tenantId/portal/orders/:orderId/shipment/awb')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Story 4-4a — orders.place: send the AWB only (your courier brings its own label)' })
+  @ApiBody({ type: PortalAwbAdviceDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: PortalShipmentResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed AWB, courier name, count or key (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("No such order of this client (not-found)") })
+  @ApiResponse({ status: 409, ...problemJsonResponse('order-not-open, shipment-exists, shipment-handed-over, awb-in-use') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async adviseAwb(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentPortalSession() session: PortalSession,
+    @Body() dto: PortalAwbAdviceDto,
+  ): Promise<PortalShipmentResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.outbound.recordPortalAwbAdvice(
+      {
+        tenantId,
+        clientId: session.clientId,
+        actorUserId: session.userId,
+        orderId,
+        awb: dto.awb,
+        courierName: dto.courierName,
+        packageCount: dto.packageCount,
+        replace: dto.replace,
+      },
+      key,
+    );
+    return { shipment: { ...snapshot.shipment } };
+  }
+
+  @Post(':tenantId/portal/orders/:orderId/documents')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(PortalSessionGuard)
+  @UseFilters(AttachmentUploadFilter)
+  @UseInterceptors(FileInterceptor('file', { limits: ATTACHMENT_UPLOAD_LIMITS }))
+  @ApiBearerAuth()
+  @ApiConsumes('multipart/form-data')
+  @ApiOperation({ summary: 'Story 4-4a — orders.place: upload your invoice, challan, e-way bill or another document for an order (an image or a PDF; at most 10 of yours per order)' })
+  @ApiBody({ schema: { type: 'object', properties: { file: { type: 'string', format: 'binary' }, kind: { type: 'string', enum: ['invoice', 'challan', 'eway-bill', 'other'] } }, required: ['file', 'kind'] } })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: ShippingFileResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing file, or a kind outside invoice, challan, eway-bill, other (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("No such order of this client (not-found)") })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A cancelled order (order-not-open), or 10 of your documents already (document-limit)') })
+  @ApiResponse({ status: 415, ...problemJsonResponse('Not an image or a PDF (attachment-type-unsupported)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('attachment-too-large, attachment-content-invalid, pdf-unreadable, pdf-too-many-pages, idempotency-key-reuse') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('file-storage-unavailable, file-storage-failed, file-storage-busy') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async uploadOrderDocument(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentPortalSession() session: PortalSession,
+    @Body() fields: OrderDocumentFieldsDto,
+    @UploadedFile() file: Express.Multer.File | undefined,
+  ): Promise<ShippingFileResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.outbound.uploadPortalOrderDocument(
+      { tenantId, clientId: session.clientId, actorUserId: session.userId, orderId, kind: fields.kind, bytes: file?.buffer },
+      key,
+    );
+    return { file: { ...snapshot.file } };
   }
 
   @Get(':tenantId/portal/inbound/asns')

@@ -464,6 +464,10 @@ describe('client portal (e2e, story 21-7)', () => {
     'POST api/v1/tenants/:tenantId/portal/orders',
     // Story 4-1c — the portal order import.
     'POST api/v1/tenants/:tenantId/portal/order-imports',
+    // Story 4-4a — the client's label, its AWB and its own documents.
+    'POST api/v1/tenants/:tenantId/portal/orders/:orderId/shipment/client-label',
+    'POST api/v1/tenants/:tenantId/portal/orders/:orderId/shipment/awb',
+    'POST api/v1/tenants/:tenantId/portal/orders/:orderId/documents',
   ]);
 
   const SESSION_GUARDS = [TenantSessionGuard, DeviceSessionGuard, AnySessionGuard, PortalSessionGuard];
@@ -735,8 +739,8 @@ describe('client portal (e2e, story 21-7)', () => {
       // plus 4-7a's two returns reads, plus 5-6a's two credit/debit note reads,
       // plus 3-7a's three recall reads (the list, one recall, its report),
       // plus 4-1c's order import, plus 4-7c's two return-to-client reads,
-      // plus 2-9a's GRN document file.
-      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(28);
+      // plus 2-9a's GRN document file, plus 4-4a's Shipping read and its three uploads.
+      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(32);
     });
 
     it('a portal token is refused on EVERY operator route — reads and writes — with the exact fence detail', async () => {
@@ -759,7 +763,8 @@ describe('client portal (e2e, story 21-7)', () => {
       const anyRoutes = routes().filter((route) => route.guards.includes(AnySessionGuard));
       // Story 3-1 adds the fourth either-family route: the bin-to-bin move.
       // Story 3-2b — the stock adjustment joined (web or handheld): five.
-      expect(anyRoutes).toHaveLength(5);
+      // Story 4-4a — the label verification and the courier handover: seven.
+      expect(anyRoutes).toHaveLength(7);
       for (const route of anyRoutes) {
         const res = await send(route.method, route.path, portalA.token);
         expect({ route: route.path, status: res.status, code: res.body.code, detail: res.body.detail }).toEqual({
@@ -1224,6 +1229,11 @@ describe('client portal (e2e, story 21-7)', () => {
           '/tenants/{tenantId}/portal/order-imports',
           '/tenants/{tenantId}/portal/orders',
           '/tenants/{tenantId}/portal/orders/{orderId}',
+          // Story 4-4a — the Shipping section and the client's uploads.
+          '/tenants/{tenantId}/portal/orders/{orderId}/documents',
+          '/tenants/{tenantId}/portal/orders/{orderId}/shipment/awb',
+          '/tenants/{tenantId}/portal/orders/{orderId}/shipment/client-label',
+          '/tenants/{tenantId}/portal/orders/{orderId}/shipping',
         '/tenants/{tenantId}/portal/recalls',
         '/tenants/{tenantId}/portal/recalls/{recallId}',
         '/tenants/{tenantId}/portal/recalls/{recallId}/report',

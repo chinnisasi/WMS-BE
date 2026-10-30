@@ -22,8 +22,8 @@ import {
 /** Story 5-2b — one row of a client's email log. */
 export interface ClientEmailLogItem {
   readonly id: string;
-  readonly kind: 'receipt' | 'dispatch';
-  /** The GRN code or the order reference (from the stored params). */
+  readonly kind: 'receipt' | 'dispatch' | 'shipment-document';
+  /** The GRN code, the order reference, or a shipping document's label (from the stored params). */
   readonly subjectLabel: string;
   readonly to: string;
   readonly status: EmailStatus;
@@ -42,7 +42,7 @@ export interface ClientEmailLog {
   /** A4 — `CLIENT_EMAIL_ENABLED`: client notices are queued on this server. */
   readonly clientMailEnabled: boolean;
   /** A5 — today's count of each notice has reached the daily limit (later events today were not emailed). */
-  readonly capReachedToday: { readonly receipt: boolean; readonly dispatch: boolean };
+  readonly capReachedToday: { readonly receipt: boolean; readonly dispatch: boolean; readonly shipmentDocument: boolean };
 }
 
 export interface ClientEmailLogQuery {
@@ -97,7 +97,7 @@ export class ClientEmailsFacade {
       return {
         items: page.map((row) => ({
           id: row.id,
-          kind: row.template === 'client-receipt' ? 'receipt' : 'dispatch',
+          kind: row.template === 'client-receipt' ? 'receipt' : row.template === 'client-shipment-document' ? 'shipment-document' : 'dispatch',
           subjectLabel: row.subjectLabel,
           to: row.to,
           status: row.status,
@@ -113,6 +113,7 @@ export class ClientEmailsFacade {
         capReachedToday: {
           receipt: counts['client-receipt'] >= CLIENT_EMAIL_DAILY_CAP,
           dispatch: counts['client-dispatch'] >= CLIENT_EMAIL_DAILY_CAP,
+          shipmentDocument: counts['client-shipment-document'] >= CLIENT_EMAIL_DAILY_CAP,
         },
       };
     });

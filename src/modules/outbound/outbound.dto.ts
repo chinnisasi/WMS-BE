@@ -55,7 +55,7 @@ import { GSTIN_RE, gstinDtoTransform } from '../../shared/primitives/gstin';
 import { MAX_HANDLING_UNITS_PER_REQUEST } from '../catalog/handling-unit';
 import { MAX_CARRIER_NAME_LENGTH, MAX_TRACKING_NUMBER_LENGTH } from './dispatch.command';
 import { ALLOCATION_SKIP_REASONS } from './allocation.command';
-import { SHIPMENT_STATUSES } from './shipment.command';
+import { SHIPMENT_KINDS, SHIPMENT_STATUSES } from './shipment.command';
 import { MAX_MANIFEST_SHIPMENTS } from './manifest.command';
 import {
   PICKLIST_LINE_STATUSES,
@@ -1982,14 +1982,18 @@ export class ShipmentDto {
   @ApiProperty({ format: 'uuid' })
   warehouseId!: string;
 
-  @ApiProperty({ enum: [...SHIPMENT_STATUSES], description: 'labelled, manifested, or (story 4-2b) voided — the label of an order cancelled with restock before it was manifested' })
+  @ApiProperty({
+    enum: [...SHIPMENT_STATUSES],
+    description:
+      'labelled, manifested, (story 4-2b) voided — the label of an order cancelled before it was manifested, or replaced — or (story 4-4a) handed_over — a client-arranged shipment closed by a courier handover',
+  })
   status!: string;
 
-  @ApiProperty({ format: 'uuid', description: 'The connection the label generated through' })
-  carrierConnectionId!: string;
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'The connection the label generated through; null on a client-arranged shipment (story 4-4a)' })
+  carrierConnectionId!: string | null;
 
-  @ApiProperty({ description: 'The adapter code at label time' })
-  carrierCode!: string;
+  @ApiProperty({ type: String, nullable: true, description: 'The adapter code at label time; null on a client-arranged shipment (story 4-4a)' })
+  carrierCode!: string | null;
 
   @ApiProperty({ description: 'The registry display name resolved at label time' })
   carrierName!: string;
@@ -1997,8 +2001,8 @@ export class ShipmentDto {
   @ApiProperty({ description: 'The adapter-issued tracking number — what dispatch auto-stamps' })
   trackingNumber!: string;
 
-  @ApiProperty({ description: 'The adapter’s opaque handle for the label document — never the bytes' })
-  labelDocumentRef!: string;
+  @ApiProperty({ type: String, nullable: true, description: 'The adapter’s opaque handle for the label document — never the bytes; null on a client-arranged shipment (story 4-4a)' })
+  labelDocumentRef!: string | null;
 
   @ApiProperty({ type: Number, nullable: true, description: 'Parcel weight in grams; null when unmeasured' })
   weightGrams!: number | null;
@@ -2028,6 +2032,21 @@ export class ShipmentDto {
 
   @ApiProperty({ type: String, nullable: true, required: false, format: 'uuid', description: 'Story 4-2b — who voided it; null otherwise. Absent on a response stored before 4-2b.' })
   voidedBy?: string | null;
+
+  @ApiProperty({ enum: [...SHIPMENT_KINDS], required: false, description: 'Story 4-4a — carrier (an adapter label), client-label (the client’s label PDF) or courier-label (the courier brings the label). Absent on a label response (read absent as carrier).' })
+  kind?: string;
+
+  @ApiProperty({ type: Number, nullable: true, required: false, description: 'Story 4-4a — parcels in the shipment (1–999); absent on a label response.' })
+  packageCount?: number | null;
+
+  @ApiProperty({ type: String, nullable: true, required: false, description: 'Story 4-4a — when the client label was scanned onto the parcel; absent on a label response.' })
+  labelVerifiedAt?: string | null;
+
+  @ApiProperty({ type: String, nullable: true, required: false, format: 'uuid', description: 'Story 4-4a — the courier handover that closed it; absent on a label response.' })
+  handoverId?: string | null;
+
+  @ApiProperty({ type: String, nullable: true, required: false, description: 'Story 4-4a — when it was handed over; absent on a label response.' })
+  handedOverAt?: string | null;
 }
 
 export class ShipmentResponse {

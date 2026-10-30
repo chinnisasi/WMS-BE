@@ -234,6 +234,12 @@ export class PortalOrderRowDto {
 
   @ApiProperty()
   createdAt!: string;
+
+  @ApiProperty({ required: false, description: 'Story 4-4a — the AWB of the order’s live shipment (your courier’s or ours); absent when it has none' })
+  awb?: string;
+
+  @ApiProperty({ required: false, description: 'Story 4-4a — the courier of the order’s live shipment; absent when it has none' })
+  courierName?: string;
 }
 
 export class PortalOrderPageResponse {

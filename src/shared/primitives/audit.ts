@@ -58,6 +58,8 @@ export const AUDIT_TARGET_TYPES = [
   // closed | report_downloaded`); its lots' blocks and releases write their
   // own `batch.blocked` / `batch.unblocked` rows under the same key.
   'batch_recall',
+  // Story 4-4a — a courier handover (`handover.created`).
+  'courier_handover',
   'bin',
   // Story 3-1 — a bin-to-bin move (`stock.moved`; `targetId` = the moveId on
   // its events' reference doc — there is no move table, the ledger is its record).
@@ -412,6 +414,19 @@ export const AUDIT_NEW_ACTIONS = [
   // (`CancelRestockCommandService`). Targets the ORDER — the label precedent
   // (`shipment.label-created`); the shipment id rides the snapshot.
   { action: 'shipment.voided', targetType: 'order' },
+  // Story 4-4a — client-arranged shipping. The shipment's rows target the
+  // ORDER (the label precedent); a stored file's rows target the attachment;
+  // the handover targets itself, or — every parcel of a handheld handover
+  // refused — the review row that holds them.
+  { action: 'shipment.client_label_recorded', targetType: 'order' },
+  { action: 'shipment.awb_recorded', targetType: 'order' },
+  { action: 'shipment.label_verified', targetType: 'order' },
+  { action: 'shipping_file.attached', targetType: 'attachment' },
+  { action: 'shipping_file.removed', targetType: 'attachment' },
+  { action: 'handover.created', targetType: 'courier_handover' },
+  { action: 'handover.parcels_refused', targetType: 'rejected_op' },
+  { action: 'handover.sheet_attached', targetType: 'attachment' },
+  { action: 'handover_photo.uploaded', targetType: 'attachment' },
   // Story 3-5b — the stock take (`StockTakeCommand`) and the count-task
   // cancel. The take's verbs also write one `count.variance.resolved` per
   // posted or recounted variance under the same key.

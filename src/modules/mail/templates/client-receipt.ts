@@ -66,7 +66,9 @@ export interface ClientReceiptEmailParams {
  * attachment — 5-2b's bytes exactly), `attached`, or sent WITHOUT the file
  * because it was `too-large` or its render `failed` (A14, A16).
  */
-export type ClientReceiptAttachmentState = 'none' | 'attached' | 'too-large' | 'failed';
+export type ClientAttachmentState = 'none' | 'attached' | 'too-large' | 'failed';
+/** Story 4-4a (D4) — the receipt's name for the shared state, kept as an alias. */
+export type ClientReceiptAttachmentState = ClientAttachmentState;
 
 const UUID_LIKE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 

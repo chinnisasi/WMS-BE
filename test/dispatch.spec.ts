@@ -14,6 +14,7 @@ import {
 } from '../src/modules/outbound/dispatch.command';
 import { CAPABILITIES, ROLE_CAPABILITIES } from '../src/modules/tenancy/permissions';
 import { getLedgerEventType } from '../src/modules/inventory/ledger-registry';
+import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
@@ -132,6 +133,8 @@ describe('dispatch: the terminal order transition (e2e, story 4.6)', () => {
     'DSP-CONCB', // …and its second order
     'DSP-SBX', // the 4.6c auto-stamp: label first, dispatch with no free text
     'DSP-SBXOVR', // …and the free-text override that wins per-arm
+    'DSP-GOLD', // story 4-4a (A31) — the literal goldens, with carrier arms…
+    'DSP-GOLDB', // …and without
   ] as const;
 
   let suiteDb: SuiteDatabase;
@@ -776,6 +779,77 @@ describe('dispatch: the terminal order transition (e2e, story 4.6)', () => {
     const holds = await holdsOfOrder(orderId);
     expect(holds.filter((hold) => hold.state === 'released')).toHaveLength(holds.length);
     expect((await atp(skuId)).reserved).toBe(0);
+  });
+
+  // ── story 4-4a (A31): literal goldens, pinned BEFORE the extraction ────────
+
+  /** The stored key row: its payload hash and its snapshot (jsonb, parsed). */
+  async function storedKey(key: string): Promise<{ payloadHash: string; snapshot: Record<string, unknown> }> {
+    const rows = (await sql`
+      select payload_hash, response_snapshot from idempotency_keys where tenant_id = ${tenantId} and key = ${key}
+    `) as unknown as { payload_hash: string; response_snapshot: unknown }[];
+    const raw = rows[0]!.response_snapshot;
+    return {
+      payloadHash: rows[0]!.payload_hash,
+      snapshot: (typeof raw === 'string' ? JSON.parse(raw) : raw) as Record<string, unknown>,
+    };
+  }
+
+  const DISPATCH_SNAPSHOT_KEYS = [
+    'carrierName',
+    'clientOrderRef',
+    'codAmountPaise',
+    'dispatchedAt',
+    'dispatchedBy',
+    'externalEventId',
+    'followOnOfOrderId',
+    'followOnOrderId',
+    'followOnRootOrderId',
+    'followOnSeq',
+    'integrationId',
+    'lines',
+    'orderId',
+    'orderStatus',
+    'orderType',
+    'retiredReservationIds',
+    'source',
+    'tenantId',
+    'totalUnits',
+    'trackingNumber',
+    'warehouseId',
+  ];
+  const DISPATCH_LINE_KEYS = ['dispatchedQty', 'ledgerEventId', 'orderLineId', 'orderedQty', 'shortfallQty', 'skuCode', 'skuId', 'skuName'];
+
+  it('A31 goldens: dispatchOrder hashes and stores exactly these keys, with and without the carrier arms', async () => {
+    const withArms = await packedOrder('DSP-GOLD', 1, 'gold');
+    const keyA = ulid();
+    await dispatchOrder(withArms.orderId, { carrierName: ' Golden Courier ', trackingNumber: 'GC-0001' }, operatorWebToken, keyA).expect(201);
+    const a = await storedKey(keyA);
+    expect(a.payloadHash).toBe(
+      hashCommandPayload({
+        command: 'outbound.dispatch',
+        tenantId,
+        orderId: withArms.orderId,
+        carrierName: 'Golden Courier',
+        trackingNumber: 'GC-0001',
+      }),
+    );
+    const dispatchA = a.snapshot.dispatch as Record<string, unknown>;
+    expect(Object.keys(a.snapshot)).toEqual(['dispatch']);
+    expect(Object.keys(dispatchA).sort()).toEqual(DISPATCH_SNAPSHOT_KEYS);
+    for (const line of dispatchA.lines as Record<string, unknown>[]) {
+      expect(Object.keys(line).sort()).toEqual(DISPATCH_LINE_KEYS);
+    }
+
+    const without = await packedOrder('DSP-GOLDB', 1, 'goldb');
+    const keyB = ulid();
+    await dispatchOrder(without.orderId, {}, operatorWebToken, keyB).expect(201);
+    const b = await storedKey(keyB);
+    expect(b.payloadHash).toBe(hashCommandPayload({ command: 'outbound.dispatch', tenantId, orderId: without.orderId }));
+    const dispatchB = b.snapshot.dispatch as Record<string, unknown>;
+    expect(Object.keys(dispatchB).sort()).toEqual(DISPATCH_SNAPSHOT_KEYS);
+    expect(dispatchB.carrierName).toBeNull();
+    expect(dispatchB.trackingNumber).toBeNull();
   });
 
   // ── Story 4.6c: the auto-stamp ─────────────────────────────────────────────

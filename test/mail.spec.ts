@@ -766,7 +766,9 @@ describe('email service and invite emails (e2e, story 5-1a)', () => {
       expect(listed('email_messages_secret_wipe_check')).toEqual(['pending', 'sending']);
       // Story 2-9a — the attachment kinds (0115), and the attachment allowed only on the receipt notice.
       expect(listed('email_messages_attachment_kind_check')).toEqual([...EMAIL_ATTACHMENT_KINDS]);
-      expect(listed('email_messages_attachment_template_check')).toEqual(['client-receipt']);
+      // Story 4-4a (0116) — the attachment is the GRN PDF on the receipt notice,
+      // or a stored file on the shipping-document notice (each its pair).
+      expect(listed('email_messages_attachment_template_check')).toEqual(['grn-pdf', 'client-receipt', 'stored-file', 'client-shipment-document']);
       expect(defs.find((d) => d.conname === 'email_messages_attachment_pairing')).toBeDefined();
     });
 

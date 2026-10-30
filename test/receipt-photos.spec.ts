@@ -66,6 +66,13 @@ class FakeFileStore implements FileStore {
     this.objects.set(input.key, { bytes: Buffer.from(input.bytes), contentType: input.contentType });
   }
 
+  // Story 4-4a — the port's read (the shipping-document mail renderer).
+  async get(key: string): Promise<Uint8Array> {
+    const object = this.objects.get(key);
+    if (object === undefined) throw new Error(`no object ${key}`);
+    return object.bytes;
+  }
+
   async presignGet(input: PresignGet): Promise<PresignedUrl> {
     return {
       url: `https://attachments.example/${input.key}?ct=${encodeURIComponent(input.contentType)}&fn=${encodeURIComponent(input.filename)}`,
@@ -1307,7 +1314,8 @@ describe('story 2-5a: damage photos on a receipt line (e2e)', () => {
         explain select a.id, exists (
           select 1 from rejected_ops r
           where r.tenant_id = a.tenant_id and r.status = 'open'
-            and jsonb_path_exists(r.payload, '$.lines[*].photoRefs[*] ? (@ == $ref)', jsonb_build_object('ref', a.client_ref))
+            and (jsonb_path_exists(r.payload, '$.lines[*].photoRefs[*] ? (@ == $ref)', jsonb_build_object('ref', a.client_ref))
+              or jsonb_path_exists(r.payload, '$.photoRefs[*] ? (@ == $ref)', jsonb_build_object('ref', a.client_ref)))
         ) as referenced
         from attachments a
         where a.tenant_id = '${tenantId}' and a.status = 'staged' and a.created_at < now()
@@ -1316,6 +1324,8 @@ describe('story 2-5a: damage photos on a receipt line (e2e)', () => {
         for update of a skip locked`)) as unknown as { 'QUERY PLAN': string }[];
       const text = plan.map((row) => row['QUERY PLAN']).join('\n');
       expect(text).toContain('jsonb_path_exists');
+      // Story 4-4a (A29) — re-taken with the second arm: a handover's top-level photoRefs.
+      expect(text).toContain('$."photoRefs"[*]');
       expect(text).toMatch(/attachments/);
     });
   });
@@ -1334,7 +1344,8 @@ describe('story 2-5a: damage photos on a receipt line (e2e)', () => {
       expect(literals('attachments_status_check').sort()).toEqual([...ATTACHMENT_STATUSES].sort());
       expect(literals('attachments_source_check').sort()).toEqual([...ATTACHMENT_SOURCES].sort());
       expect(literals('attachments_purpose_check').sort()).toEqual([...ATTACHMENT_PURPOSES].sort());
-      expect(checks.length).toBe(21);
+      // Story 4-4a (0116) — four more: doc_kind, page_count, purpose_owner, label_is_pdf.
+      expect(checks.length).toBe(25);
     });
 
     it('the OpenAPI document lists the six new routes with their methods', () => {

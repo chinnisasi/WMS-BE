@@ -682,6 +682,24 @@ describe('reporting: the operational dashboard (e2e, story 9-1)', () => {
     expect(overview.tiles.sm8.noManualPricingShare.d7.value).toBe(Math.round((2 / 3) * 10000) / 10000);
   });
 
+  it('story 4-4a (A24, A50): the pipeline’s labelledNotManifested counts CARRIER labels only — a client label uploaded before the pick is not one', async () => {
+    const before = (await readOverview()).tiles.dispatchPipeline.labelledNotManifested.value;
+    const order = (await sql`select id, client_id from orders where tenant_id = ${tenantId} and warehouse_id = ${warehouseId}
+      and not exists (select 1 from shipments s where s.order_id = orders.id) limit 1`)[0] as { id: string; client_id: string };
+    const clientLabel = uuidv7();
+    await sql`insert into shipments (id, tenant_id, warehouse_id, order_id, client_id, kind, status, carrier_name, tracking_number, label_attachment_id, labelled_by, labelled_at, recorded_surface)
+      values (${clientLabel}, ${tenantId}, ${warehouseId}, ${order.id}, ${order.client_id}, 'client-label', 'labelled', 'Delhivery', 'KPI000001', ${uuidv7()}, ${uuidv7()}, now(), 'portal')`;
+    try {
+      expect((await readOverview()).tiles.dispatchPipeline.labelledNotManifested.value).toBe(before);
+      // The control: the same row as a carrier label counts.
+      await sql`update shipments set kind = 'carrier', carrier_connection_id = ${uuidv7()}, carrier_code = 'sandbox', label_document_ref = 'sandbox://kpi',
+        label_attachment_id = null, recorded_surface = null where id = ${clientLabel}`;
+      expect((await readOverview()).tiles.dispatchPipeline.labelledNotManifested.value).toBe((before ?? 0) + 1);
+    } finally {
+      await sql`delete from shipments where id = ${clientLabel}`;
+    }
+  });
+
   it('the tile definitions: serial line = one pick line, zero-unit short counted, blind GRN + over-receipt, putaway awaiting, expiry, sync health, pipeline', async () => {
     const overview = await readOverview();
     const t = overview.tiles;

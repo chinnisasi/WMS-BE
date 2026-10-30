@@ -299,6 +299,9 @@ export class ReceivingController {
     // Story 4-7c: the Returns out arm's other kind — the warehouse's draft
     // returns to client. Same sequential composition (never nested).
     const openClientReturns = await this.returns.getOpenClientReturns(tenantId, query.warehouseId);
+    // Story 4-4a (A18, A39): the parcels awaiting a courier — the pack-bench
+    // verify and the handover match against them. Same sequential composition.
+    const dispatchArm = await this.outbound.getDispatchParcels(tenantId, query.warehouseId);
     // Story 1-1: every client a SKU or an open document references — the
     // names the device shows when a scan is another client's, and the blind
     // receipt's picker. Same sequential composition.
@@ -309,6 +312,8 @@ export class ReceivingController {
       ...openReturns.map((rma) => rma.clientId),
       ...openVendorReturns.map((rtv) => rtv.clientId),
       ...openClientReturns.map((rtc) => rtc.clientId),
+      // Story 4-4a (A39) — every dispatch parcel's client (the handover's "this parcel is BRAND-B's").
+      ...dispatchArm.parcels.map((parcel) => parcel.clientId),
       // Story 1-5b: every bin's dedicated client, so the device can name the
       // client a dedicated bin belongs to when it refuses a scan against it.
       ...snapshot.bins.map((bin) => bin.dedicatedClientId).filter((id): id is string => id !== null),
@@ -347,6 +352,9 @@ export class ReceivingController {
       // Story 4-7c — copied key by key (a mutable DTO array).
       openClientReturns: openClientReturns.map((rtc) => ({ ...rtc, lines: rtc.lines.map((line) => ({ ...line })) })),
       clients,
+      // Story 4-4a — copied key by key (a mutable DTO array).
+      dispatchParcels: dispatchArm.parcels.map((parcel) => ({ ...parcel, shipment: parcel.shipment === null ? null : { ...parcel.shipment } })),
+      dispatchParcelsTruncated: dispatchArm.truncated,
       // Story 2-3a — the open gate-ins, copied key by key (a mutable DTO array).
       openGateIns: snapshot.openGateIns.map((gateIn) => ({
         ...gateIn,

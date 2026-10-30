@@ -627,7 +627,19 @@ describe('architecture: catalog identity is catalog-module-owned (story 10.3)', 
     // guard, or it is a comment that goes stale the first time someone adds a
     // re-weigh endpoint without reading this file.
     const offenders: string[] = [];
+    // Story 4-4a (A12 step 2) — the ONE named exception: a courier handover
+    // writes the PARCEL's weight onto its `shipments` row (the handover's
+    // measurement, else the last pack's) — a shipment measurement, never the
+    // receipt-captured catch weight this rule protects. Named by file, and the
+    // file's `.set` must update `shipments` (pinned below).
+    const SHIPMENT_WEIGHT_WRITERS = [join(SRC_ROOT, 'modules', 'outbound', 'handover.command.ts')];
+    for (const path of SHIPMENT_WEIGHT_WRITERS) {
+      const source = readFileSync(path, 'utf8');
+      expect(source).toMatch(/\.update\(shipments\)\s*\.set\(\{[^}]*\bweightGrams\b/s);
+      expect(source).not.toMatch(/\.update\((?!shipments\))\w+\)\s*\.set\(\{[^}]*\bweightGrams\b/s);
+    }
     for (const file of files) {
+      if (SHIPMENT_WEIGHT_WRITERS.includes(file.path)) continue;
       // A Drizzle `.set({...weightGrams...})` on any update, and the raw-SQL
       // spelling. The column NAME alone is not banned — the migration and the
       // doc comments must be free to say it.
@@ -2623,7 +2635,8 @@ describe('architecture: the client portal (story 21-7)', () => {
    */
   const PORTAL_READS: readonly { file: string; methods: readonly string[] }[] = [
     { file: join(SRC_ROOT, 'modules', 'inventory', 'inventory.facade.ts'), methods: ['portalStock'] },
-    { file: join(SRC_ROOT, 'modules', 'outbound', 'outbound.facade.ts'), methods: ['portalOrders', 'portalOrder'] },
+    // Story 4-4a — the order's Shipping section.
+    { file: join(SRC_ROOT, 'modules', 'outbound', 'outbound.facade.ts'), methods: ['portalOrders', 'portalOrder', 'portalOrderShipping'] },
     { file: join(SRC_ROOT, 'modules', 'inbound', 'inbound.facade.ts'), methods: ['portalAsns', 'portalAsn', 'portalPurchaseOrders', 'portalPurchaseOrder', 'portalGoodsReceipts', 'portalGoodsReceipt', 'portalGoodsReceiptFile'] },
     { file: join(SRC_ROOT, 'modules', 'billing', 'billing.facade.ts'), methods: ['portalInvoices', 'portalInvoice', 'portalInvoiceNotes', 'portalInvoiceNote'] },
     { file: join(SRC_ROOT, 'modules', 'clients', 'clients.facade.ts'), methods: ['portalMeIn'] },
@@ -2678,6 +2691,8 @@ describe('architecture: the client portal (story 21-7)', () => {
         'portalStock',
         'portalOrders',
         'portalOrder',
+        // Story 4-4a — the order's Shipping section.
+        'portalOrderShipping',
         'portalAsns',
         'portalAsn',
         'portalPurchaseOrders',
@@ -2729,6 +2744,10 @@ describe('architecture: the client portal (story 21-7)', () => {
     // Story 4-1c — the portal order import's own transactions (A, B and the
     // per-order key probe) go through its stamped opener.
     { file: join(SRC_ROOT, 'modules', 'outbound', 'order-import.command.ts'), methods: ['importPortalOrders'] },
+    // Story 4-4a (A25) — the client's label, its AWB and its own documents:
+    // each entry opens its transactions through ONE stamped opener (pinned below).
+    { file: join(SRC_ROOT, 'modules', 'outbound', 'client-label.command.ts'), methods: ['portalRecordClientLabel', 'portalRecordAwbAdvice'] },
+    { file: join(SRC_ROOT, 'modules', 'outbound', 'shipping-files.command.ts'), methods: ['portalUploadOrderDocument'] },
   ];
 
   /**
@@ -2766,6 +2785,33 @@ describe('architecture: the client portal (story 21-7)', () => {
       }
     }
     expect(offenders).toEqual([]);
+  });
+
+  it('story 4-4a (A50, D34): each portal shipping entry opens EVERY transaction through its one stamped opener', () => {
+    for (const [file, entries] of [
+      [join(SRC_ROOT, 'modules', 'outbound', 'client-label.command.ts'), ['portalRecordClientLabel', 'portalRecordAwbAdvice']],
+      [join(SRC_ROOT, 'modules', 'outbound', 'shipping-files.command.ts'), ['portalUploadOrderDocument']],
+    ] as const) {
+      const source = readFileSync(file, 'utf8');
+      for (const entry of entries) {
+        const body = memberBodyOf(source, entry)!;
+        expect(body).not.toBeNull();
+        const opened = body.match(/withTenantTransaction\(/g) ?? [];
+        const stamped = body.match(/\{\s*clientId:\s*command\.clientId\s*\}\s*\)/g) ?? [];
+        expect(opened.length).toBe(1);
+        expect(stamped.length).toBe(opened.length);
+        // …and hands the opener to the shared body, which opens none itself.
+        expect(body).toMatch(/Via\(\{ \.\.\.command, writer \}, open, idempotencyKey\)/);
+      }
+      // The shared bodies and the upload pipeline open transactions only through `open`.
+      for (const via of ['recordClientLabelVia', 'recordAwbAdviceVia', 'uploadOrderDocumentVia']) {
+        const body = memberBodyOf(source, via);
+        if (body !== null) expect(body).not.toMatch(/withTenantTransaction\(/);
+      }
+    }
+    const pipeline = readFileSync(join(SRC_ROOT, 'modules', 'outbound', 'shipping-support.ts'), 'utf8');
+    const runUpload = pipeline.slice(pipeline.indexOf('export async function runUpload'));
+    expect(runUpload.slice(0, runUpload.indexOf('\n}\n'))).not.toMatch(/withTenantTransaction\(/);
   });
 
   it('story 4-1a: placePortalOrder opens no unstamped transaction itself — its one unstamped read is the documented licence seam', () => {
@@ -2974,6 +3020,28 @@ describe('architecture: the client portal (story 21-7)', () => {
       target: 'importPortalOrders',
       via: { member: 'orderImport', className: 'OrderImportCommand' },
       statement: 'return this.orderImport.importPortalOrders(command, idempotencyKey);',
+    },
+    // Story 4-4a — the client's label, its AWB and its documents: the stamp lives in the commands.
+    {
+      field: 'outbound',
+      method: 'recordPortalClientLabel',
+      target: 'portalRecordClientLabel',
+      via: { member: 'clientLabels', className: 'ClientLabelCommand' },
+      statement: 'return this.clientLabels.portalRecordClientLabel(command, idempotencyKey);',
+    },
+    {
+      field: 'outbound',
+      method: 'recordPortalAwbAdvice',
+      target: 'portalRecordAwbAdvice',
+      via: { member: 'clientLabels', className: 'ClientLabelCommand' },
+      statement: 'return this.clientLabels.portalRecordAwbAdvice(command, idempotencyKey);',
+    },
+    {
+      field: 'outbound',
+      method: 'uploadPortalOrderDocument',
+      target: 'portalUploadOrderDocument',
+      via: { member: 'shippingFiles', className: 'ShippingFilesCommand' },
+      statement: 'return this.shippingFiles.portalUploadOrderDocument(command, idempotencyKey);',
     },
   ];
 
@@ -3498,6 +3566,35 @@ describe('architecture: the audit rule — every keyed command writes its audit 
     { writer: join(SRC_ROOT, 'modules', 'catalog', 'batch-block.command.ts'), helper: join(SRC_ROOT, 'modules', 'catalog', 'batch-block.ts'), specifier: './batch-block' },
   ];
 
+  /**
+   * Story 4-4a — the reverse shape: a shared KEY-writing helper (the
+   * client-arranged shipping commands' `writeKeyInTx` / `runUpload`) whose
+   * every caller writes its own audit rows. Named, never inferred: each
+   * caller must import the helper and reference `auditEvents`.
+   */
+  const KEY_HELPERS: readonly { helper: string; specifier: string; callers: readonly string[] }[] = [
+    {
+      helper: join(SRC_ROOT, 'modules', 'outbound', 'shipping-support.ts'),
+      specifier: './shipping-support',
+      callers: ['client-label.command.ts', 'shipping-files.command.ts', 'handover.command.ts'].map((file) => join(SRC_ROOT, 'modules', 'outbound', file)),
+    },
+  ];
+
+  it('story 4-4a: a key-writing helper\'s every caller imports it and writes its own audit rows', () => {
+    for (const { helper, specifier, callers } of KEY_HELPERS) {
+      expect(KEY_WRITE.test(readFileSync(helper, 'utf8'))).toBe(true);
+      for (const caller of callers) {
+        const source = readFileSync(caller, 'utf8');
+        expect(source).toContain(`from '${specifier}'`);
+        expect(AUDIT_REF.test(source)).toBe(true);
+      }
+      // Any OTHER importer must not reach the key writer (reads and pure helpers only).
+      for (const file of files.filter((candidate) => candidate.source.includes(`from '${specifier}'`) && !callers.includes(candidate.path))) {
+        expect([file.path, /\b(writeKeyInTx|runUpload)\b/.test(file.source)]).toEqual([file.path, false]);
+      }
+    }
+  });
+
   it('every src/modules file that writes idempotencyKeys also references auditEvents', () => {
     const writers = files.filter((file) => file.path.startsWith(join(SRC_ROOT, 'modules')) && KEY_WRITE.test(file.source));
     // Meaningful: the keyed writers really are found (40 files when 9-3a landed).
@@ -3505,8 +3602,10 @@ describe('architecture: the audit rule — every keyed command writes its audit 
     expect(writers.some((file) => file.path.endsWith(join('invoicing', 'command.ts')))).toBe(true);
     expect(writers.some((file) => file.path.endsWith(join('billing', 'client-invoices.ts')))).toBe(true);
     const viaHelper = new Map(AUDIT_VIA_HELPER.map((entry) => [entry.writer, entry]));
+    const keyHelpers = new Set(KEY_HELPERS.map((entry) => entry.helper));
     const offenders = writers.filter((file) => {
       if (AUDIT_REF.test(file.source)) return false;
+      if (keyHelpers.has(file.path)) return false;
       const entry = viaHelper.get(file.path);
       return entry === undefined || !file.source.includes(`from '${entry.specifier}'`) || !AUDIT_REF.test(readFileSync(entry.helper, 'utf8'));
     });
@@ -3814,6 +3913,9 @@ describe('architecture: the client-emails module (story 5-2b)', () => {
       '../inbound/inbound.module',
       // Story 2-9a (D13) — the attachment registry's module.
       '../mail/mail.module',
+      // Story 4-4a (D8) — the stored-file renderer reads the bytes through the attachments facade.
+      '../attachments/attachments.facade',
+      '../attachments/attachments.module',
     ]);
     const offenders: string[] = [];
     for (const file of moduleFiles) {
@@ -4044,6 +4146,8 @@ describe('architecture: batch recalls are recalls-module-owned (story 3-7a)', ()
     ['outbound', 'pick.command.ts'],
     // Story 4-2b — the restock plan and the cancel name a recalled lot's recall.
     ['outbound', 'cancel-restock.command.ts'],
+    // Story 4-4a — the courier handover classifies each order's recalled lots.
+    ['outbound', 'handover.command.ts'],
     ['catalog', 'batch-block.command.ts'],
     ['inbound', 'receiving.command.ts'],
     ['inbound', 'receiving.facade.ts'],

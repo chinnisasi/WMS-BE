@@ -3,10 +3,12 @@
  * network; the one environment read is `clientEmailEnabled`.
  */
 
-/** The outbox events this module emails about, and the public event (5-2a's names) each one is. */
+/** The outbox events this module emails about, and the contact email event (`CLIENT_EMAIL_EVENTS`) each one is. */
 export const CLIENT_EMAIL_SOURCE_EVENTS = {
   'grn.recorded': 'receipt.recorded',
   'order.dispatched': 'order.dispatched',
+  // Story 4-4a (D6) — a shared shipping document or signed-sheet page.
+  'shipment.document-shared': 'shipment.documents',
 } as const;
 export type ClientEmailSourceEvent = keyof typeof CLIENT_EMAIL_SOURCE_EVENTS;
 export const CLIENT_EMAIL_SOURCE_EVENT_TYPES = Object.keys(CLIENT_EMAIL_SOURCE_EVENTS) as ClientEmailSourceEvent[];

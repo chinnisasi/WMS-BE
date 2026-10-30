@@ -596,6 +596,8 @@ function toRejectedOpResponse(entry: RejectedOpEntry): RejectedOpResponse {
     // Story 13-2 — the per-type decision rule, per row (absent only on a
     // resolve snapshot stored before 13-2).
     ...(entry.decisions === undefined ? {} : { decisions: [...entry.decisions] }),
+    // Story 4-4a (FA29) — a handover row's kept sheet photos.
+    ...(entry.photos === undefined ? {} : { photos: entry.photos.map((photo) => ({ ...photo })) }),
   };
 }
 

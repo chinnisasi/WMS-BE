@@ -14145,6 +14145,1517 @@
         ]
       }
     },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/shipment/client-label": {
+      "post": {
+        "operationId": "ShippingController_recordClientLabel",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "The label PDF (≤ 10 MB, 1–50 pages, not password-protected)"
+                  },
+                  "awb": {
+                    "type": "string"
+                  },
+                  "courierName": {
+                    "type": "string"
+                  },
+                  "transporterId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "packageCount": {
+                    "type": "string",
+                    "description": "1–999"
+                  },
+                  "replace": {
+                    "type": "string",
+                    "enum": [
+                      "true"
+                    ]
+                  }
+                },
+                "required": [
+                  "file",
+                  "awb"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientShipmentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed AWB, courier (exactly one of a transporter and a name), parcel count, key or part (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller lacks labels.execute (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown order or transporter (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The order is not open (order-not-open); it has a carrier label or a live client label without replace (shipment-exists, naming the AWB); its parcel was handed over (shipment-handed-over); the AWB is on another open order of this client (awb-in-use); the partner is not an active transporter",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Not a PDF (attachment-type-unsupported)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Password-protected or unreadable (pdf-unreadable), over 50 pages (pdf-too-many-pages), over 10 MB (attachment-too-large), or the key reused (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No file storage (file-storage-unavailable), the store failed (file-storage-failed), or too many uploads (file-storage-busy)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-4a — labels.execute: records the client’s own label PDF and its AWB for an open order (the client’s courier). The PDF is re-serialised (annotations, actions and JavaScript dropped) and stored; the shipment is client-label, labelled. With replace=true a live client label or AWB is voided first.",
+        "tags": [
+          "shipping"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/shipment/awb": {
+      "post": {
+        "operationId": "ShippingController_recordAwbAdvice",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordAwbAdviceDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientShipmentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed AWB, courier, count or key (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown order or transporter (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "order-not-open, shipment-exists, shipment-handed-over, awb-in-use",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-4a — labels.execute: pre-advises the AWB the client’s courier will bring (no file); the shipment is courier-label, labelled",
+        "tags": [
+          "shipping"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/shipment/void": {
+      "post": {
+        "operationId": "ShippingController_voidShipment",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VoidShipmentDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientShipmentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A reason outside 1–200 characters (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown order, or no live shipment (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A carrier label (shipment-not-client-arranged), or handed over (shipment-handed-over)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-4a — labels.execute: voids the order’s client-arranged shipment before its handover (its label file removed with the reason)",
+        "tags": [
+          "shipping"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/shipment/verify": {
+      "post": {
+        "operationId": "ShippingController_verifyLabel",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyLabelDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerifyLabelResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A blank scan, an unknown method, or (device) no occurredAt (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token, or a device token without a badge-in session (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown order (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The order is not open (order-not-open); no client label to verify (no-client-label)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The label reads another AWB (label-mismatch, extensions.scanned), or the key reused (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "device": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-4a — pack.execute: the client label scanned (or typed) onto the parcel must read the order’s AWB. Either session family: the web, or the handheld’s queued shipment.verify-label op (badge-in required; occurredAt required). A second verification is a no-op that stores the key.",
+        "tags": [
+          "shipping"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/shipping": {
+      "get": {
+        "operationId": "ShippingController_orderShipping",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderShippingResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown order (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-4a — the order’s shipping (any staff role): the live shipment, the voided ones, the client label, the documents, the handover and its signed sheet (short-lived presigned URLs), and the parcel tag code",
+        "tags": [
+          "shipping"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/parcel-tag": {
+      "get": {
+        "operationId": "ShippingController_parcelTag",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "format",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "zpl",
+                "pdf"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The tag file",
+            "content": {
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown order (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The order is not accepted or ready to dispatch (order-not-open)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-4a — the parcel tag (4×2 only): ZPL or PDF. The barcode is the tag code (`O` + the order id’s last 16 hex digits). A file read: no key, no audit",
+        "tags": [
+          "shipping"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/documents": {
+      "post": {
+        "operationId": "ShippingController_uploadOrderDocument",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary"
+                  },
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "invoice",
+                      "challan",
+                      "eway-bill",
+                      "pod",
+                      "other"
+                    ]
+                  }
+                },
+                "required": [
+                  "file",
+                  "kind"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShippingFileResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing file or an unknown kind (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown order (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A cancelled order (order-not-open), or 20 live warehouse documents already (document-limit)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Not a JPEG, PNG, WebP or PDF (attachment-type-unsupported)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "attachment-too-large, attachment-content-invalid, pdf-unreadable, pdf-too-many-pages, idempotency-key-reuse",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "file-storage-unavailable, file-storage-failed, file-storage-busy",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-4a — dispatch.execute: attaches a shipping document to an order (an image or a PDF; invoice, challan, eway-bill, pod or other). Shared with the client by email at once when the order is dispatched, else at its dispatch",
+        "tags": [
+          "shipping"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/handovers/{handoverId}/sheet": {
+      "post": {
+        "operationId": "ShippingController_uploadHandoverSheet",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "handoverId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary"
+                  }
+                },
+                "required": [
+                  "file"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShippingFileResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown handover (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "10 live pages already (handover-sheet-limit)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Not an image or a PDF (attachment-type-unsupported)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "attachment-too-large, attachment-content-invalid, pdf-unreadable, pdf-too-many-pages, idempotency-key-reuse",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "file-storage-unavailable, file-storage-failed, file-storage-busy",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-4a — dispatch.execute: attaches a signed handover sheet page (an image or a PDF, ≤ 10 pages per handover); emailed to the client’s opted-in contacts",
+        "tags": [
+          "shipping"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/handover-photos": {
+      "post": {
+        "operationId": "ShippingController_stageHandoverPhoto",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-op-operator",
+            "in": "header",
+            "description": "The capturing operator’s user id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "capturedAt": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "file": {
+                    "type": "string",
+                    "format": "binary"
+                  }
+                },
+                "required": [
+                  "capturedAt",
+                  "file"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StagedPhotoResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed key, x-op-operator, capturedAt or file (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The ref is stored with different bytes or another purpose (attachment-ref-conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Not a JPEG, PNG or WebP (attachment-type-unsupported)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "attachment-too-large, attachment-content-invalid, idempotency-key-reuse",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "200 photos waiting on this device (attachment-staging-limit)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "file-storage-unavailable, file-storage-failed, file-storage-busy",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-4a — the handheld’s signed-sheet photo (handover-photo.stage; the device credential + x-op-operator). Idempotency-Key = the photo ULID its handover names in photoRefs; bound to the handover in either order (2-5a’s fate table)",
+        "tags": [
+          "shipping"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/shipping-files/{attachmentId}/remove": {
+      "post": {
+        "operationId": "ShippingController_removeShippingFile",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "attachmentId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemoveShippingFileDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShippingFileResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown file (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A live client label (label-in-use), or already removed (attachment-not-attached)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-4a — orders.manage: removes a shipping document or a signed-sheet page (soft — the bytes are purged after ATTACHMENT_PURGE_DAYS). A live client label is removed only by voiding or replacing its shipment",
+        "tags": [
+          "shipping"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/handovers": {
+      "post": {
+        "operationId": "ShippingController_handOver",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID (26 chars, Crockford base32) — replays return the original result",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateHandoverDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HandoverResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A duplicate order or AWB, a malformed AWB, phone, vehicle, weight, count or time, more than 100 parcels, photoRefs on the web, a pickup time outside the last 7 days on the web (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token, or a device token without a badge-in session (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller lacks dispatch.execute (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown warehouse, client or transporter (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A parcel of another client (handover-client-mismatch, extensions.orderIds); the client departed (client-departed); web: refused parcels (handover-parcels-refused, extensions.parcels[{orderId, code, detail}]); an AWB taken concurrently, or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "device": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-4a — dispatch.execute: hands parcels of ONE client to its courier and DISPATCHES every order handed over, in one transaction. Web: all-or-nothing (409 handover-parcels-refused naming each parcel). Handheld (badge-in; occurredAt required): the passing parcels settle and the refused ones go into one Discard-only review row",
+        "tags": [
+          "shipping"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/handovers/{handoverId}": {
+      "get": {
+        "operationId": "ShippingController_handover",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "handoverId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HandoverDetailResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown handover (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-4a — one courier handover (any staff role): the frozen parties, the parcels, the signed sheet; the pickup phone unmasked for a dispatch.execute holder only",
+        "tags": [
+          "shipping"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/outbound/handover-candidates": {
+      "get": {
+        "operationId": "ShippingController_handoverCandidates",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "query",
+            "description": "The client whose packed orders are listed",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "description": "1–200 (default 100)",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HandoverCandidatesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A missing clientId or a malformed cursor (validation-failed, invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown warehouse (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-4a — the handover builder’s list: one client’s packed orders in the warehouse, oldest first (keyset), with each parcel’s shipment and tag code",
+        "tags": [
+          "shipping"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/outbound/handovers": {
+      "get": {
+        "operationId": "ShippingController_handovers",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "format": "date",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "format": "date",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "description": "1–100 (default 50)",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HandoversResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed date, client or cursor (validation-failed, invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown warehouse (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-4a — the warehouse’s courier handovers, newest first (keyset); from/to are IST dates, inclusive",
+        "tags": [
+          "shipping"
+        ]
+      }
+    },
     "/tenants/{tenantId}/receiving/goods-receipts": {
       "post": {
         "operationId": "ReceivingController_submitGoodsReceipt",
@@ -28607,6 +30118,7 @@
                 "batch",
                 "batch_alert",
                 "batch_recall",
+                "courier_handover",
                 "bin",
                 "bin_move",
                 "carrier_connection",
@@ -37896,6 +39408,565 @@
           }
         ],
         "summary": "One order of this client with its lines (kit components nested under their kit line)",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/orders/{orderId}/shipping": {
+      "get": {
+        "operationId": "PortalController_orderShipping",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalOrderShippingResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed orderId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such order of this client — unknown, or another client's (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-4a — this order’s Shipping: the status in client words, the courier and AWB, the handover time and pickup, the label, the documents and the signed sheet (short-lived download links)",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/orders/{orderId}/shipment/client-label": {
+      "post": {
+        "operationId": "PortalController_uploadClientLabel",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary"
+                  },
+                  "awb": {
+                    "type": "string"
+                  },
+                  "courierName": {
+                    "type": "string"
+                  },
+                  "packageCount": {
+                    "type": "string"
+                  },
+                  "replace": {
+                    "type": "string",
+                    "enum": [
+                      "true"
+                    ]
+                  }
+                },
+                "required": [
+                  "file",
+                  "awb",
+                  "courierName"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalShipmentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed AWB, courier name, count, key or part (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such order of this client (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "order-not-open, shipment-exists (naming the AWB), shipment-handed-over, awb-in-use (naming your own order)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Not a PDF (attachment-type-unsupported)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "pdf-unreadable, pdf-too-many-pages, attachment-too-large, idempotency-key-reuse",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "file-storage-unavailable, file-storage-failed, file-storage-busy",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-4a — orders.place: upload your own courier label (a PDF) with its AWB and courier for an open order; replace=true replaces your label before the handover",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/orders/{orderId}/shipment/awb": {
+      "post": {
+        "operationId": "PortalController_adviseAwb",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PortalAwbAdviceDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalShipmentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed AWB, courier name, count or key (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such order of this client (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "order-not-open, shipment-exists, shipment-handed-over, awb-in-use",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-4a — orders.place: send the AWB only (your courier brings its own label)",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/orders/{orderId}/documents": {
+      "post": {
+        "operationId": "PortalController_uploadOrderDocument",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary"
+                  },
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "invoice",
+                      "challan",
+                      "eway-bill",
+                      "other"
+                    ]
+                  }
+                },
+                "required": [
+                  "file",
+                  "kind"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShippingFileResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing file, or a kind outside invoice, challan, eway-bill, other (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such order of this client (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A cancelled order (order-not-open), or 10 of your documents already (document-limit)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Not an image or a PDF (attachment-type-unsupported)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "attachment-too-large, attachment-content-invalid, pdf-unreadable, pdf-too-many-pages, idempotency-key-reuse",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "file-storage-unavailable, file-storage-failed, file-storage-busy",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-4a — orders.place: upload your invoice, challan, e-way bill or another document for an order (an image or a PDF; at most 10 of yours per order)",
         "tags": [
           "portal"
         ]
@@ -48895,7 +50966,10 @@
               "return.restock",
               "rtv.pick",
               "return.receive_blind",
-              "rtc.pick"
+              "rtc.pick",
+              "shipment.verify-label",
+              "handover.create",
+              "handover-photo.stage"
             ]
           },
           "classification": {
@@ -49010,6 +51084,28 @@
           "rows"
         ]
       },
+      "RejectedOpPhotoDto": {
+        "type": "object",
+        "properties": {
+          "ref": {
+            "type": "string",
+            "description": "The photo ULID"
+          },
+          "url": {
+            "type": "string",
+            "nullable": true
+          },
+          "urlExpiresAt": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "ref",
+          "url",
+          "urlExpiresAt"
+        ]
+      },
       "RejectedOpResponse": {
         "type": "object",
         "properties": {
@@ -49055,7 +51151,10 @@
               "return.restock",
               "rtv.pick",
               "return.receive_blind",
-              "rtc.pick"
+              "rtc.pick",
+              "shipment.verify-label",
+              "handover.create",
+              "handover-photo.stage"
             ]
           },
           "classification": {
@@ -49125,6 +51224,13 @@
                 "recount",
                 "discard"
               ]
+            }
+          },
+          "photos": {
+            "description": "Story 4-4a — a handover.create row’s sheet photos still staged or attached, each with a short-lived link (null when unsigned). Absent on other rows",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RejectedOpPhotoDto"
             }
           }
         },
@@ -52804,7 +54910,8 @@
             "enum": [
               "labelled",
               "manifested",
-              "voided"
+              "voided",
+              "handed_over"
             ]
           },
           "carrierName": {
@@ -53563,18 +55670,21 @@
             "enum": [
               "labelled",
               "manifested",
-              "voided"
+              "voided",
+              "handed_over"
             ],
-            "description": "labelled, manifested, or (story 4-2b) voided — the label of an order cancelled with restock before it was manifested"
+            "description": "labelled, manifested, (story 4-2b) voided — the label of an order cancelled before it was manifested, or replaced — or (story 4-4a) handed_over — a client-arranged shipment closed by a courier handover"
           },
           "carrierConnectionId": {
             "type": "string",
+            "nullable": true,
             "format": "uuid",
-            "description": "The connection the label generated through"
+            "description": "The connection the label generated through; null on a client-arranged shipment (story 4-4a)"
           },
           "carrierCode": {
             "type": "string",
-            "description": "The adapter code at label time"
+            "nullable": true,
+            "description": "The adapter code at label time; null on a client-arranged shipment (story 4-4a)"
           },
           "carrierName": {
             "type": "string",
@@ -53586,7 +55696,8 @@
           },
           "labelDocumentRef": {
             "type": "string",
-            "description": "The adapter’s opaque handle for the label document — never the bytes"
+            "nullable": true,
+            "description": "The adapter’s opaque handle for the label document — never the bytes; null on a client-arranged shipment (story 4-4a)"
           },
           "weightGrams": {
             "type": "number",
@@ -53632,6 +55743,36 @@
             "nullable": true,
             "format": "uuid",
             "description": "Story 4-2b — who voided it; null otherwise. Absent on a response stored before 4-2b."
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "carrier",
+              "client-label",
+              "courier-label"
+            ],
+            "description": "Story 4-4a — carrier (an adapter label), client-label (the client’s label PDF) or courier-label (the courier brings the label). Absent on a label response (read absent as carrier)."
+          },
+          "packageCount": {
+            "type": "number",
+            "nullable": true,
+            "description": "Story 4-4a — parcels in the shipment (1–999); absent on a label response."
+          },
+          "labelVerifiedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 4-4a — when the client label was scanned onto the parcel; absent on a label response."
+          },
+          "handoverId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Story 4-4a — the courier handover that closed it; absent on a label response."
+          },
+          "handedOverAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 4-4a — when it was handed over; absent on a label response."
           }
         },
         "required": [
@@ -55504,6 +57645,1178 @@
         },
         "required": [
           "items"
+        ]
+      },
+      "ClientShipmentViewDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "carrier",
+              "client-label",
+              "courier-label"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "labelled",
+              "manifested",
+              "voided",
+              "handed_over"
+            ]
+          },
+          "courierName": {
+            "type": "string"
+          },
+          "awb": {
+            "type": "string",
+            "description": "The AWB / LR number as stored (normalised)"
+          },
+          "packageCount": {
+            "type": "number",
+            "nullable": true
+          },
+          "transporterId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "labelAttachmentId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "labelVerifiedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "labelVerifyMethod": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "scan",
+              "typed",
+              "handover-scan",
+              null
+            ]
+          },
+          "recordedSurface": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "web",
+              "portal",
+              "handheld",
+              null
+            ]
+          },
+          "labelledAt": {
+            "type": "string"
+          },
+          "labelledBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "handoverId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "handedOverAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true
+          },
+          "voidedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "voidReason": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "id",
+          "orderId",
+          "kind",
+          "status",
+          "courierName",
+          "awb",
+          "packageCount",
+          "transporterId",
+          "labelAttachmentId",
+          "labelVerifiedAt",
+          "labelVerifyMethod",
+          "recordedSurface",
+          "labelledAt",
+          "labelledBy",
+          "handoverId",
+          "handedOverAt",
+          "weightGrams",
+          "voidedAt",
+          "voidReason"
+        ]
+      },
+      "ClientShipmentResponse": {
+        "type": "object",
+        "properties": {
+          "shipment": {
+            "$ref": "#/components/schemas/ClientShipmentViewDto"
+          }
+        },
+        "required": [
+          "shipment"
+        ]
+      },
+      "RecordAwbAdviceDto": {
+        "type": "object",
+        "properties": {
+          "awb": {
+            "type": "string",
+            "description": "The AWB / LR number, normalised (trimmed, upper-cased, spaces and hyphens stripped): 4–50 letters, digits or \"/\""
+          },
+          "courierName": {
+            "type": "string",
+            "description": "The courier by name (1–100 characters) — or name a transporter partner; exactly one"
+          },
+          "transporterId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "A transporter partner as the courier — or type its name; exactly one"
+          },
+          "packageCount": {
+            "type": "number",
+            "description": "Parcels in the shipment, 1–999"
+          },
+          "replace": {
+            "type": "boolean",
+            "description": "Replace the order’s live client label or AWB (before the handover)"
+          }
+        },
+        "required": [
+          "awb"
+        ]
+      },
+      "VoidShipmentDto": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "description": "Why the shipment is voided, 1–200 characters"
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "VerifyLabelDto": {
+        "type": "object",
+        "properties": {
+          "scannedCode": {
+            "type": "string",
+            "description": "The scanned (or typed) AWB — compared normalised"
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "scan",
+              "typed"
+            ]
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "The handheld’s scan instant (required on the device; refused-as-ignored on the web — null there)"
+          }
+        },
+        "required": [
+          "scannedCode",
+          "method"
+        ]
+      },
+      "VerifyLabelResponse": {
+        "type": "object",
+        "properties": {
+          "shipment": {
+            "$ref": "#/components/schemas/ClientShipmentViewDto"
+          },
+          "verified": {
+            "type": "boolean",
+            "description": "True when this request verified the label; false when it already was (a no-op that stores the key)"
+          }
+        },
+        "required": [
+          "shipment",
+          "verified"
+        ]
+      },
+      "FileViewDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "purpose": {
+            "type": "string",
+            "enum": [
+              "shipping-label",
+              "shipping-document",
+              "handover-sheet"
+            ]
+          },
+          "docKind": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "invoice",
+              "challan",
+              "eway-bill",
+              "pod",
+              "other",
+              null
+            ]
+          },
+          "fileName": {
+            "type": "string",
+            "description": "The server-built name (never the uploader’s)"
+          },
+          "contentType": {
+            "type": "string",
+            "nullable": true
+          },
+          "byteSize": {
+            "type": "number",
+            "nullable": true
+          },
+          "pageCount": {
+            "type": "number",
+            "nullable": true
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "web",
+              "portal",
+              "handheld"
+            ]
+          },
+          "uploadedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "uploadedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "url": {
+            "type": "string",
+            "nullable": true,
+            "description": "A short-lived presigned URL; null when unsigned"
+          },
+          "urlExpiresAt": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "id",
+          "purpose",
+          "docKind",
+          "fileName",
+          "contentType",
+          "byteSize",
+          "pageCount",
+          "source",
+          "uploadedAt",
+          "uploadedBy",
+          "url",
+          "urlExpiresAt"
+        ]
+      },
+      "OrderShippingHandoverDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "courierName": {
+            "type": "string"
+          },
+          "handedOverAt": {
+            "type": "string"
+          },
+          "pickupPersonName": {
+            "type": "string"
+          },
+          "pickupPersonPhoneMasked": {
+            "type": "string",
+            "nullable": true
+          },
+          "vehicleNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "sheet": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FileViewDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "courierName",
+          "handedOverAt",
+          "pickupPersonName",
+          "pickupPersonPhoneMasked",
+          "vehicleNumber",
+          "sheet"
+        ]
+      },
+      "OrderShippingResponse": {
+        "type": "object",
+        "properties": {
+          "shipment": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ClientShipmentViewDto"
+              }
+            ]
+          },
+          "history": {
+            "description": "Voided shipments, newest first",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientShipmentViewDto"
+            }
+          },
+          "label": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/FileViewDto"
+              }
+            ]
+          },
+          "documents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FileViewDto"
+            }
+          },
+          "handover": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OrderShippingHandoverDto"
+              }
+            ]
+          },
+          "parcelTagCode": {
+            "type": "string",
+            "description": "The parcel tag’s code (`O` + the order id’s last 16 hex digits)"
+          },
+          "storageEnabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "shipment",
+          "history",
+          "label",
+          "documents",
+          "handover",
+          "parcelTagCode",
+          "storageEnabled"
+        ]
+      },
+      "ShippingFileSnapshotDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "purpose": {
+            "type": "string",
+            "enum": [
+              "shipping-label",
+              "shipping-document",
+              "handover-sheet"
+            ]
+          },
+          "docKind": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "invoice",
+              "challan",
+              "eway-bill",
+              "pod",
+              "other",
+              null
+            ]
+          },
+          "contentType": {
+            "type": "string",
+            "nullable": true
+          },
+          "byteSize": {
+            "type": "number",
+            "nullable": true
+          },
+          "pageCount": {
+            "type": "number",
+            "nullable": true
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "web",
+              "portal",
+              "handheld"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "uploadedAt": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "id",
+          "purpose",
+          "docKind",
+          "contentType",
+          "byteSize",
+          "pageCount",
+          "source",
+          "status",
+          "uploadedAt"
+        ]
+      },
+      "ShippingFileResponse": {
+        "type": "object",
+        "properties": {
+          "file": {
+            "$ref": "#/components/schemas/ShippingFileSnapshotDto"
+          }
+        },
+        "required": [
+          "file"
+        ]
+      },
+      "StagedPhotoResponse": {
+        "type": "object",
+        "properties": {
+          "ref": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "staged",
+              "attached",
+              "removed"
+            ]
+          }
+        },
+        "required": [
+          "ref",
+          "status"
+        ]
+      },
+      "RemoveShippingFileDto": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "description": "Why, 1–200 characters"
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "HandoverCourierDto": {
+        "type": "object",
+        "properties": {
+          "transporterId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "A transporter partner — or name it; exactly one"
+          },
+          "courierName": {
+            "type": "string",
+            "description": "The courier’s name, 1–100 characters"
+          }
+        }
+      },
+      "HandoverParcelDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "awb": {
+            "type": "string",
+            "nullable": true,
+            "description": "The AWB scanned on the parcel (required with no verified client label)"
+          },
+          "packageCount": {
+            "type": "number",
+            "nullable": true,
+            "description": "Parcels, 1–999 (default: the shipment’s, else 1)"
+          },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true,
+            "description": "Weight in grams, 1–1,000,000 (default: the last pack measurement)"
+          }
+        },
+        "required": [
+          "orderId"
+        ]
+      },
+      "CreateHandoverDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "One handover carries one client’s parcels"
+          },
+          "courier": {
+            "$ref": "#/components/schemas/HandoverCourierDto"
+          },
+          "pickupPersonName": {
+            "type": "string",
+            "description": "Who collected the parcels, 1–100 characters"
+          },
+          "pickupPersonPhone": {
+            "type": "string",
+            "nullable": true
+          },
+          "vehicleNumber": {
+            "type": "string",
+            "nullable": true,
+            "description": "Vehicle number (normalised: KA01AB1234)"
+          },
+          "occurredAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "The pickup time: on the web within the last 7 days (default now); required on the handheld"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "description": "Up to 500 characters"
+          },
+          "parcels": {
+            "description": "1–100 parcels",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HandoverParcelDto"
+            }
+          },
+          "photoRefs": {
+            "description": "The handheld’s signed-sheet photo refs (≤ 10; refused on the web)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "warehouseId",
+          "clientId",
+          "courier",
+          "pickupPersonName",
+          "parcels"
+        ]
+      },
+      "HandoverViewDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "description": "HO-NNNN"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "courierName": {
+            "type": "string"
+          },
+          "transporterId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "pickupPersonName": {
+            "type": "string"
+          },
+          "vehicleNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "handedOverAt": {
+            "type": "string"
+          },
+          "shipmentCount": {
+            "type": "number"
+          },
+          "packageCount": {
+            "type": "number"
+          },
+          "codShipmentCount": {
+            "type": "number"
+          },
+          "codTotalPaise": {
+            "type": "number"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "web",
+              "handheld"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "warehouseId",
+          "clientId",
+          "courierName",
+          "transporterId",
+          "pickupPersonName",
+          "vehicleNumber",
+          "handedOverAt",
+          "shipmentCount",
+          "packageCount",
+          "codShipmentCount",
+          "codTotalPaise",
+          "source"
+        ]
+      },
+      "HandoverParcelResultDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "shipmentId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "awb": {
+            "type": "string"
+          },
+          "dispatched": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "followOnOrderId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "orderId",
+          "shipmentId",
+          "awb",
+          "dispatched",
+          "followOnOrderId"
+        ]
+      },
+      "HandoverRefusedParcelDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "order-not-found",
+              "warehouse-mismatch",
+              "order-not-ready",
+              "order-already-dispatched",
+              "shipment-not-client-arranged",
+              "label-not-verified",
+              "awb-mismatch",
+              "awb-required",
+              "awb-in-use",
+              "order-holds-recalled-batch"
+            ]
+          },
+          "detail": {
+            "type": "string"
+          },
+          "orderStatus": {
+            "type": "string",
+            "description": "The order’s status as read under its lock (e.g. cancelled vs accepted for order-not-ready); absent when the order was not found"
+          }
+        },
+        "required": [
+          "orderId",
+          "code",
+          "detail"
+        ]
+      },
+      "HandoverResponse": {
+        "type": "object",
+        "properties": {
+          "handover": {
+            "nullable": true,
+            "description": "Null when every parcel of a handheld handover was refused (the review row holds them)",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/HandoverViewDto"
+              }
+            ]
+          },
+          "parcels": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HandoverParcelResultDto"
+            }
+          },
+          "refused": {
+            "description": "Handheld only: the parcels refused into one review row (Discard only)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HandoverRefusedParcelDto"
+            }
+          },
+          "rejectedOpId": {
+            "type": "string",
+            "nullable": true,
+            "description": "The review row’s op id (derived from the key)"
+          }
+        },
+        "required": [
+          "handover",
+          "parcels",
+          "refused",
+          "rejectedOpId"
+        ]
+      },
+      "HandoverDetailParcelDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLabel": {
+            "type": "string"
+          },
+          "shipmentId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "carrier",
+              "client-label",
+              "courier-label"
+            ]
+          },
+          "awb": {
+            "type": "string"
+          },
+          "packageCount": {
+            "type": "number",
+            "nullable": true
+          },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true
+          },
+          "codAmountPaise": {
+            "type": "number",
+            "nullable": true
+          },
+          "destinationCity": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "orderId",
+          "orderLabel",
+          "shipmentId",
+          "kind",
+          "awb",
+          "packageCount",
+          "weightGrams",
+          "codAmountPaise",
+          "destinationCity"
+        ]
+      },
+      "HandoverDetailDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "description": "HO-NNNN"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "courierName": {
+            "type": "string"
+          },
+          "transporterId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "pickupPersonName": {
+            "type": "string"
+          },
+          "vehicleNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "handedOverAt": {
+            "type": "string"
+          },
+          "shipmentCount": {
+            "type": "number"
+          },
+          "packageCount": {
+            "type": "number"
+          },
+          "codShipmentCount": {
+            "type": "number"
+          },
+          "codTotalPaise": {
+            "type": "number"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "web",
+              "handheld"
+            ]
+          },
+          "pickupPersonPhone": {
+            "type": "string",
+            "nullable": true,
+            "description": "Unmasked for a dispatch.execute holder; masked otherwise"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true
+          },
+          "clientSnapshot": {
+            "type": "object",
+            "description": "The client as frozen at the handover (ClientPartySnapshotV1)"
+          },
+          "warehouseSnapshot": {
+            "type": "object",
+            "description": "The warehouse as frozen at the handover"
+          },
+          "courierSnapshot": {
+            "type": "object",
+            "nullable": true,
+            "description": "The transporter as frozen (TransporterSnapshotV1), when one was named"
+          },
+          "createdBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "parcels": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HandoverDetailParcelDto"
+            }
+          },
+          "sheet": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FileViewDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "warehouseId",
+          "clientId",
+          "courierName",
+          "transporterId",
+          "pickupPersonName",
+          "vehicleNumber",
+          "handedOverAt",
+          "shipmentCount",
+          "packageCount",
+          "codShipmentCount",
+          "codTotalPaise",
+          "source",
+          "pickupPersonPhone",
+          "note",
+          "clientSnapshot",
+          "warehouseSnapshot",
+          "courierSnapshot",
+          "createdBy",
+          "parcels",
+          "sheet"
+        ]
+      },
+      "HandoverDetailResponse": {
+        "type": "object",
+        "properties": {
+          "handover": {
+            "$ref": "#/components/schemas/HandoverDetailDto"
+          }
+        },
+        "required": [
+          "handover"
+        ]
+      },
+      "HandoverCandidateShipmentDto": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "carrier",
+              "client-label",
+              "courier-label"
+            ]
+          },
+          "awb": {
+            "type": "string"
+          },
+          "courierName": {
+            "type": "string"
+          },
+          "packageCount": {
+            "type": "number",
+            "nullable": true
+          },
+          "labelVerified": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "kind",
+          "awb",
+          "courierName",
+          "packageCount",
+          "labelVerified"
+        ]
+      },
+      "HandoverCandidateDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLabel": {
+            "type": "string"
+          },
+          "clientOrderRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "externalEventId": {
+            "type": "string",
+            "nullable": true
+          },
+          "followOnSeq": {
+            "type": "number",
+            "nullable": true
+          },
+          "parcelTagCode": {
+            "type": "string"
+          },
+          "destinationCity": {
+            "type": "string",
+            "nullable": true
+          },
+          "codAmountPaise": {
+            "type": "number",
+            "nullable": true
+          },
+          "packedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "shipment": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/HandoverCandidateShipmentDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "orderId",
+          "orderLabel",
+          "clientOrderRef",
+          "externalEventId",
+          "followOnSeq",
+          "parcelTagCode",
+          "destinationCity",
+          "codAmountPaise",
+          "packedAt",
+          "shipment"
+        ]
+      },
+      "HandoverCandidatesResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HandoverCandidateDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "HandoverListItemDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "courierName": {
+            "type": "string"
+          },
+          "shipmentCount": {
+            "type": "number"
+          },
+          "packageCount": {
+            "type": "number"
+          },
+          "handedOverAt": {
+            "type": "string"
+          },
+          "sheetPageCount": {
+            "type": "number"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "web",
+              "handheld"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "clientId",
+          "clientCode",
+          "courierName",
+          "shipmentCount",
+          "packageCount",
+          "handedOverAt",
+          "sheetPageCount",
+          "source"
+        ]
+      },
+      "HandoversResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HandoverListItemDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
         ]
       },
       "GrnLineInputDto": {
@@ -58205,6 +61518,83 @@
           "label"
         ]
       },
+      "CatalogDispatchParcelShipmentDto": {
+        "type": "object",
+        "properties": {
+          "shipmentId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "client-label",
+              "courier-label"
+            ]
+          },
+          "awb": {
+            "type": "string",
+            "description": "The AWB as stored (normalised)"
+          },
+          "courierName": {
+            "type": "string"
+          },
+          "labelVerified": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "shipmentId",
+          "kind",
+          "awb",
+          "courierName",
+          "labelVerified"
+        ]
+      },
+      "CatalogDispatchParcelDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLabel": {
+            "type": "string"
+          },
+          "parcelTagCode": {
+            "type": "string",
+            "description": "The parcel tag code (`O` + the order id’s last 16 hex digits)"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "accepted",
+              "ready_to_dispatch"
+            ]
+          },
+          "shipment": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CatalogDispatchParcelShipmentDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "orderId",
+          "clientId",
+          "orderLabel",
+          "parcelTagCode",
+          "status",
+          "shipment"
+        ]
+      },
       "CatalogSnapshotResponse": {
         "type": "object",
         "properties": {
@@ -58384,6 +61774,17 @@
             "items": {
               "$ref": "#/components/schemas/CatalogAdjustReasonDto"
             }
+          },
+          "dispatchParcels": {
+            "description": "Story 4-4a (additive): the parcels awaiting a courier — the warehouse's packed orders, plus its accepted orders holding a live client-arranged shipment (never one with a carrier shipment), at most 2000, oldest first. The pack bench verifies a client label against it; the handover matches scanned AWBs and parcel tags against it. An older server omits it (the device reads it as empty)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogDispatchParcelDto"
+            }
+          },
+          "dispatchParcelsTruncated": {
+            "type": "boolean",
+            "description": "Story 4-4a (additive): true when dispatchParcels was capped at 2000 — hand over newer parcels on the web, or refresh later"
           }
         },
         "required": [
@@ -58410,7 +61811,9 @@
           "receiptShortReasons",
           "receiptPhotos",
           "moveReasons",
-          "adjustReasons"
+          "adjustReasons",
+          "dispatchParcels",
+          "dispatchParcelsTruncated"
         ]
       },
       "GoodsReceiptEntryDto": {
@@ -69061,6 +72464,7 @@
               "batch",
               "batch_alert",
               "batch_recall",
+              "courier_handover",
               "bin",
               "bin_move",
               "carrier_connection",
@@ -69170,6 +72574,7 @@
               "batch",
               "batch_alert",
               "batch_recall",
+              "courier_handover",
               "bin",
               "bin_move",
               "carrier_connection",
@@ -70017,7 +73422,8 @@
               "type": "string",
               "enum": [
                 "receipt.recorded",
-                "order.dispatched"
+                "order.dispatched",
+                "shipment.documents"
               ]
             }
           },
@@ -70097,12 +73503,13 @@
           },
           "emailEvents": {
             "type": "array",
-            "description": "Story 5-2b — the client emails this contact receives: receipt.recorded (each GRN), order.dispatched (each order). Omitted = none. No event twice; refused on the warehouse’s own (self) client",
+            "description": "Story 5-2b — the client emails this contact receives: receipt.recorded (each GRN), order.dispatched (each order), and (story 4-4a) shipment.documents (each shipping document and signed handover sheet). Omitted = none. No event twice; refused on the warehouse’s own (self) client",
             "items": {
               "type": "string",
               "enum": [
                 "receipt.recorded",
-                "order.dispatched"
+                "order.dispatched",
+                "shipment.documents"
               ]
             }
           }
@@ -70165,7 +73572,8 @@
               "type": "string",
               "enum": [
                 "receipt.recorded",
-                "order.dispatched"
+                "order.dispatched",
+                "shipment.documents"
               ]
             }
           }
@@ -70235,7 +73643,8 @@
               "type": "string",
               "enum": [
                 "receipt.recorded",
-                "order.dispatched"
+                "order.dispatched",
+                "shipment.documents"
               ]
             }
           }
@@ -70267,12 +73676,13 @@
             "type": "string",
             "enum": [
               "receipt",
-              "dispatch"
+              "dispatch",
+              "shipment-document"
             ]
           },
           "subjectLabel": {
             "type": "string",
-            "description": "The GRN code (a receipt) or the order reference (a dispatch)"
+            "description": "The GRN code (a receipt), the order reference (a dispatch), or the order or HO code with its page (a shipping document — story 4-4a)"
           },
           "to": {
             "type": "string",
@@ -70330,11 +73740,16 @@
           "dispatch": {
             "type": "boolean",
             "description": "Today’s dispatch emails reached the daily limit (500) — later dispatches today were not emailed"
+          },
+          "shipmentDocument": {
+            "type": "boolean",
+            "description": "Story 4-4a — today’s shipping-document emails reached the daily limit (500)"
           }
         },
         "required": [
           "receipt",
-          "dispatch"
+          "dispatch",
+          "shipmentDocument"
         ]
       },
       "ClientEmailLogResponse": {
@@ -74666,6 +78081,14 @@
           },
           "createdAt": {
             "type": "string"
+          },
+          "awb": {
+            "type": "string",
+            "description": "Story 4-4a — the AWB of the order’s live shipment (your courier’s or ours); absent when it has none"
+          },
+          "courierName": {
+            "type": "string",
+            "description": "Story 4-4a — the courier of the order’s live shipment; absent when it has none"
           }
         },
         "required": [
@@ -75151,6 +78574,14 @@
           "createdAt": {
             "type": "string"
           },
+          "awb": {
+            "type": "string",
+            "description": "Story 4-4a — the AWB of the order’s live shipment (your courier’s or ours); absent when it has none"
+          },
+          "courierName": {
+            "type": "string",
+            "description": "Story 4-4a — the courier of the order’s live shipment; absent when it has none"
+          },
           "lines": {
             "type": "array",
             "items": {
@@ -75175,6 +78606,231 @@
           "lineCount",
           "createdAt",
           "lines"
+        ]
+      },
+      "PortalFileDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "description": "invoice, challan, eway-bill, pod, other, label or signed-sheet"
+          },
+          "fileName": {
+            "type": "string"
+          },
+          "contentType": {
+            "type": "string",
+            "nullable": true
+          },
+          "pageCount": {
+            "type": "number",
+            "nullable": true
+          },
+          "uploadedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "uploadedByYou": {
+            "type": "boolean"
+          },
+          "url": {
+            "type": "string",
+            "nullable": true
+          },
+          "urlExpiresAt": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "fileName",
+          "contentType",
+          "pageCount",
+          "uploadedAt",
+          "uploadedByYou",
+          "url",
+          "urlExpiresAt"
+        ]
+      },
+      "PortalOrderShippingResponse": {
+        "type": "object",
+        "properties": {
+          "canRecord": {
+            "type": "boolean",
+            "description": "The client may record a label or AWB now (Upload / Replace / Send AWB): the order is open and has no live shipment, or a client-arranged one not yet handed over"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "cancelled",
+              "no-label-yet",
+              "label-received",
+              "awb-received",
+              "ready-for-pickup",
+              "handed-over",
+              "shipped",
+              "shipped-no-courier-record"
+            ]
+          },
+          "courierName": {
+            "type": "string",
+            "nullable": true
+          },
+          "awb": {
+            "type": "string",
+            "nullable": true
+          },
+          "packageCount": {
+            "type": "number",
+            "nullable": true
+          },
+          "handedOverAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "vehicleNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "handoverCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "pickupPersonName": {
+            "type": "string",
+            "nullable": true,
+            "description": "Who collected the parcels — as on the signed sheet"
+          },
+          "label": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PortalFileDto"
+              }
+            ]
+          },
+          "documents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalFileDto"
+            }
+          },
+          "handoverSheet": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalFileDto"
+            }
+          }
+        },
+        "required": [
+          "canRecord",
+          "status",
+          "courierName",
+          "awb",
+          "packageCount",
+          "handedOverAt",
+          "vehicleNumber",
+          "handoverCode",
+          "pickupPersonName",
+          "label",
+          "documents",
+          "handoverSheet"
+        ]
+      },
+      "PortalShipmentViewDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "carrier",
+              "client-label",
+              "courier-label"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "labelled",
+              "manifested",
+              "voided",
+              "handed_over"
+            ]
+          },
+          "courierName": {
+            "type": "string"
+          },
+          "awb": {
+            "type": "string"
+          },
+          "packageCount": {
+            "type": "number",
+            "nullable": true
+          },
+          "recordedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "orderId",
+          "kind",
+          "status",
+          "courierName",
+          "awb",
+          "packageCount",
+          "recordedAt"
+        ]
+      },
+      "PortalShipmentResponse": {
+        "type": "object",
+        "properties": {
+          "shipment": {
+            "$ref": "#/components/schemas/PortalShipmentViewDto"
+          }
+        },
+        "required": [
+          "shipment"
+        ]
+      },
+      "PortalAwbAdviceDto": {
+        "type": "object",
+        "properties": {
+          "awb": {
+            "type": "string",
+            "description": "The AWB / LR number (normalised: 4–50 letters, digits or \"/\")"
+          },
+          "courierName": {
+            "type": "string",
+            "description": "The courier’s name, 1–100 characters"
+          },
+          "packageCount": {
+            "type": "number",
+            "description": "Parcels, 1–999"
+          },
+          "replace": {
+            "type": "boolean",
+            "description": "Replace your label or AWB (before the handover)"
+          }
+        },
+        "required": [
+          "awb",
+          "courierName"
         ]
       },
       "PortalAsnRowDto": {

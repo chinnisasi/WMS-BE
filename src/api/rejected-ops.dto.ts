@@ -108,6 +108,13 @@ export class SyncReportResponse {
   rows!: SyncReportRowAckResponse[];
 }
 
+/** Story 4-4a (FA29) — one kept sheet photo of a handover review row. */
+export class RejectedOpPhotoDto {
+  @ApiProperty({ description: 'The photo ULID' }) ref!: string;
+  @ApiProperty({ type: String, nullable: true }) url!: string | null;
+  @ApiProperty({ type: String, nullable: true }) urlExpiresAt!: string | null;
+}
+
 export class RejectedOpResponse {
   @ApiProperty({ format: 'uuid' })
   id!: string;
@@ -174,6 +181,13 @@ export class RejectedOpResponse {
       "Story 13-2 — the decisions this row's op type admits (the per-type rule; a return.receive row is ['discard'] only). Always present on the list; absent only on a resolve response stored before 13-2",
   })
   decisions?: (typeof REJECTED_OP_DECISIONS)[number][];
+
+  @ApiProperty({
+    required: false,
+    type: [RejectedOpPhotoDto],
+    description: 'Story 4-4a — a handover.create row’s sheet photos still staged or attached, each with a short-lived link (null when unsigned). Absent on other rows',
+  })
+  photos?: RejectedOpPhotoDto[];
 }
 
 export class RejectedOpListQuery {

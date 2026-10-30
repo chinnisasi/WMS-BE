@@ -291,7 +291,7 @@ export class CreateClientContactDto {
     enum: [...CLIENT_EMAIL_EVENTS],
     isArray: true,
     description:
-      'Story 5-2b — the client emails this contact receives: receipt.recorded (each GRN), order.dispatched (each order). Omitted = none. No event twice; refused on the warehouse’s own (self) client',
+      'Story 5-2b — the client emails this contact receives: receipt.recorded (each GRN), order.dispatched (each order), and (story 4-4a) shipment.documents (each shipping document and signed handover sheet). Omitted = none. No event twice; refused on the warehouse’s own (self) client',
   })
   @IsOptional()
   @IsArray()
@@ -456,8 +456,8 @@ export class ClientEmailLogQuery {
 /** Story 5-2b — one client email. */
 export class ClientEmailLogItemDto {
   @ApiProperty({ format: 'uuid' }) id!: string;
-  @ApiProperty({ enum: ['receipt', 'dispatch'] }) kind!: 'receipt' | 'dispatch';
-  @ApiProperty({ description: 'The GRN code (a receipt) or the order reference (a dispatch)' }) subjectLabel!: string;
+  @ApiProperty({ enum: ['receipt', 'dispatch', 'shipment-document'] }) kind!: 'receipt' | 'dispatch' | 'shipment-document';
+  @ApiProperty({ description: 'The GRN code (a receipt), the order reference (a dispatch), or the order or HO code with its page (a shipping document — story 4-4a)' }) subjectLabel!: string;
   @ApiProperty({ description: 'The recipient' }) to!: string;
   @ApiProperty({ enum: [...EMAIL_STATUSES] }) status!: EmailStatus;
   @ApiProperty({ type: String, nullable: true, description: 'Why it was not sent, skipped or cancelled (e.g. suppressed, expired, allowlist, provider-off, unsubscribed)' })
@@ -470,6 +470,7 @@ export class ClientEmailLogItemDto {
 export class ClientEmailCapDto {
   @ApiProperty({ description: 'Today’s receipt emails reached the daily limit (500) — later receipts today were not emailed' }) receipt!: boolean;
   @ApiProperty({ description: 'Today’s dispatch emails reached the daily limit (500) — later dispatches today were not emailed' }) dispatch!: boolean;
+  @ApiProperty({ description: 'Story 4-4a — today’s shipping-document emails reached the daily limit (500)' }) shipmentDocument!: boolean;
 }
 
 export class ClientEmailLogResponse {

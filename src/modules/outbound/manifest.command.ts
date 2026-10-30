@@ -178,10 +178,22 @@ export class ManifestCommandService {
           `${wrongState.length} of the named shipment(s) are not in the labelled state: ${namedSample(wrongState)}. Only a labelled shipment closes onto a manifest.`,
         );
       }
+      // Story 4-4a (A24, A50) — a client-arranged shipment is closed by a
+      // courier handover, never a manifest. Refused BY NAME before the
+      // connection check, which would otherwise read a null connection as
+      // "different carrier connections" (or, on an all-client-arranged set,
+      // pass it and hit the manifest's NOT NULL).
+      const clientArranged = [...byId.values()].filter((row) => row.kind !== 'carrier').map((row) => row.id);
+      if (clientArranged.length > 0) {
+        throw manifestConflict(
+          'Shipments are client-arranged',
+          `${clientArranged.length} of the named shipment(s) are client-arranged (the client's own courier): ${namedSample(clientArranged)} — hand them over to the courier instead (Pack & Dispatch → Hand over). Nothing was written.`,
+        );
+      }
       // ONE connection — the hand-over document's whole point. The carrier
       // code rides the connection (a connection never changes carrier), so
       // one connection id implies one code.
-      const connectionIds = [...new Set([...byId.values()].map((row) => row.carrierConnectionId))];
+      const connectionIds = [...new Set([...byId.values()].map((row) => row.carrierConnectionId!))];
       if (connectionIds.length > 1) {
         throw manifestConflict(
           'Shipments span carrier connections',
@@ -197,8 +209,10 @@ export class ManifestCommandService {
         id: manifestId,
         tenantId: command.tenantId,
         warehouseId: command.warehouseId,
-        carrierConnectionId: first.carrierConnectionId,
-        carrierCode: first.carrierCode,
+        // Non-null: every member is a `carrier` row (the kind guard above,
+        // and `shipments_carrier_arms`).
+        carrierConnectionId: first.carrierConnectionId!,
+        carrierCode: first.carrierCode!,
         shipmentCount: shipmentIds.length,
         createdBy: command.actorUserId,
       });
@@ -243,8 +257,8 @@ export class ManifestCommandService {
           id: manifestId,
           tenantId: command.tenantId,
           warehouseId: command.warehouseId,
-          carrierConnectionId: first.carrierConnectionId,
-          carrierCode: first.carrierCode,
+          carrierConnectionId: first.carrierConnectionId!,
+          carrierCode: first.carrierCode!,
           shipmentCount: shipmentIds.length,
           shipmentIds,
           codShipmentCount: cod.codShipmentCount,

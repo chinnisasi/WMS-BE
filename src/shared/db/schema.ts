@@ -3707,6 +3707,11 @@ export const orders = pgTable(
     index('orders_tenant_client_open_idx')
       .on(table.tenantId, table.clientId, table.warehouseId)
       .where(sql`"status" IN ('accepted','ready_to_dispatch')`),
+    // Story 4-4a (0116, A5) — the handover candidates and the device's
+    // dispatch parcels: a warehouse's packed orders, oldest first.
+    index('orders_ready_to_dispatch_idx')
+      .on(table.tenantId, table.warehouseId, table.updatedAt, table.id)
+      .where(sql`status = 'ready_to_dispatch'`),
     // Story 4-2c (0104) — one follow-on per parent: the dispatch race backstop.
     uniqueIndex('orders_follow_on_of_unique')
       .on(table.tenantId, table.followOnOfOrderId)
@@ -4412,16 +4417,29 @@ export const shipments = pgTable(
     warehouseId: uuid('warehouse_id').notNull(),
     orderId: uuid('order_id').notNull(),
     status: text('status').notNull().default('labelled'),
-    /** The connection the label was generated through (the manifest groups by it). */
-    carrierConnectionId: uuid('carrier_connection_id').notNull(),
-    /** The adapter code at label time (`sandbox`, `delhivery`, …). */
-    carrierCode: text('carrier_code').notNull(),
+    /**
+     * Story 4-4a — `carrier` (4.6c, an adapter label), `client-label` (the
+     * client supplied the label PDF and its AWB) or `courier-label` (the
+     * courier brings the label; the AWB is pre-advised or scanned at
+     * handover). `shipments_kind_check` (0116).
+     */
+    kind: text('kind').notNull().default('carrier'),
+    /**
+     * Story 4-4a — the order's client, backfilled by 0116 and set by every
+     * writer. Nullable in this release so an old api task that inserts
+     * without it during the rolling deploy still works (PENDING: SET NOT NULL).
+     */
+    clientId: uuid('client_id'),
+    /** The connection the label was generated through (the manifest groups by it). Null off `carrier`. */
+    carrierConnectionId: uuid('carrier_connection_id'),
+    /** The adapter code at label time (`sandbox`, `delhivery`, …). Null off `carrier`. */
+    carrierCode: text('carrier_code'),
     /** The registry display name resolved at label time (point-in-time, 11-1 precedent). */
     carrierName: text('carrier_name').notNull(),
     /** The adapter-issued tracking number — what dispatch auto-stamps. */
     trackingNumber: text('tracking_number').notNull(),
-    /** The adapter's opaque handle for the label document — never the bytes. */
-    labelDocumentRef: text('label_document_ref').notNull(),
+    /** The adapter's opaque handle for the label document — never the bytes. Null off `carrier`. */
+    labelDocumentRef: text('label_document_ref'),
     /** The label request's optional weight (grams), same bounds as pack. */
     weightGrams: integer('weight_grams'),
     /** The label request's optional dimensions (mm), same bounds as pack. */
@@ -4436,15 +4454,49 @@ export const shipments = pgTable(
     voidedAt: timestamp('voided_at', { withTimezone: true, mode: 'string' }),
     /** Story 4-2b — who voided it (the cancelling user). */
     voidedBy: uuid('voided_by'),
+    /** Story 4-4a — the client label file (`attachments`, purpose `shipping-label`); only on `client-label`. */
+    labelAttachmentId: uuid('label_attachment_id'),
+    /** Story 4-4a — the transporter partner named as the courier, with its frozen `TransporterSnapshotV1`. */
+    courierPartnerId: uuid('courier_partner_id'),
+    courierSnapshot: jsonb('courier_snapshot'),
+    /** Story 4-4a — parcels in the shipment (1–999). */
+    packageCount: smallint('package_count'),
+    /** Story 4-4a — the courier handover that closed it (`status = 'handed_over'`). */
+    handoverId: uuid('handover_id'),
+    handedOverAt: timestamp('handed_over_at', { withTimezone: true, mode: 'string' }),
+    /** Story 4-4a — the client label scanned onto the parcel (all three or none). */
+    labelVerifiedAt: timestamp('label_verified_at', { withTimezone: true, mode: 'string' }),
+    labelVerifiedBy: uuid('label_verified_by'),
+    labelVerifiedDeviceId: uuid('label_verified_device_id'),
+    /** `scan` | `typed` | `handover-scan`. */
+    labelVerifyMethod: text('label_verify_method'),
+    /** Story 4-4a — why a client-arranged shipment was voided (1–200). */
+    voidReason: text('void_reason'),
+    /** Story 4-4a — `web` | `portal` | `handheld`; null exactly on `carrier`. */
+    recordedSurface: text('recorded_surface'),
     ...tenantTimestamps,
   },
   (table) => [
     // One LABELLED shipment per order — the race backstop behind the
     // command's already-labelled 409. Partial: a manifested shipment stops
-    // participating (its row is the order's shipment record).
+    // participating (its row is the order's shipment record). Story 4-4a: a
+    // subset of `shipments_tenant_order_live_unique` (dropping it is PENDING).
     uniqueIndex('shipments_tenant_order_labelled_unique')
       .on(table.tenantId, table.orderId)
       .where(sql`status = 'labelled'`),
+    // Story 4-4a (0116) — one LIVE shipment per order, every kind.
+    uniqueIndex('shipments_tenant_order_live_unique')
+      .on(table.tenantId, table.orderId)
+      .where(sql`status <> 'voided'`),
+    // Story 4-4a (0116, D6) — an AWB is unique among a client's OPEN
+    // client-arranged shipments (the race backstop behind `awb-in-use`).
+    uniqueIndex('shipments_client_awb_open_unique')
+      .on(table.tenantId, table.clientId, table.trackingNumber)
+      .where(sql`status = 'labelled' AND kind <> 'carrier'`),
+    // Story 4-4a (0116) — one handover's shipments.
+    index('shipments_handover_idx')
+      .on(table.tenantId, table.handoverId)
+      .where(sql`handover_id IS NOT NULL`),
     // The warehouse-scoped list's keyset index from day one (UX-DR25).
     index('shipments_tenant_warehouse_created_at_id_idx').on(
       table.tenantId,
@@ -4508,6 +4560,67 @@ export const manifests = pgTable(
 );
 
 export type Manifest = typeof manifests.$inferSelect;
+
+/**
+ * Story 4-4a — a courier handover (`HO-NNNN`): one courier, one client, one
+ * pickup. It records the courier (a transporter partner, frozen as
+ * `courier_snapshot`, or a free-text name), the pickup person, phone and
+ * vehicle, the time, the counts and the COD figures, and freezes the client
+ * and warehouse parties its sheet prints. Its shipments point back through
+ * `shipments.handover_id`; creating it dispatches every order it carries.
+ * Every CHECK and the RLS policy (the tenant arm plus the 0041 client
+ * clause) live ONLY in `drizzle/0116_client_arranged_shipping.sql`. No FKs.
+ */
+export const courierHandovers = pgTable(
+  'courier_handovers',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    code: text('code').notNull(),
+    courierPartnerId: uuid('courier_partner_id'),
+    courierSnapshot: jsonb('courier_snapshot'),
+    courierName: text('courier_name').notNull(),
+    pickupPersonName: text('pickup_person_name').notNull(),
+    pickupPersonPhone: text('pickup_person_phone'),
+    vehicleNumber: text('vehicle_number'),
+    handedOverAt: timestamp('handed_over_at', { withTimezone: true, mode: 'string' }).notNull(),
+    shipmentCount: integer('shipment_count').notNull(),
+    packageCount: integer('package_count').notNull(),
+    codShipmentCount: integer('cod_shipment_count').notNull(),
+    codTotalPaise: bigint('cod_total_paise', { mode: 'number' }).notNull(),
+    clientSnapshot: jsonb('client_snapshot').notNull(),
+    warehouseSnapshot: jsonb('warehouse_snapshot').notNull(),
+    /** `web` | `handheld`. */
+    source: text('source').notNull(),
+    deviceId: uuid('device_id'),
+    note: text('note'),
+    createdBy: uuid('created_by').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('courier_handovers_tenant_code_unique').on(table.tenantId, table.code),
+    // The warehouse list's keyset.
+    index('courier_handovers_tenant_warehouse_handed_over_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.handedOverAt.desc(),
+      table.id.desc(),
+    ),
+    // A client's handovers (5-2c's list to come).
+    index('courier_handovers_tenant_client_handed_over_idx').on(
+      table.tenantId,
+      table.clientId,
+      table.handedOverAt.desc(),
+      table.id.desc(),
+    ),
+  ],
+);
+
+export type CourierHandover = typeof courierHandovers.$inferSelect;
 
 /**
  * Transfer orders (Story 5-1, FR-18/FR-29): the two-leg relocation state
@@ -7436,6 +7549,10 @@ export const attachments = pgTable(
     sha256: text('sha256'),
     width: integer('width'),
     height: integer('height'),
+    /** Story 4-4a — a shipping document's kind (`invoice` … `other`); only on `shipping-document`. */
+    docKind: text('doc_kind'),
+    /** Story 4-4a — a PDF's page count (1–50); exactly on `application/pdf`. */
+    pageCount: smallint('page_count'),
     capturedAt: timestamp('captured_at', { withTimezone: true, mode: 'string' }),
     uploadedAt: timestamp('uploaded_at', { withTimezone: true, mode: 'string' }),
     deviceId: uuid('device_id'),
@@ -7468,6 +7585,10 @@ export const attachments = pgTable(
         sql`status in ('uploading', 'staged', 'awaited') or (status in ('removed', 'discarded') and purged_at is null)`,
       ),
     index('attachments_sweep_discovery_idx').on(table.status, table.createdAt),
+    // Story 4-4a (0116) — an order's and a handover's files.
+    index('attachments_tenant_owner_purpose_idx')
+      .on(table.tenantId, table.ownerType, table.ownerId, table.purpose)
+      .where(sql`owner_id IS NOT NULL`),
   ],
 );
 

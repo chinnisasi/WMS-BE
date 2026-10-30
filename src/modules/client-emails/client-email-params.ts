@@ -9,12 +9,16 @@ import { orderLabelOf } from '../../shared/primitives/order-label';
 import { toMilli } from '../../shared/primitives/quantity';
 import {
   CLIENT_EMAIL_MAX_LINES,
+  SHEET_PARCELS_SHOWN,
+  type ClientShipmentDocumentEmailParams,
+  type ShipmentDocumentKind,
   type ClientDispatchEmailParams,
   type ClientDispatchLineParams,
   type ClientEmailTemplate,
   type ClientReceiptEmailParams,
   type ClientReceiptLineParams,
 } from '../mail/mail.facade';
+import type { ShipmentDocumentEmailFacts, ShipmentDocumentFactInput } from '../outbound/outbound.facade';
 
 /**
  * Story 5-2b — the client notices' stored parameters, built KEY BY KEY from
@@ -176,5 +180,58 @@ export function buildDispatchEmailParams(
     lines: lines.slice(0, CLIENT_EMAIL_MAX_LINES),
     moreLines: Math.max(0, lines.length - CLIENT_EMAIL_MAX_LINES),
     shortShipped: kept.some((line) => toMilli(line.shortfallQty) > 0),
+  };
+}
+
+// ── story 4-4a: a shared shipping document ─────────────────────────────────
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DOC_KINDS = ['invoice', 'challan', 'eway-bill', 'pod', 'other'] as const;
+
+/** D6 — the `shipment.document-shared` payload, decoded key by key; null when malformed. */
+export function decodeDocumentShared(payload: unknown): ShipmentDocumentFactInput | null {
+  if (typeof payload !== 'object' || payload === null) return null;
+  const value = payload as Record<string, unknown>;
+  const id = (key: string, nullable: boolean): string | null | undefined => {
+    const raw = value[key];
+    if (raw === null && nullable) return null;
+    return typeof raw === 'string' && UUID.test(raw) ? raw : undefined;
+  };
+  const attachmentId = id('attachmentId', false);
+  const clientId = id('clientId', false);
+  const orderId = id('orderId', true);
+  const handoverId = id('handoverId', true);
+  const purpose = value.purpose;
+  const docKind = value.docKind;
+  if (attachmentId == null || clientId == null || orderId === undefined || handoverId === undefined) return null;
+  if (purpose !== 'shipping-document' && purpose !== 'handover-sheet') return null;
+  if (purpose === 'shipping-document' && (typeof docKind !== 'string' || !(DOC_KINDS as readonly string[]).includes(docKind) || orderId === null)) return null;
+  if (purpose === 'handover-sheet' && handoverId === null) return null;
+  return { attachmentId, clientId, orderId, handoverId, purpose, docKind: typeof docKind === 'string' ? docKind : null };
+}
+
+/** The `client-shipment-document` params, key by key from the payload and the enqueue-time facts. */
+export function buildShipmentDocumentEmailParams(
+  fact: ShipmentDocumentFactInput,
+  facts: ShipmentDocumentEmailFacts,
+  names: Omit<ClientEmailNames, 'warehouseName'> & { readonly warehouseName?: string },
+): ClientShipmentDocumentEmailParams {
+  const documentKind: ShipmentDocumentKind = fact.purpose === 'handover-sheet' ? 'handover-sheet' : (fact.docKind as ShipmentDocumentKind);
+  return {
+    tenantName: names.tenantName,
+    clientName: names.clientName,
+    replyTo: names.replyTo,
+    documentKind,
+    subjectLabel: facts.subjectLabel,
+    orderId: facts.orderId,
+    orderRef: facts.orderRef,
+    handoverCode: facts.handoverCode,
+    handedOverAt: facts.handedOverAt,
+    courierName: facts.courierName,
+    awb: facts.awb,
+    fileName: facts.fileName,
+    page: facts.page,
+    parcels: facts.parcels.slice(0, SHEET_PARCELS_SHOWN).map((parcel) => ({ orderRef: parcel.orderRef, awb: parcel.awb })),
+    moreParcels: Math.max(0, facts.parcels.length - SHEET_PARCELS_SHOWN),
   };
 }

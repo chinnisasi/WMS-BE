@@ -183,7 +183,12 @@ describe('client email params (story 5-2b)', () => {
 
   it('the dedupe key and the rules', () => {
     expect(clientEmailDedupeKey('client-receipt', GRN, 'a@x.in')).toBe(`client-receipt:${GRN}:a@x.in`);
-    expect(CLIENT_EMAIL_SOURCE_EVENTS).toEqual({ 'grn.recorded': 'receipt.recorded', 'order.dispatched': 'order.dispatched' });
+    // Story 4-4a — the third source: a shared shipping document or signed-sheet page.
+    expect(CLIENT_EMAIL_SOURCE_EVENTS).toEqual({
+      'grn.recorded': 'receipt.recorded',
+      'order.dispatched': 'order.dispatched',
+      'shipment.document-shared': 'shipment.documents',
+    });
     expect(CLIENT_EMAIL_DAILY_CAP).toBe(500);
     expect(CLIENT_EMAIL_STALE_EVENT_MS).toBe(24 * 60 * 60 * 1000);
     expect(clientEmailEnabled({})).toBe(false);

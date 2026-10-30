@@ -65,18 +65,24 @@ export {
 } from '../../shared/primitives/batch-allocation';
 
 /**
- * Story 5-2b (D10) — the client emails a contact may opt into: 5-2a's public
- * event names, mirrored by the 0114 `client_contacts_email_events_check` CHECK
- * (no NULL, no duplicate), the DTO's `@IsIn` and the web. Owned here (not in
+ * Story 5-2b (D10) — the client emails a contact may opt into, mirrored by
+ * the `client_contacts_email_events_check` CHECK (0114; 0116 re-added it —
+ * no NULL, no duplicate), the DTO's `@IsIn` and the web. Owned here (not in
  * `client-emails`) because the contact commands cancel by template and
  * `client-emails` imports `clients.facade` — the map there would cycle.
  * Pinned against the CHECK by `test/client-master.spec.ts`.
+ *
+ * Story 4-4a (A43) — an EMAIL-ONLY vocabulary, no longer described as 5-2a's
+ * public webhook event names (the webhook vocabulary is its own):
+ * `shipment.documents` is the shipping documents and signed handover sheets.
  */
-export const CLIENT_EMAIL_EVENTS = ['receipt.recorded', 'order.dispatched'] as const;
+export const CLIENT_EMAIL_EVENTS = ['receipt.recorded', 'order.dispatched', 'shipment.documents'] as const;
 export type ClientEmailEvent = (typeof CLIENT_EMAIL_EVENTS)[number];
 
 /** Story 5-2b — the email template each event is sent with (`mail-rules.ts` `EMAIL_TEMPLATES`). */
 export const CLIENT_EMAIL_EVENT_TEMPLATE = {
   'receipt.recorded': 'client-receipt',
   'order.dispatched': 'client-dispatch',
+  // Story 4-4a — a shipping document or a signed handover-sheet page.
+  'shipment.documents': 'client-shipment-document',
 } as const satisfies Record<ClientEmailEvent, ClientEmailTemplate>;

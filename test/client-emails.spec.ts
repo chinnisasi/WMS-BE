@@ -551,6 +551,20 @@ describe('receipt and dispatch emails (e2e, story 5-2b)', () => {
   describe('events that queue nothing (no row ever)', () => {
     afterEach(() => wipeMail(acme));
 
+    it('story 4-4a — a shared document that is gone (unknown, removed, or not the client’s) queues nothing: document-gone', async () => {
+      const docs = await createClient('DOCS', 'Docs Brand');
+      await addContact(docs, { name: 'D', email: 'd@docs.example', emailEvents: ['shipment.documents'] }).expect(201);
+      const event: DomainEvent = {
+        eventId: uuidv7(),
+        type: 'shipment.document-shared',
+        tenantId,
+        occurredAt: new Date().toISOString(),
+        payload: { attachmentId: uuidv7(), clientId: docs, orderId: uuidv7(), handoverId: null, purpose: 'shipping-document', docKind: 'pod' },
+      };
+      expect(await handler.deliver(event)).toEqual({ kind: 'skipped', reason: 'document-gone' });
+      expect(await mailRows(docs)).toHaveLength(0);
+    });
+
     it('no subscriber: a client with contacts but none opted in', async () => {
       const quiet = await createClient('QUIET', 'Quiet Brand');
       await addContact(quiet, { name: 'Q', email: 'q@quiet.example' }).expect(201);
@@ -620,13 +634,13 @@ describe('receipt and dispatch emails (e2e, story 5-2b)', () => {
       const busy = await createClient('BUSY', 'Busy Brand');
       for (const who of ['x', 'y', 'z']) await addContact(busy, { name: who, email: `${who}@busy.example`, emailEvents: ['receipt.recorded'] }).expect(201);
       await seedClientRows(busy, 'client-receipt', 499);
-      expect((await emailLog(busy).expect(200)).body.capReachedToday).toEqual({ receipt: false, dispatch: false });
+      expect((await emailLog(busy).expect(200)).body.capReachedToday).toEqual({ receipt: false, dispatch: false, shipmentDocument: false });
       expect(await handler.deliver(receiptEvent(busy))).toEqual({ kind: 'queued', queued: 3, deduped: 0 });
       expect(await mailRows(busy)).toHaveLength(502);
       expect(await handler.deliver(receiptEvent(busy))).toEqual({ kind: 'skipped', reason: 'over-cap' });
       expect(await handler.deliver(receiptEvent(busy))).toEqual({ kind: 'skipped', reason: 'over-cap' });
       expect(await mailRows(busy)).toHaveLength(502);
-      expect((await emailLog(busy).expect(200)).body.capReachedToday).toEqual({ receipt: true, dispatch: false });
+      expect((await emailLog(busy).expect(200)).body.capReachedToday).toEqual({ receipt: true, dispatch: false, shipmentDocument: false });
     });
 
     it('the IST day on the database clock: 23:59:59 IST yesterday does not count, 00:00:00 IST today does; any status counts', async () => {
@@ -636,7 +650,7 @@ describe('receipt and dispatch emails (e2e, story 5-2b)', () => {
       await seedClientRows(edge, 'client-dispatch', 2, midnight, 'cancelled');
       await seedClientRows(edge, 'client-receipt', 1, midnight, 'failed');
       const counts = await withTenantTransaction(db, tenantId, (tx: TenantTx) => clientEmailCountsTodayInTx(tx, tenantId, edge));
-      expect(counts).toEqual({ 'client-dispatch': 2, 'client-receipt': 1 });
+      expect(counts).toEqual({ 'client-dispatch': 2, 'client-receipt': 1, 'client-shipment-document': 0 });
     });
 
     it('AC: 500 ACME dispatch rows today → another ACME order dispatches, no row is written; the log answers capReachedToday.dispatch', async () => {
@@ -651,7 +665,7 @@ describe('receipt and dispatch emails (e2e, story 5-2b)', () => {
         expect(await spy.mock.results.find((r, i) => spy.mock.calls[i]![0].type === 'order.dispatched')!.value).toEqual({ kind: 'skipped', reason: 'over-cap' });
         spy.mockRestore();
         expect(await sql`select 1 from email_messages where tenant_id = ${tenantId} and dedupe_key like ${`client-dispatch:${orderId}:%`}`).toHaveLength(0);
-        expect((await emailLog(acme).expect(200)).body.capReachedToday).toEqual({ receipt: false, dispatch: true });
+        expect((await emailLog(acme).expect(200)).body.capReachedToday).toEqual({ receipt: false, dispatch: true, shipmentDocument: false });
       } finally {
         await removeContact(acme, cap).expect(200);
         await wipeMail(acme);

@@ -9,6 +9,7 @@ import {
   ingestBackorderRefusals,
   orders,
   picklistLines,
+  shipments,
   skus,
 } from '../../shared/db/schema';
 import type { Order, OrderLine, SkuStatus } from '../../shared/db/schema';
@@ -54,6 +55,7 @@ import { CatalogFacade } from '../catalog/catalog.facade';
 import type { KitCompositionLine } from '../catalog/catalog.facade';
 import { lockSkuStatusesInTx, skuInactive } from '../catalog/catalog.facade';
 import { picklistLineDrewUnits } from './wave.command';
+import { CANCELLED_VOID_REASON, voidClientArrangedShipmentInTx } from './client-arranged';
 import {
   ORDER_LINE_OWNER_TYPE,
   ORDER_LINE_RESERVATION_TTL_SECONDS,
@@ -1893,6 +1895,45 @@ export class OrderCommandService {
           .update(orderLines)
           .set({ reservedQty: 0, reservationId: null, updatedAt: nowIso() })
           .where(and(eq(orderLines.tenantId, command.tenantId), eq(orderLines.orderId, order.id)));
+        // Story 4-4a (A24, A27) — the order's live client-arranged label is
+        // voided with it ("Order cancelled"), its file removed by the same
+        // actor (D10). Under the flip's row lock, so the channel cancellation
+        // (which runs this command) does the same. The response is unchanged.
+        const liveLabel = await tx
+          .select()
+          .from(shipments)
+          .where(
+            and(
+              eq(shipments.tenantId, command.tenantId),
+              eq(shipments.orderId, order.id),
+              eq(shipments.status, 'labelled'),
+              ne(shipments.kind, 'carrier'),
+            ),
+          )
+          .for('update');
+        for (const shipment of liveLabel) {
+          // B10 — one instant for the void, its outbox event and its audit row.
+          const voidedAt = nowIso();
+          await voidClientArrangedShipmentInTx(tx, this.outbox, {
+            tenantId: command.tenantId,
+            shipment,
+            actorUserId: command.actorUserId,
+            reason: CANCELLED_VOID_REASON,
+            at: voidedAt,
+          });
+          // The label precedent (4-2b A12): the shipment's audit rows target the order.
+          await tx.insert(auditEvents).values({
+            id: uuidv7(),
+            tenantId: command.tenantId,
+            actorUserId: command.actorUserId,
+            action: 'shipment.voided',
+            targetType: 'order',
+            targetId: order.id,
+            reference: idempotencyKey,
+            changes: { shipmentId: shipment.id, reason: CANCELLED_VOID_REASON },
+            occurredAt: voidedAt,
+          });
+        }
       }
       const target =
         winner ?? (await tx.select().from(orders).where(eq(orders.id, order.id)).limit(1))[0]!;
