@@ -6,6 +6,7 @@ import {
   dispatchOrderRefOf,
   qcHeldLinesOf,
 } from './client-email-params';
+import { buildDocumentsNeededEmailParams } from './client-email-params';
 import { CLIENT_EMAIL_DAILY_CAP, CLIENT_EMAIL_SOURCE_EVENTS, CLIENT_EMAIL_STALE_EVENT_MS, clientEmailEnabled } from './client-email-rules';
 
 /**
@@ -197,5 +198,28 @@ describe('client email params (story 5-2b)', () => {
     expect(clientEmailEnabled({ CLIENT_EMAIL_ENABLED: ' TRUE ' })).toBe(true);
     expect(clientEmailEnabled({ CLIENT_EMAIL_ENABLED: 'false' })).toBe(false);
     expect(clientEmailEnabled({ CLIENT_EMAIL_ENABLED: 'yes' })).toBe(false);
+  });
+
+  it('story 4-6a (A20) — the documents-needed params over the five reasons: what is needed, the threshold it cites (national for value, the record’s for an owed bill) and an expired bill’s date', () => {
+    const names = { tenantName: 'Acme 3PL', clientName: 'ACME', warehouseName: 'Main', replyTo: null };
+    const base = { orderId: 'o-1', orderRef: 'SO-1', nationalThresholdPaise: 5_000_000, recordThresholdPaise: 10_000_000, ewayValidUntil: '2026-11-01' };
+    const cases = [
+      [{ state: 'missing', requiredBecause: 'policy-b2b' }, { needs: 'invoice', reason: 'policy-b2b', threshold: null, ewayValidUntil: null }],
+      [{ state: 'missing', requiredBecause: 'policy-all' }, { needs: 'invoice', reason: 'policy-all', threshold: null, ewayValidUntil: null }],
+      [{ state: 'missing', requiredBecause: 'value' }, { needs: 'invoice', reason: 'value', threshold: '₹50,000', ewayValidUntil: null }],
+      [{ state: 'eway-required', requiredBecause: null }, { needs: 'eway-bill', reason: 'eway-pending', threshold: '₹1,00,000', ewayValidUntil: null }],
+      [{ state: 'eway-expired', requiredBecause: null }, { needs: 'eway-bill', reason: 'eway-expired', threshold: null, ewayValidUntil: '2026-11-01' }],
+    ] as const;
+    for (const [input, expected] of cases) {
+      expect(buildDocumentsNeededEmailParams({ ...base, ...input }, names)).toEqual({
+        tenantName: 'Acme 3PL',
+        clientName: 'ACME',
+        warehouseName: 'Main',
+        orderId: 'o-1',
+        orderRef: 'SO-1',
+        replyTo: null,
+        ...expected,
+      });
+    }
   });
 });

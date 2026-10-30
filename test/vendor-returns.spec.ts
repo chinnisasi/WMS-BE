@@ -784,6 +784,23 @@ describe('story 2-8b: the return to vendor (e2e)', () => {
       await dispatch(below, captureBody({ declaredValuePaise: 1_000_000 })).expect(200);
     });
 
+    it('story 4-6a (A41) — a Karnataka vendor under a Karnataka intra-state override (₹1,00,000): ₹80,000 dispatches with no bill; an exemption without a value is 400', async () => {
+      await asOwner('post', '/eway/state-thresholds').send({ stateCode: '29', thresholdPaise: 10_000_000, effectiveFrom: new Date(Date.now() + 5.5 * 3_600_000 - 86_400_000).toISOString().slice(0, 10) }).expect(201);
+      const local = await newPartner({
+        code: 'V-KA',
+        name: 'Vendor Karnataka',
+        roles: ['vendor'],
+        gstin: '29VENDR1234Q1Z9',
+        registeredAddress: { line1: '3 Peenya Road', city: 'Bengaluru', stateCode: '29', pincode: '560058' },
+      });
+      await linkVendor(app, tenantId, ownerToken, local, brand);
+      await receiveDamagedBlind('RU', 0, 1);
+      const rtv = await createOk([line('RU', 1)], { vendorId: local, consigneeAddress: 'registered' });
+      await pick(rtv).expect(200);
+      expect((await dispatch(rtv, captureBody({ ewayExemption: { reason: 'customs' } })).expect(400)).body.detail).toMatch(/goes with a declaredValuePaise/);
+      expect(((await dispatch(rtv, captureBody({ declaredValuePaise: 8_000_000 })).expect(200)).body as Rtv).dispatch).toMatchObject({ declaredValuePaise: 8_000_000, ewayBill: null });
+    });
+
     it('A7 — the vendor is not re-checked at dispatch: a picked RTV of a vendor deactivated meanwhile dispatches and prints the frozen vendor', async () => {
       const temp = await newPartner({ code: 'V-TMP', name: 'Temp Vendor', roles: ['vendor'], registeredAddress: { line1: '5 Temp', city: 'Pune', stateCode: '27', pincode: '411001' } });
       await linkVendor(app, tenantId, ownerToken, temp, brand);

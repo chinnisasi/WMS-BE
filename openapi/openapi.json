@@ -16237,7 +16237,17 @@
             }
           },
           "400": {
-            "description": "A reason outside 1–200 characters (validation-failed)",
+            "description": "Missing or malformed Idempotency-Key, a malformed orderId, or a reason outside 1–200 characters (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -16247,7 +16257,7 @@
             }
           },
           "403": {
-            "description": "Missing orders.manage (role-denied)",
+            "description": "Session belongs to another tenant (permission-denied), a client-portal session, or missing orders.manage (role-denied)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -16363,7 +16373,17 @@
             }
           },
           "400": {
-            "description": "A malformed field, a date outside its window, a missing consignor GSTIN, or an amendment after dispatch without a reason (validation-failed)",
+            "description": "Missing or malformed Idempotency-Key, a malformed orderId, a malformed field, a date outside its window, a missing consignor GSTIN, or an amendment after dispatch without a reason (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -16373,7 +16393,7 @@
             }
           },
           "403": {
-            "description": "Missing dispatch.execute, or orders.manage for an exemption or an amendment after dispatch (role-denied)",
+            "description": "Session belongs to another tenant (permission-denied); a client-portal session or missing dispatch.execute (role-denied); orders.manage (an office role) is required for an e-way exemption, any amendment after dispatch, or a declared value that turns a required e-way bill into not-required (role-denied)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -16453,6 +16473,36 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/OrderConsignmentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed orderId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
                 }
               }
             }
@@ -16548,7 +16598,27 @@
             }
           },
           "400": {
-            "description": "A malformed clientId or view (validation-failed)",
+            "description": "A malformed warehouseId, clientId or view (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -16559,6 +16629,16 @@
           },
           "404": {
             "description": "Unknown warehouse (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No national e-way threshold in force (eway-threshold-missing)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -40848,7 +40928,7 @@
             }
           },
           "400": {
-            "description": "A malformed field or a date outside its window (validation-failed)",
+            "description": "Missing or malformed Idempotency-Key, a malformed orderId or field, a date outside its window, a missing consignor GSTIN, or an amendment after dispatch without a reason (validation-failed)",
             "content": {
               "application/problem+json": {
                 "schema": {

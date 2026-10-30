@@ -16,6 +16,12 @@ import { ewayRequired, thresholdForMovement } from '../src/shared/eway/eway-thre
 import { liveConsignmentRecordsQuery } from '../src/modules/invoicing/consignment-seam';
 import { consignmentExceptionsQuery, consignmentNeededPassQuery, portalOpenOrdersQuery } from '../src/modules/outbound/consignment.read';
 import { uuidv7 } from '../src/shared/primitives/ids';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { AttachmentsFacade } from '../src/modules/attachments/attachments.facade';
+import type { FileStore, FilePut, PresignGet, PresignedUrl } from '../src/modules/attachments/file-store';
+import { ConsignmentCommand } from '../src/modules/invoicing/consignment.command';
+import { consignmentNeededInTx, consignmentReadClock } from '../src/modules/outbound/consignment.read';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { pdfPagesText } from './support/pdf-text';
 import { expectAuditRow, noOpIdempotencyKey } from './support/audit-guard';
@@ -58,6 +64,26 @@ function ewb(): string {
   ewbCounter += 1;
   return `4101${String(ewbCounter).padStart(8, '0')}`;
 }
+
+/** An in-memory file store (the port's e2e fake, as 4-4a's suite). */
+class MemoryFileStore implements FileStore {
+  readonly mode = 'local' as const;
+  readonly objects = new Map<string, Buffer>();
+  async put(input: FilePut): Promise<void> {
+    this.objects.set(input.key, Buffer.from(input.bytes));
+  }
+  async presignGet(input: PresignGet): Promise<PresignedUrl> {
+    return { url: `https://files.example/${input.key}`, expiresAt: new Date(Date.now() + 300_000).toISOString() };
+  }
+  async delete(key: string): Promise<void> {
+    this.objects.delete(key);
+  }
+  async get(key: string): Promise<Uint8Array> {
+    return this.objects.get(key)!;
+  }
+}
+
+const JPEG = readFileSync(join(__dirname, 'fixtures', 'images', 'baseline.jpg'));
 
 /** Maharashtra — an inter-state movement from the Karnataka warehouse. */
 const MAHARASHTRA = testAddress({ state: 'Maharashtra', city: 'Pune', pincode: '411001' });
@@ -106,6 +132,7 @@ describe('client consignment compliance (e2e, story 4-6a)', () => {
     relay = app.get<unknown>(OUTBOX_RELAY) as OutboxRelay;
     mail = app.get(MailFacade);
     captured = app.get<LogEmailGateway>(EMAIL_GATEWAY);
+    app.get(AttachmentsFacade).fileStore = new MemoryFileStore();
 
     const ownerEmail = `owner-${ulid().toLowerCase()}@example.com`;
     const registered = await http().post(API).set(KEY_HEADER, ulid()).send({ name: `Docs Co ${ulid()}`, ownerEmail, password: PASSWORD }).expect(201);
@@ -826,13 +853,13 @@ describe('client consignment compliance (e2e, story 4-6a)', () => {
     const wh = uuidv7();
     const client = uuidv7();
     const template = await acceptedOrder();
-    // 24,200 orders of a fake warehouse and client (the template row's columns, fresh ids): 2,200 packed and
-    // 2,200 accepted among a history of dispatched ones — a real warehouse's shape.
+    // 24,200 orders of a fake warehouse and client (the template row's columns, fresh ids): 4,400 packed and
+    // 4,400 accepted among a history of dispatched ones — a real warehouse's shape, more open than one 5,000-row scan.
     await sql`
       insert into orders
       select (jsonb_populate_record(null::orders, to_jsonb(o) || jsonb_build_object(
         'id', gen_random_uuid(), 'warehouse_id', ${wh}::uuid, 'client_id', ${client}::uuid,
-        'status', case g % 11 when 0 then 'accepted' when 1 then 'ready_to_dispatch' else 'dispatched' end,
+        'status', case g % 11 when 0 then 'accepted' when 1 then 'accepted' when 2 then 'ready_to_dispatch' when 3 then 'ready_to_dispatch' else 'dispatched' end,
         'client_order_ref', null, 'external_event_id', null, 'source_payload_hash', null,
         'follow_on_of_order_id', null, 'follow_on_root_order_id', null, 'follow_on_seq', null,
         'created_at', now() - (g || ' minutes')::interval, 'updated_at', now() - (g || ' minutes')::interval))).*
@@ -876,6 +903,131 @@ describe('client consignment compliance (e2e, story 4-6a)', () => {
     expect(await plan(consignmentNeededPassQuery(db, tenantId, wh, null, 'accepted', 50))).toContain('orders_accepted_tenant_warehouse_idx');
     expect(await plan(consignmentExceptionsQuery(db, tenantId, wh, null))).toContain('shipments_compliance_exception_idx');
     expect(await plan(portalOpenOrdersQuery(db, tenantId, client))).toContain('orders_tenant_client_open_idx');
+    // The worklist over this warehouse scans 5,000 of its 8,800 open orders: truncated, honestly.
+    const realDb = app.get<unknown>(DATABASE) as Database;
+    const needed = await withTenantTransaction(realDb, tenantId, (tx: TenantTx) => consignmentNeededInTx(tx, tenantId, wh, null, istDay()));
+    expect(needed.truncated).toBe(true);
+  });
+
+  // ── review additions ──────────────────────────────────────────────────────
+
+  it('A45 self-heal: an e-way number live on an order an old task cancelled is withdrawn ("Order cancelled", audited with the version) and the new record lands', async () => {
+    const number = ewb();
+    const dead = await packedOrder();
+    await record(dead, body({ ewayBill: { number, date: istDay(), validUntil: istDay(1) } })).expect(201);
+    await sql`update orders set status = 'cancelled' where id = ${dead}`;
+    const fresh = await packedOrder();
+    const key = ulid();
+    await record(fresh, body({ ewayBill: { number, date: istDay(), validUntil: istDay(1) } }), opsToken, key).expect(201);
+    expect(await versions(dead)).toEqual([{ seq: 1, status: 'withdrawn', dispatched_at: null, end_reason: 'Order cancelled' }]);
+    const heal = (await sql`select changes, target_id from audit_events where tenant_id = ${tenantId} and reference = ${key} and action = 'consignment.withdrawn'`) as unknown as { changes: Record<string, unknown>; target_id: string }[];
+    expect(heal).toHaveLength(1);
+    expect(heal[0]!.target_id).toBe(dead);
+    expect(heal[0]!.changes).toMatchObject({ seq: 1, selfHeal: true, reason: 'Order cancelled', recordId: expect.any(String) });
+  });
+
+  it('A46 value drop: a floor operator amending ₹1,18,000 (bill owed) to ₹42,000 is 403; the office may', async () => {
+    const orderId = await packedOrder();
+    await record(orderId, body({ ewayBill: undefined }), floorWebToken).expect(201);
+    const lower = body({ ewayBill: undefined, declaredValuePaise: 4_200_000 });
+    expect((await record(orderId, lower, floorWebToken).expect(403)).body.detail).toBe('Only an office role can lower a declared value below the e-way threshold.');
+    expect((await record(orderId, lower).expect(201)).body.consignment.eway.status).toBe('not-required');
+  });
+
+  it('AC5 variant: a pre-advised courier label (its shipment labelled) handed over on the device with no record: that shipment row is flagged and listed', async () => {
+    const orderId = await packedOrder();
+    await http().post(`${API}/${tenantId}/outbound/orders/${orderId}/shipment/awb`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+      .send({ awb: 'AWBPRE0001', courierName: 'VRL' }).expect(201);
+    const device = await handOver({ occurredAt: new Date().toISOString(), parcels: [{ orderId, awb: 'AWBPRE0001' }] }, operatorToken).expect(201);
+    expect(device.body.parcels[0]).toMatchObject({ orderId, complianceException: 'consignment-documents-missing' });
+    expect(await sql`select status, compliance_exception from shipments where order_id = ${orderId} and status <> 'voided'`).toEqual([{ status: 'handed_over', compliance_exception: 'consignment-documents-missing' }]);
+    expect((await worklist('exceptions').expect(200)).body.exceptions.map((r: { orderId: string }) => r.orderId)).toContain(orderId);
+    expect((await readConsignment(orderId).expect(200)).body.complianceException).toBe('consignment-documents-missing');
+  });
+
+  it('a backdated web handover cannot pass a bill that has expired (409 parcel code eway-bill-expired)', async () => {
+    const orderId = await packedOrder();
+    await record(orderId, body({ brandDocument: { type: 'invoice', number: 'INV-BD', date: istDay(-3) }, ewayBill: { number: ewb(), date: istDay(-3), validUntil: istDay(-1) } })).expect(201);
+    const refused = await handOver({ occurredAt: new Date(Date.now() - 2 * 86_400_000).toISOString(), parcels: [{ orderId, awb: 'AWBBD00001' }] }).expect(409);
+    expect(refused.body.parcels.map((p: { code: string }) => p.code)).toEqual(['eway-bill-expired']);
+  });
+
+  it('a departed client’s portal record is 409 client-departed (the command’s own re-read; the guard refuses it earlier over HTTP)', async () => {
+    const gamma = await createClient('GAMMA', 'Gamma Brand');
+    const user = await portalUser(gamma);
+    await sql`update clients set status = 'departed' where id = ${gamma}`;
+    await expect(
+      app.get(ConsignmentCommand).recordPortalConsignment({ tenantId, actorUserId: user.userId, clientId: gamma, orderId: uuidv7(), body: body() as never }, ulid()),
+    ).rejects.toMatchObject({ response: expect.objectContaining({ code: 'client-departed' }) });
+  });
+
+  it('A40 — declaredBelowRatedValue: true below the rated floor (view and worklist row), false at it', async () => {
+    const below = await packedOrder({ quantity: 2, ratePaise: 6_000_000, extra: { orderType: 'b2c' } });
+    expect((await record(below, body({ ewayBill: undefined, declaredValuePaise: 6_000_000 })).expect(201)).body.consignment.declaredBelowRatedValue).toBe(true);
+    expect((await worklist().expect(200)).body.needed.find((r: { orderId: string }) => r.orderId === below)).toMatchObject({ state: 'eway-required', declaredBelowRatedValue: true });
+    const at = await packedOrder({ quantity: 2, ratePaise: 6_000_000, extra: { orderType: 'b2c' } });
+    expect((await record(at, body({ ewayBill: undefined, declaredValuePaise: 12_000_000 })).expect(201)).body.consignment.declaredBelowRatedValue).toBe(false);
+  });
+
+  it('the staff read’s warnings: a duplicate document names the other order; the consignor’s state against the warehouse GSTIN; the scans are only invoice, challan and e-way bill kinds', async () => {
+    const one = await packedOrder();
+    const two = await packedOrder();
+    const doc = { type: 'invoice', number: 'INV-DUP-1', date: istDay() };
+    await record(one, body({ brandDocument: doc })).expect(201);
+    await record(two, body({ brandDocument: doc })).expect(201);
+    const read = (await readConsignment(two).expect(200)).body;
+    expect(read.duplicates).toEqual([{ orderId: one, orderLabel: expect.any(String) }]);
+    expect(read.consignorStateMismatch).toBe(false);
+    await sql`update warehouses set gstin = '27AAACW1234F1Z5' where id = ${warehouseId}`;
+    try {
+      expect((await readConsignment(two).expect(200)).body.consignorStateMismatch).toBe(true);
+    } finally {
+      await sql`update warehouses set gstin = null where id = ${warehouseId}`;
+    }
+    for (const kind of ['invoice', 'pod']) {
+      await http().post(`${API}/${tenantId}/outbound/orders/${two}/documents`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).field('kind', kind)
+        .attach('file', JPEG, { filename: 'doc.jpg', contentType: 'image/jpeg' }).expect(201);
+    }
+    const scans = (await readConsignment(two).expect(200)).body.scans as { docKind: string }[];
+    expect(scans.map((scan) => scan.docKind)).toEqual(['invoice']);
+  });
+
+  it('the portal needed list puts packed orders before accepted ones', async () => {
+    await acceptedOrder();
+    await packedOrder();
+    const stages = ((await http().get(`${API}/${tenantId}/portal/consignments/needed`).set('Authorization', `Bearer ${acmePortal}`).expect(200)).body.items as { stage: string }[]).map((r) => r.stage);
+    expect(stages).toContain('accepted');
+    expect(stages.indexOf('accepted')).toBeGreaterThan(stages.lastIndexOf('packed'));
+  });
+
+  it('an unchanged resend by a floor operator on a dispatched order is the 200 no-op (before A46); "0042" → "42" is a real amendment (201)', async () => {
+    const orderId = await packedOrder();
+    const first = body({ brandDocument: { type: 'invoice', number: '0042', date: istDay() } });
+    await record(orderId, first).expect(201);
+    await dispatch(orderId).expect(201);
+    const noop = ulid();
+    noOpIdempotencyKey(tenantId, noop, 'consignment.record:unchanged');
+    expect((await record(orderId, first, floorWebToken, noop).expect(200)).body.unchanged).toBe(true);
+    const corrected = await record(orderId, { ...first, brandDocument: { type: 'invoice', number: '42', date: istDay() }, reason: 'Number typo' }).expect(201);
+    expect(corrected.body.consignment).toMatchObject({ seq: 2, brandDocument: { number: '42' } });
+  });
+
+  it('no national threshold in force (a data fault): the Orders tab, the candidates, the device snapshot and the portal list answer 200 without the consignment key; the explicit read keeps the 409', async () => {
+    const orderId = await packedOrder();
+    const saved = consignmentReadClock.now;
+    consignmentReadClock.now = () => Date.parse('2017-06-01T06:00:00Z');
+    try {
+      const list = await http().get(`${API}/${tenantId}/warehouses/${warehouseId}/outbound/orders?status=ready_to_dispatch&limit=100`).set('Authorization', `Bearer ${opsToken}`).expect(200);
+      expect((list.body.items as { id: string }[]).find((row) => row.id === orderId)).not.toHaveProperty('consignmentState');
+      const candidates = await http().get(`${API}/${tenantId}/warehouses/${warehouseId}/outbound/handover-candidates?clientId=${acme}&limit=200`).set('Authorization', `Bearer ${opsToken}`).expect(200);
+      expect((candidates.body.items as { orderId: string }[]).find((row) => row.orderId === orderId)).not.toHaveProperty('consignment');
+      const snapshot = await http().get(`${API}/${tenantId}/devices/catalog-snapshot?warehouseId=${warehouseId}`).set('Authorization', `Bearer ${operatorToken}`).expect(200);
+      expect((snapshot.body.dispatchParcels as { orderId: string }[]).find((row) => row.orderId === orderId)).not.toHaveProperty('consignment');
+      expect((await http().get(`${API}/${tenantId}/portal/consignments/needed`).set('Authorization', `Bearer ${acmePortal}`).expect(200)).body.items).toEqual([]);
+      expect((await readConsignment(orderId).expect(409)).body.code).toBe('eway-threshold-missing');
+    } finally {
+      consignmentReadClock.now = saved;
+    }
   });
 
   it('the routes are in the OpenAPI document', async () => {
