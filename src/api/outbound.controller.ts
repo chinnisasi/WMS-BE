@@ -3,7 +3,7 @@ import { FileInterceptor } from '@nestjs/platform-express';
 // The global `Express.Multer.File` type (FileInterceptor's upload) lives in @types/multer.
 import type {} from 'multer';
 import type { Response } from 'express';
-import { ApiBearerAuth, ApiBody, ApiConsumes, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiProduces, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiBody, ApiConsumes, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiProduces, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { MAX_SHEET_UPLOAD_BYTES } from '../shared/import/sheet-reader';
 import { SheetUploadFilter } from '../shared/import/upload-filter';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
@@ -65,6 +65,7 @@ import {
   WavePolicyListResponse,
   WavePolicyResponse,
   WaveResponse,
+  PackFileQueryDto,
 } from '../modules/outbound/outbound.dto';
 
 const IDEMPOTENCY_HEADER = [
@@ -577,21 +578,16 @@ export class OutboundController {
   @ApiResponse({ status: 422, ...problemJsonResponse('More than 1000 labels in one print (too-many-labels, naming the cartons to ask for)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'orderId', format: 'uuid' })
-  @ApiQuery({ name: 'format', required: false, enum: ['pdf', 'zpl'] })
-  @ApiQuery({ name: 'layout', required: false, enum: ['a4', 'label'] })
-  @ApiQuery({ name: 'cartons', required: false, description: 'Comma-separated carton numbers (the label layout)' })
   async packingSlip(
     @Param('tenantId') tenantId: string,
     @Param('orderId') orderId: string,
-    @Query('format') format: string | undefined,
-    @Query('layout') layout: string | undefined,
-    @Query('cartons') cartons: string | undefined,
+    @Query() fileQuery: PackFileQueryDto,
     @CurrentSession() session: TenantSession,
     @Res() res: Response,
   ): Promise<void> {
     assertOwnTenant(session, tenantId);
     assertUuidParam(orderId, 'orderId');
-    const query = parsePackFileQuery({ format, layout, cartons }, { format: 'pdf', layout: 'a4' });
+    const query = parsePackFileQuery(fileQuery, { format: 'pdf', layout: 'a4' });
     sendDocumentFile(res, await this.outbound.packingSlipFile(tenantId, orderId, query));
   }
 
@@ -617,15 +613,10 @@ export class OutboundController {
   @ApiResponse({ status: 409, ...problemJsonResponse('The order is not ready to dispatch (order-not-packed, naming its status)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'orderId', format: 'uuid' })
-  @ApiQuery({ name: 'format', required: false, enum: ['zpl', 'pdf'] })
-  @ApiQuery({ name: 'layout', required: false, enum: ['label', 'a4'] })
-  @ApiQuery({ name: 'cartons', required: false, description: 'Comma-separated carton numbers' })
   async cartonLabels(
     @Param('tenantId') tenantId: string,
     @Param('orderId') orderId: string,
-    @Query('format') format: string | undefined,
-    @Query('layout') layout: string | undefined,
-    @Query('cartons') cartons: string | undefined,
+    @Query() fileQuery: PackFileQueryDto,
     @CurrentSession() session: TenantSession,
     @Res() res: Response,
   ): Promise<void> {
@@ -633,7 +624,7 @@ export class OutboundController {
     // Authority before every path and query 400 (the 2-10b shape).
     await this.outbound.assertCanPrintCartonLabels(tenantId, session.userId);
     assertUuidParam(orderId, 'orderId');
-    const query = parsePackFileQuery({ format, layout, cartons }, { format: 'zpl', layout: 'label' });
+    const query = parsePackFileQuery(fileQuery, { format: 'zpl', layout: 'label' });
     sendDocumentFile(res, await this.outbound.cartonLabelsFile(tenantId, session.userId, orderId, query));
   }
 

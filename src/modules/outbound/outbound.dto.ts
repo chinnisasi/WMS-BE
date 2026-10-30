@@ -3228,3 +3228,27 @@ export class OrderShelfLifeResponse {
   @ApiProperty({ type: OrderShelfLifeDto })
   orderShelfLife!: OrderShelfLifeDto;
 }
+
+/**
+ * Story 4-5a (A13, A14, A48) — the packing-document file routes' query. The
+ * pipe checks only that each is a string: the vocabularies, the `zpl` + `a4`
+ * refusal and the carton list are judged by `parsePackFileQuery` — AFTER the
+ * carton labels' `labels.execute` check, so a role without it gets 403
+ * whatever it sent.
+ */
+export class PackFileQueryDto {
+  @ApiProperty({ required: false, enum: ['pdf', 'zpl'], description: 'The file format (the slip defaults to pdf, the carton labels to zpl)' })
+  @IsOptional()
+  @IsString()
+  format?: string;
+
+  @ApiProperty({ required: false, enum: ['a4', 'label'], description: 'a4 (PDF only) or label (4×6 per carton); the slip defaults to a4, the carton labels to label' })
+  @IsOptional()
+  @IsString()
+  layout?: string;
+
+  @ApiProperty({ required: false, description: 'Comma-separated carton numbers, unique, 1–200 (default every carton)', example: '1,3' })
+  @IsOptional()
+  @IsString()
+  cartons?: string;
+}

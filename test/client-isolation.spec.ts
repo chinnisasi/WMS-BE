@@ -7,6 +7,7 @@ import { withTenantTransaction, type TenantTx } from '../src/shared/db/tenant-sc
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { orderShippingInTx, handoverDetailInTx, dispatchParcelsInTx } from '../src/modules/outbound/shipping.read';
 import { listByOwnerInTx } from '../src/modules/attachments/attachment-records';
+import { packDocumentInTx } from '../src/modules/outbound/pack-documents.read';
 
 // The suite talks to the real Postgres (docker-compose dev DB by default; CI
 // provides the service container). No app boots here — this suite is about
@@ -1213,8 +1214,10 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // its parent (the 0073 EXISTS shape). Retargeted 155 → 157.
       // Story 4-4a (0116) — courier_handovers (the tenant arm plus the client
       // clause); shipments re-created with the client clause. 157 → 158.
-      expect(policies).toHaveLength(158);
-      for (const table of ['shipments', 'courier_handovers']) {
+      // Story 4-5a (0117) — order_packs, order_cartons, order_carton_lines, each
+      // with the client clause on both arms. 158 → 161.
+      expect(policies).toHaveLength(161);
+      for (const table of ['shipments', 'courier_handovers', 'order_packs', 'order_cartons', 'order_carton_lines']) {
         const row = policies.find((candidate) => candidate.tablename === table)!;
         expect(row.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
         expect(row.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
@@ -2011,6 +2014,61 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       await expect(run).rejects.toThrow(ROLLBACK);
       expect(String((refused as Error | null)?.message)).toMatch(/row-level security/);
       expect(await sql`select count(*)::int as n from shipments where id = ${shipmentId}`).toEqual([{ n: 0 }]);
+    });
+  });
+
+  describe('story 4-5a (A30): the packing document read and the three carton tables under a client stamp', () => {
+    let probeDb: PostgresJsDatabase<typeof schema>;
+    const orderA = uuidv7();
+    const packA = uuidv7();
+    const cartonA = uuidv7();
+
+    beforeAll(async () => {
+      await ensureProbeRole();
+      probeDb = drizzle(postgres(probeUrl(), { max: 1 }), { schema });
+      await sql`insert into orders (id, tenant_id, client_id, warehouse_id, status, source, destination_contact_name, destination_phone, destination_line1, destination_city, destination_state, destination_pincode)
+        values (${orderA}, ${tenantId}, ${clientA}, ${warehouseId}, 'ready_to_dispatch', 'manual', 'Ravi', '9876543210', '1 Road', 'Bengaluru', 'KA', '560001')`;
+      const parties = {
+        v: 1,
+        client: { v: 1, code: 'A', name: 'Brand A', legalName: null, gstin: null, registeredAddress: null },
+        warehouse: { code: 'WH', name: 'Main', gstin: null, address: null },
+      };
+      await sql`insert into order_packs (id, tenant_id, warehouse_id, client_id, order_id, seq, status, carton_count, document_parties, parties_frozen_at, source, packed_by, packed_at)
+        values (${packA}, ${tenantId}, ${warehouseId}, ${clientA}, ${orderA}, 1, 'live', 1, ${sql.json(parties)}, now(), 'web', ${uuidv7()}, now())`;
+      const code = 'O' + orderA.replace(/-/g, '').slice(-16).toUpperCase() + '.1.1';
+      await sql`insert into order_cartons (id, tenant_id, warehouse_id, client_id, order_id, pack_id, pack_seq, seq, code, unit_count, line_count)
+        values (${cartonA}, ${tenantId}, ${warehouseId}, ${clientA}, ${orderA}, ${packA}, 1, 1, ${code}, 2000, 1)`;
+      await sql`insert into order_carton_lines (id, tenant_id, client_id, order_id, carton_id, sku_id, qty)
+        values (${uuidv7()}, ${tenantId}, ${clientA}, ${orderA}, ${cartonA}, ${skuAId}, 2000)`;
+    });
+
+    afterAll(async () => {
+      await (probeDb as unknown as { $client: { end(): Promise<void> } } | undefined)?.$client.end();
+    });
+
+    /** The real document read with the app's client predicate REMOVED (no clientId option) — RLS alone. */
+    async function readAs(clientId: string) {
+      return withTenantTransaction(
+        probeDb,
+        tenantId,
+        async (tx) => ({
+          doc: await packDocumentInTx(tx, tenantId, orderA, { ledgerEvents: async () => [], batchFacts: async () => new Map() }, { printedAt: new Date().toISOString() }),
+          packs: (await tx.execute(dsql`select count(*)::int as n from order_packs where order_id = ${orderA}`)) as unknown as { n: number }[],
+          cartons: (await tx.execute(dsql`select count(*)::int as n from order_cartons where order_id = ${orderA}`)) as unknown as { n: number }[],
+          lines: (await tx.execute(dsql`select count(*)::int as n from order_carton_lines where order_id = ${orderA}`)) as unknown as { n: number }[],
+        }),
+        { clientId },
+      );
+    }
+
+    it('client B’s stamp sees none of A’s pack, cartons or lines and gets no document; A’s stamp gets them all (the positive control)', async () => {
+      const asB = await readAs(clientB);
+      expect(asB.doc).toBeNull();
+      expect([asB.packs[0]!.n, asB.cartons[0]!.n, asB.lines[0]!.n]).toEqual([0, 0, 0]);
+      const asA = await readAs(clientA);
+      expect([asA.packs[0]!.n, asA.cartons[0]!.n, asA.lines[0]!.n]).toEqual([1, 1, 1]);
+      expect(asA.doc?.doc.cartons.map((carton) => carton.lines.map((line) => line.qty))).toEqual([[2]]);
+      expect(asA.doc?.doc.client.name).toBe('Brand A');
     });
   });
 

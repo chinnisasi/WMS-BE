@@ -11649,6 +11649,298 @@
         ]
       }
     },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/packing-slip": {
+      "get": {
+        "description": "`format=pdf|zpl` (default pdf), `layout=a4|label` (default a4; a4 is PDF only), `cartons=1,3` (the label layout only: unique carton numbers, default every carton). One print renders at most 1000 labels. `Content-Disposition: attachment` — `{order label}-packing-slip.pdf` or `{order label}-carton-slips.{zpl|pdf}`; the name is not readable cross-origin, so a client builds it itself.",
+        "operationId": "OutboundController_packingSlip",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "format",
+            "required": false,
+            "in": "query",
+            "description": "The file format (the slip defaults to pdf, the carton labels to zpl)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pdf",
+                "zpl"
+              ]
+            }
+          },
+          {
+            "name": "layout",
+            "required": false,
+            "in": "query",
+            "description": "a4 (PDF only) or label (4×6 per carton); the slip defaults to a4, the carton labels to label",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "a4",
+                "label"
+              ]
+            }
+          },
+          {
+            "name": "cartons",
+            "required": false,
+            "in": "query",
+            "description": "Comma-separated carton numbers, unique, 1–200 (default every carton)",
+            "schema": {
+              "example": "1,3",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The slip: a PDF, or ZPL as `text/plain; charset=us-ascii`",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed orderId, format, layout or cartons list (a zero, a duplicate, above 200), or zpl with the a4 layout (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Order does not exist in this tenant, or a listed carton number is above the pack’s count (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The order is neither packed nor dispatched (order-not-packed, naming its status)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "More than 1000 labels in one print (too-many-labels, naming the cartons to ask for)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-5a — the packing slip of a packed or dispatched order: `layout=a4` (default) is the A4 PDF of the whole order — the frozen parties (brand, warehouse, consignee), the lines with batches and serials, the carton breakdown, and \"This is not a tax invoice\"; `layout=label` is the 4×6 thermal slip per carton (ZPL or PDF), a carton of more than 12 SKUs continuing on further labels. A document read — no capability beyond the session",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/carton-labels": {
+      "get": {
+        "description": "`format=zpl|pdf` (default zpl), `layout=label|a4` (default label; a4 is PDF only), `cartons=1,3` (default every carton). Only a `ready_to_dispatch` order prints (a dispatched order has left; a cancelled one has no live pack). `Content-Disposition: attachment` — `{order label}-carton-labels.{zpl|pdf}`.",
+        "operationId": "OutboundController_cartonLabels",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "format",
+            "required": false,
+            "in": "query",
+            "description": "The file format (the slip defaults to pdf, the carton labels to zpl)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pdf",
+                "zpl"
+              ]
+            }
+          },
+          {
+            "name": "layout",
+            "required": false,
+            "in": "query",
+            "description": "a4 (PDF only) or label (4×6 per carton); the slip defaults to a4, the carton labels to label",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "a4",
+                "label"
+              ]
+            }
+          },
+          {
+            "name": "cartons",
+            "required": false,
+            "in": "query",
+            "description": "Comma-separated carton numbers, unique, 1–200 (default every carton)",
+            "schema": {
+              "example": "1,3",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The labels: ZPL as `text/plain; charset=us-ascii`, or a PDF",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed orderId, format, layout or cartons list, or zpl with the a4 layout (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks labels.execute (role-denied) — checked before anything it sent",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Order does not exist in this tenant, or a listed carton number is above the pack’s count (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The order is not ready to dispatch (order-not-packed, naming its status)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-5a — labels.execute: the 4×6 carton labels of a packed order, one per carton — FROM the brand c/o the warehouse, TO the consignee, CARTON n/N, the order, weight and size, the payment (COD on carton 1 only), the courier and AWB with its barcode when a live shipment holds one, and the carton code’s barcode. ZPL (203 dpi) first; PDF one 4×6 page per carton, or two per landscape A4 sheet",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
     "/tenants/{tenantId}/outbound/orders/{orderId}/dispatch": {
       "post": {
         "operationId": "OutboundController_dispatchOrder",
@@ -39729,6 +40021,94 @@
           }
         ],
         "summary": "Story 4-4a — this order’s Shipping: the status in client words, the courier and AWB, the handover time and pickup, the label, the documents and the signed sheet (short-lived download links)",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/orders/{orderId}/packing-slip": {
+      "get": {
+        "operationId": "PortalController_orderPackingSlip",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The PDF",
+            "content": {
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed orderId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No packed order of this client — unknown, another client's, or not packed yet (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-5a — this order’s packing slip as an A4 PDF, once it is packed or dispatched: the parties, the lines with batches and serials, the cartons and their contents, and \"This is not a tax invoice\". Named `{order label}-packing-slip.pdf`",
         "tags": [
           "portal"
         ]
@@ -79327,6 +79707,48 @@
           "urlExpiresAt"
         ]
       },
+      "PortalCartonTotalDto": {
+        "type": "object",
+        "properties": {
+          "uom": {
+            "type": "string"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Base units of this UoM in the carton"
+          }
+        },
+        "required": [
+          "uom",
+          "qty"
+        ]
+      },
+      "PortalCartonDto": {
+        "type": "object",
+        "properties": {
+          "seq": {
+            "type": "number",
+            "description": "Carton number, 1..N"
+          },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true,
+            "description": "Grams, when weighed"
+          },
+          "totals": {
+            "description": "Units per UoM — never a cross-UoM total (A36)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalCartonTotalDto"
+            }
+          }
+        },
+        "required": [
+          "seq",
+          "weightGrams",
+          "totals"
+        ]
+      },
       "PortalOrderShippingResponse": {
         "type": "object",
         "properties": {
@@ -79396,6 +79818,18 @@
             "items": {
               "$ref": "#/components/schemas/PortalFileDto"
             }
+          },
+          "cartons": {
+            "nullable": true,
+            "description": "Story 4-5a — the cartons of the pack, once packed (null before)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalCartonDto"
+            }
+          },
+          "packingSlipAvailable": {
+            "type": "boolean",
+            "description": "Story 4-5a — the packing slip can be downloaded (packed or dispatched)"
           }
         },
         "required": [
@@ -79410,7 +79844,9 @@
           "pickupPersonName",
           "label",
           "documents",
-          "handoverSheet"
+          "handoverSheet",
+          "cartons",
+          "packingSlipAvailable"
         ]
       },
       "PortalShipmentViewDto": {
