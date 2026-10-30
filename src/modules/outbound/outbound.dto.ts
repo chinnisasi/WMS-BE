@@ -52,7 +52,8 @@ import { CONSIGNEE_RESOLUTIONS } from '../partners/partners.facade';
 // gate every HTTP caller actually hits. (`order.command` / `pick.command`
 // set the precedent above; `pack.command` imports no DTO, so no cycle.)
 import { MAX_DIMENSION_MM, MAX_SCAN_LINES, MAX_WEIGHT_GRAMS } from './pack.command';
-import { MAX_CARTONS_PER_PACK, MAX_PACK_SEQ, MAX_SCAN_LINES_PER_CARTON, ORDER_PACK_STATUSES } from './cartons';
+import { MAX_CARTONS_PER_PACK, MAX_PACK_SEQ, MAX_PALLET_INNER_COUNT, MAX_PALLET_WEIGHT_GRAMS, MAX_SCAN_LINES_PER_CARTON, ORDER_PACK_STATUSES } from './cartons';
+import { PACKAGE_TYPES } from '../../shared/primitives/freight';
 import { MAX_RECARTON_REASON_LENGTH } from './carton.command';
 import { GSTIN_RE, gstinDtoTransform } from '../../shared/primitives/gstin';
 import { MAX_HANDLING_UNITS_PER_REQUEST } from '../catalog/handling-unit';
@@ -1599,15 +1600,40 @@ export class DevicePackCartonDto {
     nullable: true,
     type: Number,
     minimum: 1,
-    maximum: MAX_WEIGHT_GRAMS,
-    description: 'Optional carton weight in grams.',
+    maximum: MAX_PALLET_WEIGHT_GRAMS,
+    description: 'Optional package weight in grams: a carton at most 1,000,000, a pallet at most 3,000,000 (story 4-9a).',
   })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(1)
-  @Max(MAX_WEIGHT_GRAMS)
+  @Max(MAX_PALLET_WEIGHT_GRAMS)
   weightGrams?: number | null;
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    enum: [...PACKAGE_TYPES, null],
+    description: 'Story 4-9a — the package type: `carton` (the default when absent) or `pallet` (labelled "PALLET n/N").',
+  })
+  @IsOptional()
+  @IsIn([...PACKAGE_TYPES])
+  type?: (typeof PACKAGE_TYPES)[number] | null;
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    type: Number,
+    minimum: 1,
+    maximum: MAX_PALLET_INNER_COUNT,
+    description: 'Story 4-9a — a pallet only: the cartons on it ("said to contain n cartons").',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(MAX_PALLET_INNER_COUNT)
+  innerCount?: number | null;
 }
 
 /** Story 4-5a (A7) — one carton on the web: the device shape plus optional dimensions. */
@@ -1719,6 +1745,12 @@ export class PackedCartonDto {
 
   @ApiProperty({ type: [PackedCartonLineDto] })
   lines!: readonly PackedCartonLineDto[];
+
+  @ApiProperty({ required: false, enum: [...PACKAGE_TYPES], description: 'Story 4-9a — present only on a pallet; absent is a carton.' })
+  type?: string;
+
+  @ApiProperty({ required: false, type: Number, nullable: true, description: 'Story 4-9a — a pallet\'s inner carton count.' })
+  innerCount?: number | null;
 }
 
 /** One line of the packing slip. */
@@ -1975,6 +2007,12 @@ export class PackCartonViewDto {
 
   @ApiProperty({ description: 'SKUs in the carton' })
   lineCount!: number;
+
+  @ApiProperty({ required: false, enum: [...PACKAGE_TYPES], description: 'Story 4-9a — present only on a pallet; absent is a carton.' })
+  type?: string;
+
+  @ApiProperty({ required: false, type: Number, nullable: true, description: 'Story 4-9a — a pallet\'s inner carton count.' })
+  innerCount?: number | null;
 
   @ApiProperty({ type: [UomTotalDto], description: 'Per-UoM totals — never a cross-UoM unit total' })
   totals!: UomTotalDto[];

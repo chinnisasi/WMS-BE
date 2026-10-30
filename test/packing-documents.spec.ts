@@ -466,6 +466,98 @@ describe('packing documents: cartons at pack and re-carton (e2e, story 4-5a)', (
     expect((await packedDocs(orderId)).every((doc) => !('weightGrams' in doc))).toBe(true);
   });
 
+  it('story 4-9a (A19) — pallets: a 1,250 kg pallet "STC 600" and a carton pack 201; type and inner count stored and read back; the hash adds type and innerCount to a pallet only (literal golden)', async () => {
+    const orderId = await pickedOrder([{ skuId: sku('PD-B'), quantity: 3 }]);
+    const key = ulid();
+    const body = {
+      scanned: [{ skuId: sku('PD-B'), qty: 3 }],
+      cartons: [
+        { scanned: [{ skuId: sku('PD-B'), qty: 2 }], weightGrams: 1_250_000, type: 'pallet', innerCount: 600 },
+        { scanned: [{ skuId: sku('PD-B'), qty: 1 }], weightGrams: 12_000, type: 'carton' },
+      ],
+    };
+    const res = await packWeb(orderId, body, key).expect(201);
+    expect(res.body.pack.cartons[0]).toMatchObject({ seq: 1, weightGrams: 1_250_000, type: 'pallet', innerCount: 600 });
+    expect('type' in res.body.pack.cartons[1]).toBe(false);
+    const rows = (await sql`select seq, package_type, inner_count, weight_grams from order_cartons where order_id = ${orderId} order by seq`) as unknown as Record<string, unknown>[];
+    expect(rows).toEqual([
+      { seq: 1, package_type: 'pallet', inner_count: 600, weight_grams: 1_250_000 },
+      { seq: 2, package_type: 'carton', inner_count: null, weight_grams: 12_000 },
+    ]);
+    expect((await packRows(orderId))[0]).toMatchObject({ carton_count: 2, gross_weight_grams: 1_262_000 });
+    const read = await cartonsRead(orderId).expect(200);
+    expect(read.body.pack.cartons[0]).toMatchObject({ seq: 1, type: 'pallet', innerCount: 600 });
+    expect('type' in read.body.pack.cartons[1]).toBe(false);
+    // The literal golden: `type` and `innerCount` ride the pallet's entry only; the carton's entry is 4-5a's.
+    const literal = JSON.stringify({
+      tenantId,
+      orderId,
+      scanned: [{ skuId: sku('PD-B'), qty: 3000 }],
+      cartons: [
+        { scanned: [{ skuId: sku('PD-B'), qty: 2000 }], weightGrams: 1_250_000, type: 'pallet', innerCount: 600 },
+        { scanned: [{ skuId: sku('PD-B'), qty: 1000 }], weightGrams: 12_000 },
+      ],
+    });
+    const stored = (await sql`select payload_hash from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`) as unknown as { payload_hash: string }[];
+    expect(stored[0]!.payload_hash).toBe(createHash('sha256').update(literal, 'utf8').digest('hex'));
+    // An explicit `type: 'carton'` hashes as an absent type: the same body without it replays.
+    const replay = await packWeb(orderId, { ...body, cartons: [body.cartons[0], { scanned: [{ skuId: sku('PD-B'), qty: 1 }], weightGrams: 12_000 }] }, key).expect(201);
+    expect(replay.body).toEqual(res.body);
+  });
+
+  it('story 4-9a (A19, A47) — package refusals: a 3,100 kg pallet, a 1,001 kg carton, an inner count on a carton, an inner count of 10,000, a gross over 200 t — 400, nothing written', async () => {
+    const orderId = await pickedOrder([{ skuId: sku('PD-B'), quantity: 70 }]);
+    const one = (extra: Record<string, unknown>) => ({ scanned: [{ skuId: sku('PD-B'), qty: 70 }], cartons: [{ scanned: [{ skuId: sku('PD-B'), qty: 70 }], ...extra }] });
+    const heavyPallet = await packWeb(orderId, one({ type: 'pallet', weightGrams: 3_100_000 })).expect(400);
+    expect(heavyPallet.body.code).toBe('validation-failed');
+    const heavyCarton = await packWeb(orderId, one({ weightGrams: 1_000_001 })).expect(400);
+    expect(heavyCarton.body.detail).toContain('at most 1000000');
+    const innerOnCarton = await packWeb(orderId, one({ innerCount: 12 })).expect(400);
+    expect(innerOnCarton.body.detail).toContain("innerCount (cartons on a pallet) is a pallet's");
+    const tooMany = await packWeb(orderId, one({ type: 'pallet', innerCount: 10_000 })).expect(400);
+    expect(tooMany.body.code).toBe('validation-failed');
+    const crate = await packWeb(orderId, one({ type: 'crate' })).expect(400);
+    expect(crate.body.code).toBe('validation-failed');
+    const pallets = Array.from({ length: 70 }, () => ({ scanned: [{ skuId: sku('PD-B'), qty: 1 }], type: 'pallet', weightGrams: 2_900_000 }));
+    const gross = await packWeb(orderId, { scanned: [{ skuId: sku('PD-B'), qty: 70 }], cartons: pallets }).expect(400);
+    expect(gross.body.detail).toContain('a pack is at most 200000000 g');
+    expect(await packRows(orderId)).toHaveLength(0);
+  });
+
+  it('story 4-9a (A19) — the handheld and a re-carton pack pallets too: the device op carries type and innerCount; a re-carton to pallets stores them, and the same pallets again are the 200 no-op', async () => {
+    const orderId = await pickedOrder([{ skuId: sku('PD-A'), quantity: 4 }]);
+    const device = await packDevice({
+      orderId,
+      scanned: [{ skuId: sku('PD-A'), qty: 4 }],
+      cartons: [
+        { scanned: [{ skuId: sku('PD-A'), qty: 3 }], type: 'pallet', innerCount: 30, weightGrams: 2_000_000 },
+        { scanned: [{ skuId: sku('PD-A'), qty: 1 }] },
+      ],
+    }).expect(201);
+    expect(device.body.pack.cartons[0]).toMatchObject({ type: 'pallet', innerCount: 30 });
+    const split = [
+      { scanned: [{ skuId: sku('PD-A'), qty: 2 }], type: 'pallet', innerCount: 20, weightGrams: 1_500_000 },
+      { scanned: [{ skuId: sku('PD-A'), qty: 2 }], type: 'pallet' },
+    ] as unknown as CartonBody[];
+    const first = await recarton(orderId, split).expect(201);
+    expect(first.body.pack.cartons.map((c: { type?: string; innerCount?: number | null }) => [c.type, c.innerCount])).toEqual([
+      ['pallet', 20],
+      ['pallet', null],
+    ]);
+    const rows = (await sql`select c.seq, c.package_type, c.inner_count from order_cartons c join order_packs p on p.id = c.pack_id where c.order_id = ${orderId} and p.status = 'live' order by c.seq`) as unknown as Record<string, unknown>[];
+    expect(rows).toEqual([
+      { seq: 1, package_type: 'pallet', inner_count: 20 },
+      { seq: 2, package_type: 'pallet', inner_count: null },
+    ]);
+    const again = await recarton(orderId, split, undefined, noOpIdempotencyKey(tenantId, ulid(), 'order.recarton:unchanged')).expect(200);
+    expect(again.body.unchanged).toBe(true);
+    // A carton keeps its 1,000 kg bound on a re-carton: the 1,500 kg box as a carton is a 400.
+    await recarton(orderId, [
+      { scanned: [{ skuId: sku('PD-A'), qty: 2 }], weightGrams: 1_500_000 },
+      { scanned: [{ skuId: sku('PD-A'), qty: 2 }] },
+    ] as unknown as CartonBody[], 'Unpalletised').expect(400);
+  });
+
   it('dimensions ride the ledger only for a one-carton pack (A39)', async () => {
     const orderId = await pickedOrder([{ skuId: sku('PD-A'), quantity: 2 }]);
     await packWeb(orderId, {

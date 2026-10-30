@@ -1569,6 +1569,8 @@ function packCartonsOf(
     readonly scanned: readonly { readonly skuId: string; readonly qty: number; readonly handlingUnitIds?: readonly string[] | null }[];
     readonly weightGrams?: number | null;
     readonly dimensionsMm?: { readonly lengthMm: number; readonly widthMm: number; readonly heightMm: number } | null;
+    readonly type?: 'carton' | 'pallet' | null;
+    readonly innerCount?: number | null;
   }[],
 ): PackCartonInput[] {
   return cartons.map((carton) => ({
@@ -1583,6 +1585,9 @@ function packCartonsOf(
       carton.dimensionsMm == null
         ? undefined
         : { lengthMm: carton.dimensionsMm.lengthMm, widthMm: carton.dimensionsMm.widthMm, heightMm: carton.dimensionsMm.heightMm },
+    // Story 4-9a (A19) — a `carton` type is the default and is sent as absent, so it hashes as 4-5a's body.
+    ...(carton.type === 'pallet' ? { type: 'pallet' as const } : carton.type == null || carton.type === 'carton' ? {} : { type: carton.type }),
+    ...(carton.innerCount == null ? {} : { innerCount: carton.innerCount }),
   }));
 }
 
@@ -1603,6 +1608,7 @@ function packViewBody(view: PackView): PackViewDto {
       weightGrams: carton.weightGrams,
       dimensionsMm: carton.dimensionsMm === null ? null : { ...carton.dimensionsMm },
       lineCount: carton.lineCount,
+      ...(carton.type === undefined ? {} : { type: carton.type, innerCount: carton.innerCount ?? null }),
       totals: carton.totals.map((total) => ({ uom: total.uom, qty: total.qty })),
       lines: carton.lines.map((line) => ({
         skuId: line.skuId,

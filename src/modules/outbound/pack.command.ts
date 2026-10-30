@@ -183,6 +183,9 @@ export interface PackedCartonSnapshot {
   /** Base units, Σ lines. */
   readonly unitCount: number;
   readonly lines: readonly PackedCartonLineSnapshot[];
+  /** Story 4-9a (A19) — present only on a pallet (a carton snapshot keeps 4-5a's bytes). */
+  readonly type?: 'pallet';
+  readonly innerCount?: number | null;
 }
 
 // ── snapshots ────────────────────────────────────────────────────────────────
@@ -947,6 +950,7 @@ export class PackCommandService {
           skuCode: skuById.get(line.skuId)?.code ?? line.skuId,
           qty: fromMilli(line.qty),
         })),
+        ...(carton.packageType === 'pallet' ? { type: 'pallet' as const, innerCount: carton.innerCount } : {}),
       }));
 
       const snapshot: PackSnapshot = {

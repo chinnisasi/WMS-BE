@@ -17,6 +17,7 @@ import type { TenantTx } from '../../shared/db/tenant-scope';
 import { auditEvents, orderCartonLines, orderCartons, orderPacks, skus } from '../../shared/db/schema';
 import type { LedgerEvent, OrderCarton, OrderPack } from '../../shared/db/schema';
 import { cartonCode } from '../../shared/primitives/carton-code';
+import type { PackageType } from '../../shared/primitives/freight';
 import { canonicalInstant } from '../../shared/primitives/time';
 import { fromMilli, toMilli } from '../../shared/primitives/quantity';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
@@ -43,6 +44,9 @@ export interface PackRecordCarton {
   readonly lines: readonly PackRecordLine[];
   readonly handoverId: string | null;
   readonly handoverScannedAt: string | null;
+  /** Story 4-9a (A4) — `carton` | `pallet` (a virtual pack's one carton is a carton). */
+  readonly packageType?: PackageType;
+  readonly innerCount?: number | null;
 }
 
 /** A pack, stored or virtual (A9). */
@@ -228,6 +232,8 @@ async function storedPackRecordInTx(tx: TenantTx, tenantId: string, pack: OrderP
       lines: sortById(linesByCarton.get(row.id) ?? []),
       handoverId: row.handoverId,
       handoverScannedAt: instantOrNull(row.handoverScannedAt),
+      packageType: row.packageType as PackageType,
+      innerCount: row.innerCount,
     })),
   };
 }
@@ -398,6 +404,9 @@ export interface LiveCartonFacts {
   readonly dimensionsMm: CartonDimensions | null;
   readonly handoverId: string | null;
   readonly handoverScannedAt: string | null;
+  /** Story 4-9a (A4). */
+  readonly packageType: PackageType;
+  readonly innerCount: number | null;
 }
 
 /** Decision 10 — the stored live cartons of several orders, by order id, each list in seq order. */
@@ -424,6 +433,8 @@ export async function liveCartonsOfOrdersInTx(
       dimensionsMm: dimensionsOfRow(carton),
       handoverId: carton.handoverId,
       handoverScannedAt: instantOrNull(carton.handoverScannedAt),
+      packageType: carton.packageType as PackageType,
+      innerCount: carton.innerCount,
     });
     result.set(carton.orderId, entry);
   }
@@ -473,6 +484,9 @@ export interface PackCartonView {
   readonly weightGrams: number | null;
   readonly dimensionsMm: CartonDimensions | null;
   readonly lineCount: number;
+  /** Story 4-9a (A19) — present only on a pallet; absent is a carton. */
+  readonly type?: 'pallet';
+  readonly innerCount?: number | null;
   /** A36 — per UoM, never a cross-UoM unit total. */
   readonly totals: readonly UomTotalView[];
   readonly lines: readonly PackCartonLineView[];
@@ -554,6 +568,7 @@ export async function packViewInTx(tx: TenantTx, tenantId: string, record: PackR
         weightGrams: carton.weightGrams,
         dimensionsMm: carton.dimensionsMm,
         lineCount: lines.length,
+        ...(carton.packageType === 'pallet' ? { type: 'pallet' as const, innerCount: carton.innerCount ?? null } : {}),
         totals: uomTotalsOf(lines),
         lines,
       };

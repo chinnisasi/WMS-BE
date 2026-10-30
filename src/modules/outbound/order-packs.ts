@@ -17,6 +17,7 @@ import { orderCartonLines, orderCartons, orderPacks } from '../../shared/db/sche
 import type { OrderPack } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { cartonCode } from '../../shared/primitives/carton-code';
+import type { PackageType } from '../../shared/primitives/freight';
 import { documentWarehousePartyOf, type DocumentWarehouseParty } from '../../shared/documents/parties';
 import { getWarehouseCodeInTx, invoicePartyFactsInTx } from '../tenancy/tenancy.service';
 import { clientPartySnapshotOf, getClientInTx, type ClientPartySnapshotV1 } from '../clients/clients.facade';
@@ -66,6 +67,9 @@ export interface CartonWrite {
   readonly weightGrams: number | null;
   readonly dimensionsMm: CartonDimensions | null;
   readonly lines: readonly CartonLineWrite[];
+  /** Story 4-9a (A4) — `carton` | `pallet`; absent is a carton. */
+  readonly packageType?: PackageType;
+  readonly innerCount?: number | null;
 }
 
 /** An aggregated body carton as a write: its SKUs sorted by id, each with its sorted ids. */
@@ -74,6 +78,8 @@ export function cartonWriteOf(carton: AggregatedCarton): CartonWrite {
     seq: carton.seq,
     weightGrams: carton.weightGrams,
     dimensionsMm: carton.dimensionsMm,
+    packageType: carton.packageType,
+    innerCount: carton.innerCount,
     lines: [...carton.totals.entries()]
       .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
       .map(([skuId, qty]) => ({ skuId, qty, handlingUnitIds: carton.handlingUnitIdsBySku.get(skuId) ?? null })),
@@ -107,6 +113,8 @@ export interface WrittenCarton {
   /** Milli-units. */
   readonly unitCount: number;
   readonly lines: readonly CartonLineWrite[];
+  readonly packageType: PackageType;
+  readonly innerCount: number | null;
 }
 
 export interface WrittenPack {
@@ -158,6 +166,8 @@ export async function insertPackInTx(tx: TenantTx, input: InsertPackInput): Prom
     dimensionsMm: carton.dimensionsMm,
     unitCount: carton.lines.reduce((sum, line) => sum + line.qty, 0),
     lines: carton.lines,
+    packageType: carton.packageType ?? 'carton',
+    innerCount: carton.innerCount ?? null,
   }));
   const cartonRows = written.map((carton) => ({
     id: carton.id,
@@ -177,6 +187,8 @@ export async function insertPackInTx(tx: TenantTx, input: InsertPackInput): Prom
     lineCount: carton.lines.length,
     handoverId: null,
     handoverScannedAt: null,
+    packageType: carton.packageType,
+    innerCount: carton.innerCount,
     createdAt: input.now,
   }));
   for (let at = 0; at < cartonRows.length; at += INSERT_CHUNK_ROWS) {
