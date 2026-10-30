@@ -572,6 +572,26 @@ export class LedgerReferenceDocDto {
 
   @ApiProperty({ required: false, format: 'uuid', description: 'Story 2-8b — the return-to-vendor line dispatched (vendor-return arm only)' })
   vendorReturnLineId?: string;
+
+  // ── Story 4-7c: the client-return arm (additive) ──────────────────────────
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description:
+      'Story 4-7c — the return-to-client document the units left under (client-return arm: rtc.dispatched). On a line drawn from RETURNS the arm also carries `returnReceiptLineId` and `rmaId` (absent on a DAMAGED line)',
+  })
+  clientReturnId?: string;
+
+  @ApiProperty({ required: false, format: 'uuid', description: 'Story 4-7c — the return-to-client line dispatched (client-return arm only)' })
+  clientReturnLineId?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: 'The return receipt line the units were received on — (story 4-7a) on the return-disposition arm, and (story 4-7c) on the client-return arm of a line drawn from RETURNS',
+  })
+  returnReceiptLineId?: string;
 }
 
 /** One event-timeline row. */

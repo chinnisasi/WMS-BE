@@ -1742,6 +1742,66 @@ export class CatalogOpenVendorReturnDto {
   lines!: readonly CatalogOpenVendorReturnLineDto[];
 }
 
+/** Story 4-7c (A10) — one line of an open return to client as the device snapshot carries it. */
+export class CatalogOpenClientReturnLineDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ description: '1-based, the document order' })
+  lineNo!: number;
+
+  @ApiProperty({ enum: ['returns', 'damaged'], description: 'Where the units are picked from — the Returns area or the Damaged area' })
+  source!: 'returns' | 'damaged';
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty()
+  skuName!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The batch the pick must scan (null on an untracked SKU)' })
+  batchCode!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'A serial line: the serial the pick must scan (picked 0 or 1)' })
+  serialNumber!: string | null;
+
+  @ApiProperty()
+  uom!: string;
+
+  @ApiProperty({ description: 'Units to pick (base units) — the pick takes at most this' })
+  qty!: number;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The RMA the returned units came back on (returns lines)' })
+  rmaCode!: string | null;
+}
+
+/** Story 4-7c (A10) — one draft return to client, the handheld's pick work. */
+export class CatalogOpenClientReturnDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ enum: ['client'], description: "The return shipment's kind" })
+  kind!: 'client';
+
+  @ApiProperty({ description: 'RTC-0001' })
+  code!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  clientId!: string;
+
+  @ApiProperty({ description: "The brand's frozen name (the consignee)" })
+  clientName!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC' })
+  createdAt!: string;
+
+  @ApiProperty({ type: [CatalogOpenClientReturnLineDto] })
+  lines!: readonly CatalogOpenClientReturnLineDto[];
+}
+
 /** Story 3-1 — one move reason as the device snapshot carries it. */
 export class CatalogMoveReasonDto {
   @ApiProperty({ enum: ['consolidate', 're-slot', 'make-room', 'found-misplaced', 'client-request', 'other'] })
@@ -1825,6 +1885,13 @@ export class CatalogSnapshotResponse {
       "Story 2-8b (additive): the warehouse's DRAFT returns to vendor, oldest first — the handheld's Returns out tab picks them scan-verified (rtv.pick). An older server omits it",
   })
   openVendorReturns!: readonly CatalogOpenVendorReturnDto[];
+
+  @ApiProperty({
+    type: [CatalogOpenClientReturnDto],
+    description:
+      "Story 4-7c (additive): the warehouse's DRAFT returns to client, oldest first — the handheld's Returns out tab picks them scan-verified (rtc.pick) beside the returns to vendor. An older server omits it",
+  })
+  openClientReturns!: readonly CatalogOpenClientReturnDto[];
 
   @ApiProperty({
     type: [CatalogSnapshotClientDto],

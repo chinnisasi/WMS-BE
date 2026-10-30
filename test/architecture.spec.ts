@@ -1133,6 +1133,30 @@ describe('architecture: clients are clients-module-owned (story 21-1)', () => {
     expect([...new Set(reaches)]).toEqual(['vendor-return-claims']);
   });
 
+  it('story 4-7c: returns/client-return-claims.ts imports only drizzle-orm and shared/ — inventory and inbound import it, never the returns module', () => {
+    const source = readFileSync(join(SRC_ROOT, 'modules', 'returns', 'client-return-claims.ts'), 'utf8');
+    expect(source).toMatch(/export async function openClientReturnClaimsInTx\(/);
+    expect(source).toMatch(/export async function openClientReturnClaimsByArmInTx\(/);
+    const offenders: string[] = [];
+    for (const match of source.matchAll(/from '([^']+)'/g)) {
+      const target = match[1]!;
+      if (target !== 'drizzle-orm' && !target.startsWith('../../shared/')) offenders.push(`imports ${target}`);
+    }
+    expect(offenders).toEqual([]);
+    // The inventory module reaches exactly one returns file — no facade, no module.
+    const inventoryRoot = join(SRC_ROOT, 'modules', 'inventory');
+    const reaches = files
+      .filter((file) => file.path.startsWith(inventoryRoot))
+      .flatMap((file) => [...file.source.matchAll(/from '\.\.\/returns\/([^']+)'/g)].map((m) => m[1]!));
+    expect([...new Set(reaches)]).toEqual(['client-return-claims']);
+    // And inbound reaches exactly that one returns file too.
+    const inboundRoot = join(SRC_ROOT, 'modules', 'inbound');
+    const inboundReaches = files
+      .filter((file) => file.path.startsWith(inboundRoot))
+      .flatMap((file) => [...file.source.matchAll(/from '\.\.\/returns\/([^']+)'/g)].map((m) => m[1]!));
+    expect([...new Set(inboundReaches)]).toEqual(['client-return-claims']);
+  });
+
   /**
    * Story 2-5a — the attachments module's boundary. Its records seam
    * (`attachment-records.ts`) imports only drizzle-orm and shared/ (§7h), so
@@ -2316,6 +2340,7 @@ describe('architecture: return authorizations are returns-module-owned (story 13
   const returnsRoot = join(SRC_ROOT, 'modules', 'returns');
   const returnsFiles = files.filter((file) => file.path.startsWith(returnsRoot));
   // Story 4-7a — six own tables: the dispositions and the hold settlements.
+  // Story 4-7c — eight: the return-to-client document and its lines.
   const RETURNS_TABLES = [
     'returnAuthorizations',
     'returnAuthorizationLines',
@@ -2323,9 +2348,11 @@ describe('architecture: return authorizations are returns-module-owned (story 13
     'returnReceiptLines',
     'returnDispositions',
     'returnHoldSettlements',
+    'clientReturns',
+    'clientReturnLines',
   ] as const;
   const RAW_RETURNS_WRITE =
-    /\b(insert into|update|delete from)\s+"?(return_authorizations|return_authorization_lines|return_receipts|return_receipt_lines|return_dispositions|return_hold_settlements)\b/i;
+    /\b(insert into|update|delete from)\s+"?(return_authorizations|return_authorization_lines|return_receipts|return_receipt_lines|return_dispositions|return_hold_settlements|client_returns|client_return_lines)\b/i;
   const OWN_SCHEMA_NAMES = new Set([
     'returnAuthorizations',
     'returnAuthorizationLines',
@@ -2339,6 +2366,10 @@ describe('architecture: return authorizations are returns-module-owned (story 13
     'returnHoldSettlements',
     'ReturnDispositionRow',
     'ReturnHoldSettlementRow',
+    'clientReturns',
+    'clientReturnLines',
+    'ClientReturnRow',
+    'ClientReturnLineRow',
     'idempotencyKeys',
     'auditEvents',
   ]);
@@ -2413,9 +2444,13 @@ describe('architecture: return authorizations are returns-module-owned (story 13
     const importsReturns = /(?:modules\/returns|\.\.\/returns)\//;
     // Story 1-2a: `client-wind-down` is the declared file-level seam the
     // clients status command composes (it imports only shared/ and its own table).
-    const reaching = /(?:modules\/returns|\.\.\/returns)\/(?!(?:returns\.(?:facade|module|dto)|client-wind-down)['"])/;
+    // Story 4-7c (A7, D2): `client-return-claims` is the §7h seam inbound and
+    // inventory read the RTC claims on the DAMAGED pool through (pinned to
+    // exactly those importers below).
+    const reaching = /(?:modules\/returns|\.\.\/returns)\/(?!(?:returns\.(?:facade|module|dto)|client-wind-down|client-return-claims)['"])/;
     expect(reaching.test("from '../modules/returns/return-authorization.command'")).toBe(true);
     expect(reaching.test("from '../modules/returns/returns.facade'")).toBe(false);
+    expect(reaching.test("from '../returns/client-return-claims'")).toBe(false);
     const importers = files.filter((file) => !file.path.startsWith(returnsRoot) && importsReturns.test(file.source));
     expect(importers.some((file) => file.path === join(SRC_ROOT, 'api', 'returns.controller.ts'))).toBe(true);
     const allowed = (path: string): boolean =>
@@ -2423,9 +2458,29 @@ describe('architecture: return authorizations are returns-module-owned (story 13
       path === join(SRC_ROOT, 'app.module.ts') ||
       // Story 1-2a — the clients status command composes the wind-down read
       // (and only that: `reaching` below still refuses anything else).
-      path === join(SRC_ROOT, 'modules', 'clients', 'clients.command.ts');
+      path === join(SRC_ROOT, 'modules', 'clients', 'clients.command.ts') ||
+      // Story 4-7c (A7, D2) — the RTC claims seam's three readers: the
+      // DAMAGED write-off, the RTV create and the RTV returnable read.
+      path === join(SRC_ROOT, 'modules', 'inventory', 'inventory.command.ts') ||
+      path === join(SRC_ROOT, 'modules', 'inbound', 'vendor-return.command.ts') ||
+      path === join(SRC_ROOT, 'modules', 'inbound', 'vendor-return.facade.ts') ||
+      // Story 4-7c — the ledger register names a return to client by its
+      // code, read through the facade (5-3a's registers read every owning
+      // module through its facade; returns imports nothing back).
+      path === join(SRC_ROOT, 'modules', 'reporting', 'registers.ts') ||
+      path === join(SRC_ROOT, 'modules', 'reporting', 'reporting.facade.ts') ||
+      path === join(SRC_ROOT, 'modules', 'reporting', 'reporting.module.ts');
     expect(importers.filter((file) => !allowed(file.path)).map((file) => file.path)).toEqual([]);
     expect(importers.filter((file) => reaching.test(file.source)).map((file) => file.path)).toEqual([]);
+    // Story 4-7c — the claims seam is imported by exactly its three readers.
+    const seamImporters = importers.filter((file) => /from '\.\.\/returns\/client-return-claims'/.test(file.source)).map((file) => file.path).sort();
+    expect(seamImporters).toEqual(
+      [
+        join(SRC_ROOT, 'modules', 'inbound', 'vendor-return.command.ts'),
+        join(SRC_ROOT, 'modules', 'inbound', 'vendor-return.facade.ts'),
+        join(SRC_ROOT, 'modules', 'inventory', 'inventory.command.ts'),
+      ].sort(),
+    );
     const moduleSource = readFileSync(join(returnsRoot, 'returns.module.ts'), 'utf8');
     expect(moduleSource).toMatch(/exports:\s*\[ReturnsFacade\]/);
   });
@@ -2494,7 +2549,13 @@ describe('architecture: return authorizations are returns-module-owned (story 13
     const offenders: string[] = [];
     for (const file of returnsFiles) {
       for (const match of file.source.matchAll(/from '\.\.\/inbound\/([a-z.-]+)'/g)) {
-        const allowed = match[1] === 'qc.facade' || (match[1] === 'inbound.module' && file.path === join(returnsRoot, 'returns.module.ts'));
+        // Story 4-7c (D2) — and 2-8b's RTV claims seam (§7h, imports only
+        // drizzle-orm and shared/): the RTC create and returnable read count
+        // the RTVs' claims on the one DAMAGED pool.
+        const allowed =
+          match[1] === 'qc.facade' ||
+          match[1] === 'vendor-return-claims' ||
+          (match[1] === 'inbound.module' && file.path === join(returnsRoot, 'returns.module.ts'));
         if (!allowed) offenders.push(`${file.path}: imports inbound/${match[1]!}`);
       }
       if (/\bqcHolds\b|\bqc_holds\b|\bqc_inspection/.test(file.source)) offenders.push(`${file.path}: names a QC table`);
@@ -2573,7 +2634,8 @@ describe('architecture: the client portal (story 21-7)', () => {
     // Story 3-7a — the client's batch recalls, one recall and its report.
     { file: join(SRC_ROOT, 'modules', 'reporting', 'reporting.facade.ts'), methods: ['portalServiceReport', 'portalRecalls', 'portalRecall', 'portalRecallReport'] },
     // Story 4-7a — the client's returns and their dispositions.
-    { file: join(SRC_ROOT, 'modules', 'returns', 'returns.facade.ts'), methods: ['portalReturns', 'portalReturn'] },
+    // Story 4-7c — the client's returns to client ("Shipments back to you").
+    { file: join(SRC_ROOT, 'modules', 'returns', 'returns.facade.ts'), methods: ['portalReturns', 'portalReturn', 'portalClientReturns', 'portalClientReturn'] },
     // Story 3-7a — the portal report download's audit row: an audit
     // side-effect of the read, stamped exactly like one (never a command).
     { file: join(SRC_ROOT, 'modules', 'recalls', 'recalls.facade.ts'), methods: ['portalRecordReportDownload'] },
@@ -2634,6 +2696,9 @@ describe('architecture: the client portal (story 21-7)', () => {
         'portalServiceReport',
         'portalReturns',
         'portalReturn',
+        // Story 4-7c — the client's returns to client.
+        'portalClientReturns',
+        'portalClientReturn',
         // Story 3-7a — the batch recalls.
         'portalRecalls',
         'portalRecall',

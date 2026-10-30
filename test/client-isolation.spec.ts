@@ -1206,7 +1206,18 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // dock_appointments client-bound on both arms (the 0064 ASN shape, for
       // 2-3c's portal booking), dock_appointment_documents riding its parent
       // (the asn_lines shape). Retargeted 151 → 155.
-      expect(policies).toHaveLength(155);
+      // Story 4-7c: + two (0113) — client_returns client-bound on both arms
+      // (the 0097 shape — the portal reads an RTC), client_return_lines riding
+      // its parent (the 0073 EXISTS shape). Retargeted 155 → 157.
+      expect(policies).toHaveLength(157);
+      {
+        const rtc = policies.find((row) => row.policyname === 'client_returns_tenant_isolation')!;
+        expect(rtc.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+        expect(rtc.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+        const rtcLines = policies.find((row) => row.policyname === 'client_return_lines_tenant_isolation')!;
+        expect(rtcLines.qual).toContain('client_returns');
+        expect(rtcLines.with_check).toContain('client_returns');
+      }
       {
         const appointments = policies.find((row) => row.policyname === 'dock_appointments_tenant_isolation')!;
         expect(appointments.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");

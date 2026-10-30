@@ -61,6 +61,7 @@ import { assertClientTakesWorkInTx } from '../clients/clients.facade';
 // Story 2-8b (A2) — the §7h free-function seam: inbound's open RTV claims on
 // the DAMAGED pool (it imports only drizzle-orm and shared/; no module edge).
 import { openVendorReturnClaimsInTx } from '../inbound/vendor-return-claims';
+import { openClientReturnClaimsInTx } from '../returns/client-return-claims';
 
 /**
  * `stock.adjustment` (Story 2.1): the first movement producer, exercisable
@@ -1137,7 +1138,9 @@ export class StockAdjustmentCommand {
   /**
    * Story 2-8b (A2) — the DAMAGED arm's on-hand after the write-off must still
    * cover every open RTV claim on that arm, else 409 `damaged-claimed-by-rtv`
-   * naming the RTVs. The arm is the batch row for a batch-tracked SKU (the
+   * naming the RTVs. Story 4-7c (D3) — then, whatever stage 1 decided, the
+   * on-hand must cover RTV + RTC claims together, else 409
+   * `damaged-claimed-by-rtc` naming the RTCs (and the RTVs beside them). The arm is the batch row for a batch-tracked SKU (the
    * parity check above guarantees `batchRef`), the bin's SKU row otherwise.
    */
   private async assertDamagedUnclaimedInTx(
@@ -1148,7 +1151,44 @@ export class StockAdjustmentCommand {
   ): Promise<void> {
     const batchId = sku.batchTracked ? (command.batchRef ?? null) : null;
     const claims = await openVendorReturnClaimsInTx(tx, command.tenantId, command.warehouseId, sku.id, batchId);
-    if (claims.claimedMilli <= 0) return;
+    // Story 4-7c (decision 6, D3) — the return-to-client claims on the same
+    // arm: read up front, judged in the SECOND stage below, after 2-8b's
+    // first stage (whose refusal stays byte-identical).
+    const rtcClaims = await openClientReturnClaimsInTx(tx, command.tenantId, command.warehouseId, sku.id, batchId);
+    if (claims.claimedMilli <= 0 && rtcClaims.claimedMilli <= 0) return;
+    const onHand = await this.damagedArmOnHandInTx(tx, command, sku.id, batchId);
+    // Stage 1 — 2-8b's RTV-only check (unchanged).
+    if (claims.claimedMilli > 0 && onHand - writeOffMilli < claims.claimedMilli) {
+      const free = Math.max(0, onHand - claims.claimedMilli);
+      throw new ProblemException(
+        'damaged-claimed-by-rtv',
+        409,
+        'Damaged units are claimed by a return to vendor',
+        `${fromMilli(claims.claimedMilli)} ${sku.uom} of SKU "${sku.code}" in DAMAGED are claimed by ${claims.codes.join(', ')} (on hand ${fromMilli(onHand)} ${sku.uom}) — at most ${fromMilli(free)} ${sku.uom} can be written off. Cancel the return to vendor, or write off fewer units.`,
+        { vendorReturnCodes: [...claims.codes], claimedQty: fromMilli(claims.claimedMilli), onHandQty: fromMilli(onHand) },
+      );
+    }
+    // Stage 2 — 4-7c: RTV + RTC claims together (one pool).
+    const total = claims.claimedMilli + rtcClaims.claimedMilli;
+    if (rtcClaims.claimedMilli <= 0 || onHand - writeOffMilli >= total) return;
+    const free = Math.max(0, onHand - total);
+    const holders = [...claims.codes, ...rtcClaims.codes].sort();
+    throw new ProblemException(
+      'damaged-claimed-by-rtc',
+      409,
+      'Damaged units are claimed by a return to client',
+      `${fromMilli(total)} ${sku.uom} of SKU "${sku.code}" in DAMAGED are claimed by ${holders.join(', ')} (on hand ${fromMilli(onHand)} ${sku.uom}) — at most ${fromMilli(free)} ${sku.uom} can be written off. Cancel the return to client, or write off fewer units.`,
+      {
+        clientReturnCodes: [...rtcClaims.codes],
+        vendorReturnCodes: [...claims.codes],
+        claimedQty: fromMilli(total),
+        onHandQty: fromMilli(onHand),
+      },
+    );
+  }
+
+  /** The DAMAGED arm's on-hand in the adjusted bin — the batch row, else the SKU row (milli). */
+  private async damagedArmOnHandInTx(tx: TenantTx, command: AdjustStockCommand, skuId: string, batchId: string | null): Promise<number> {
     const onHandRows =
       batchId === null
         ? await tx
@@ -1159,7 +1199,7 @@ export class StockAdjustmentCommand {
                 eq(stockOnHand.tenantId, command.tenantId),
                 eq(stockOnHand.warehouseId, command.warehouseId),
                 eq(stockOnHand.binId, command.binId),
-                eq(stockOnHand.skuId, sku.id),
+                eq(stockOnHand.skuId, skuId),
               ),
             )
         : await tx
@@ -1170,20 +1210,11 @@ export class StockAdjustmentCommand {
                 eq(batchOnHand.tenantId, command.tenantId),
                 eq(batchOnHand.warehouseId, command.warehouseId),
                 eq(batchOnHand.binId, command.binId),
-                eq(batchOnHand.skuId, sku.id),
+                eq(batchOnHand.skuId, skuId),
                 eq(batchOnHand.batchId, batchId),
               ),
             );
-    const onHand = Number(onHandRows[0]?.quantity ?? 0);
-    if (onHand - writeOffMilli >= claims.claimedMilli) return;
-    const free = Math.max(0, onHand - claims.claimedMilli);
-    throw new ProblemException(
-      'damaged-claimed-by-rtv',
-      409,
-      'Damaged units are claimed by a return to vendor',
-      `${fromMilli(claims.claimedMilli)} ${sku.uom} of SKU "${sku.code}" in DAMAGED are claimed by ${claims.codes.join(', ')} (on hand ${fromMilli(onHand)} ${sku.uom}) — at most ${fromMilli(free)} ${sku.uom} can be written off. Cancel the return to vendor, or write off fewer units.`,
-      { vendorReturnCodes: [...claims.codes], claimedQty: fromMilli(claims.claimedMilli), onHandQty: fromMilli(onHand) },
-    );
+    return Number(onHandRows[0]?.quantity ?? 0);
   }
 
   /**

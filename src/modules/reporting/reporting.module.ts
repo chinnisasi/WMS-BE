@@ -5,6 +5,7 @@ import { InboundModule } from '../inbound/inbound.module';
 import { InventoryModule } from '../inventory/inventory.module';
 import { OutboundModule } from '../outbound/outbound.module';
 import { RecallsModule } from '../recalls/recalls.module';
+import { ReturnsModule } from '../returns/returns.module';
 import { ReportingFacade } from './reporting.facade';
 
 /**
@@ -23,9 +24,12 @@ import { ReportingFacade } from './reporting.facade';
  *
  * Story 3-7a — the batch recall's detail, trace and report read the recall
  * document through `RecallsFacade` (recalls imports nothing back).
+ *
+ * Story 4-7c — the ledger register names a return to client by its code,
+ * read through `ReturnsFacade` (returns imports nothing back).
  */
 @Module({
-  imports: [SharedModule, InventoryModule, InboundModule, OutboundModule, CatalogModule, RecallsModule],
+  imports: [SharedModule, InventoryModule, InboundModule, OutboundModule, CatalogModule, RecallsModule, ReturnsModule],
   providers: [ReportingFacade],
   exports: [ReportingFacade],
 })

@@ -16,6 +16,8 @@ import {
   type RtvSourceKind,
 } from './vendor-return.command';
 import { damagedArmKey, openVendorReturnClaimsByArmInTx, sourceClaimsByGrnLineInTx } from './vendor-return-claims';
+import { openClientReturnClaimsByArmInTx } from '../returns/client-return-claims';
+import { mergeArmClaims } from './vendor-return.command';
 import {
   grnLineSourceFactsInTx,
   listVendorReturnsInTx,
@@ -147,7 +149,12 @@ export class VendorReturnFacade {
       const truncatedArms = supported.length > RETURNABLE_MAX_ARMS;
       const arms = supported.slice(0, RETURNABLE_MAX_ARMS);
       const skuIds = [...new Set(arms.map((arm) => arm.skuId))];
-      const claims = await openVendorReturnClaimsByArmInTx(tx, tenantId, warehouseId, skuIds);
+      // Story 4-7c (D4) — one pool: RTC claims count before `available` and
+      // before each source's `claimable` cap (the field names do not change).
+      const claims = mergeArmClaims(
+        await openVendorReturnClaimsByArmInTx(tx, tenantId, warehouseId, skuIds),
+        await openClientReturnClaimsByArmInTx(tx, tenantId, warehouseId, skuIds),
+      );
       const intakes = await this.inventory.damagedIntakeGrnLinesInTx(tx, tenantId, warehouseId, bin.binId, skuIds);
       const grnLineIds = intakes.map((row) => row.grnLineId);
       const sources = await grnLineSourceFactsInTx(tx, tenantId, grnLineIds);

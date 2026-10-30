@@ -158,6 +158,13 @@ export type RejectedOpType =
   // the RTV again. Excluded from `ApplicableOpType`, so tenancy never imports
   // the RTV command.
   | 'rtv.pick'
+  // Story 4-7c — the handheld's pick of a return to client, refused on
+  // replay (the RTC was cancelled or picked meanwhile, its lines changed,
+  // every line picked 0, another warehouse's RTC, a role that lost the
+  // floor). DEVICE-UPLOADED; Discard ONLY: the pick moved nothing, so there
+  // is nothing to re-apply. Excluded from `ApplicableOpType`, so tenancy
+  // never imports returns.
+  | 'rtc.pick'
   // Story 4-7b — an unannounced parcel's refused entries (server-raised: the
   // catalog could not place them — an unknown SKU, serial or batch, another
   // client's item) or a whole-op refusal (device-uploaded). Discard ONLY:
@@ -186,6 +193,7 @@ export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'return.restock',
   'rtv.pick',
   'return.receive_blind',
+  'rtc.pick',
 ];
 
 /**
@@ -266,6 +274,8 @@ export const REJECTED_OP_DECISIONS_BY_TYPE: Readonly<Record<RejectedOpType, read
   'return.restock': ['discard'],
   // Story 2-8b — a refused RTV pick: Discard only (see the type's comment).
   'rtv.pick': ['discard'],
+  // Story 4-7c — a refused RTC pick: Discard only (the rtv.pick shape).
+  'rtc.pick': ['discard'],
   // Story 4-7b — an unannounced parcel's refused entries: Discard only.
   'return.receive_blind': ['discard'],
 };
@@ -287,6 +297,7 @@ type ApplicableOpType = Exclude<
   | 'return.restock'
   | 'rtv.pick'
   | 'return.receive_blind'
+  | 'rtc.pick'
 >;
 
 function isApplicableOpType(opType: RejectedOpType): opType is ApplicableOpType {
@@ -545,6 +556,14 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
   ],
   'rtv.pick': [
     ['vendorReturnId', 'string'],
+    ['warehouseId', 'uuid-or-null'],
+    ['occurredAt', 'string'],
+    ['lines', 'array'],
+  ],
+  // Story 4-7c — the handheld's RTC pick as it enqueued it (the request body
+  // plus the RTC id the path carries); a malformed id still reaches the queue.
+  'rtc.pick': [
+    ['clientReturnId', 'string'],
     ['warehouseId', 'uuid-or-null'],
     ['occurredAt', 'string'],
     ['lines', 'array'],
@@ -1280,7 +1299,9 @@ export class SyncReportCommand {
                         ? ' The lines were already booked — acknowledge the row.'
                         : row.opType === 'rtv.pick'
                           ? ' The pick moved nothing — return any staged units to DAMAGED, or pick the return to vendor again on the handheld.'
-                          : ''),
+                          : row.opType === 'rtc.pick'
+                            ? ' The pick moved nothing — return any staged units to the Returns or Damaged area, or pick the return to client again on the handheld.'
+                            : ''),
             { decisions: [...admitted] },
           );
         }

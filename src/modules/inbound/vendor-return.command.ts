@@ -36,6 +36,7 @@ import { CatalogFacade } from '../catalog/catalog.facade';
 import { uomPrecision } from '../catalog/uom';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import { damagedArmKey, openVendorReturnClaimsByArmInTx, sourceClaimsByGrnLineInTx } from './vendor-return-claims';
+import { openClientReturnClaimsByArmInTx } from '../returns/client-return-claims';
 import {
   consigneeAddressOf,
   grnLineSourceFactsInTx,
@@ -365,7 +366,12 @@ export class VendorReturnCommand {
       const damagedBin = await findDamagedBinInTx(tx, tenantId, normalized.warehouseId);
       const arms = damagedBin === null ? [] : await this.inventory.damagedArmsInTx(tx, tenantId, normalized.warehouseId, damagedBin.binId, { skuIds });
       const onHand = new Map(arms.map((arm) => [damagedArmKey(arm.skuId, arm.batchId), arm.quantity]));
-      const claims = await openVendorReturnClaimsByArmInTx(tx, tenantId, normalized.warehouseId, skuIds);
+      const rtvClaims = await openVendorReturnClaimsByArmInTx(tx, tenantId, normalized.warehouseId, skuIds);
+      // Story 4-7c (decision 6, D4) — ONE pool: the open return-to-client
+      // claims on the same arms count too (the code and the `claimedQty`
+      // extension name both kinds, sorted).
+      const rtcClaims = await openClientReturnClaimsByArmInTx(tx, tenantId, normalized.warehouseId, skuIds);
+      const claims = mergeArmClaims(rtvClaims, rtcClaims);
       // A4 — the request is summed PER ARM across its lines (two sources, one arm).
       const requested = new Map<string, { milli: number; skuId: string; batchId: string | null }>();
       for (const line of lines) {
@@ -888,6 +894,28 @@ export class VendorReturnCommand {
       throw err;
     }
   }
+}
+
+/**
+ * Story 4-7c (D4) — the RTV and RTC claims of each DAMAGED arm summed, their
+ * codes merged and sorted (the two seams key arms identically — pinned by
+ * test/client-returns.spec.ts).
+ */
+export function mergeArmClaims(
+  rtv: ReadonlyMap<string, { readonly claimedMilli: number; readonly codes: readonly string[] }>,
+  rtc: ReadonlyMap<string, { readonly claimedMilli: number; readonly codes: readonly string[] }>,
+): Map<string, { claimedMilli: number; codes: string[] }> {
+  const out = new Map<string, { claimedMilli: number; codes: string[] }>();
+  for (const source of [rtv, rtc]) {
+    for (const [key, claim] of source) {
+      const entry = out.get(key) ?? { claimedMilli: 0, codes: [] };
+      entry.claimedMilli += claim.claimedMilli;
+      entry.codes.push(...claim.codes);
+      out.set(key, entry);
+    }
+  }
+  for (const entry of out.values()) entry.codes.sort();
+  return out;
 }
 
 /** A9 — the dispatch hash's capture fields, in a fixed order, absent as null. */

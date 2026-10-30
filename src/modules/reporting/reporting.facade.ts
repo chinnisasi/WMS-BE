@@ -9,6 +9,7 @@ import { UUID_RE } from '../../shared/primitives/ids';
 import { assertWarehouseInTenant, getMemberRoleIn, getWarehouseCodeInTx } from '../tenancy/tenancy.service';
 import { CatalogFacade } from '../catalog/catalog.facade';
 import { InboundFacade } from '../inbound/inbound.facade';
+import { ReturnsFacade } from '../returns/returns.facade';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import { OutboundFacade } from '../outbound/outbound.facade';
 import { RecallsFacade, type RecallMode, type RecallStatus } from '../recalls/recalls.facade';
@@ -372,6 +373,8 @@ export class ReportingFacade {
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
     // Story 3-7a — the recall document and its ONE figures definition.
     @Inject(RecallsFacade) private readonly recalls: RecallsFacade,
+    // Story 4-7c — the ledger register names a return to client by its code.
+    @Inject(ReturnsFacade) private readonly returns: ReturnsFacade,
   ) {}
 
   // ── story 3-7a: the batch recall's reads and report ─────────────────────
@@ -725,7 +728,7 @@ export class ReportingFacade {
             now,
             maxRows: this.registerMaxRows,
             limit: this.registerMaxRows + 1,
-            sources: { inventory: this.inventory, inbound: this.inbound, outbound: this.outbound, catalog: this.catalog },
+            sources: { inventory: this.inventory, inbound: this.inbound, outbound: this.outbound, catalog: this.catalog, returns: this.returns },
           });
           assertWithinCap(query.report, cells.length, this.registerMaxRows);
           return { rows: cells, warehouseCode: code, clientCode: client };

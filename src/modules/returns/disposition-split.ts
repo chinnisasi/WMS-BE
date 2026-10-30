@@ -1,5 +1,13 @@
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
-import { returnAuthorizations, returnDispositions, returnHoldSettlements, returnReceiptLines, returnReceipts } from '../../shared/db/schema';
+import {
+  clientReturnLines,
+  clientReturns,
+  returnAuthorizations,
+  returnDispositions,
+  returnHoldSettlements,
+  returnReceiptLines,
+  returnReceipts,
+} from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 
@@ -16,6 +24,15 @@ import { ProblemException } from '../../shared/problem-details/problem.exception
  *
  * Conservation: `qty = open_qty + restocked + scrapped + onHold + failed`,
  * i.e. `open_qty = qty − restocked − scrapped − quarantined + returned`.
+ *
+ * Story 4-7c (decision 5, D6) — the return to client is the FOURTH
+ * outcome, read from the module's own `client_return_lines`:
+ * - `returningToClient` — Σ the line's claims on `draft` (`qty`) and
+ *   `picked` (`picked_qty`) RTCs: units on a return shipment not yet gone;
+ * - `returnedToClient` — Σ `picked_qty` of its lines on `dispatched` RTCs.
+ * A cancelled RTC claims nothing. `rtcClaimed = returningToClient +
+ * returnedToClient` joins the equation:
+ * `open_qty = basis − restocked − scrapped − quarantined + returned − rtcClaimed`.
  */
 export interface LineSplit {
   readonly restocked: number;
@@ -27,6 +44,10 @@ export interface LineSplit {
   readonly onHold: number;
   readonly priorQuarantines: number;
   readonly lastReasonCode: string | null;
+  /** Story 4-7c — on a draft or picked return to client (milli). */
+  readonly returningToClient: number;
+  /** Story 4-7c — shipped back to the client (milli). */
+  readonly returnedToClient: number;
 }
 
 export const EMPTY_SPLIT: LineSplit = {
@@ -39,7 +60,12 @@ export const EMPTY_SPLIT: LineSplit = {
   onHold: 0,
   priorQuarantines: 0,
   lastReasonCode: null,
+  returningToClient: 0,
+  returnedToClient: 0,
 };
+
+/** Story 4-7c — the RTC statuses whose lines still claim their receipt line's units (dispatched stays claimed, as shipped). */
+export const RTC_CLAIMING_STATUSES = ['draft', 'picked', 'dispatched'] as const;
 
 /** The split of each named receipt line (a line with no disposition is absent — read it as `EMPTY_SPLIT`). */
 export async function lineSplitsInTx(tx: TenantTx, tenantId: string, lineIds: readonly string[]): Promise<Map<string, LineSplit>> {
@@ -80,9 +106,28 @@ export async function lineSplitsInTx(tx: TenantTx, tenantId: string, lineIds: re
     )
     .orderBy(returnDispositions.returnReceiptLineId, desc(returnDispositions.createdAt), desc(returnDispositions.id));
   const reasonByLine = new Map(reasons.map((row) => [row.lineId, row.reasonCode]));
+  // Story 4-7c — the return-to-client claims of each line (own tables).
+  const rtc = await tx
+    .select({
+      lineId: clientReturnLines.returnReceiptLineId,
+      returning: sql<string>`coalesce(sum(case when ${clientReturns.status} = 'draft' then ${clientReturnLines.qty} else ${clientReturnLines.pickedQty} end) filter (where ${clientReturns.status} in ('draft', 'picked')), 0)::bigint`,
+      returned: sql<string>`coalesce(sum(${clientReturnLines.pickedQty}) filter (where ${clientReturns.status} = 'dispatched'), 0)::bigint`,
+    })
+    .from(clientReturnLines)
+    .innerJoin(clientReturns, and(eq(clientReturns.tenantId, clientReturnLines.tenantId), eq(clientReturns.id, clientReturnLines.clientReturnId)))
+    .where(
+      and(
+        eq(clientReturnLines.tenantId, tenantId),
+        inArray(clientReturnLines.returnReceiptLineId, ids),
+        inArray(clientReturns.status, [...RTC_CLAIMING_STATUSES]),
+      ),
+    )
+    .groupBy(clientReturnLines.returnReceiptLineId);
+  const rtcByLine = new Map(rtc.map((row) => [row.lineId!, { returning: Number(row.returning), returned: Number(row.returned) }]));
   for (const row of sums) {
     const quarantined = Number(row.quarantined);
     const settledHeld = Number(row.settledHeld);
+    const claim = rtcByLine.get(row.lineId);
     out.set(row.lineId, {
       restocked: Number(row.restocked),
       scrapped: Number(row.scrapped),
@@ -93,7 +138,14 @@ export async function lineSplitsInTx(tx: TenantTx, tenantId: string, lineIds: re
       onHold: quarantined - settledHeld,
       priorQuarantines: Number(row.quarantines),
       lastReasonCode: reasonByLine.get(row.lineId) ?? null,
+      returningToClient: claim?.returning ?? 0,
+      returnedToClient: claim?.returned ?? 0,
     });
+  }
+  // A line with RTC claims and no disposition row.
+  for (const [lineId, claim] of rtcByLine) {
+    if (out.has(lineId)) continue;
+    out.set(lineId, { ...EMPTY_SPLIT, returningToClient: claim.returning, returnedToClient: claim.returned });
   }
   return out;
 }
@@ -144,10 +196,12 @@ export async function assertLinesConservedInTx(tx: TenantTx, tenantId: string, l
   for (const line of lines) {
     const split = splits.get(line.id) ?? EMPTY_SPLIT;
     const basis = dispositionBasis(Number(line.qty), line.reviewStatus);
-    const expected = basis - split.restocked - split.scrapped - split.quarantined + split.returned;
+    // Story 4-7c (D6) — the fourth outcome: the return-to-client claims.
+    const rtcClaimed = split.returningToClient + split.returnedToClient;
+    const expected = basis - split.restocked - split.scrapped - split.quarantined + split.returned - rtcClaimed;
     if (Number(line.openQty) !== expected || split.onHold < 0) {
       throw dispositionDataFault(
-        `Return receipt line "${line.id}" does not conserve: open ${Number(line.openQty)} milli-units, but basis ${basis} (received ${Number(line.qty)}, review ${line.reviewStatus ?? 'none'}) − restocked ${split.restocked} − scrapped ${split.scrapped} − quarantined ${split.quarantined} + returned ${split.returned} = ${expected}.`,
+        `Return receipt line "${line.id}" does not conserve: open ${Number(line.openQty)} milli-units, but basis ${basis} (received ${Number(line.qty)}, review ${line.reviewStatus ?? 'none'}) − restocked ${split.restocked} − scrapped ${split.scrapped} − quarantined ${split.quarantined} + returned ${split.returned} − to client ${rtcClaimed} = ${expected}.`,
       );
     }
   }

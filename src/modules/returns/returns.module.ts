@@ -10,6 +10,7 @@ import { ReturnAuthorizationCommand } from './return-authorization.command';
 import { ReturnReceiptCommand } from './return-receipt.command';
 import { ReturnsFacade } from './returns.facade';
 import { BlindReturnCommand } from './blind-return.command';
+import { ClientReturnCommand } from './client-return.command';
 
 /**
  * Returns module (story 13-1, Epic 13 — the platform's first reverse flow).
@@ -42,13 +43,28 @@ import { BlindReturnCommand } from './blind-return.command';
  * the module's own tables and reaches outbound (the parcel lookup, the
  * returnable facts) through `OutboundFacade`.
  *
+ * Story 4-7c adds `ClientReturnCommand` (the return to client: create,
+ * `rtc.pick`, dispatch, cancel) and two more tables it owns exclusively
+ * (`client_returns`, `client_return_lines`). It reaches clients and partners
+ * through their facade free functions and the RTV claims through 2-8b's
+ * `inbound/vendor-return-claims.ts` seam; inbound and inventory read the RTC
+ * claims only through `client-return-claims.ts` (§7h).
+ *
  * Exports only its facade. Nothing imports this module back but the api shell
  * and the root composition, so there is no cycle. `forwardRef(catalog)`: the
  * catalog ↔ tenancy pattern every catalog importer follows.
  */
 @Module({
   imports: [SharedModule, OutboundModule, InventoryModule, forwardRef(() => CatalogModule), forwardRef(() => InboundModule)],
-  providers: [ReturnAuthorizationCommand, ReturnReceiptCommand, ReturnDispositionCommand, ReturnHoldSettlementHandler, BlindReturnCommand, ReturnsFacade],
+  providers: [
+    ReturnAuthorizationCommand,
+    ReturnReceiptCommand,
+    ReturnDispositionCommand,
+    ReturnHoldSettlementHandler,
+    BlindReturnCommand,
+    ClientReturnCommand,
+    ReturnsFacade,
+  ],
   exports: [ReturnsFacade],
 })
 export class ReturnsModule {}

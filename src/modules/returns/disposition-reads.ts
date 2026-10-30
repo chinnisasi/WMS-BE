@@ -1,5 +1,7 @@
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import {
+  clientReturnLines,
+  clientReturns,
   returnAuthorizationLines,
   returnAuthorizations,
   returnDispositions,
@@ -216,6 +218,10 @@ export interface PortalReturnRow {
   readonly failedInspectionTotal: number;
   readonly scrappedTotal: number;
   readonly openTotal: number;
+  /** Story 4-7c — units on a draft or picked return to client (base units). */
+  readonly returningToClientTotal: number;
+  /** Story 4-7c — units shipped back to the client (base units). */
+  readonly returnedToClientTotal: number;
 }
 
 export interface PortalReturnLine {
@@ -229,6 +235,10 @@ export interface PortalReturnLine {
   readonly failedInspectionQty: number;
   readonly scrappedQty: number;
   readonly openQty: number;
+  /** Story 4-7c — on a draft or picked return to client. */
+  readonly returningToClientQty: number;
+  /** Story 4-7c — shipped back to the client. */
+  readonly returnedToClientQty: number;
 }
 
 export interface PortalReturnDisposition {
@@ -252,9 +262,11 @@ interface Totals {
   settledHeld: number;
   failed: number;
   open: number;
+  returningToClient: number;
+  returnedToClient: number;
 }
 
-const ZERO: Totals = { received: 0, restocked: 0, scrapped: 0, quarantined: 0, settledHeld: 0, failed: 0, open: 0 };
+const ZERO: Totals = { received: 0, restocked: 0, scrapped: 0, quarantined: 0, settledHeld: 0, failed: 0, open: 0, returningToClient: 0, returnedToClient: 0 };
 
 /**
  * The per-RMA-line totals of a set of authorizations, from the module's own
@@ -319,6 +331,34 @@ async function rmaLineTotalsInTx(tx: TenantTx, tenantId: string, clientId: strin
     totals.settledHeld = Number(row.settledHeld);
     totals.failed = Number(row.failed);
   }
+  // Story 4-7c (D6) — the return-to-client claims, through the client-scoped
+  // RTC header (`client_returns.client_id = $client`).
+  const rtc = await tx
+    .select({
+      rmaLineId: returnReceiptLines.rmaLineId,
+      returning: sql<string>`coalesce(sum(case when ${clientReturns.status} = 'draft' then ${clientReturnLines.qty} else ${clientReturnLines.pickedQty} end) filter (where ${clientReturns.status} in ('draft', 'picked')), 0)::bigint`,
+      returned: sql<string>`coalesce(sum(${clientReturnLines.pickedQty}) filter (where ${clientReturns.status} = 'dispatched'), 0)::bigint`,
+    })
+    .from(clientReturnLines)
+    .innerJoin(clientReturns, and(eq(clientReturns.tenantId, clientReturnLines.tenantId), eq(clientReturns.id, clientReturnLines.clientReturnId)))
+    .innerJoin(
+      returnReceiptLines,
+      and(eq(returnReceiptLines.tenantId, clientReturnLines.tenantId), eq(returnReceiptLines.id, clientReturnLines.returnReceiptLineId)),
+    )
+    .where(
+      and(
+        eq(clientReturns.tenantId, tenantId),
+        eq(clientReturns.clientId, clientId),
+        inArray(clientReturnLines.rmaId, [...rmaIds]),
+        inArray(clientReturns.status, ['draft', 'picked', 'dispatched']),
+      ),
+    )
+    .groupBy(returnReceiptLines.rmaLineId);
+  for (const row of rtc) {
+    const totals = get(row.rmaLineId);
+    totals.returningToClient = Number(row.returning);
+    totals.returnedToClient = Number(row.returned);
+  }
   return out;
 }
 
@@ -331,7 +371,11 @@ function portalVisiblePredicate() {
   return sql`(${returnAuthorizations.origin} = 'authorized' or ${returnAuthorizations.reviewStatus} = 'accepted')`;
 }
 
-/** The `awaiting` predicate over `return_authorizations` (A30): an open line, or a quarantine with no settlement. */
+/**
+ * The `awaiting` predicate over `return_authorizations` (A30): an open line,
+ * or a quarantine with no settlement — or (4-7c A5) a line on a draft or
+ * picked return to client (the goods are still on the dock).
+ */
 function awaitingPredicate(tenantId: string, clientId: string) {
   return sql`(
     exists (
@@ -348,6 +392,12 @@ function awaitingPredicate(tenantId: string, clientId: string) {
           select 1 from ${returnHoldSettlements} s
           where s.tenant_id = d.tenant_id and s.disposition_id = d.id
         )
+    )
+    or exists (
+      select 1 from ${clientReturnLines} cl
+      join ${clientReturns} cr on cr.tenant_id = cl.tenant_id and cr.id = cl.client_return_id
+      where cr.tenant_id = ${tenantId}::uuid and cr.client_id = ${clientId}::uuid
+        and cl.rma_id = ${returnAuthorizations.id} and cr.status in ('draft', 'picked')
     )
   )`;
 }
@@ -375,6 +425,8 @@ function toPortalRow(
     failedInspectionTotal: fromMilli(sum((t) => t.failed)),
     scrappedTotal: fromMilli(sum((t) => t.scrapped)),
     openTotal: fromMilli(sum((t) => t.open)),
+    returningToClientTotal: fromMilli(sum((t) => t.returningToClient)),
+    returnedToClientTotal: fromMilli(sum((t) => t.returnedToClient)),
   };
 }
 
@@ -501,6 +553,8 @@ export async function portalReturnInTx(
         failedInspectionQty: fromMilli(t.failed),
         scrappedQty: fromMilli(t.scrapped),
         openQty: fromMilli(t.open),
+        returningToClientQty: fromMilli(t.returningToClient),
+        returnedToClientQty: fromMilli(t.returnedToClient),
       };
     }),
     dispositions: dispositions.map((row) => ({

@@ -146,7 +146,8 @@ function lineNotFound(id: string): ProblemException {
   return new ProblemException('not-found', 404, 'Return receipt line not found', `No return receipt line with id "${id}" exists in this tenant.`);
 }
 
-function exceedsAwaiting(detail: string, awaitingMilli: number): ProblemException {
+/** 409 `exceeds-awaiting` (+`awaitingQty`) — exported for 4-7c's return-to-client create (D5). */
+export function exceedsAwaiting(detail: string, awaitingMilli: number): ProblemException {
   return new ProblemException('exceeds-awaiting', 409, 'More than is awaiting disposition', detail, {
     awaitingQty: fromMilli(awaitingMilli),
   });
@@ -384,7 +385,7 @@ interface LockedLine {
   readonly handlingUnitId: string | null;
 }
 
-interface ReceiptHeader {
+export interface ReceiptHeader {
   readonly id: string;
   readonly code: string;
   readonly clientId: string;
@@ -442,6 +443,46 @@ interface DispositionPlan {
   readonly allocations: readonly Allocation[];
   readonly returnsBinId: string;
   readonly idempotencyKey: string;
+}
+
+/**
+ * The receipt headers of a set of receipts, with their RMA's review status
+ * (read UNLOCKED through the join — 4-7b's accept locks the RMA, then the
+ * lines, so a locked read here would cycle). Story 4-7c (D5) exports it, so
+ * the return-to-client create reads the same header the dispose reads.
+ */
+export async function receiptHeadersInTx(tx: TenantTx, tenantId: string, receiptIds: readonly string[]): Promise<Map<string, ReceiptHeader>> {
+  const ids = [...new Set(receiptIds)];
+  if (ids.length === 0) return new Map();
+  const rows = await tx
+    .select({
+      id: returnReceipts.id,
+      code: returnReceipts.code,
+      clientId: returnReceipts.clientId,
+      warehouseId: returnReceipts.warehouseId,
+      rmaId: returnReceipts.rmaId,
+      reviewStatus: returnAuthorizations.reviewStatus,
+    })
+    .from(returnReceipts)
+    .innerJoin(
+      returnAuthorizations,
+      and(eq(returnAuthorizations.tenantId, returnReceipts.tenantId), eq(returnAuthorizations.id, returnReceipts.rmaId)),
+    )
+    .where(and(eq(returnReceipts.tenantId, tenantId), inArray(returnReceipts.id, ids)));
+  return new Map(rows.map((row) => [row.id, row]));
+}
+
+/**
+ * Story 4-7c (D5) — exactly the two header guards of a disposition, in
+ * dispose's order: a blind return not yet accepted (409 `review-pending` /
+ * `review-rejected`), then another warehouse's receipt (409
+ * `document-warehouse-mismatch`). The dispose and the RTC create both call it.
+ */
+export function assertReceiptLineDisposable(header: ReceiptHeader, warehouseId: string): void {
+  if (header.reviewStatus === 'pending' || header.reviewStatus === 'rejected') {
+    throw blindReviewBlocks(header.code, header.reviewStatus);
+  }
+  if (header.warehouseId !== warehouseId) throw documentWarehouseMismatch(header.code);
 }
 
 /**
@@ -513,15 +554,13 @@ export class ReturnDispositionCommand {
       const replayedUnderLock = await this.replay(tx, tenantId, idempotencyKey, payloadHash);
       if (replayedUnderLock !== null) return replayedUnderLock;
 
-      const header = (await this.headersInTx(tx, tenantId, [line.returnReceiptId])).get(line.returnReceiptId);
+      const header = (await receiptHeadersInTx(tx, tenantId, [line.returnReceiptId])).get(line.returnReceiptId);
       if (header === undefined) throw dispositionDataFault(`Return receipt line "${line.id}" names a receipt that does not exist.`);
       // ── guards, in the spec's order ─────────────────────────────────────
       // Story 4-7b (A1, D1) — a blind return is dispositioned only once
-      // accepted: the first guard after the header read.
-      if (header.reviewStatus === 'pending' || header.reviewStatus === 'rejected') {
-        throw blindReviewBlocks(header.code, header.reviewStatus);
-      }
-      if (header.warehouseId !== normalized.warehouseId) throw documentWarehouseMismatch(header.code);
+      // accepted: the first guard after the header read; then the warehouse
+      // (both in `assertReceiptLineDisposable`, shared with 4-7c's RTC create).
+      assertReceiptLineDisposable(header, normalized.warehouseId);
       const checked = validateRecordableQuantity(normalized.qty, 'qty', sku.uom, sku.uomPrecision, 'non-negative');
       if (!checked.ok) throw invalid(checked.detail);
       const milli = checked.milli;
@@ -695,7 +734,7 @@ export class ReturnDispositionCommand {
       }
       const replayedUnderLock = await this.replay(tx, tenantId, idempotencyKey, payloadHash);
       if (replayedUnderLock !== null) return replayedUnderLock;
-      const headers = await this.headersInTx(
+      const headers = await receiptHeadersInTx(
         tx,
         tenantId,
         candidates.map((line) => line.returnReceiptId),
@@ -999,27 +1038,6 @@ export class ReturnDispositionCommand {
       throw new ProblemException('not-found', 404, 'SKU not found', `No SKU with id "${skuId}" exists in this tenant.`);
     }
     return { ...facts, id: skuId };
-  }
-
-  private async headersInTx(tx: TenantTx, tenantId: string, receiptIds: readonly string[]): Promise<Map<string, ReceiptHeader>> {
-    const ids = [...new Set(receiptIds)];
-    if (ids.length === 0) return new Map();
-    const rows = await tx
-      .select({
-        id: returnReceipts.id,
-        code: returnReceipts.code,
-        clientId: returnReceipts.clientId,
-        warehouseId: returnReceipts.warehouseId,
-        rmaId: returnReceipts.rmaId,
-        reviewStatus: returnAuthorizations.reviewStatus,
-      })
-      .from(returnReceipts)
-      .innerJoin(
-        returnAuthorizations,
-        and(eq(returnAuthorizations.tenantId, returnReceipts.tenantId), eq(returnAuthorizations.id, returnReceipts.rmaId)),
-      )
-      .where(and(eq(returnReceipts.tenantId, tenantId), inArray(returnReceipts.id, ids)));
-    return new Map(rows.map((row) => [row.id, row]));
   }
 
   private async rmaCodesInTx(tx: TenantTx, tenantId: string, rmaIds: readonly string[]): Promise<Map<string, string>> {

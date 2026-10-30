@@ -628,6 +628,12 @@ export class ReturnReceiptLineViewDto {
 
   @ApiProperty({ required: false, minimum: 0, description: 'Story 4-7b — an unannounced return\'s line: units reversed at review (qty once rejected, else 0); absent on an authorized return' })
   reversedQty?: number;
+
+  @ApiProperty({ required: false, minimum: 0, description: 'Story 4-7c — units on a draft or picked return to client, base UoM; present (with returnedToClientQty) only when either is above 0' })
+  returningToClientQty?: number;
+
+  @ApiProperty({ required: false, minimum: 0, description: 'Story 4-7c — units shipped back to the client, base UoM; present (with returningToClientQty) only when either is above 0' })
+  returnedToClientQty?: number;
 }
 
 export class ReturnReceiptViewDto {
@@ -960,6 +966,12 @@ export class PortalReturnRowDto {
 
   @ApiProperty()
   openTotal!: number;
+
+  @ApiProperty({ description: 'Story 4-7c — units on a return to the client being prepared (base units)' })
+  returningToClientTotal!: number;
+
+  @ApiProperty({ description: 'Story 4-7c — units shipped back to the client (base units)' })
+  returnedToClientTotal!: number;
 }
 
 export class PortalReturnPageResponse {
@@ -1000,6 +1012,12 @@ export class PortalReturnLineDto {
 
   @ApiProperty()
   openQty!: number;
+
+  @ApiProperty({ description: 'Story 4-7c — on a return to the client being prepared' })
+  returningToClientQty!: number;
+
+  @ApiProperty({ description: 'Story 4-7c — shipped back to the client' })
+  returnedToClientQty!: number;
 }
 
 export class PortalReturnDispositionDto {
