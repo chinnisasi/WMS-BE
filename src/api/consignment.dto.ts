@@ -213,10 +213,12 @@ export class ConsignmentGateDto {
 
 export class ConsignmentRecordResponse {
   @ApiProperty({ type: ConsignmentViewDto }) consignment!: ConsignmentViewDto;
+  @ApiProperty({ required: false, enum: [true], description: 'Present (true) on the 200 no-op: the body equals the live version — nothing written, the key stored' }) unchanged?: boolean;
 }
 
 export class PortalConsignmentRecordResponse {
   @ApiProperty({ type: PortalConsignmentViewDto }) consignment!: PortalConsignmentViewDto;
+  @ApiProperty({ required: false, enum: [true], description: 'Present (true) on the 200 no-op: the body equals the live version — nothing written, the key stored' }) unchanged?: boolean;
 }
 
 export class ConsignmentWithdrawResponse {

@@ -513,8 +513,17 @@ describe('client consignment compliance (e2e, story 4-6a)', () => {
     // A portal resend of the same document is a no-op (D25 — source and actor excluded).
     const noop = ulid();
     noOpIdempotencyKey(tenantId, noop, 'consignment.record:unchanged');
-    const unchanged = await portalRecord(orderId, second, acmePortal, noop).expect(201);
-    expect(unchanged.body.consignment.seq).toBe(2);
+    const unchanged = await portalRecord(orderId, second, acmePortal, noop).expect(200);
+    expect(unchanged.body).toMatchObject({ unchanged: true, consignment: { seq: 2 } });
+    // A replay of the no-op key is 200 too (the flag rides the stored snapshot).
+    expect((await portalRecord(orderId, second, acmePortal, noop).expect(200)).body).toEqual(unchanged.body);
+    // The staff surface: the same body again is the same 200 no-op.
+    const staffNoop = ulid();
+    noOpIdempotencyKey(tenantId, staffNoop, 'consignment.record:unchanged');
+    expect((await record(orderId, second, opsToken, staffNoop).expect(200)).body).toMatchObject({ unchanged: true, consignment: { seq: 2 } });
+    expect((await record(orderId, second, opsToken, staffNoop).expect(200)).body.unchanged).toBe(true);
+    // A new version answers 201 with no flag.
+    expect(amended.body).not.toHaveProperty('unchanged');
     expect((await versions(orderId)).length).toBe(2);
     expect(await sql`select count(*)::int as n from audit_events where tenant_id = ${tenantId} and reference = ${noop}`).toEqual([{ n: 0 }]);
   });

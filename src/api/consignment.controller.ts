@@ -1,4 +1,5 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, Res, UseGuards } from '@nestjs/common';
+import type { Response } from 'express';
 import { ApiBearerAuth, ApiBody, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
 import { ProblemException } from '../shared/problem-details/problem.exception';
@@ -89,7 +90,8 @@ export class ConsignmentController {
   })
   @ApiBody({ type: RecordConsignmentDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
-  @ApiResponse({ status: 201, type: ConsignmentRecordResponse })
+  @ApiResponse({ status: 201, type: ConsignmentRecordResponse, description: 'A new version (a replay re-serves it)' })
+  @ApiResponse({ status: HttpStatus.OK, type: ConsignmentRecordResponse, description: 'The body equals the live version — nothing written, the key stored (unchanged: true; a replay of the key is 200 too)' })
   @ApiResponse({ status: 400, ...problemJsonResponse('A malformed field, a date outside its window, a missing consignor GSTIN, or an amendment after dispatch without a reason (validation-failed)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Missing dispatch.execute, or orders.manage for an exemption or an amendment after dispatch (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Unknown order (not-found)') })
@@ -103,11 +105,13 @@ export class ConsignmentController {
     @IdempotencyKey() idempotencyKey: string | undefined,
     @CurrentSession() session: TenantSession,
     @Body() dto: RecordConsignmentDto,
+    @Res({ passthrough: true }) res: Response,
   ): Promise<ConsignmentRecordResponse> {
     assertOwnTenant(session.tenantId, tenantId);
     assertUuid(orderId, 'orderId');
     const key = parseRequiredIdempotencyKey(idempotencyKey);
     const snapshot = await this.consignment.recordConsignment({ tenantId, actorUserId: session.userId, orderId, body: dto }, key);
+    if (snapshot.unchanged === true) res.status(HttpStatus.OK);
     return JSON.parse(JSON.stringify(snapshot)) as ConsignmentRecordResponse;
   }
 

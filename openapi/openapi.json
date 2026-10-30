@@ -16342,8 +16342,18 @@
           }
         },
         "responses": {
+          "200": {
+            "description": "The body equals the live version — nothing written, the key stored (unchanged: true; a replay of the key is 200 too)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsignmentRecordResponse"
+                }
+              }
+            }
+          },
           "201": {
-            "description": "",
+            "description": "A new version (a replay re-serves it)",
             "content": {
               "application/json": {
                 "schema": {
@@ -40817,8 +40827,18 @@
           }
         },
         "responses": {
+          "200": {
+            "description": "The body equals the live version — nothing written, the key stored (unchanged: true; a replay of the key is 200 too)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalConsignmentRecordResponse"
+                }
+              }
+            }
+          },
           "201": {
-            "description": "",
+            "description": "A new version (a replay re-serves it)",
             "content": {
               "application/json": {
                 "schema": {
@@ -61689,6 +61709,13 @@
         "properties": {
           "consignment": {
             "$ref": "#/components/schemas/ConsignmentViewDto"
+          },
+          "unchanged": {
+            "type": "boolean",
+            "enum": [
+              true
+            ],
+            "description": "Present (true) on the 200 no-op: the body equals the live version — nothing written, the key stored"
           }
         },
         "required": [
@@ -82459,6 +82486,13 @@
         "properties": {
           "consignment": {
             "$ref": "#/components/schemas/PortalConsignmentViewDto"
+          },
+          "unchanged": {
+            "type": "boolean",
+            "enum": [
+              true
+            ],
+            "description": "Present (true) on the 200 no-op: the body equals the live version — nothing written, the key stored"
           }
         },
         "required": [

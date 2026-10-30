@@ -76,10 +76,13 @@ export interface WithdrawConsignmentCommand {
 
 export interface ConsignmentRecordSnapshot {
   readonly consignment: ConsignmentView;
+  /** A9 step 9 — the body equals the live version: nothing written, the key stored; the route answers 200. Absent otherwise. */
+  readonly unchanged?: true;
 }
 
 export interface PortalConsignmentRecordSnapshot {
   readonly consignment: PortalConsignmentView;
+  readonly unchanged?: true;
 }
 
 export interface ConsignmentWithdrawSnapshot {
@@ -371,10 +374,11 @@ export class ConsignmentCommand {
       ewayExemptionNote: valid.ewayExemptionNote,
     };
     if (live !== null && NO_OP_COLUMNS.every((column) => normalizeColumn(live[column]) === normalizeColumn(wouldBe[column]))) {
+      // The matrix's 200: `unchanged: true` rides the stored snapshot, so a replay of this key is 200 too.
       const snapshot =
         surface.kind === 'portal'
-          ? { consignment: toPortalConsignmentView(live, surface.actorUserId) }
-          : { consignment: toConsignmentView(live, { ratedValuePaise: order.ratedValuePaise }) };
+          ? { consignment: toPortalConsignmentView(live, surface.actorUserId), unchanged: true as const }
+          : { consignment: toConsignmentView(live, { ratedValuePaise: order.ratedValuePaise }), unchanged: true as const };
       await writeKeyInTx(tx, tenantId, key, payloadHash, snapshot);
       return { replayed: snapshot };
     }

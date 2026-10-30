@@ -504,7 +504,8 @@ export class PortalController {
   })
   @ApiBody({ type: RecordConsignmentDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
-  @ApiResponse({ status: HttpStatus.CREATED, type: PortalConsignmentRecordResponse })
+  @ApiResponse({ status: HttpStatus.CREATED, type: PortalConsignmentRecordResponse, description: 'A new version (a replay re-serves it)' })
+  @ApiResponse({ status: HttpStatus.OK, type: PortalConsignmentRecordResponse, description: 'The body equals the live version — nothing written, the key stored (unchanged: true; a replay of the key is 200 too)' })
   @ApiResponse({ status: 400, ...problemJsonResponse('A malformed field or a date outside its window (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
   @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
@@ -519,11 +520,13 @@ export class PortalController {
     @IdempotencyKey() idempotencyKey: string | undefined,
     @CurrentPortalSession() session: PortalSession,
     @Body() dto: RecordConsignmentDto,
+    @Res({ passthrough: true }) res: Response,
   ): Promise<PortalConsignmentRecordResponse> {
     assertOwnTenant(session, tenantId);
     assertUuidParam(orderId, 'orderId');
     const key = parseRequiredIdempotencyKey(idempotencyKey);
     const snapshot = await this.consignment.recordPortalConsignment({ tenantId, clientId: session.clientId, actorUserId: session.userId, orderId, body: dto }, key);
+    if (snapshot.unchanged === true) res.status(HttpStatus.OK);
     return JSON.parse(JSON.stringify(snapshot)) as PortalConsignmentRecordResponse;
   }
 
