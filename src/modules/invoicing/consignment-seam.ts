@@ -344,9 +344,9 @@ export async function liveEwayHolderInTx(
   clientId: string,
   ewayBillNumber: string,
   scope: 'same-client' | 'other-client',
-): Promise<{ readonly orderId: string; readonly clientId: string } | null> {
+): Promise<{ readonly id: string; readonly seq: number; readonly orderId: string; readonly clientId: string } | null> {
   const rows = await tx
-    .select({ orderId: orderConsignmentRecords.orderId, clientId: orderConsignmentRecords.clientId })
+    .select({ id: orderConsignmentRecords.id, seq: orderConsignmentRecords.seq, orderId: orderConsignmentRecords.orderId, clientId: orderConsignmentRecords.clientId })
     .from(orderConsignmentRecords)
     .where(
       and(

@@ -1,6 +1,7 @@
 import { Type } from 'class-transformer';
 import { ArrayMaxSize, ArrayMinSize, IsArray, IsBoolean, IsIn, IsInt, IsOptional, IsString, IsUUID, MaxLength, ValidateNested } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
+import { CONSIGNMENT_GATE_CODES } from '../shared/primitives/consignment-gate';
 import { ConsignmentDocumentViewDto, ParcelConsignmentDto } from './consignment.dto';
 import {
   HANDOVER_PARCEL_REFUSALS,
@@ -364,7 +365,7 @@ export class HandoverParcelResultDto {
   @ApiProperty({ type: String, nullable: true, format: 'uuid' }) followOnOrderId!: string | null;
   @ApiProperty({
     required: false,
-    enum: ['consignment-documents-missing', 'eway-bill-required', 'eway-bill-expired'],
+    enum: [...CONSIGNMENT_GATE_CODES],
     description: "Story 4-6a (A14) — a handheld parcel that left without the brand's documents (a stale snapshot): handed over and flagged, never refused. Absent otherwise",
   })
   complianceException?: string;
@@ -499,7 +500,7 @@ export class HandoverDetailParcelDto {
   @ApiProperty({ required: false, type: ConsignmentDocumentViewDto, nullable: true, description: 'Story 4-6a (A19) — the brand’s document the parcel LEFT under (the stamped version); null when none was recorded' }) taxDocument?: ConsignmentDocumentViewDto | null;
   @ApiProperty({ required: false, type: String, nullable: true, description: 'Story 4-6a — the stamped version’s e-way bill number' }) ewayBillNumber?: string | null;
   @ApiProperty({ required: false, type: String, nullable: true, description: 'Story 4-6a — the stamped version’s e-way validity (YYYY-MM-DD)' }) ewayValidUntil?: string | null;
-  @ApiProperty({ required: false, type: String, nullable: true, enum: ['consignment-documents-missing', 'eway-bill-required', 'eway-bill-expired', null], description: 'Story 4-6a (A14) — a handheld parcel that left without its documents' }) complianceException?: string | null;
+  @ApiProperty({ required: false, type: String, nullable: true, enum: [...CONSIGNMENT_GATE_CODES, null], description: 'Story 4-6a (A14) — a handheld parcel that left without its documents' }) complianceException?: string | null;
   @ApiProperty({ required: false, type: HandoverLateRecordDto, nullable: true, description: 'Story 4-6a (A39) — the live version recorded after the dispatch (it clears an exception)' }) lateRecord?: HandoverLateRecordDto | null;
 }
 

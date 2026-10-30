@@ -373,6 +373,9 @@ function assertRtcDispatchExtras(normalized: NormalizedRtcDispatch): void {
     throw invalid(`declaredValuePaise is a whole number of paise, 0–${MAX_DECLARED_VALUE_PAISE}.`);
   }
   const exemption = normalized.ewayExemption ?? { reason: null, note: null };
+  if ((exemption.reason !== null || exemption.note !== null) && normalized.declaredValuePaise === null) {
+    throw invalid('ewayExemption goes with a declaredValuePaise — an exemption answers a value above the e-way threshold.');
+  }
   assertEwayExemptionShape(exemption.reason, exemption.note, normalized.capture.ewayBillNumber !== null);
 }
 

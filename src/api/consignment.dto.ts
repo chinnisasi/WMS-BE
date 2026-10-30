@@ -8,7 +8,7 @@ import {
   EWAY_EXEMPTION_REASONS,
   ORDER_BRAND_DOCUMENT_TYPES,
 } from '../shared/primitives/consignment-record';
-import { CONSIGNMENT_GATE_STATES, CONSIGNMENT_REQUIRED_BECAUSE } from '../shared/primitives/consignment-gate';
+import { CONSIGNMENT_GATE_CODES, CONSIGNMENT_GATE_STATES, CONSIGNMENT_REQUIRED_BECAUSE } from '../shared/primitives/consignment-gate';
 import { CONSIGNMENT_DOCUMENT_RULES } from '../modules/clients/clients.schema';
 
 /**
@@ -301,7 +301,7 @@ export class ConsignmentExceptionRowDto {
   @ApiProperty({ type: String, nullable: true, format: 'uuid' }) handoverId!: string | null;
   @ApiProperty({ type: String, nullable: true }) handoverCode!: string | null;
   @ApiProperty({ type: String, nullable: true }) handedOverAt!: string | null;
-  @ApiProperty({ enum: ['consignment-documents-missing', 'eway-bill-required', 'eway-bill-expired'] }) code!: string;
+  @ApiProperty({ enum: [...CONSIGNMENT_GATE_CODES] }) code!: string;
   @ApiProperty({ enum: [...CONSIGNMENT_GATE_STATES], description: 'Re-judged on the handover day' }) state!: string;
 }
 

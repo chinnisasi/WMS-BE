@@ -210,10 +210,15 @@ ALTER TABLE "order_consignment_records" ADD CONSTRAINT "order_consignment_record
 );--> statement-breakpoint
 -- ── hand-amended: the immutability trigger (A1, the 0056 precedent) ──────
 -- A version's numbers are never rewritten (a correction is a new version):
--- only the ending columns, `updated_at` and a one-way `dispatched_at` stamp
--- may change. SECURITY INVOKER (the default) — it reads nothing.
+-- only a LIVE version changes — its ending (live → superseded | withdrawn,
+-- the ended_* columns set once), `updated_at` and a one-way `dispatched_at`
+-- stamp. An ended version is frozen whole: never revived, its ending never
+-- rewritten. SECURITY INVOKER (the default) — it reads nothing.
 CREATE FUNCTION "order_consignment_records_refuse_rewrite"() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+	IF OLD."status" <> 'live' THEN
+		RAISE EXCEPTION 'order_consignment_records is immutable: an ended version (%) never changes', OLD."status";
+	END IF;
 	IF (to_jsonb(NEW) - ARRAY['status', 'ended_at', 'ended_by', 'end_reason', 'dispatched_at', 'updated_at'])
 		IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['status', 'ended_at', 'ended_by', 'end_reason', 'dispatched_at', 'updated_at']) THEN
 		RAISE EXCEPTION 'order_consignment_records is immutable: only its ending columns and dispatch stamp change (a correction is a new version)';
@@ -454,6 +459,31 @@ BEGIN
 				RAISE EXCEPTION 'migration 0118: the trigger let dispatched_at be stamped twice.';
 		END;
 		UPDATE "order_consignment_records" SET "status" = 'superseded', "ended_at" = now(), "ended_by" = u, "end_reason" = 'Amended' WHERE "id" = o;
+		-- An ended version is frozen: never revived, its ending never rewritten.
+		BEGIN
+			UPDATE "order_consignment_records" SET "status" = 'live', "ended_at" = NULL, "ended_by" = NULL, "end_reason" = NULL WHERE "id" = o;
+			RAISE EXCEPTION USING ERRCODE = 'P0118', MESSAGE = 'a version was revived';
+		EXCEPTION
+			WHEN SQLSTATE 'P0001' THEN
+				GET STACKED DIAGNOSTICS message = MESSAGE_TEXT;
+				IF message NOT LIKE 'order_consignment_records is immutable: an ended version%' THEN
+					RAISE EXCEPTION 'migration 0118: the revival was refused by "%".', message;
+				END IF;
+			WHEN SQLSTATE 'P0118' THEN
+				RAISE EXCEPTION 'migration 0118: the trigger let an ended version be revived.';
+		END;
+		BEGIN
+			UPDATE "order_consignment_records" SET "end_reason" = 'Rewritten' WHERE "id" = o;
+			RAISE EXCEPTION USING ERRCODE = 'P0118', MESSAGE = 'an ending was rewritten';
+		EXCEPTION
+			WHEN SQLSTATE 'P0001' THEN
+				GET STACKED DIAGNOSTICS message = MESSAGE_TEXT;
+				IF message NOT LIKE 'order_consignment_records is immutable: an ended version%' THEN
+					RAISE EXCEPTION 'migration 0118: the ending rewrite was refused by "%".', message;
+				END IF;
+			WHEN SQLSTATE 'P0118' THEN
+				RAISE EXCEPTION 'migration 0118: the trigger let an ending be rewritten.';
+		END;
 		RAISE EXCEPTION USING ERRCODE = 'P0118', MESSAGE = 'rollback the trigger probes';
 	EXCEPTION
 		WHEN SQLSTATE 'P0118' THEN
@@ -524,6 +554,48 @@ BEGIN
 	IF refused_by IS DISTINCT FROM 'shipments_compliance_exception_check' THEN
 		RAISE EXCEPTION 'migration 0118: an exception on a labelled shipment was refused by % (expected shipments_compliance_exception_check).', coalesce(refused_by, 'nothing');
 	END IF;
+	refused_by := NULL;
+	BEGIN
+		INSERT INTO "shipments" ("id","tenant_id","warehouse_id","order_id","client_id","status","kind","carrier_name","tracking_number","label_attachment_id","package_count","labelled_by","labelled_at","recorded_surface",
+			"handover_id","handed_over_at","label_verified_at","label_verified_by","label_verify_method","compliance_exception")
+		VALUES (gen_random_uuid(), t, gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), 'handed_over', 'client-label', 'Delhivery', 'AWB0120', gen_random_uuid(), 1, u, now(), 'portal',
+			gen_random_uuid(), now(), now(), u, 'handover-scan', 'paperwork-missing');
+		RAISE EXCEPTION USING ERRCODE = 'P0118', MESSAGE = 'a refused probe landed';
+	EXCEPTION
+		WHEN check_violation THEN
+			GET STACKED DIAGNOSTICS refused_by = CONSTRAINT_NAME;
+		WHEN SQLSTATE 'P0118' THEN
+			refused_by := NULL;
+	END;
+	IF refused_by IS DISTINCT FROM 'shipments_compliance_exception_check' THEN
+		RAISE EXCEPTION 'migration 0118: an unknown exception code was refused by % (expected shipments_compliance_exception_check).', coalesce(refused_by, 'nothing');
+	END IF;
+	-- vendor_returns: a declared value of 0 and of 10^12 is accepted.
+	BEGIN
+		INSERT INTO "vendor_returns" ("id","tenant_id","warehouse_id","client_id","vendor_id","code","status","consignee_address_kind","vendor_snapshot","client_snapshot","created_by","declared_value_paise")
+		VALUES (gen_random_uuid(), t, gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), 'RTV-P119', 'draft', 'dispatch', '{}', '{}', u, 0),
+		       (gen_random_uuid(), t, gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), 'RTV-P120', 'draft', 'dispatch', '{}', '{}', u, 1000000000000);
+		RAISE EXCEPTION USING ERRCODE = 'P0118', MESSAGE = 'rollback the accepted probes';
+	EXCEPTION
+		WHEN check_violation OR unique_violation THEN
+			RAISE EXCEPTION 'migration 0118: an accepted declared value was refused (%).', SQLERRM;
+		WHEN SQLSTATE 'P0118' THEN
+			NULL;
+	END;
+	refused_by := NULL;
+	BEGIN
+		INSERT INTO "vendor_returns" ("id","tenant_id","warehouse_id","client_id","vendor_id","code","status","consignee_address_kind","vendor_snapshot","client_snapshot","created_by","declared_value_paise")
+		VALUES (gen_random_uuid(), t, gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), 'RTV-P121', 'draft', 'dispatch', '{}', '{}', u, 1000000000001);
+		RAISE EXCEPTION USING ERRCODE = 'P0118', MESSAGE = 'a refused probe landed';
+	EXCEPTION
+		WHEN check_violation THEN
+			GET STACKED DIAGNOSTICS refused_by = CONSTRAINT_NAME;
+		WHEN SQLSTATE 'P0118' THEN
+			refused_by := NULL;
+	END;
+	IF refused_by IS DISTINCT FROM 'vendor_returns_declared_value_range' THEN
+		RAISE EXCEPTION 'migration 0118: a declared value over 10^12 was refused by % (expected vendor_returns_declared_value_range).', coalesce(refused_by, 'nothing');
+	END IF;
 	-- vendor_returns: a declared value is 0–10^12.
 	refused_by := NULL;
 	BEGIN
@@ -580,7 +652,9 @@ BEGIN
 	IF refused_by IS DISTINCT FROM 'client_contacts_email_events_check' THEN
 		RAISE EXCEPTION 'migration 0118: a duplicate documents-needed event was refused by % (expected client_contacts_email_events_check).', coalesce(refused_by, 'nothing');
 	END IF;
-	IF EXISTS (SELECT 1 FROM "email_messages" WHERE "tenant_id" = t) OR EXISTS (SELECT 1 FROM "clients" WHERE "tenant_id" = t) THEN
+	IF EXISTS (SELECT 1 FROM "email_messages" WHERE "tenant_id" = t) OR EXISTS (SELECT 1 FROM "clients" WHERE "tenant_id" = t)
+		OR EXISTS (SELECT 1 FROM "shipments" WHERE "tenant_id" = t) OR EXISTS (SELECT 1 FROM "vendor_returns" WHERE "tenant_id" = t)
+		OR EXISTS (SELECT 1 FROM "client_contacts" WHERE "tenant_id" = t) THEN
 		RAISE EXCEPTION 'migration 0118: a probe row survived.';
 	END IF;
 END $$;

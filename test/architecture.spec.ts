@@ -3231,10 +3231,13 @@ describe('architecture: the client portal (story 21-7)', () => {
     }
     // Story 4-6a (A51) — a portal write whose command the controller injects
     // itself (its file mapped to its class above) is called directly.
+    // A write file without a class mapping is reached through a declared
+    // delegation (below); a MAPPED one must be an injected field, or it throws.
     for (const { file, methods } of PORTAL_WRITES) {
       const cls = PORTAL_READ_CLASS_BY_FILE.get(file);
-      const field = cls === undefined ? undefined : fieldOfClass.get(cls);
-      if (field === undefined) continue;
+      if (cls === undefined) continue;
+      const field = fieldOfClass.get(cls);
+      if (field === undefined) throw new Error(`${cls} (from ${file}) is not an injected portal controller field`);
       for (const method of methods) allowed.add(`${field}.${method}`);
     }
     for (const { field, method } of PORTAL_DELEGATIONS) allowed.add(`${field}.${method}`);

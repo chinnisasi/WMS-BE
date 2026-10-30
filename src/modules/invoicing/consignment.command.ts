@@ -250,7 +250,7 @@ export class ConsignmentCommand {
         targetId: order.id,
         reference: key,
         changes: { recordId: live.id, seq: live.seq, reason },
-        occurredAt: new Date().toISOString(),
+        occurredAt: at,
       });
       const history = (await consignmentHistoryOfOrderInTx(tx, command.tenantId, order.id)).map((row) => toConsignmentView(row));
       const snapshot: ConsignmentWithdrawSnapshot = { consignment: null, history };
@@ -342,24 +342,6 @@ export class ConsignmentCommand {
         { declaredValuePaise: valid.declaredValuePaise, codAmountPaise: order.codAmountPaise },
       );
     }
-    // A46 — who may clear the gate (staff): an exemption, an amendment after
-    // dispatch, or a value that turns a required bill into not-required needs
-    // an office role. The brand (portal) speaks for its own documents.
-    if (surface.kind === 'staff' && !surface.elevated) {
-      const dropsRequirement = live !== null && live.ewayRequired && !ewayRequired;
-      if (ewayStatus === 'exempt' || order.status === 'dispatched' || dropsRequirement) {
-        throw new ProblemException(
-          'role-denied',
-          403,
-          'Role lacks the required capability',
-          ewayStatus === 'exempt'
-            ? 'Only an office role can record an e-way exemption.'
-            : order.status === 'dispatched'
-              ? 'Only an office role can amend a record after the goods left.'
-              : 'Only an office role can lower a declared value below the e-way threshold.',
-        );
-      }
-    }
     // 7.9 unchanged → a no-op that stores the key (`consignment.record:unchanged`).
     const wouldBe: Record<(typeof NO_OP_COLUMNS)[number], unknown> = {
       brandDocumentType: valid.brandDocumentType,
@@ -382,6 +364,24 @@ export class ConsignmentCommand {
       await writeKeyInTx(tx, tenantId, key, payloadHash, snapshot);
       return { replayed: snapshot };
     }
+    // A46 — who may clear the gate (staff): an exemption, an amendment after
+    // dispatch, or a value that turns a required bill into not-required needs
+    // an office role. The brand (portal) speaks for its own documents.
+    if (surface.kind === 'staff' && !surface.elevated) {
+      const dropsRequirement = live !== null && live.ewayRequired && !ewayRequired;
+      if (ewayStatus === 'exempt' || order.status === 'dispatched' || dropsRequirement) {
+        throw new ProblemException(
+          'role-denied',
+          403,
+          'Role lacks the required capability',
+          ewayStatus === 'exempt'
+            ? 'Only an office role can record an e-way exemption.'
+            : order.status === 'dispatched'
+              ? 'Only an office role can amend a record after the goods left.'
+              : 'Only an office role can lower a declared value below the e-way threshold.',
+        );
+      }
+    }
     // A35 — the version limit.
     if (live !== null && live.seq >= CONSIGNMENT_RECORD_LIMITS.maxVersions) {
       throw new ProblemException(
@@ -402,7 +402,7 @@ export class ConsignmentCommand {
         // A45 (D30) — a dead order's record (an old task's cancel) is withdrawn, never a refusal.
         const holderOrder = await this.outbound.lockOrderStatusInTx(tx, tenantId, holder.orderId);
         if (holderOrder !== null && holderOrder.status === 'cancelled') {
-          await withdrawConsignmentOnCancelInTx(tx, this.outbox, { tenantId, orderId: holder.orderId, actorUserId: surface.actorUserId, at: now });
+          const withdrawnId = await withdrawConsignmentOnCancelInTx(tx, this.outbox, { tenantId, orderId: holder.orderId, actorUserId: surface.actorUserId, at: now });
           await tx.insert(auditEvents).values({
             id: uuidv7(),
             tenantId,
@@ -411,8 +411,8 @@ export class ConsignmentCommand {
             targetType: 'order',
             targetId: holder.orderId,
             reference: key,
-            changes: { reason: 'Order cancelled', selfHeal: true },
-            occurredAt: new Date().toISOString(),
+            changes: { recordId: withdrawnId ?? holder.id, seq: holder.seq, reason: 'Order cancelled', selfHeal: true },
+            occurredAt: now,
           });
         } else {
           throw ewayInUse(valid.ewayBillNumber, holder.orderId, holderOrder?.label ?? holder.orderId);
@@ -515,7 +515,7 @@ export class ConsignmentCommand {
       targetId: order.id,
       reference: key,
       changes: { recordId: inserted.id, seq, source: inserted.source, ...(valid.reason === null ? {} : { reason: valid.reason }), fields: changes },
-      occurredAt: new Date().toISOString(),
+      occurredAt: now,
     });
     const snapshot =
       surface.kind === 'portal'
@@ -557,10 +557,12 @@ export async function writeKeyInTx(tx: TenantTx, tenantId: string, key: string, 
   }
 }
 
-function normalizeColumn(value: unknown): string | number | null {
+/**
+ * A column as the no-op and the audit diff compare it: text as text (a
+ * document number "0042" is not "42"), the declared value as its number.
+ */
+function normalizeColumn(value: unknown): string | null {
   if (value === null || value === undefined) return null;
-  if (typeof value === 'number') return value;
-  if (typeof value === 'string' && /^-?\d+$/.test(value) && value.length < 16) return Number(value);
   return String(value);
 }
 

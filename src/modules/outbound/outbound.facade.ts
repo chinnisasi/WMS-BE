@@ -758,7 +758,8 @@ export class OutboundFacade {
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       await assertWarehouseInTenant(tx, tenantId, warehouseId);
       if (query.view === 'exceptions') {
-        return { view: 'exceptions' as const, needed: [], exceptions: await consignmentExceptionsInTx(tx, tenantId, warehouseId, query.clientId), truncated: false };
+        const exceptions = await consignmentExceptionsInTx(tx, tenantId, warehouseId, query.clientId);
+        return { view: 'exceptions' as const, needed: [], exceptions: exceptions.rows, truncated: exceptions.truncated };
       }
       const needed = await consignmentNeededInTx(tx, tenantId, warehouseId, query.clientId, consignmentTodayIst());
       return { view: 'needed' as const, needed: needed.rows, exceptions: [], truncated: needed.truncated };

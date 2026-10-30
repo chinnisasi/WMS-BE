@@ -240,6 +240,9 @@ describe('migration 0118: consignment compliance', () => {
     await expect(sql`update order_consignment_records set dispatched_at = now() + interval '1 day' where id = ${row.id as string}`).rejects.toThrow(/stamped once/);
     await sql`update order_consignment_records set status = 'superseded', ended_at = now(), ended_by = ${userId}, end_reason = 'Amended' where id = ${row.id as string}`;
     expect(await sql`select status from order_consignment_records where id = ${row.id as string}`).toEqual([{ status: 'superseded' }]);
+    // An ended version is frozen: never revived, its ending never rewritten.
+    await expect(sql`update order_consignment_records set status = 'live', ended_at = null, ended_by = null, end_reason = null where id = ${row.id as string}`).rejects.toThrow(/an ended version/);
+    await expect(sql`update order_consignment_records set end_reason = 'Rewritten' where id = ${row.id as string}`).rejects.toThrow(/an ended version/);
   });
 
   it('RLS (A1, A28): a client-stamped wms_rls_probe reads only its client’s records and writes only its own (the portal write set: supersede, insert); the operator shape sees both', async () => {

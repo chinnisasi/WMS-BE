@@ -434,10 +434,12 @@ export class HandoverCommand {
         let complianceException: ConsignmentGateCode | null = null;
         const facts = consignmentFacts.get(order.id)!;
         const dispatchDay = istDateOf(occurredAtOf(order.id));
-        const threshold = await thresholds.on(dispatchDay);
+        let threshold = await thresholds.on(dispatchDay);
         let gate = judgeConsignment(facts, threshold, dispatchDay);
         if (!gate.blocking && surface === 'web' && todayIst !== dispatchDay) {
-          gate = judgeConsignment(facts, await thresholds.on(todayIst), todayIst);
+          // The refusal names the figure of the judgement that blocks.
+          threshold = await thresholds.on(todayIst);
+          gate = judgeConsignment(facts, threshold, todayIst);
         }
         if (gate.blocking) {
           if (surface === 'web') {

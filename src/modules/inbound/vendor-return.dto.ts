@@ -16,7 +16,7 @@ import {
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 import { MAX_QUANTITY_BASE, MIN_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../../shared/primitives/quantity';
-import { RTV_BRAND_DOCUMENT_TYPES, type BrandDocumentType } from '../../shared/primitives/consignment-capture';
+import { CONSIGNMENT_CAPTURE_LIMITS, RTV_BRAND_DOCUMENT_TYPES, type BrandDocumentType } from '../../shared/primitives/consignment-capture';
 import { EWAY_EXEMPTION_REASONS } from '../../shared/primitives/consignment-record';
 import { PartnerAddressDto, VendorSnapshotDto } from '../partners/partners.dto';
 import {
@@ -235,7 +235,7 @@ export class DispatchVendorReturnDto {
     nullable: true,
     required: false,
     minimum: 0,
-    maximum: 1_000_000_000_000,
+    maximum: CONSIGNMENT_CAPTURE_LIMITS.declaredValueMaxPaise,
     description: "Story 4-6a — the consignment value on the brand's document in paise, judged against the e-way threshold (above it an e-way bill number or an exemption is required). Optional on the API for older callers; the web always sends it",
   })
   @IsOptional()

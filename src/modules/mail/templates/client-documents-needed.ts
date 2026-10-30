@@ -102,7 +102,10 @@ export function renderClientDocumentsNeededEmail(params: ClientDocumentsNeededEm
       ? `${tenant} has packed order ${ref} for ${client} at ${warehouse}. It is waiting for your tax invoice (or delivery challan) before it can leave.`
       : `${tenant} has packed order ${ref} for ${client} at ${warehouse}. It is waiting for your e-way bill before it can leave.`;
   const why = documentsNeededReasonText(params);
-  const action = 'Record the document number, its date, the declared value and the e-way bill in the client portal — the order is released as soon as it is recorded.';
+  const action =
+    params.needs === 'invoice'
+      ? 'Record the document number, its date and the declared value — and the e-way bill when one is needed — in the client portal; the order is released as soon as it is recorded.'
+      : 'Record the e-way bill number, its date and its validity in the client portal; the order is released as soon as it is recorded.';
 
   const text = [what, '', why, '', action, '', `Open the order: ${portalUrl}`, '', footer, ''].join('\n');
   const body = clientHtml(

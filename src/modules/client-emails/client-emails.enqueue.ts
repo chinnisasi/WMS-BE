@@ -224,12 +224,17 @@ export class ClientEmailsEnqueueHandler implements OnModuleInit {
       // non-transient fault acks without a row.
       let read: Awaited<ReturnType<OutboundFacade['consignmentGateOfOrderInTx']>>;
       try {
-        read = await this.outbound.consignmentGateOfOrderInTx(tx, tenantId, packedOrderId, istDateOf(new Date(clientEmailClock.now()).toISOString()));
+        // In a SAVEPOINT: a non-transient database error rolls back to it, so
+        // the outer transaction stays usable and the skip commits cleanly.
+        read = await tx.transaction((sp) =>
+          this.outbound.consignmentGateOfOrderInTx(sp as unknown as TenantTx, tenantId, packedOrderId, istDateOf(new Date(clientEmailClock.now()).toISOString())),
+        );
       } catch (err) {
         if (isTransientDbError(err)) throw err;
         return skip('gate-unreadable', clientId);
       }
-      if (read === null) return skip('no-client', clientId);
+      // The order is gone (it cannot reach here with a client and no row, but never mail it).
+      if (read === null) return skip('not-open', clientId);
       const status = read.facts.order.status;
       if (status !== 'accepted' && status !== 'ready_to_dispatch') return skip('not-open', clientId);
       const gate = read.gate;

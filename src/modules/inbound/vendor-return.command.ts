@@ -631,6 +631,9 @@ export class VendorReturnCommand {
       throw invalid(`declaredValuePaise is a whole number of paise, 0–${CONSIGNMENT_CAPTURE_LIMITS.declaredValueMaxPaise}.`);
     }
     const exemption = normalizeEwayExemption(command.ewayExemption);
+    if ((exemption.reason !== null || exemption.note !== null) && declaredValuePaise === null) {
+      throw invalid('ewayExemption goes with a declaredValuePaise — an exemption answers a value above the e-way threshold.');
+    }
     assertEwayExemptionShape(exemption.reason, exemption.note, valid.ewayBillNumber !== null);
     const vendorReturnId = command.vendorReturnId.toLowerCase();
     // A9 — the dispatch's fingerprint: every capture field after normalisation.

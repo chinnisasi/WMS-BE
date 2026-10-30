@@ -506,7 +506,7 @@ export class PortalController {
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiResponse({ status: HttpStatus.CREATED, type: PortalConsignmentRecordResponse, description: 'A new version (a replay re-serves it)' })
   @ApiResponse({ status: HttpStatus.OK, type: PortalConsignmentRecordResponse, description: 'The body equals the live version — nothing written, the key stored (unchanged: true; a replay of the key is 200 too)' })
-  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed field or a date outside its window (validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed orderId or field, a date outside its window, a missing consignor GSTIN, or an amendment after dispatch without a reason (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
   @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
   @ApiResponse({ status: 404, ...problemJsonResponse("No such order of this client (not-found)") })

@@ -27,6 +27,7 @@ import {
   MaxLength,
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
+import { CONSIGNMENT_GATE_STATES } from '../../shared/primitives/consignment-gate';
 import { BooleanFlag, IsInstant } from '../../shared/primitives/instant-range';
 import { PurchaseOrderLineDto } from './inbound.dto';
 import {
@@ -1831,7 +1832,7 @@ export class CatalogDispatchParcelShipmentDto {
 
 /** Story 4-6a (A23) — a parcel's consignment gate as the device reads it. */
 export class CatalogDispatchParcelConsignmentDto {
-  @ApiProperty({ enum: ['not-applicable', 'dispatched', 'eway-required', 'eway-expired', 'ready', 'missing', 'not-required'] }) state!: string;
+  @ApiProperty({ enum: [...CONSIGNMENT_GATE_STATES] }) state!: string;
   @ApiProperty() blocking!: boolean;
   @ApiProperty({ type: String, nullable: true }) ewayBillNumber!: string | null;
   @ApiProperty({ type: String, nullable: true, description: 'YYYY-MM-DD — the last valid day' }) ewayValidUntil!: string | null;

@@ -163,6 +163,8 @@ function requiredBecauseWords(because: ConsignmentRequiredBecause | null, thresh
 export const CONSIGNMENT_WORKLIST_SCAN = 5000;
 /** A16 — at most this many exception rows. */
 export const CONSIGNMENT_EXCEPTIONS_MAX = 500;
+/** A16 — at most this many flagged shipments are scanned to find them (newest first). */
+export const CONSIGNMENT_EXCEPTIONS_SCAN = 5000;
 /** A18 — at most this many portal needed rows. */
 export const PORTAL_CONSIGNMENTS_NEEDED_MAX = 500;
 const FACT_CHUNK = 500;
@@ -313,9 +315,13 @@ export async function consignmentExceptionsInTx(
   tenantId: string,
   warehouseId: string,
   clientId: string | null,
-): Promise<ConsignmentExceptionRow[]> {
-  const rows = await consignmentExceptionsQuery(tx, tenantId, warehouseId, clientId);
-  if (rows.length === 0) return [];
+): Promise<{ rows: ConsignmentExceptionRow[]; truncated: boolean }> {
+  // Scan up to 5,000 flagged rows (newest first), drop the ones a late record
+  // cleared, keep 500: the cap applies AFTER the cleared filter.
+  const rows = await consignmentExceptionsQuery(tx, tenantId, warehouseId, clientId, CONSIGNMENT_EXCEPTIONS_SCAN + 1);
+  let truncated = rows.length > CONSIGNMENT_EXCEPTIONS_SCAN;
+  rows.splice(CONSIGNMENT_EXCEPTIONS_SCAN);
+  if (rows.length === 0) return { rows: [], truncated };
   const facts = await consignmentFactsOfOrdersInTx(tx, tenantId, rows.map((row) => row.shipment.orderId));
   const thresholds = new NationalThresholds(tx);
   const out: ConsignmentExceptionRow[] = [];
@@ -338,12 +344,17 @@ export async function consignmentExceptionsInTx(
       code: shipment.complianceException!,
       state: gate.state,
     });
+    if (out.length > CONSIGNMENT_EXCEPTIONS_MAX) break;
   }
-  return out;
+  if (out.length > CONSIGNMENT_EXCEPTIONS_MAX) {
+    truncated = true;
+    out.splice(CONSIGNMENT_EXCEPTIONS_MAX);
+  }
+  return { rows: out, truncated };
 }
 
 /** A50 — the exceptions read (exported so the suite EXPLAINs the REAL query; on `shipments_compliance_exception_idx`). */
-export function consignmentExceptionsQuery(tx: TenantTx, tenantId: string, warehouseId: string, clientId: string | null) {
+export function consignmentExceptionsQuery(tx: TenantTx, tenantId: string, warehouseId: string, clientId: string | null, limit: number = CONSIGNMENT_EXCEPTIONS_SCAN + 1) {
   return tx
     .select({ shipment: shipments, handoverCode: courierHandovers.code })
     .from(shipments)
@@ -357,7 +368,7 @@ export function consignmentExceptionsQuery(tx: TenantTx, tenantId: string, wareh
       ),
     )
     .orderBy(desc(shipments.handedOverAt), desc(shipments.id))
-    .limit(CONSIGNMENT_EXCEPTIONS_MAX);
+    .limit(limit);
 }
 
 /** A50 — the portal needed list's scan (exported so the suite EXPLAINs the REAL query; on 0101's `orders_tenant_client_open_idx`). */
@@ -365,8 +376,12 @@ export function portalOpenOrdersQuery(tx: TenantTx, tenantId: string, clientId: 
   return tx
     .select()
     .from(orders)
-    .where(and(eq(orders.tenantId, tenantId), eq(orders.clientId, clientId), sql`${orders.status} IN ('accepted','ready_to_dispatch')`));
+    .where(and(eq(orders.tenantId, tenantId), eq(orders.clientId, clientId), sql`${orders.status} IN ('accepted','ready_to_dispatch')`))
+    .limit(PORTAL_CONSIGNMENTS_SCAN);
 }
+
+/** A18 — at most this many of the client's open orders are scanned for the needed list (then sorted in memory, 500 kept). */
+export const PORTAL_CONSIGNMENTS_SCAN = 5000;
 
 /** A18 — one row of the portal's needed list (no warehouse flag, no staff fact). */
 export interface PortalConsignmentNeededRow {
@@ -387,7 +402,9 @@ export interface PortalConsignmentNeededRow {
  */
 export async function portalConsignmentsNeededInTx(tx: TenantTx, tenantId: string, clientId: string, todayIst: string): Promise<PortalConsignmentNeededRow[]> {
   const open = await portalOpenOrdersQuery(tx, tenantId, clientId);
-  const national = await nationalThresholdInForceInTx(tx, todayIst);
+  // No threshold in force (a data fault): an empty list, never a 409 on the portal's Orders page.
+  const national = await nationalThresholdOrNullInTx(tx, todayIst);
+  if (national === null) return [];
   const kept = await inChunks(open, async (chunk) => {
     const facts = await consignmentFactsOfOrderRowsInTx(tx, tenantId, chunk);
     const out: { row: PortalConsignmentNeededRow; packed: boolean; createdAt: string }[] = [];
@@ -589,6 +606,16 @@ export function consignmentTodayIst(): string {
   return istDateOf(new Date(consignmentReadClock.now()).toISOString());
 }
 
+/** The national threshold, or null when none is in force (`eway-threshold-missing` — a JS throw after its query, so the transaction stays usable). */
+async function nationalThresholdOrNullInTx(tx: TenantTx, istDate: string): Promise<number | null> {
+  try {
+    return await nationalThresholdInForceInTx(tx, istDate);
+  } catch (err) {
+    if (err instanceof ProblemException && (err.getResponse() as { code?: string }).code === 'eway-threshold-missing') return null;
+    throw err;
+  }
+}
+
 /** A16 — one parcel's consignment as the 4-4a candidates and the device snapshot carry it. */
 export interface ParcelConsignment {
   readonly state: ConsignmentGateState;
@@ -602,7 +629,11 @@ export async function parcelConsignmentsInTx(tx: TenantTx, tenantId: string, ord
   const out = new Map<string, ParcelConsignment>();
   const ids = [...new Set(orderIds)];
   if (ids.length === 0) return out;
-  const national = await nationalThresholdInForceInTx(tx, todayIst);
+  // An enrichment: with no national threshold in force (a data fault) the
+  // key is omitted, never a 409 on the Orders tab, the candidates or the
+  // device snapshot. The explicit consignment reads keep the 409.
+  const national = await nationalThresholdOrNullInTx(tx, todayIst);
+  if (national === null) return out;
   for (let i = 0; i < ids.length; i += FACT_CHUNK) {
     const facts = await consignmentFactsOfOrdersInTx(tx, tenantId, ids.slice(i, i + FACT_CHUNK));
     for (const [orderId, fact] of facts) {
