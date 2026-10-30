@@ -1,4 +1,4 @@
-import { PDFArray, PDFDocument, PDFRawStream, decodePDFRawStream, type PDFPage } from 'pdf-lib';
+import { PDFArray, PDFDocument, PDFName, PDFNumber, PDFRawStream, decodePDFRawStream, type PDFPage } from 'pdf-lib';
 import { decodeCode128B } from '../../src/shared/labels/code128';
 import { zplUnescapeBarcode } from '../../src/shared/labels/text';
 
@@ -13,19 +13,37 @@ import { zplUnescapeBarcode } from '../../src/shared/labels/text';
  *   back into module widths and decode them with `decodeCode128B`.
  */
 
-export interface ZplLabel {
-  readonly raw: string;
+export interface ZplBarcode {
   readonly payload: string;
   readonly moduleWidth: number;
+}
+
+export interface ZplLabel {
+  readonly raw: string;
+  /** The FIRST barcode's payload (2-10a labels carry one). */
+  readonly payload: string;
+  readonly moduleWidth: number;
+  /** Story 4-5a — every `^BC` field of the label, in order (a carton label carries the AWB's and the carton code's). */
+  readonly barcodes: readonly ZplBarcode[];
 }
 
 export function parseZplLabels(zpl: string): ZplLabel[] {
   const labels = zpl.split('^XZ').filter((chunk) => chunk.includes('^XA'));
   return labels.map((raw) => {
-    const barcode = /\^BY(\d+)\^BCN,\d+,N,N,N,N\^FH\^FD>:(.*?)\^FS/.exec(raw);
-    if (barcode === null) throw new Error(`no start-B barcode field in label: ${raw}`);
-    return { raw, payload: zplUnescapeBarcode(barcode[2]!), moduleWidth: Number(barcode[1]) };
+    const barcodes = [...raw.matchAll(/\^BY(\d+)\^BCN,\d+,N,N,N,N\^FH\^FD>:(.*?)\^FS/g)].map((m) => ({
+      payload: zplUnescapeBarcode(m[2]!),
+      moduleWidth: Number(m[1]),
+    }));
+    if (barcodes.length === 0) throw new Error(`no start-B barcode field in label: ${raw}`);
+    return { raw, payload: barcodes[0]!.payload, moduleWidth: barcodes[0]!.moduleWidth, barcodes };
   });
+}
+
+/** Story 4-5a — the text of every `^FD` text field (not barcodes), `^FH` escapes undone, in order. */
+export function zplTexts(raw: string): string[] {
+  return [...raw.matchAll(/\^A0N,\d+,\d+(?:\^FR)?\^FH\^FD(.*?)\^FS/g)].map((m) =>
+    m[1]!.replace(/_([0-9A-Fa-f]{2})/g, (_x, hex: string) => String.fromCharCode(parseInt(hex, 16))),
+  );
 }
 
 interface Bar {
@@ -101,12 +119,33 @@ export interface PdfLabelPage {
   readonly payloads: string[];
 }
 
+/**
+ * Story 4-5a (A49) — the barcode rectangles a page declares (`/WMSBarcodeBands`,
+ * x y w h in points, written by the shipping-label and document renderers), or
+ * null on a page that declares none (2-10a labels: every bar is read).
+ */
+function declaredBands(page: PDFPage): { x: number; y: number; w: number; h: number }[] | null {
+  const entry = page.node.get(PDFName.of('WMSBarcodeBands'));
+  if (!(entry instanceof PDFArray)) return null;
+  const numbers = entry.asArray().map((item) => (item instanceof PDFNumber ? item.asNumber() : Number.NaN));
+  const bands: { x: number; y: number; w: number; h: number }[] = [];
+  for (let i = 0; i + 3 < numbers.length; i += 4) bands.push({ x: numbers[i]!, y: numbers[i + 1]!, w: numbers[i + 2]!, h: numbers[i + 3]! });
+  return bands;
+}
+
+function insideBand(bar: Bar, bands: readonly { x: number; y: number; w: number; h: number }[]): boolean {
+  const eps = 0.01;
+  return bands.some((band) => bar.x >= band.x - eps && bar.x + bar.width <= band.x + band.w + eps && Math.abs(bar.y - band.y) <= eps);
+}
+
 export async function readPdfLabels(pdf: Buffer | Uint8Array): Promise<PdfLabelPage[]> {
   const doc = await PDFDocument.load(pdf);
   const pages: PdfLabelPage[] = [];
   for (const page of doc.getPages()) {
     const { width, height } = page.getSize();
-    const symbols = symbolsOf(barsOf(await pageContent(doc, page)));
+    const bands = declaredBands(page);
+    const bars = barsOf(await pageContent(doc, page));
+    const symbols = symbolsOf(bands === null ? bars : bars.filter((bar) => insideBand(bar, bands)));
     pages.push({ width, height, payloads: symbols.map((widths) => decodeCode128B(widths)) });
   }
   return pages;
