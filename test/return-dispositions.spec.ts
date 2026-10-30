@@ -1192,6 +1192,9 @@ describe('returns disposition (e2e, story 4-7a)', () => {
       'openTotal',
       'orderId',
       'orderReference',
+      // Story 4-7b (A25, D2) — the allowlist grows by exactly these two.
+      'origin',
+      'parcelReference',
       'receivedTotal',
       'restockedTotal',
       'scrappedTotal',

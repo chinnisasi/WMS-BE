@@ -657,6 +657,8 @@ describe('story 21-4: metering and storage snapshots', () => {
         'pick.restocked': ['to'],
         // Story 2-8b — a return to vendor: a draw out of DAMAGED (on-hand drops; storage stops).
         'rtv.dispatched': ['from'],
+        // Story 4-7b — a blind return reversed at review: a draw out of RETURNS (on-hand drops; storage stops).
+        'return.reversed': ['from'],
       };
 
       it('every registered type is classified, and each arm folds as the replay rule says', async () => {

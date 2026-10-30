@@ -395,6 +395,8 @@ export interface SerialLatestEvent {
   readonly toBinId: string | null;
   /** Milli-units, signed. */
   readonly quantityDelta: number;
+  /** Story 4-7b (A7) — the batch the event carried (a blind return of a batch-and-serial unit must name it). */
+  readonly batchRef: string | null;
 }
 
 /** A serial's derived current location (the ledger's latest event's bin). */
@@ -1658,6 +1660,7 @@ export class InventoryFacade {
         fromBinId: ledgerEvents.fromBinId,
         toBinId: ledgerEvents.toBinId,
         quantityDelta: ledgerEvents.quantityDelta,
+        batchRef: ledgerEvents.batchRef,
       })
       .from(ledgerEvents)
       .where(and(eq(ledgerEvents.tenantId, tenantId), inArray(ledgerEvents.serialRef, distinct)))
@@ -1672,6 +1675,7 @@ export class InventoryFacade {
         fromBinId: row.fromBinId,
         toBinId: row.toBinId,
         quantityDelta: Number(row.quantityDelta),
+        batchRef: row.batchRef,
       });
     }
     return latest;

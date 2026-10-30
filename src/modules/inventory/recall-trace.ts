@@ -92,7 +92,7 @@ export interface BatchLedgerFigures {
   readonly received: number;
   /** Σ `grn.damaged`. */
   readonly receivedDamaged: number;
-  /** Σ `return.received`. */
+  /** Σ `return.received` − Σ |δ| `return.reversed` (4-7b D5 — a blind return rejected at review nets out). */
   readonly returned: number;
   /** Σ |δ| `return.scrapped` (4-7a — a returned unit of the lot scrapped out of RETURNS). */
   readonly returnScrapped: number;
@@ -142,6 +142,11 @@ export async function batchLedgerFiguresInTx(tx: TenantTx, tenantId: string, bat
         break;
       case 'return.received':
         a.returned += magnitude;
+        break;
+      // Story 4-7b (D5) — a blind return's booking reversed at review: the
+      // units were never returned, so they come off `returned`.
+      case 'return.reversed':
+        a.returned -= magnitude;
         break;
       case 'return.scrapped':
         a.returnScrapped += magnitude;

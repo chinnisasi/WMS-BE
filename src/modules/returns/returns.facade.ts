@@ -1,9 +1,9 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { returnAuthorizations } from '../../shared/db/schema';
-import { withTenantTransaction } from '../../shared/db/tenant-scope';
+import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import type { Page } from '../../shared/primitives/pagination';
@@ -25,11 +25,16 @@ import type {
   CreateRmaCommand,
   ReturnableOrder,
   RmaDetail,
+  RmaOrigin,
+  RmaReviewStatus,
   RmaStatus,
 } from './return-authorization.command';
 import { ReturnReceiptCommand, openReturnsInTx, receiptsOfRmaInTx } from './return-receipt.command';
 import type { OpenReturn, ReceiveReturnCommand, ReturnReceiptResult } from './return-receipt.command';
 import { ReturnDispositionCommand } from './return-disposition.command';
+import { BlindReturnCommand } from './blind-return.command';
+import type { AcceptBlindCommand, BlindAcceptResult, BlindReceiptResult, ReceiveBlindCommand, RejectBlindCommand } from './blind-return.command';
+import { RECEIVABLE_RMA_STATUSES } from './return-receipt.command';
 import type { DisposeReturnCommand, RestockReturnCommand, ReturnDispositionResult } from './return-disposition.command';
 import {
   awaitingDispositionsInTx,
@@ -44,6 +49,11 @@ import {
 import { PORTAL_PAGE_DEFAULT_LIMIT } from '../../shared/primitives/portal-page';
 
 export {
+  AUTHORIZABLE_REASON_CODES,
+  BLIND_MATCH_KINDS,
+  BLIND_REJECT_REASONS,
+  RMA_ORIGINS,
+  RMA_REVIEW_STATUSES,
   MAX_RMA_EXTERNAL_REFERENCE,
   MAX_RMA_LINES,
   MAX_RMA_NOTE,
@@ -63,7 +73,23 @@ export type {
   RmaLineSnapshot,
   RmaSerial,
   RmaStatus,
+  RmaOrigin,
+  RmaReviewStatus,
+  BlindMatchKind,
+  BlindRejectReason,
+  AuthorizableReasonCode,
 } from './return-authorization.command';
+export { BLIND_ENTRY_REFUSALS, MAX_BLIND_REVIEW_NOTE, MAX_PARCEL_REFERENCE } from './blind-return.command';
+export type {
+  AcceptBlindCommand,
+  BlindAcceptResult,
+  BlindEntryInput,
+  BlindEntryRefusal,
+  BlindReceiptResult,
+  ReceiveBlindCommand,
+  RejectBlindCommand,
+} from './blind-return.command';
+export { RETURN_BLIND_ACCEPTED_EVENT, RETURN_BLIND_RECORDED_EVENT, RETURN_BLIND_REJECTED_EVENT } from './events';
 export { RETURN_AUTHORIZATION_CANCELLED_EVENT, RETURN_AUTHORIZATION_CREATED_EVENT, RETURN_RECEIPT_RECORDED_EVENT } from './events';
 export {
   MAX_RETURN_NOTE,
@@ -124,6 +150,10 @@ export interface ListRmasQuery {
   readonly orderId?: string | undefined;
   /** Story 1-5a — only one client's return authorizations (an unknown id is an empty page). */
   readonly clientId?: string | undefined;
+  /** Story 4-7b — only authorized or only blind (unannounced) RMAs. */
+  readonly origin?: RmaOrigin | undefined;
+  /** Story 4-7b — only blind RMAs in one review state (the Unannounced tab reads `pending`). */
+  readonly reviewStatus?: RmaReviewStatus | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
 }
@@ -170,6 +200,7 @@ export class ReturnsFacade {
     @Inject(ReturnAuthorizationCommand) private readonly command: ReturnAuthorizationCommand,
     @Inject(ReturnReceiptCommand) private readonly receipts: ReturnReceiptCommand,
     @Inject(ReturnDispositionCommand) private readonly dispositions: ReturnDispositionCommand,
+    @Inject(BlindReturnCommand) private readonly blind: BlindReturnCommand,
     @Inject(OutboundFacade) private readonly outbound: OutboundFacade,
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
     @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
@@ -186,6 +217,21 @@ export class ReturnsFacade {
   /** Story 13-2 — `return.receive`, the device op (see `ReturnReceiptCommand`). */
   receive(command: ReceiveReturnCommand, idempotencyKey: string): Promise<ReturnReceiptResult> {
     return this.receipts.receive(command, idempotencyKey);
+  }
+
+  /** Story 4-7b — `return.receive_blind`, the device's unannounced parcel (see `BlindReturnCommand.receive`). */
+  receiveBlind(command: ReceiveBlindCommand, idempotencyKey: string): Promise<BlindReceiptResult> {
+    return this.blind.receive(command, idempotencyKey);
+  }
+
+  /** Story 4-7b — accept an unannounced return at review, optionally linking a dispatched order. */
+  acceptBlind(command: AcceptBlindCommand, idempotencyKey: string): Promise<BlindAcceptResult> {
+    return this.blind.accept(command, idempotencyKey);
+  }
+
+  /** Story 4-7b — reject an unannounced return at review, reversing its booking. */
+  rejectBlind(command: RejectBlindCommand, idempotencyKey: string): Promise<RmaDetail> {
+    return this.blind.reject(command, idempotencyKey);
   }
 
   /** Story 4-7a — the web's disposition of one receipt line (see `ReturnDispositionCommand.dispose`). */
@@ -261,7 +307,7 @@ export class ReturnsFacade {
    */
   async getOpenReturns(tenantId: string, warehouseId: string): Promise<OpenReturn[]> {
     return withTenantTransaction(this.db, tenantId, (tx) =>
-      openReturnsInTx(tx, { catalog: this.catalog, inventory: this.inventory }, tenantId, canonicalUuid(warehouseId)),
+      openReturnsInTx(tx, { catalog: this.catalog, inventory: this.inventory, outbound: this.outbound }, tenantId, canonicalUuid(warehouseId)),
     );
   }
 
@@ -291,6 +337,8 @@ export class ReturnsFacade {
             query.status === undefined ? undefined : eq(returnAuthorizations.status, query.status),
             query.orderId === undefined ? undefined : eq(returnAuthorizations.orderId, canonicalUuid(query.orderId)),
             query.clientId === undefined ? undefined : eq(returnAuthorizations.clientId, canonicalUuid(query.clientId)),
+            query.origin === undefined ? undefined : eq(returnAuthorizations.origin, query.origin),
+            query.reviewStatus === undefined ? undefined : eq(returnAuthorizations.reviewStatus, query.reviewStatus),
             before === undefined
               ? undefined
               : sql`(${returnAuthorizations.createdAt}, ${returnAuthorizations.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
@@ -303,6 +351,8 @@ export class ReturnsFacade {
         this.catalog,
         tenantId,
         rows.map((row) => row.header),
+        // Story 4-7b — the list always emits origin and review.
+        { withReview: true },
       );
       const page = buildPage(
         details.map((detail, index) => ({ createdAt: fullPrecisionInstant(rows[index]!.createdAtText), id: detail.id, detail })),
@@ -322,9 +372,64 @@ export class ReturnsFacade {
   async get(tenantId: string, rmaId: string): Promise<RmaDetail | null> {
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       const id = canonicalUuid(rmaId);
-      const detail = await rmaDetailInTx(tx, this.catalog, tenantId, id);
+      const detail = await rmaDetailInTx(tx, this.catalog, tenantId, id, { withReview: true });
       if (detail === null) return null;
-      return { ...detail, receipts: await receiptsOfRmaInTx(tx, this.catalog, tenantId, id) };
+      const reviewStatus = detail.reviewStatus ?? null;
+      return {
+        ...detail,
+        receipts: await receiptsOfRmaInTx(tx, this.catalog, tenantId, id, reviewStatus),
+        // Story 4-7b — the review card's two read-only facts (detail only).
+        ...(detail.origin === 'blind'
+          ? {
+              openRmasForSuggestedOrder: await this.openRmasOfOrderInTx(tx, tenantId, detail.suggestedOrderId ?? null),
+              sameParcelRmas: await this.sameParcelRmasInTx(tx, tenantId, id, detail.parcelReference ?? null),
+            }
+          : {}),
+      };
     });
+  }
+
+  /** Story 4-7b — the receivable RMAs of an order (own tables; the card's "an RMA is open for this order"). */
+  private async openRmasOfOrderInTx(
+    tx: TenantTx,
+    tenantId: string,
+    orderId: string | null,
+  ): Promise<{ id: string; code: string; status: RmaStatus }[]> {
+    if (orderId === null) return [];
+    const rows = await tx
+      .select({ id: returnAuthorizations.id, code: returnAuthorizations.code, status: returnAuthorizations.status })
+      .from(returnAuthorizations)
+      .where(
+        and(
+          eq(returnAuthorizations.tenantId, tenantId),
+          eq(returnAuthorizations.orderId, orderId),
+          inArray(returnAuthorizations.status, [...RECEIVABLE_RMA_STATUSES]),
+        ),
+      )
+      .orderBy(asc(returnAuthorizations.createdAt), asc(returnAuthorizations.id));
+    return rows.map((row) => ({ id: row.id, code: row.code, status: row.status as RmaStatus }));
+  }
+
+  /** Story 4-7b (A20) — the other blind RMAs received with the same parcel reference, any review state. */
+  private async sameParcelRmasInTx(
+    tx: TenantTx,
+    tenantId: string,
+    rmaId: string,
+    parcelReference: string | null,
+  ): Promise<{ id: string; code: string; reviewStatus: RmaReviewStatus }[]> {
+    if (parcelReference === null) return [];
+    const rows = await tx
+      .select({ id: returnAuthorizations.id, code: returnAuthorizations.code, reviewStatus: returnAuthorizations.reviewStatus })
+      .from(returnAuthorizations)
+      .where(
+        and(
+          eq(returnAuthorizations.tenantId, tenantId),
+          eq(returnAuthorizations.origin, 'blind'),
+          eq(returnAuthorizations.parcelReference, parcelReference),
+          ne(returnAuthorizations.id, rmaId),
+        ),
+      )
+      .orderBy(asc(returnAuthorizations.createdAt), asc(returnAuthorizations.id));
+    return rows.map((row) => ({ id: row.id, code: row.code, reviewStatus: row.reviewStatus as RmaReviewStatus }));
   }
 }

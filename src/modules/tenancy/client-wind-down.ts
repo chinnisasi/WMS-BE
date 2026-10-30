@@ -39,6 +39,8 @@ export const SKU_NAMING_OP_TYPES = [
   'stock.adjust',
   // Story 4-7a — a refused handheld restock names its SKU (`skuId`).
   'return.restock',
+  // Story 4-7b — an unannounced parcel's refused entries (`entries[*].skuId`).
+  'return.receive_blind',
 ] as const;
 
 const UUID_TEXT = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';

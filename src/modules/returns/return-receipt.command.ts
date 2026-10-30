@@ -36,6 +36,7 @@ import type { SkuFacts } from '../catalog/catalog.facade';
 import { MAX_HANDLING_UNIT_WEIGHT_GRAMS } from '../catalog/handling-unit';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import type { LedgerMovement } from '../inventory/inventory.facade';
+import type { OutboundFacade } from '../outbound/outbound.facade';
 import { canonicalUuid, rmaNotFound } from './return-authorization.command';
 import type { RmaStatus } from './return-authorization.command';
 import { RETURN_RECEIPT_RECORDED_EVENT } from './events';
@@ -223,6 +224,15 @@ export interface ReturnReceiptLineView {
   readonly scrappedQty: number;
   readonly onHoldQty: number;
   readonly failedInspectionQty: number;
+  /**
+   * Story 4-7b (A1, D1) — a BLIND RMA's line: `qty` while its review is
+   * pending (nothing can be dispositioned yet), and `qty` once it is
+   * rejected (the booking was reversed). Optional — a stored 13-2 snapshot
+   * never carried them; the detail read emits both for every blind RMA (0
+   * when not in that state) and neither for an authorized one.
+   */
+  readonly pendingReviewQty?: number;
+  readonly reversedQty?: number;
 }
 
 /** One receipt as the detail read shows it. */
@@ -259,6 +269,12 @@ export interface OpenReturn {
   readonly orderReference: string | null;
   /** Story 1-1 — the RMA's client (the device resolves a typed code within it). */
   readonly clientId: string;
+  /**
+   * Story 4-7b (A19) — the order's carrier tracking numbers (non-voided
+   * shipments): a scanned forward AWB on an unannounced parcel redirects the
+   * operator to this RMA's receipt. Omitted when the order has none.
+   */
+  readonly trackingNumbers?: readonly string[];
   readonly lines: readonly OpenReturnLine[];
 }
 
@@ -569,7 +585,7 @@ async function receivedSerialsByLineInTx(
  */
 export async function openReturnsInTx(
   tx: TenantTx,
-  deps: { readonly catalog: CatalogFacade; readonly inventory: InventoryFacade },
+  deps: { readonly catalog: CatalogFacade; readonly inventory: InventoryFacade; readonly outbound?: OutboundFacade },
   tenantId: string,
   warehouseId: string,
 ): Promise<OpenReturn[]> {
@@ -585,6 +601,15 @@ export async function openReturnsInTx(
     )
     .orderBy(asc(returnAuthorizations.createdAt), asc(returnAuthorizations.id));
   if (headers.length === 0) return [];
+  // Story 4-7b (A19) — the orders' tracking numbers, one read.
+  const trackingByOrder =
+    deps.outbound === undefined
+      ? new Map<string, string[]>()
+      : await deps.outbound.trackingNumbersByOrderIdsInTx(
+          tx,
+          tenantId,
+          headers.flatMap((header) => (header.orderId === null ? [] : [header.orderId])),
+        );
   const lines = await tx
     .select()
     .from(returnAuthorizationLines)
@@ -629,20 +654,25 @@ export async function openReturnsInTx(
       const facts = skuFacts.get(line.skuId);
       return facts !== undefined && (facts.batchTracked || facts.serialTracked);
     });
+    // A receivable RMA is always authorized (a blind one is born `received`),
+    // so it names its order and every line its order line (A4: type-only).
+    const orderId = header.orderId ?? '';
     const picks = needsPicks
-      ? pickFactsOf(await deps.inventory.ledgerEventsByOrderRefInTx(tx, tenantId, header.warehouseId, header.orderId))
+      ? pickFactsOf(await deps.inventory.ledgerEventsByOrderRefInTx(tx, tenantId, header.warehouseId, orderId))
       : pickFactsOf([]);
+    const tracking = trackingByOrder.get(orderId);
     out.push({
       id: header.id,
       code: header.code,
       orderReference: header.orderReference,
       clientId: header.clientId,
+      ...(tracking === undefined || tracking.length === 0 ? {} : { trackingNumbers: tracking }),
       lines: own.map((line) => {
         const facts = skuFacts.get(line.skuId);
         const received = receivedSerials.get(line.id) ?? new Set<string>();
         const batchCodes =
           facts?.batchTracked === true
-            ? [...(picks.batchIdsByOrderLine.get(line.orderLineId) ?? new Set<string>())]
+            ? [...(picks.batchIdsByOrderLine.get(line.orderLineId ?? '') ?? new Set<string>())]
                 .map((id) => batchCodeById.get(id))
                 .filter((code): code is string => code !== undefined)
                 .sort()
@@ -683,6 +713,8 @@ export async function receiptsOfRmaInTx(
   catalog: CatalogFacade,
   tenantId: string,
   rmaId: string,
+  /** Story 4-7b — the RMA's review status: non-null (a blind RMA) adds `pendingReviewQty` / `reversedQty`. */
+  reviewStatus: string | null = null,
 ): Promise<ReturnReceiptView[]> {
   const headers = await tx
     .select({
@@ -768,6 +800,12 @@ export async function receiptsOfRmaInTx(
         scrappedQty: fromMilli(split.scrapped),
         onHoldQty: fromMilli(split.onHold),
         failedInspectionQty: fromMilli(split.failed),
+        ...(reviewStatus === null
+          ? {}
+          : {
+              pendingReviewQty: reviewStatus === 'pending' ? fromMilli(Number(line.qty)) : 0,
+              reversedQty: reviewStatus === 'rejected' ? fromMilli(Number(line.qty)) : 0,
+            }),
         };
       }),
   }));
@@ -847,7 +885,7 @@ export function classifyReturnEntry(
     if (resolved === undefined) return { reason: 'batch-not-dispatched' };
     if (serialId !== null) {
       if (ctx.picks.batchBySerial.get(serialId) !== resolved) return { reason: 'batch-not-dispatched' };
-    } else if (ctx.picks.batchIdsByOrderLine.get(line.orderLineId)?.has(resolved) !== true) {
+    } else if (ctx.picks.batchIdsByOrderLine.get(line.orderLineId ?? '')?.has(resolved) !== true) {
       return { reason: 'batch-not-dispatched' };
     }
     // No more back from a batch than the line picked from it.
@@ -994,7 +1032,7 @@ export class ReturnReceiptCommand {
         return line !== undefined && skuFacts.get(line.skuId)?.batchTracked === true;
       });
       const picks = needsPicks
-        ? pickFactsOf(await this.inventory.ledgerEventsByOrderRefInTx(tx, tenantId, rma.warehouseId, rma.orderId))
+        ? pickFactsOf(await this.inventory.ledgerEventsByOrderRefInTx(tx, tenantId, rma.warehouseId, rma.orderId ?? ''))
         : pickFactsOf([]);
       const batchIdByCode = new Map<string, string>();
       if (needsPicks) {
@@ -1010,7 +1048,7 @@ export class ReturnReceiptCommand {
       // Units already received back per (order line, batch), across every
       // RMA of the order (own tables) — the per-batch ceiling's other half.
       const receivedMilliByLineBatch = needsPicks
-        ? await receivedBatchMilliInTx(tx, tenantId, [...new Set(rmaLines.map((line) => line.orderLineId))])
+        ? await receivedBatchMilliInTx(tx, tenantId, [...new Set(rmaLines.flatMap((line) => (line.orderLineId === null ? [] : [line.orderLineId])))])
         : new Map<string, number>();
 
       // 10. Classify each entry, in request order, against the remaining

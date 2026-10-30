@@ -7759,6 +7759,7 @@
                   "stock.moved",
                   "return.restocked",
                   "return.scrapped",
+                  "return.reversed",
                   "rtv.dispatched"
                 ]
               }
@@ -40824,6 +40825,33 @@
             }
           },
           {
+            "name": "origin",
+            "required": false,
+            "in": "query",
+            "description": "Story 4-7b — only authorized, or only blind (unannounced), return authorizations",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "authorized",
+                "blind"
+              ]
+            }
+          },
+          {
+            "name": "reviewStatus",
+            "required": false,
+            "in": "query",
+            "description": "Story 4-7b — only unannounced returns in one review state (the Unannounced tab reads pending)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "accepted",
+                "rejected"
+              ]
+            }
+          },
+          {
             "name": "cursor",
             "required": false,
             "in": "query",
@@ -40892,6 +40920,126 @@
           }
         ],
         "summary": "Lists return authorizations newest first (keyset on createdAt, id), optionally one warehouse’s (tenant-wide without it), one status’s, one order’s — each with its lines",
+        "tags": [
+          "returns"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/returns/blind-receipts": {
+      "post": {
+        "operationId": "ReturnsController_receiveBlind",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the device token)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReceiveBlindReturnDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Recorded: the blind RMA and its receipt (null when every entry was refused), the suggested order, and per entry applied or refused with its reason (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlindReceiptResultDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an invalid body — no entries or over 150, a malformed id, a non-boolean clientPrompted, a parcel reference over 64 characters, a non-positive qty, an unknown condition, a note over 200 characters, a serial or weight entry whose qty is not 1, both a serial and a weight, or a non-UTC occurredAt (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Unknown or revoked device (device-revoked), or the operator is not a floor role (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A user zone or bin named RETURNS blocks the system returns bin (returns-bin-conflict), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "return.receive_blind — receives an unannounced parcel (no RMA) exactly once (badge-in session required): each entry of the parcel's client that resolves books a return.received into RETURNS under an auto-created blind return authorization (born received, review pending — nothing can be dispositioned or reach ATP until it is accepted on the web); every other entry is refused into ONE review-queue row (Discard only). The parcel reference suggests one dispatched order (carrier AWB, then the order reference)",
         "tags": [
           "returns"
         ]
@@ -41664,6 +41812,264 @@
           }
         ],
         "summary": "Cancels an open return authorization nothing was received against (returns.manage), with a reason — its quantity and serials become returnable again",
+        "tags": [
+          "returns"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/returns/{rmaId}/accept": {
+      "post": {
+        "operationId": "ReturnsController_acceptBlind",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "rmaId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcceptBlindReturnDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The accepted return and its unlinked lines (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlindAcceptResultDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed rmaId or orderId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks returns.manage (role-denied), or a client-portal session (role-denied — operators only)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The return authorization or the order does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The return was authorized, not received unannounced — member origin (rma-not-blind); its review is already decided — member reviewStatus (review-not-pending); the order is another client's (order-client-mismatch), another warehouse's (document-warehouse-mismatch) or not dispatched — member orderStatus (order-not-dispatched); or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Accepts an unannounced return at review (returns.manage): optionally links a dispatched order of the parcel's client and warehouse — each line links to an order line it fits (its SKU, enough returnable, its serials dispatched there) and then counts against that order's returnable; a line that fits nowhere stays unlinked and is named, never refused — and opens its units to disposition",
+        "tags": [
+          "returns"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/returns/{rmaId}/reject": {
+      "post": {
+        "operationId": "ReturnsController_rejectBlind",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "rmaId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RejectBlindReturnDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The rejected return (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReturnAuthorizationDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, an unknown reasonCode, \"other\" without a note, or a note over 200 characters (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks returns.manage (role-denied), or a client-portal session (role-denied — operators only)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The return authorization does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The return was authorized, not received unannounced — member origin (rma-not-blind); its review is already decided — member reviewStatus (review-not-pending); its units exceed the tenant's write-off threshold — members threshold, totalQty (reject-above-threshold); RETURNS is under a reconcile quarantine (disposition-scope-quarantined); or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Rejects an unannounced return at review (returns.manage) with a reason: each received line is reversed out of RETURNS (return.reversed), a returned case is rejected, and the units can be received again correctly. Only while the review is pending; refused above the tenant write-off threshold",
         "tags": [
           "returns"
         ]
@@ -46949,7 +47355,8 @@
               "stock.adjust",
               "receipt-photo.stage",
               "return.restock",
-              "rtv.pick"
+              "rtv.pick",
+              "return.receive_blind"
             ]
           },
           "classification": {
@@ -47107,7 +47514,8 @@
               "stock.adjust",
               "receipt-photo.stage",
               "return.restock",
-              "rtv.pick"
+              "rtv.pick",
+              "return.receive_blind"
             ]
           },
           "classification": {
@@ -72940,7 +73348,9 @@
           },
           "orderId": {
             "type": "string",
-            "format": "uuid"
+            "nullable": true,
+            "format": "uuid",
+            "description": "Story 4-7b — null on an accepted unannounced return linked to no order"
           },
           "orderReference": {
             "type": "string",
@@ -72949,6 +73359,19 @@
           "externalReference": {
             "type": "string",
             "nullable": true
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "authorized",
+              "blind"
+            ],
+            "description": "Story 4-7b — authorized, or blind (an unannounced parcel — listed once accepted)"
+          },
+          "parcelReference": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 4-7b — an unannounced return's scanned AWB or order number"
           },
           "createdAt": {
             "type": "string",
@@ -72984,6 +73407,8 @@
           "orderId",
           "orderReference",
           "externalReference",
+          "origin",
+          "parcelReference",
           "createdAt",
           "lineCount",
           "receivedTotal",
@@ -73036,7 +73461,8 @@
               "wrong-item",
               "not-as-described",
               "changed-mind",
-              "other"
+              "other",
+              "unannounced"
             ],
             "description": "Why the customer returned it"
           },
@@ -73137,7 +73563,9 @@
           },
           "orderId": {
             "type": "string",
-            "format": "uuid"
+            "nullable": true,
+            "format": "uuid",
+            "description": "Story 4-7b — null on an accepted unannounced return linked to no order"
           },
           "orderReference": {
             "type": "string",
@@ -73146,6 +73574,19 @@
           "externalReference": {
             "type": "string",
             "nullable": true
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "authorized",
+              "blind"
+            ],
+            "description": "Story 4-7b — authorized, or blind (an unannounced parcel — listed once accepted)"
+          },
+          "parcelReference": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 4-7b — an unannounced return's scanned AWB or order number"
           },
           "createdAt": {
             "type": "string",
@@ -73194,6 +73635,8 @@
           "orderId",
           "orderReference",
           "externalReference",
+          "origin",
+          "parcelReference",
           "createdAt",
           "lineCount",
           "receivedTotal",
@@ -76698,7 +77141,9 @@
           },
           "orderLineId": {
             "type": "string",
-            "format": "uuid"
+            "nullable": true,
+            "format": "uuid",
+            "description": "The order line returned — story 4-7b: null on an unannounced line no accept has linked"
           },
           "skuId": {
             "type": "string",
@@ -76721,7 +77166,8 @@
               "wrong-item",
               "not-as-described",
               "changed-mind",
-              "other"
+              "other",
+              "unannounced"
             ]
           },
           "reasonNote": {
@@ -76818,6 +77264,16 @@
             "type": "number",
             "minimum": 0,
             "description": "Story 4-7a — units that failed a return hold's inspection (now in DAMAGED), base UoM"
+          },
+          "pendingReviewQty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 4-7b — an unannounced return's line: units awaiting review (qty while pending, else 0); absent on an authorized return"
+          },
+          "reversedQty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 4-7b — an unannounced return's line: units reversed at review (qty once rejected, else 0); absent on an authorized return"
           }
         },
         "required": [
@@ -76872,6 +77328,57 @@
           "lines"
         ]
       },
+      "RmaRefDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "partially_received",
+              "received",
+              "cancelled"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "status"
+        ]
+      },
+      "SameParcelRmaDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "reviewStatus": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "accepted",
+              "rejected"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "reviewStatus"
+        ]
+      },
       "ReturnAuthorizationDto": {
         "type": "object",
         "properties": {
@@ -76894,7 +77401,9 @@
           },
           "orderId": {
             "type": "string",
-            "format": "uuid"
+            "nullable": true,
+            "format": "uuid",
+            "description": "The order returned — story 4-7b: null on an unannounced return not linked to an order"
           },
           "orderReference": {
             "type": "string",
@@ -76918,7 +77427,8 @@
           },
           "orderDispatchedAt": {
             "type": "string",
-            "description": "When the order was dispatched (ISO-8601 UTC) — recorded at authorization"
+            "nullable": true,
+            "description": "When the order was dispatched (ISO-8601 UTC) — recorded at authorization; story 4-7b: null exactly when orderId is"
           },
           "createdAt": {
             "type": "string",
@@ -76958,6 +77468,93 @@
             "items": {
               "$ref": "#/components/schemas/ReturnReceiptViewDto"
             }
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "authorized",
+              "blind"
+            ],
+            "description": "Story 4-7b — authorized (13-1) or blind (an unannounced parcel). Always present on the list and detail reads; absent on a pre-4-7b create/cancel response"
+          },
+          "reviewStatus": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "pending",
+              "accepted",
+              "rejected",
+              null
+            ],
+            "description": "Story 4-7b — a blind return's review; null on an authorized one"
+          },
+          "parcelReference": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 4-7b — the scanned AWB or order number of a blind return"
+          },
+          "suggestedOrderId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Story 4-7b — the dispatched order the parcel reference matched (a suggestion only)"
+          },
+          "matchKind": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "awb",
+              "order-reference",
+              null
+            ],
+            "description": "Story 4-7b — how the reference matched: the carrier AWB or the order reference"
+          },
+          "clientPrompted": {
+            "type": "boolean",
+            "nullable": true,
+            "description": "Story 4-7b — the operator chose the client at a barcode several clients share; null on an authorized return"
+          },
+          "reviewedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 4-7b — when the review was decided (ISO-8601 UTC)"
+          },
+          "reviewedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Story 4-7b — who decided the review"
+          },
+          "reviewReasonCode": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "mis-scanned",
+              "not-our-goods",
+              "duplicate",
+              "other",
+              null
+            ],
+            "description": "Story 4-7b — why a blind return was rejected"
+          },
+          "reviewNote": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 4-7b — the reject's note"
+          },
+          "openRmasForSuggestedOrder": {
+            "description": "Story 4-7b — detail only: the suggested order's open or partially received return authorizations (the card's flag)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RmaRefDto"
+            }
+          },
+          "sameParcelRmas": {
+            "description": "Story 4-7b — detail only: other unannounced returns received with the same parcel reference, any review state",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SameParcelRmaDto"
+            }
           }
         },
         "required": [
@@ -76976,6 +77573,226 @@
           "cancelledBy",
           "cancelReason",
           "lines"
+        ]
+      },
+      "BlindReceiptEntryDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The SKU scanned — the parcel's client's (sku-not-of-client otherwise)"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units received, base UoM. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded. A serial entry is exactly 1 unit; a catch-weight entry is exactly 1 case.",
+            "minimum": 0.001,
+            "maximum": 9007199254740
+          },
+          "condition": {
+            "type": "string",
+            "enum": [
+              "resaleable",
+              "opened",
+              "damaged",
+              "missing-parts"
+            ],
+            "description": "The inspection grade (13-2)"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "description": "An inspection note — trimmed, blank means absent, at most 200 characters",
+            "maxLength": 400
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "Batch-tracked SKUs: an existing batch of the SKU (never created)",
+            "maxLength": 128
+          },
+          "serialNumber": {
+            "type": "string",
+            "nullable": true,
+            "description": "Serial-tracked SKUs: an existing serial of the SKU, out of stock (qty 1)",
+            "maxLength": 400
+          },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true,
+            "description": "Catch-weight SKUs: the case's weight in whole grams (qty 1), at most 1000000",
+            "minimum": 1,
+            "maximum": 1000000
+          }
+        },
+        "required": [
+          "skuId",
+          "qty",
+          "condition"
+        ]
+      },
+      "ReceiveBlindReturnDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The warehouse receiving the parcel"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The parcel's client — fixed on the handheld by the first unit's SKU"
+          },
+          "clientPrompted": {
+            "type": "boolean",
+            "description": "The operator chose the client at a barcode several clients share (A24)"
+          },
+          "parcelReference": {
+            "type": "string",
+            "nullable": true,
+            "description": "The scanned AWB or order number — trimmed, blank means skipped, at most 64 characters",
+            "maxLength": 128
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Device time (ISO-8601 UTC, Z-suffixed) — the ledger events' business time"
+          },
+          "entries": {
+            "minItems": 1,
+            "maxItems": 150,
+            "description": "1–150 entries — one parcel is one op; the device receives the rest as another parcel",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BlindReceiptEntryDto"
+            }
+          }
+        },
+        "required": [
+          "warehouseId",
+          "clientId",
+          "clientPrompted",
+          "occurredAt",
+          "entries"
+        ]
+      },
+      "BlindEntryAppliedDto": {
+        "type": "object",
+        "properties": {
+          "entryIndex": {
+            "type": "number",
+            "description": "The entry's place in the op (0-based)"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units booked into RETURNS, base UoM"
+          }
+        },
+        "required": [
+          "entryIndex",
+          "qty"
+        ]
+      },
+      "BlindEntryRefusedDto": {
+        "type": "object",
+        "properties": {
+          "entryIndex": {
+            "type": "number",
+            "description": "The entry's place in the op (0-based)"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "not-in-catalog",
+              "sku-not-of-client",
+              "kit-cannot-hold-stock",
+              "qty-precision",
+              "missing-capture",
+              "unexpected-capture",
+              "weight-out-of-range",
+              "serial-unknown",
+              "serial-blocked",
+              "serial-in-stock",
+              "serial-duplicate",
+              "batch-unknown"
+            ],
+            "description": "Why it was not booked — the entry is in the review queue (Discard only)"
+          }
+        },
+        "required": [
+          "entryIndex",
+          "reason"
+        ]
+      },
+      "BlindReceiptResultDto": {
+        "type": "object",
+        "properties": {
+          "rmaId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The blind return authorization created; null when every entry was refused"
+          },
+          "rmaCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "RMA-0001; null when every entry was refused"
+          },
+          "returnReceiptId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The receipt; null when every entry was refused"
+          },
+          "code": {
+            "type": "string",
+            "nullable": true,
+            "description": "RRN-0001; null when every entry was refused"
+          },
+          "suggestedOrderId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The one dispatched order the parcel reference matched; null when none or several did"
+          },
+          "matchKind": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "awb",
+              "order-reference",
+              null
+            ]
+          },
+          "applied": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BlindEntryAppliedDto"
+            }
+          },
+          "refused": {
+            "description": "The refused entries — all of them sit in ONE review-queue row (Discard only)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BlindEntryRefusedDto"
+            }
+          },
+          "reviewOpId": {
+            "type": "string",
+            "nullable": true,
+            "description": "The review row's op id when entries were refused (derived from the key); null otherwise"
+          }
+        },
+        "required": [
+          "rmaId",
+          "rmaCode",
+          "returnReceiptId",
+          "code",
+          "suggestedOrderId",
+          "matchKind",
+          "applied",
+          "refused",
+          "reviewOpId"
         ]
       },
       "ReturnReceiptEntryDto": {
@@ -77634,6 +78451,248 @@
         },
         "required": [
           "reason"
+        ]
+      },
+      "AcceptBlindReturnDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The dispatched order to link — the parcel's client and warehouse; null is the explicit \"No order\""
+          }
+        },
+        "required": [
+          "orderId"
+        ]
+      },
+      "BlindAcceptResultDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "description": "The server-allocated code, `RMA-0001`, unique per tenant"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "partially_received",
+              "received",
+              "cancelled"
+            ]
+          },
+          "orderId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The order returned — story 4-7b: null on an unannounced return not linked to an order"
+          },
+          "orderReference": {
+            "type": "string",
+            "nullable": true,
+            "description": "The order's reference at authorization — story 4-1b: its client order number, else its channel reference (external event id); null when it has neither. An RMA created before 4-1b holds the channel reference only"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The order's warehouse — where the return will be received"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The order's client"
+          },
+          "externalReference": {
+            "type": "string",
+            "nullable": true,
+            "description": "A channel's or customer's RMA number; null when none was given"
+          },
+          "orderDispatchedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "When the order was dispatched (ISO-8601 UTC) — recorded at authorization; story 4-7b: null exactly when orderId is"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC creation time (the keyset field)"
+          },
+          "createdBy": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Who authorized it"
+          },
+          "cancelledAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "When it was cancelled (ISO-8601 UTC); null unless cancelled"
+          },
+          "cancelledBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Who cancelled it; null unless cancelled"
+          },
+          "cancelReason": {
+            "type": "string",
+            "nullable": true,
+            "description": "Why it was cancelled; null unless cancelled"
+          },
+          "lines": {
+            "description": "The authorized lines, in the order they were named",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReturnAuthorizationLineDto"
+            }
+          },
+          "receipts": {
+            "description": "Story 13-2 — the receipts against this authorization, oldest first. Present ONLY on GET /returns/{rmaId}; absent on the list and on the create/cancel responses",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReturnReceiptViewDto"
+            }
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "authorized",
+              "blind"
+            ],
+            "description": "Story 4-7b — authorized (13-1) or blind (an unannounced parcel). Always present on the list and detail reads; absent on a pre-4-7b create/cancel response"
+          },
+          "reviewStatus": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "pending",
+              "accepted",
+              "rejected",
+              null
+            ],
+            "description": "Story 4-7b — a blind return's review; null on an authorized one"
+          },
+          "parcelReference": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 4-7b — the scanned AWB or order number of a blind return"
+          },
+          "suggestedOrderId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Story 4-7b — the dispatched order the parcel reference matched (a suggestion only)"
+          },
+          "matchKind": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "awb",
+              "order-reference",
+              null
+            ],
+            "description": "Story 4-7b — how the reference matched: the carrier AWB or the order reference"
+          },
+          "clientPrompted": {
+            "type": "boolean",
+            "nullable": true,
+            "description": "Story 4-7b — the operator chose the client at a barcode several clients share; null on an authorized return"
+          },
+          "reviewedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 4-7b — when the review was decided (ISO-8601 UTC)"
+          },
+          "reviewedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Story 4-7b — who decided the review"
+          },
+          "reviewReasonCode": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "mis-scanned",
+              "not-our-goods",
+              "duplicate",
+              "other",
+              null
+            ],
+            "description": "Story 4-7b — why a blind return was rejected"
+          },
+          "reviewNote": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 4-7b — the reject's note"
+          },
+          "openRmasForSuggestedOrder": {
+            "description": "Story 4-7b — detail only: the suggested order's open or partially received return authorizations (the card's flag)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RmaRefDto"
+            }
+          },
+          "sameParcelRmas": {
+            "description": "Story 4-7b — detail only: other unannounced returns received with the same parcel reference, any review state",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SameParcelRmaDto"
+            }
+          },
+          "unlinkedLines": {
+            "description": "The RMA line ids left unlinked (every line under \"No order\")",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "status",
+          "orderId",
+          "orderReference",
+          "warehouseId",
+          "clientId",
+          "externalReference",
+          "orderDispatchedAt",
+          "createdAt",
+          "createdBy",
+          "cancelledAt",
+          "cancelledBy",
+          "cancelReason",
+          "lines",
+          "unlinkedLines"
+        ]
+      },
+      "RejectBlindReturnDto": {
+        "type": "object",
+        "properties": {
+          "reasonCode": {
+            "type": "string",
+            "enum": [
+              "mis-scanned",
+              "not-our-goods",
+              "duplicate",
+              "other"
+            ],
+            "description": "`other` requires a note"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "description": "Required for \"other\"; trimmed, blank means absent, at most 200 characters",
+            "maxLength": 400
+          }
+        },
+        "required": [
+          "reasonCode"
         ]
       },
       "CreateVendorReturnLineDto": {

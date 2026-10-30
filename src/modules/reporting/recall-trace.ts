@@ -316,7 +316,9 @@ const EVENT_SECTIONS: Readonly<Record<'dispatched' | 'received' | 'received_dama
   dispatched: PICK_NETTING_TYPES,
   received: ['grn.received'],
   received_damaged: ['grn.damaged'],
-  returned: ['return.received'],
+  // Story 4-7b (D5) — a blind return reversed at review is listed beside the
+  // intakes, signed negative, so the section sums to the netted figure.
+  returned: ['return.received', 'return.reversed'],
   return_scrapped: ['return.scrapped'],
   // Story 2-8b — the draw out of DAMAGED at a return-to-vendor's dispatch.
   returned_to_vendor: ['rtv.dispatched'],
@@ -336,7 +338,7 @@ export interface RecallEventRow {
   readonly lot: RecallLotFacts;
   readonly event: BatchTraceEvent;
   readonly warehouseCode: string;
-  /** Base units, positive. */
+  /** Base units, positive — except a `return.reversed` row in `returned`, which is negative (4-7b D5). */
   readonly quantity: number;
   readonly duringRecall: boolean;
   readonly order: OrderTraceFacts | null;
@@ -466,6 +468,8 @@ export async function eventRowsPageInTx(
               ? (grn?.document ?? null)
               : `damaged on receipt${damage === undefined ? '' : ` (${damage})`} — held in DAMAGED; the units leave by a write-off or a return to vendor`,
         });
+      } else if (section === 'returned' && event.type === 'return.reversed') {
+        rows.push({ ...base, quantity: -Math.abs(event.quantity), reason: 'a blind return reversed at review — the units were never returned' });
       } else if (section === 'returned') {
         rows.push({ ...base, reason: 'returned by the consignee (an authorised return received into RETURNS)' });
       } else if (section === 'return_scrapped') {

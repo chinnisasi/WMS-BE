@@ -9,11 +9,16 @@ import type { DeviceSession, TenantSession } from '../modules/tenancy/jwt-sessio
 import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/idempotency-guard';
 import { UUID_RE } from '../shared/primitives/ids';
 import { ReturnsFacade } from '../modules/returns/returns.facade';
-import type { ReturnableOrder, ReturnDispositionResult, ReturnReceiptResult, RmaDetail } from '../modules/returns/returns.facade';
+import type { BlindAcceptResult, BlindReceiptResult, ReturnableOrder, ReturnDispositionResult, ReturnReceiptResult, RmaDetail } from '../modules/returns/returns.facade';
 // Constructor params are types here but must stay value imports: Nest
 // decorator metadata needs the runtime class tokens (eslint rule bends).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import {
+  AcceptBlindReturnDto,
+  BlindAcceptResultDto,
+  BlindReceiptResultDto,
+  ReceiveBlindReturnDto,
+  RejectBlindReturnDto,
   AwaitingDispositionListResponse,
   AwaitingDispositionQuery,
   CancelReturnAuthorizationDto,
@@ -66,6 +71,11 @@ const READ_403 = 'Session belongs to another tenant (permission-denied), or a cl
  * `POST returns/restocks` (the handheld's `return.restock`, a badge-in floor
  * role) and `GET returns/awaiting` (the queue, oldest first) — the literal
  * `awaiting` declared before `:rmaId`, like `returnable`.
+ *
+ * Story 4-7b adds blind returns: `POST returns/blind-receipts` (the
+ * handheld's `return.receive_blind` — an unannounced parcel; declared before
+ * every `:rmaId` route), and the web review `POST returns/:rmaId/accept` and
+ * `POST returns/:rmaId/reject` (`returns.manage`).
  */
 @ApiTags('returns')
 @ApiExtraModels(ProblemDetailsDto)
@@ -128,6 +138,79 @@ export class ReturnsController {
       key,
     );
     return toRmaDto(rma);
+  }
+
+  /**
+   * Story 4-7b — `return.receive_blind`, the handheld's unannounced parcel
+   * (badge-in device session; the key is the op's ULID). The literal
+   * `blind-receipts` is declared BEFORE every `:rmaId` route (guide §6).
+   */
+  @Post(':tenantId/returns/blind-receipts')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(DeviceSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "return.receive_blind — receives an unannounced parcel (no RMA) exactly once (badge-in session required): each entry of the parcel's client that resolves books a return.received into RETURNS under an auto-created blind return authorization (born received, review pending — nothing can be dispositioned or reach ATP until it is accepted on the web); every other entry is refused into ONE review-queue row (Discard only). The parcel reference suggests one dispatched order (carrier AWB, then the order reference)",
+  })
+  @ApiBody({ type: ReceiveBlindReturnDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({
+    status: HttpStatus.CREATED,
+    type: BlindReceiptResultDto,
+    description: 'Recorded: the blind RMA and its receipt (null when every entry was refused), the suggested order, and per entry applied or refused with its reason (the idempotency snapshot)',
+  })
+  @ApiResponse({
+    status: 400,
+    ...problemJsonResponse(
+      'Missing or malformed Idempotency-Key, or an invalid body — no entries or over 150, a malformed id, a non-boolean clientPrompted, a parcel reference over 64 characters, a non-positive qty, an unknown condition, a note over 200 characters, a serial or weight entry whose qty is not 1, both a serial and a weight, or a non-UTC occurredAt (validation-failed)',
+    ),
+  })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Unknown or revoked device (device-revoked), or the operator is not a floor role (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse does not exist in this tenant (not-found)') })
+  @ApiResponse({
+    status: 409,
+    ...problemJsonResponse('A user zone or bin named RETURNS blocks the system returns bin (returns-bin-conflict), or a concurrent idempotent request (conflict)'),
+  })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the device token)' })
+  async receiveBlind(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentDeviceSession() session: DeviceSession,
+    @Body() dto: ReceiveBlindReturnDto,
+  ): Promise<BlindReceiptResultDto> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    if (session.userId === null) {
+      throw new ProblemException('unauthenticated', 401, 'Badge-in required', 'This endpoint requires an operator badge-in session.');
+    }
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const result = await this.returns.receiveBlind(
+      {
+        tenantId,
+        deviceId: session.deviceId,
+        operatorUserId: session.userId,
+        warehouseId: dto.warehouseId,
+        clientId: dto.clientId,
+        clientPrompted: dto.clientPrompted,
+        parcelReference: dto.parcelReference ?? null,
+        occurredAt: dto.occurredAt,
+        // BASE units cross this edge; the command scales them behind its
+        // replay lookup. Optional keys normalise in the command.
+        entries: dto.entries.map((entry) => ({
+          skuId: entry.skuId,
+          qty: entry.qty,
+          condition: entry.condition,
+          note: entry.note ?? null,
+          batchCode: entry.batchCode ?? null,
+          serialNumber: entry.serialNumber ?? null,
+          weightGrams: entry.weightGrams ?? null,
+        })),
+      },
+      key,
+    );
+    return toBlindReceiptDto(result);
   }
 
   /**
@@ -402,6 +485,8 @@ export class ReturnsController {
       status: query.status,
       orderId: query.orderId,
       clientId: query.clientId,
+      origin: query.origin,
+      reviewStatus: query.reviewStatus,
       cursor: query.cursor,
       limit: query.limit,
     });
@@ -470,6 +555,84 @@ export class ReturnsController {
     const rma = await this.returns.cancel({ tenantId, actorUserId: session.userId, rmaId, reason: dto.reason }, key);
     return toRmaDto(rma);
   }
+
+  /** Story 4-7b — accept an unannounced return at review (returns.manage). */
+  @Post(':tenantId/returns/:rmaId/accept')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Accepts an unannounced return at review (returns.manage): optionally links a dispatched order of the parcel's client and warehouse — each line links to an order line it fits (its SKU, enough returnable, its serials dispatched there) and then counts against that order's returnable; a line that fits nowhere stays unlinked and is named, never refused — and opens its units to disposition",
+  })
+  @ApiBody({ type: AcceptBlindReturnDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: BlindAcceptResultDto, description: 'The accepted return and its unlinked lines (the idempotency snapshot)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed rmaId or orderId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse(WRITE_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The return authorization or the order does not exist in this tenant (not-found)') })
+  @ApiResponse({
+    status: 409,
+    ...problemJsonResponse(
+      "The return was authorized, not received unannounced — member origin (rma-not-blind); its review is already decided — member reviewStatus (review-not-pending); the order is another client's (order-client-mismatch), another warehouse's (document-warehouse-mismatch) or not dispatched — member orderStatus (order-not-dispatched); or a concurrent idempotent request (conflict)",
+    ),
+  })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'rmaId', format: 'uuid' })
+  async acceptBlind(
+    @Param('tenantId') tenantId: string,
+    @Param('rmaId') rmaId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: AcceptBlindReturnDto,
+  ): Promise<BlindAcceptResultDto> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(rmaId, 'rmaId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const result = await this.returns.acceptBlind({ tenantId, actorUserId: session.userId, rmaId, orderId: dto.orderId ?? null }, key);
+    return toBlindAcceptDto(result);
+  }
+
+  /** Story 4-7b — reject an unannounced return at review, reversing its booking (returns.manage). */
+  @Post(':tenantId/returns/:rmaId/reject')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Rejects an unannounced return at review (returns.manage) with a reason: each received line is reversed out of RETURNS (return.reversed), a returned case is rejected, and the units can be received again correctly. Only while the review is pending; refused above the tenant write-off threshold',
+  })
+  @ApiBody({ type: RejectBlindReturnDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: ReturnAuthorizationDto, description: 'The rejected return (the idempotency snapshot)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an unknown reasonCode, "other" without a note, or a note over 200 characters (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse(WRITE_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The return authorization does not exist in this tenant (not-found)') })
+  @ApiResponse({
+    status: 409,
+    ...problemJsonResponse(
+      "The return was authorized, not received unannounced — member origin (rma-not-blind); its review is already decided — member reviewStatus (review-not-pending); its units exceed the tenant's write-off threshold — members threshold, totalQty (reject-above-threshold); RETURNS is under a reconcile quarantine (disposition-scope-quarantined); or a concurrent idempotent request (conflict)",
+    ),
+  })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'rmaId', format: 'uuid' })
+  async rejectBlind(
+    @Param('tenantId') tenantId: string,
+    @Param('rmaId') rmaId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: RejectBlindReturnDto,
+  ): Promise<ReturnAuthorizationDto> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(rmaId, 'rmaId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const rma = await this.returns.rejectBlind({ tenantId, actorUserId: session.userId, rmaId, reasonCode: dto.reasonCode, note: dto.note ?? null }, key);
+    return toRmaDto(rma);
+  }
 }
 
 function assertOwnTenantToken(tokenTenantId: string, tenantId: string): void {
@@ -501,6 +664,18 @@ function toRmaDto(rma: RmaDetail): ReturnAuthorizationDto {
       ? {}
       : { receipts: receipts.map((receipt) => ({ ...receipt, lines: receipt.lines.map((line) => ({ ...line })) })) }),
   };
+}
+
+function toBlindReceiptDto(result: BlindReceiptResult): BlindReceiptResultDto {
+  return {
+    ...result,
+    applied: result.applied.map((item) => ({ ...item })),
+    refused: result.refused.map((item) => ({ ...item })),
+  };
+}
+
+function toBlindAcceptDto(result: BlindAcceptResult): BlindAcceptResultDto {
+  return { ...toRmaDto(result), unlinkedLines: [...result.unlinkedLines] };
 }
 
 function toDispositionDto(result: ReturnDispositionResult): ReturnDispositionResultDto {
