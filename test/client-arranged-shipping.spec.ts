@@ -1216,6 +1216,30 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
     for (const photo of row.photos!) expect(photo.url).toContain('https://files.example/');
   });
 
+  it('matrix "AWB pre-advice": a portal AWB advice with no file → 201, courier-label labelled, the AWB normalised, recorded on the portal surface', async () => {
+    const orderId = await acceptedOrder();
+    const res = await awbAdvice(orderId, { awb: ' lr-2026 0101 ', courierName: 'VRL Logistics', packageCount: 2 }, acmePortal, ulid(), true).expect(201);
+    expect(res.body.shipment).toMatchObject({ orderId, kind: 'courier-label', status: 'labelled', awb: 'LR20260101', courierName: 'VRL Logistics', packageCount: 2 });
+    const [row] = await shipmentsOf(orderId);
+    expect(row).toMatchObject({ kind: 'courier-label', status: 'labelled', tracking_number: 'LR20260101', recorded_surface: 'portal', label_attachment_id: null, client_id: acme });
+    const portal = await http().get(`${API}/${tenantId}/portal/orders/${orderId}/shipping`).set('Authorization', `Bearer ${acmePortal}`).expect(200);
+    expect(portal.body).toMatchObject({ status: 'awb-received', awb: 'LR20260101', courierName: 'VRL Logistics', label: null });
+  });
+
+  it('matrix "Handover, web" — the webhook leg: each handed-over order’s order.dispatched outbox row carries the AWB and the courier', async () => {
+    const one = await packedOrder();
+    await awbAdvice(one, { awb: 'AWBHOOK001', courierName: 'Delhivery' }).expect(201);
+    const two = await packedOrder();
+    await handOver({ courier: { courierName: 'Delhivery' }, parcels: [{ orderId: one, awb: 'AWBHOOK001' }, { orderId: two, awb: 'awb-hook-002' }] }).expect(201);
+    for (const [orderId, awb] of [[one, 'AWBHOOK001'], [two, 'AWBHOOK002']] as const) {
+      const rows = (await sql`select payload from outbox_messages where tenant_id = ${tenantId} and type = 'order.dispatched' and payload->'dispatch'->>'orderId' = ${orderId}`) as unknown as {
+        payload: { dispatch: { trackingNumber: string | null; carrierName: string | null; orderStatus: string } };
+      }[];
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.payload.dispatch).toMatchObject({ orderStatus: 'dispatched', trackingNumber: awb, carrierName: 'Delhivery' });
+    }
+  });
+
   it('A44 — the portal status derivation', () => {
     expect(portalShippingStatus('cancelled', null, false)).toBe('cancelled');
     expect(portalShippingStatus('accepted', null, false)).toBe('no-label-yet');
