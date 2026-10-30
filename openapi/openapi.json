@@ -11415,6 +11415,240 @@
         ]
       }
     },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/cartons": {
+      "post": {
+        "operationId": "OutboundController_recartonOrder",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecartonOrderDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The split sent is the live one — nothing written, the key stored (unchanged: true)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecartonResponse"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "The live pack after the re-carton (a replay re-serves it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecartonResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key or path parameter, a malformed carton (an empty carton, a fractional each, a case in two cartons, a measurement out of bounds), or a missing reason (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks pack.execute (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Order, or a carton’s SKU, does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The order is not packed or has left (order-not-packed, naming its status); a carrier label covers it (shipment-labelled-by-carrier — cancel and re-pack); the order is on its 99th pack (recarton-limit); or a concurrent idempotent request (conflict). Nothing is written",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The new cartons do not hold exactly what was packed (carton-contents-mismatch, `skus[{skuCode, packed, cartoned}]`); or an idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "pack.execute — story 4-5a: re-packs a packed order into a new set of cartons on the web — the same goods, a new split. The live pack is superseded (its carton labels stop scanning at the handover) and the next pack is written with the parties the first pack froze. A client-arranged label’s piece count follows, and its verification is cleared (re-verify it on the new boxes). The live split sent again is a no-op that stores the key",
+        "tags": [
+          "outbound"
+        ]
+      },
+      "get": {
+        "operationId": "OutboundController_getOrderCartons",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderCartonsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed path parameter (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Order does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The order has never been packed (order-not-packed, naming its status)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 4-5a — an order’s cartons: the live pack (else the latest — a cancelled order shows its cancelled pack) with each carton’s code, weight, size and contents (per-UoM totals), and every pack in its history. An order packed before cartons were recorded reads as one legacy carton. A document read — no capability beyond the session",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
     "/tenants/{tenantId}/outbound/orders/{orderId}/dispatch": {
       "post": {
         "operationId": "OutboundController_dispatchOrder",
@@ -55182,6 +55416,40 @@
           "heightMm"
         ]
       },
+      "PackCartonDto": {
+        "type": "object",
+        "properties": {
+          "scanned": {
+            "description": "What the operator scanned into THIS carton (per SKU, summed as the top-level scan is). At least one line.",
+            "minItems": 1,
+            "maxItems": 500,
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PackScanLineDto"
+            }
+          },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 1000000,
+            "description": "Optional carton weight in grams."
+          },
+          "dimensionsMm": {
+            "nullable": true,
+            "description": "Optional carton dimensions in millimetres — all three sides together, or the object omitted.",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PackDimensionsDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "scanned"
+        ]
+      },
       "PackOrderDto": {
         "type": "object",
         "properties": {
@@ -55209,6 +55477,15 @@
                 "$ref": "#/components/schemas/PackDimensionsDto"
               }
             ]
+          },
+          "cartons": {
+            "minItems": 1,
+            "maxItems": 200,
+            "description": "Story 4-5a — optional: the cartons the parcel was packed into, in order (carton 1 first). Per SKU the cartons must add up to `scanned` exactly, a catch-weight case sits in exactly one carton, and the top-level weightGrams and dimensionsMm must then be absent (weigh each carton). Omitted, the pack is one carton holding the whole scan.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PackCartonDto"
+            }
           }
         },
         "required": [
@@ -55259,6 +55536,72 @@
           "packedQty",
           "shortfallQty",
           "ledgerEventId"
+        ]
+      },
+      "PackedCartonLineDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units of this SKU in the carton, in base UoM"
+          }
+        },
+        "required": [
+          "skuId",
+          "skuCode",
+          "qty"
+        ]
+      },
+      "PackedCartonDto": {
+        "type": "object",
+        "properties": {
+          "seq": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 200
+          },
+          "code": {
+            "type": "string",
+            "description": "The carton code printed on its label: the parcel tag + \".{pack}.{carton}\""
+          },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true
+          },
+          "dimensionsMm": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PackDimensionsDto"
+              }
+            ]
+          },
+          "unitCount": {
+            "type": "number",
+            "description": "Units in the carton, in base UoM (across SKUs — a count, not a measure)"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PackedCartonLineDto"
+            }
+          }
+        },
+        "required": [
+          "seq",
+          "code",
+          "weightGrams",
+          "dimensionsMm",
+          "unitCount",
+          "lines"
         ]
       },
       "PackDto": {
@@ -55373,6 +55716,18 @@
             "items": {
               "$ref": "#/components/schemas/PackedLineDto"
             }
+          },
+          "packSeq": {
+            "type": "number",
+            "minimum": 1,
+            "description": "Story 4-5a — the pack number (1 at pack). Absent only on a replayed response stored before 4-5a — read absent as 1."
+          },
+          "cartons": {
+            "description": "Story 4-5a — the cartons the parcel was packed into. Absent only on a replayed response stored before 4-5a — read absent as one carton.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PackedCartonDto"
+            }
           }
         },
         "required": [
@@ -55400,6 +55755,287 @@
         },
         "required": [
           "pack"
+        ]
+      },
+      "RecartonOrderDto": {
+        "type": "object",
+        "properties": {
+          "cartons": {
+            "minItems": 1,
+            "maxItems": 200,
+            "description": "The new split, carton 1 first: per SKU it must hold exactly what was packed (and every catch-weight case, each in one carton).",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PackCartonDto"
+            }
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "Why the order is re-packed (1–200 characters)"
+          }
+        },
+        "required": [
+          "cartons",
+          "reason"
+        ]
+      },
+      "UomTotalDto": {
+        "type": "object",
+        "properties": {
+          "uom": {
+            "type": "string"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Base units of this UoM"
+          }
+        },
+        "required": [
+          "uom",
+          "qty"
+        ]
+      },
+      "PackCartonLineViewDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "uom": {
+            "type": "string",
+            "description": "The SKU’s base UoM"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units of this SKU in the carton, in base UoM"
+          },
+          "handlingUnitIds": {
+            "nullable": true,
+            "description": "Catch weight — the cases in this carton, sorted; null otherwise",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "skuId",
+          "skuCode",
+          "skuName",
+          "uom",
+          "qty",
+          "handlingUnitIds"
+        ]
+      },
+      "PackCartonViewDto": {
+        "type": "object",
+        "properties": {
+          "seq": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 200
+          },
+          "code": {
+            "type": "string",
+            "description": "The carton code on its label: the parcel tag + \".{pack}.{carton}\""
+          },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true
+          },
+          "dimensionsMm": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PackDimensionsDto"
+              }
+            ]
+          },
+          "lineCount": {
+            "type": "number",
+            "description": "SKUs in the carton"
+          },
+          "totals": {
+            "description": "Per-UoM totals — never a cross-UoM unit total",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UomTotalDto"
+            }
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PackCartonLineViewDto"
+            }
+          }
+        },
+        "required": [
+          "seq",
+          "code",
+          "weightGrams",
+          "dimensionsMm",
+          "lineCount",
+          "totals",
+          "lines"
+        ]
+      },
+      "PackViewDto": {
+        "type": "object",
+        "properties": {
+          "packSeq": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 99
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "live",
+              "superseded",
+              "cancelled"
+            ]
+          },
+          "legacy": {
+            "type": "boolean",
+            "description": "True for an order packed before cartons were recorded (one virtual carton)"
+          },
+          "partiesFrozen": {
+            "type": "boolean",
+            "description": "False when the documents print the live parties (\"Party details are current, not as at packing\")"
+          },
+          "cartonCount": {
+            "type": "number"
+          },
+          "grossWeightGrams": {
+            "type": "number",
+            "nullable": true,
+            "description": "Σ carton weights when every carton is weighed, else null"
+          },
+          "packedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC — the physical pack (a re-carton keeps it)"
+          },
+          "packedBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "cartons": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PackCartonViewDto"
+            }
+          }
+        },
+        "required": [
+          "packSeq",
+          "status",
+          "legacy",
+          "partiesFrozen",
+          "cartonCount",
+          "grossWeightGrams",
+          "packedAt",
+          "packedBy",
+          "cartons"
+        ]
+      },
+      "RecartonResponse": {
+        "type": "object",
+        "properties": {
+          "pack": {
+            "description": "The live pack after the re-carton",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PackViewDto"
+              }
+            ]
+          },
+          "unchanged": {
+            "type": "boolean",
+            "description": "True when the split was the live one — nothing was written"
+          },
+          "clientLabelReverify": {
+            "type": "boolean",
+            "description": "True when a client label’s verification was cleared — re-verify the client label on the new boxes"
+          }
+        },
+        "required": [
+          "pack",
+          "unchanged",
+          "clientLabelReverify"
+        ]
+      },
+      "PackHistoryDto": {
+        "type": "object",
+        "properties": {
+          "packSeq": {
+            "type": "number"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "live",
+              "superseded",
+              "cancelled"
+            ]
+          },
+          "cartonCount": {
+            "type": "number"
+          },
+          "endedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "endedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "endReason": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "packSeq",
+          "status",
+          "cartonCount",
+          "endedAt",
+          "endedBy",
+          "endReason"
+        ]
+      },
+      "OrderCartonsResponse": {
+        "type": "object",
+        "properties": {
+          "pack": {
+            "description": "The live pack, else the latest (a cancelled order shows its cancelled pack)",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PackViewDto"
+              }
+            ]
+          },
+          "history": {
+            "description": "Every pack of the order, newest first",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PackHistoryDto"
+            }
+          }
+        },
+        "required": [
+          "pack",
+          "history"
         ]
       },
       "DispatchOrderDto": {
@@ -57539,6 +58175,30 @@
           "pick"
         ]
       },
+      "DevicePackCartonDto": {
+        "type": "object",
+        "properties": {
+          "scanned": {
+            "description": "What the operator scanned into THIS carton (per SKU, summed as the top-level scan is). At least one line.",
+            "minItems": 1,
+            "maxItems": 500,
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PackScanLineDto"
+            }
+          },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 1000000,
+            "description": "Optional carton weight in grams."
+          }
+        },
+        "required": [
+          "scanned"
+        ]
+      },
       "DevicePackDto": {
         "type": "object",
         "properties": {
@@ -57561,6 +58221,15 @@
             "type": "string",
             "format": "uuid",
             "description": "The fully-picked order being packed"
+          },
+          "cartons": {
+            "minItems": 1,
+            "maxItems": 200,
+            "description": "Story 4-5a — optional: the cartons the parcel was packed into, in order (carton 1 first). Per SKU the cartons must add up to `scanned` exactly, a catch-weight case sits in exactly one carton, and the top-level weightGrams and dimensionsMm must then be absent (weigh each carton). Omitted, the pack is one carton holding the whole scan. The device never measures boxes, so a carton carries no dimensionsMm.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DevicePackCartonDto"
+            }
           }
         },
         "required": [

@@ -3576,7 +3576,8 @@ describe('architecture: the audit rule — every keyed command writes its audit 
     {
       helper: join(SRC_ROOT, 'modules', 'outbound', 'shipping-support.ts'),
       specifier: './shipping-support',
-      callers: ['client-label.command.ts', 'shipping-files.command.ts', 'handover.command.ts'].map((file) => join(SRC_ROOT, 'modules', 'outbound', file)),
+      // Story 4-5a — the re-carton (`carton.command.ts`) writes its key through it too.
+      callers: ['client-label.command.ts', 'shipping-files.command.ts', 'handover.command.ts', 'carton.command.ts'].map((file) => join(SRC_ROOT, 'modules', 'outbound', file)),
     },
   ];
 

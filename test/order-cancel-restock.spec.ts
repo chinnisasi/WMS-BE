@@ -692,6 +692,20 @@ describe('story 4-2b: cancel with restock (e2e)', () => {
     expect((await plan(orderId).expect(200)).body.lines).toEqual([]);
   });
 
+  it('story 4-5a (A10): the packed order’s live pack is cancelled in the same transaction, with the cancelling user and instant', async () => {
+    await seed('CR-PACK', binA, 5);
+    const orderId = await packedOrder('CR-PACK', 2);
+    const live = (await sql`select status from order_packs where tenant_id = ${tenantId} and order_id = ${orderId}`) as unknown as { status: string }[];
+    expect(live.map((row) => row.status)).toEqual(['live']);
+    await cancelRestock(orderId).expect(200);
+    const rows = (await sql`
+      select p.status, p.ended_at is not null as ended, p.ended_by = o.actor_user_id as by_canceller, p.end_reason
+      from order_packs p
+      join audit_events o on o.tenant_id = p.tenant_id and o.target_id = p.order_id and o.action = 'order.cancelled'
+      where p.tenant_id = ${tenantId} and p.order_id = ${orderId}`) as unknown as { status: string; ended: boolean; by_canceller: boolean; end_reason: string | null }[];
+    expect(rows).toEqual([{ status: 'cancelled', ended: true, by_canceller: true, end_reason: null }]);
+  });
+
   it('already cancelled under a new key: 200 with the current order, restock null, the key stored, no audit row; an unknown order 404; the plan of an unknown order 404', async () => {
     await seed('CR-AGN', binA, 5);
     const orderId = await packedOrder('CR-AGN', 1);

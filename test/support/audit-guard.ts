@@ -164,7 +164,7 @@ export const AUDIT_NO_OP_ARMS = {
    */
   'order.recarton:unchanged': (snapshot: unknown) =>
     isRecord(snapshot) &&
-    sameKeys(snapshot, ['pack', 'unchanged', 'clientLabelReverify']) &&
+    sameKeys(snapshot, ['clientLabelReverify', 'pack', 'unchanged']) &&
     snapshot.unchanged === true &&
     isRecord(snapshot.pack),
   /** Story 6-1b — `SecondFactorCommand.reset` of a user with no two-factor sign-in and no enrolment code. */

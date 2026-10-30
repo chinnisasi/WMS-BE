@@ -489,6 +489,7 @@ export class OutboundController {
   @ApiBody({ type: RecartonOrderDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiResponse({ status: HttpStatus.CREATED, type: RecartonResponse, description: 'The live pack after the re-carton (a replay re-serves it)' })
+  @ApiResponse({ status: HttpStatus.OK, type: RecartonResponse, description: 'The split sent is the live one — nothing written, the key stored (unchanged: true)' })
   @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key or path parameter, a malformed carton (an empty carton, a fractional each, a case in two cartons, a measurement out of bounds), or a missing reason (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks pack.execute (role-denied)') })
@@ -503,6 +504,7 @@ export class OutboundController {
     @IdempotencyKey() idempotencyKey: string | undefined,
     @CurrentSession() session: TenantSession,
     @Body() dto: RecartonOrderDto,
+    @Res({ passthrough: true }) res: Response,
   ): Promise<RecartonResponse> {
     assertOwnTenant(session, tenantId);
     assertUuidParam(orderId, 'orderId');
@@ -511,6 +513,8 @@ export class OutboundController {
       { tenantId, actorUserId: session.userId, orderId, cartons: packCartonsOf(dto.cartons), reason: dto.reason },
       key,
     );
+    // The live split sent again changes nothing: 200, the key stored.
+    if (snapshot.unchanged) res.status(HttpStatus.OK);
     return { pack: packViewBody(snapshot.pack), unchanged: snapshot.unchanged, clientLabelReverify: snapshot.clientLabelReverify };
   }
 
