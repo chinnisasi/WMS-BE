@@ -991,4 +991,54 @@ describe('B2B freight dispatch (e2e, story 4-9a)', () => {
     const second = await read(`?limit=2&cursor=${first.nextCursor!}`);
     expect(second.items.map((item) => item.orderId)).toEqual(all.items.slice(2, 4).map((item) => item.orderId));
   });
+
+  // ── matrix rows: a courier label, a cancel before a stale device departure, key reuse ──
+
+  it('matrix — adding an order with a live courier shipment (an AWB pre-advice) is refused order-has-courier-shipment; nothing is written', async () => {
+    const order = await acceptedOrder('A-TEE');
+    await http().post(`${API}/${tenantId}/outbound/orders/${order}/shipment/awb`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+      .send({ awb: `AWB${ulid().slice(16)}`, courierName: 'Delhivery' }).expect(201);
+    const before = (await sql`select count(*)::int as n from freight_loads where tenant_id = ${tenantId}`)[0]!.n as number;
+    const refused = await createLoad({ orderIds: [order] }).expect(409);
+    expect(refused.body).toMatchObject({ code: 'freight-orders-refused', orders: [{ orderId: order, code: 'order-has-courier-shipment' }] });
+    expect(await sql`select count(*)::int as n from freight_loads where tenant_id = ${tenantId}`).toEqual([{ n: before }]);
+    expect(await sql`select count(*)::int as n from freight_consignments where order_id = ${order}`).toEqual([{ n: 0 }]);
+    // On an existing load, too.
+    const load = (await createLoad({}).expect(201)).body.load;
+    expect((await post(`freight-loads/${load.id}/orders`, { orderIds: [order] }).expect(409)).body).toMatchObject({ orders: [{ orderId: order, code: 'order-has-courier-shipment' }] });
+    expect(await sql`select count(*)::int as n from freight_consignments where order_id = ${order}`).toEqual([{ n: 0 }]);
+  });
+
+  it('matrix — a device departure whose snapshot predates a web cancel: the three others dispatch (201), the cancelled order is one Discard-only review row (consignment-removed)', async () => {
+    const orders = [await packedOrder('A-TEE', 1), await packedOrder('A-TEE', 1), await packedOrder('A-TEE', 1), await packedOrder('A-TEE', 1)];
+    const load = (await createLoad({ orderIds: orders }).expect(201)).body.load;
+    for (const order of orders) await deviceScan(load.id, cartonCode(order, 1, 1)).expect(201);
+    const cancelled = orders[3]!;
+    await http().post(`${API}/${tenantId}/outbound/orders/${cancelled}/cancel-with-restock`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({}).expect(200);
+    expect(await consignmentOf(cancelled)).toMatchObject({ status: 'removed', remove_reason: 'Order cancelled' });
+    const res = await depart(load.id, orders.map((orderId) => ({ orderId, decision: 'dispatch' })), { occurredAt: new Date().toISOString(), warehouseId }, ulid(), operatorToken).expect(201);
+    expect(res.body.dispatched.map((d: { orderId: string }) => d.orderId).sort()).toEqual(orders.slice(0, 3).sort());
+    expect(res.body.refused).toEqual([expect.objectContaining({ orderId: cancelled, code: 'consignment-removed' })]);
+    for (const order of orders.slice(0, 3)) expect(await orderStatus(order)).toBe('dispatched');
+    expect(await orderStatus(cancelled)).toBe('cancelled');
+    const review = (await sql`select op_type, payload from rejected_ops where tenant_id = ${tenantId} and op_id = ${res.body.rejectedOpId as string}`) as unknown as { op_type: string; payload: { refusals: { orderId: string; code: string }[] } }[];
+    expect(review).toHaveLength(1);
+    expect(review[0]!.op_type).toBe('freight.dispatch');
+    expect(review[0]!.payload.refusals).toEqual([expect.objectContaining({ orderId: cancelled, code: 'consignment-removed' })]);
+    expect(REJECTED_OP_DECISIONS_BY_TYPE['freight.dispatch']).toEqual(['discard']);
+  });
+
+  it('matrix — the same key with a different body is 422 idempotency-key-reuse: the create, the scan and the departure', async () => {
+    const order = await packedOrder('A-TEE', 2);
+    const createKey = ulid();
+    const load = (await createLoad({ orderIds: [order] }, createKey).expect(201)).body.load;
+    expect((await createLoad({ orderIds: [order], note: 'another body' }, createKey).expect(422)).body.code).toBe('idempotency-key-reuse');
+    const scanKey = ulid();
+    await scan(load.id, cartonCode(order, 1, 1), scanKey).expect(201);
+    expect((await scan(load.id, cartonCode(order, 1, 2), scanKey).expect(422)).body.code).toBe('idempotency-key-reuse');
+    await scan(load.id, cartonCode(order, 1, 2)).expect(201);
+    const departKey = ulid();
+    await depart(load.id, [{ orderId: order, decision: 'dispatch', lrNumber: 'REUSE1' }], {}, departKey).expect(201);
+    expect((await depart(load.id, [{ orderId: order, decision: 'dispatch', lrNumber: 'REUSE2' }], {}, departKey).expect(422)).body.code).toBe('idempotency-key-reuse');
+  });
 });
