@@ -70,8 +70,8 @@ export type ClientReceiptAttachmentState = 'none' | 'attached' | 'too-large' | '
 
 const UUID_LIKE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** The attachment's file name in the body (the server's name rule, `{GRN code}.pdf`). */
-function attachedFileName(grnCode: string): string {
+/** The attachment's file name in the body — the SAME rule as inbound's `grnDocumentFilename(code, 'pdf')` (mail imports nothing from inbound; `test/grn-document.spec.ts` pins the two equal). */
+export function attachedFileName(grnCode: string): string {
   return `${grnCode.replace(/[^A-Za-z0-9._-]/g, '_') || 'GRN'}.pdf`;
 }
 

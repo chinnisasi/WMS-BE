@@ -1,6 +1,7 @@
 import type { DocumentPage } from '../../shared/documents/a4-pdf';
 import { pdfPagesText, pdfText } from '../../../test/support/pdf-text';
 import { grnDocumentCsv } from './grn-document.csv';
+import { DOCUMENT_FONTS } from '../../shared/documents/text';
 import {
   FOOTER_TOP,
   GRN_DOCUMENTS_OMITTED,
@@ -9,6 +10,7 @@ import {
   GRN_NOT_FROZEN,
   GRN_RECEIPT_NOTE,
   layoutGrnDocument,
+  wrapText,
 } from './grn-document.layout';
 import { grnWarehousePartyOf, type GrnDocument, type GrnDocumentLine } from './grn-document.types';
 import { grnDocumentFile } from './grn-document.view';
@@ -264,6 +266,17 @@ describe('the GRN document layout (story 2-9a)', () => {
     const clientRuns = pages[0]!.runs.filter((run) => run.text.includes('Building'));
     expect(clientRuns).toHaveLength(4);
     expect(clientRuns[3]!.text.endsWith('…')).toBe(true);
+  });
+
+  it('wrapText: a 10,000-character unbroken token wraps fast and ends in …; a width narrower than one glyph terminates', () => {
+    const started = Date.now();
+    const lines = wrapText('W'.repeat(10_000), DOCUMENT_FONTS.regular, 8, 100, 4);
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(lines).toHaveLength(4);
+    expect(lines[3]!.endsWith('…')).toBe(true);
+    const narrow = wrapText('WWW MMM', DOCUMENT_FONTS.bold, 8, 1, 10);
+    expect(narrow).toEqual(['W', 'W', 'W', 'M', 'M', 'M']);
+    expect(layoutGrnDocument(doc({ lines: [line(1, { skuName: 'X'.repeat(10_000) })] })).length).toBeGreaterThan(0);
   });
 
   describe('pagination', () => {

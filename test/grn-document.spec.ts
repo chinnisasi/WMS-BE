@@ -18,6 +18,27 @@ import { mintSignIn } from './support/sign-in';
 import { testAddress } from './support/shipment-address';
 import { createLinkedVendor } from './support/linked-vendor';
 import { pdfText } from './support/pdf-text';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { AttachmentsFacade } from '../src/modules/attachments/attachments.facade';
+import type { FileStore, FilePut, PresignGet, PresignedUrl } from '../src/modules/attachments/file-store';
+import { attachedFileName } from '../src/modules/mail/templates/client-receipt';
+import { grnDocumentFilename } from '../src/modules/inbound/grn-document.types';
+
+/** An in-memory file store (2-5a's e2e fake): the damage photo fixture needs one. */
+class MemoryFileStore implements FileStore {
+  readonly mode = 'local' as const;
+  readonly objects = new Map<string, Buffer>();
+  async put(input: FilePut): Promise<void> {
+    this.objects.set(input.key, Buffer.from(input.bytes));
+  }
+  async presignGet(input: PresignGet): Promise<PresignedUrl> {
+    return { url: `https://attachments.example/${input.key}`, expiresAt: new Date(Date.now() + 300_000).toISOString() };
+  }
+  async delete(key: string): Promise<void> {
+    this.objects.delete(key);
+  }
+}
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -106,6 +127,7 @@ describe('the GRN document (e2e, story 2-9a)', () => {
     mail = app.get(MailFacade);
     registry = app.get(MailAttachmentRegistry);
     captured = app.get<LogEmailGateway>(EMAIL_GATEWAY);
+    app.get(AttachmentsFacade).fileStore = new MemoryFileStore();
 
     const ownerEmail = `owner-${ulid().toLowerCase()}@example.com`;
     const registered = await http().post(API).set(KEY_HEADER, ulid()).send({ name: `Acme 3PL ${ulid()}`, ownerEmail, password: PASSWORD }).expect(201);
@@ -122,7 +144,7 @@ describe('the GRN document (e2e, story 2-9a)', () => {
 
     acme = await client('ACME', 'ACME Brand');
     beta = await client('BETA', 'Beta Brand');
-    await importSkus(acme, ['A-TEE,Acme tee,pcs,false', 'A-RICE,Acme rice,kg,false', 'A-QC,Acme serum,pcs,true', 'A-LOT,Acme lot,pcs,true']);
+    await importSkus(acme, ['A-TEE,Acme tee,pcs,false', 'A-RICE,Acme rice,kg,false', 'A-QC,Acme serum,pcs,true', 'A-LOT,Acme lot,pcs,true', 'A-SER,Acme phone,pcs,false,true', 'A-FAC,Acme facts,pcs,true']);
     await importSkus(beta, ['B-TEE,Beta tee,pcs,false']);
     vendorId = await createLinkedVendor(app, tenantId, ownerToken, { code: 'V-01', name: 'Fabrics Co', clientIds: [acme], gstin: '24AAACF1234A1Z5' });
     betaVendorId = await createLinkedVendor(app, tenantId, ownerToken, { code: 'V-02', name: 'Beta Supply', clientIds: [beta] });
@@ -166,7 +188,7 @@ describe('the GRN document (e2e, story 2-9a)', () => {
   }
 
   async function importSkus(clientId: string, rows: string[]): Promise<void> {
-    const csv = ['sku_code,name,uom,gst_rate,batch_tracked', ...rows.map((row) => { const [code, name, uom, batch] = row.split(','); return `${code},${name},${uom},1800,${batch}`; })].join('\n');
+    const csv = ['sku_code,name,uom,gst_rate,batch_tracked,serial_tracked', ...rows.map((row) => { const [code, name, uom, batch, serial] = row.split(','); return `${code},${name},${uom},1800,${batch},${serial ?? 'false'}`; })].join('\n');
     await http().post(`${API}/${tenantId}/catalog/imports`).set(auth(ownerToken)).set(KEY_HEADER, ulid())
       .field('mode', 'initial').field('clientId', clientId)
       .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' }).expect(201);
@@ -191,7 +213,8 @@ describe('the GRN document (e2e, story 2-9a)', () => {
   /** `grn.submit` through the DEVICE route (the handheld's path). */
   async function receive(body: Record<string, unknown>, key = ulid()): Promise<Grn> {
     const res = await http().post(`${API}/${tenantId}/receiving/goods-receipts`).set(auth(operatorToken)).set(KEY_HEADER, key)
-      .send({ warehouseId, occurredAt: occurredAt(), ...body }).expect(201);
+      .send({ warehouseId, occurredAt: occurredAt(), ...body });
+    if (res.status !== 201) throw new Error(`grn.submit answered ${res.status}: ${JSON.stringify(res.body)}`);
     return res.body.goodsReceipt as Grn;
   }
 
@@ -466,6 +489,42 @@ describe('the GRN document (e2e, story 2-9a)', () => {
     });
   });
 
+  describe('QC: a released hold, and two holds on one line', () => {
+    const setQc = (on: boolean) =>
+      http().put(`${API}/${tenantId}/clients/${acme}/receiving-policy`).set(auth(ownerToken)).set(KEY_HEADER, ulid())
+        .send({ receivingToleranceBps: 0, qcOnReceipt: on, expiryRequired: false, minShelfLifeDays: null }).expect(200);
+    const release = (holdId: string) => http().post(`${API}/${tenantId}/receiving/qc-holds/${holdId}/release`).set(auth(opsToken)).set(KEY_HEADER, ulid()).expect(200);
+
+    beforeAll(async () => {
+      await setQc(true);
+    });
+    afterAll(async () => {
+      await setQc(false);
+    });
+
+    it('a released receipt hold reads {status released, releasedQty n, heldQty n}', async () => {
+      const grn = await blind(acme, [docLine('A-TEE', 5)]);
+      const hold = (await sql`select id from qc_holds where tenant_id = ${tenantId} and grn_line_id = ${grn.lines[0]!.id}`)[0]!.id as string;
+      await release(hold);
+      const res = await staffDoc(grn.id).expect(200);
+      expect(res.body.lines[0].qc).toEqual({ status: 'released', heldQty: 5, releasedQty: 5, passedQty: 0, failedQty: 0 });
+    });
+
+    it('one open and one released hold on a line: status on-hold, the quantities summed', async () => {
+      const po = await purchaseOrder(vendorId, [{ code: 'A-TEE', qty: 10 }]);
+      const grn = await receive({ poId: po.id, lines: [{ poLineId: po.lineIds[0], skuId: sku.get('A-TEE'), batchCode: null, mfgDate: null, qty: 12 }] });
+      const first = (await sql`select id from qc_holds where tenant_id = ${tenantId} and grn_line_id = ${grn.lines[0]!.id}`)[0]!.id as string;
+      await release(first);
+      const excess = (await sql`select id from over_receipts where grn_id = ${grn.id} and status = 'pending'`)[0]!.id as string;
+      await http().post(`${API}/${tenantId}/receiving/over-receipts/${excess}/approve`).set(auth(ownerToken)).set(KEY_HEADER, ulid()).expect(200);
+      expect(await sql`select 1 from qc_holds where tenant_id = ${tenantId} and grn_line_id = ${grn.lines[0]!.id}`).toHaveLength(2);
+      const res = await staffDoc(grn.id).expect(200);
+      expect(res.body.lines[0].qc).toEqual({ status: 'on-hold', heldQty: 12, releasedQty: 10, passedQty: 0, failedQty: 0 });
+      const text = (await pdfText((await staffFile(grn.id, '?format=pdf').expect(200)).body as Buffer)).split('\n').join(' ');
+      expect(text).toContain('On hold 2 · Released 10');
+    });
+  });
+
   // ── the statement bound (A12, D12) ─────────────────────────────────────────
 
   describe('the read’s statement bound', () => {
@@ -512,6 +571,84 @@ describe('the GRN document (e2e, story 2-9a)', () => {
       });
       expect(plan.map((row) => Object.values(row)[0]).join('\n')).toContain('ledger_events_hold_ref_idx');
     });
+  });
+
+  // ── the per-line facts (review additions) ──────────────────────────────────
+
+  describe('per-line facts on one GRN: batch dates, serials, a photo, approved and rejected excess', () => {
+    it('the JSON and the PDF print the IST mfg/expiry (no day shift), the serial counts, the photo count and both excess outcomes', async () => {
+      const po = await purchaseOrder(vendorId, [{ code: 'A-FAC', qty: 5 }, { code: 'A-SER', qty: 1 }]);
+      const grn = await receive({
+        poId: po.id,
+        lines: [
+          { poLineId: po.lineIds[0], skuId: sku.get('A-FAC'), batchCode: 'FX-1', mfgDate: '2026-08-31T18:30:00.000Z', expiryDate: '2027-08-31', qty: 7 },
+          { poLineId: po.lineIds[1], skuId: sku.get('A-SER'), batchCode: null, mfgDate: null, qty: 2, serials: ['SER-A1', 'SER-A2'], unreadableSerialQty: 1 },
+        ],
+      });
+      const pending = (await sql`select id, grn_line_id from over_receipts where grn_id = ${grn.id} and status = 'pending'`) as unknown as { id: string; grn_line_id: string }[];
+      const facLine = grn.lines[0]!.id;
+      const serLine = grn.lines[1]!.id;
+      const approve = pending.find((row) => row.grn_line_id === facLine)!;
+      const reject = pending.find((row) => row.grn_line_id === serLine)!;
+      await http().post(`${API}/${tenantId}/receiving/over-receipts/${approve.id}/approve`).set(auth(ownerToken)).set(KEY_HEADER, ulid()).expect(200);
+      await http().post(`${API}/${tenantId}/receiving/over-receipts/${reject.id}/reject`).set(auth(ownerToken)).set(KEY_HEADER, ulid()).send({}).expect(200);
+      const jpeg = readFileSync(join(__dirname, 'fixtures', 'images', 'baseline.jpg'));
+      await http().post(`${API}/${tenantId}/receiving/goods-receipts/${grn.id}/lines/${facLine}/photos`).set(auth(opsToken)).set(KEY_HEADER, ulid())
+        .attach('file', jpeg, { filename: 'evidence.jpg', contentType: 'image/jpeg' }).expect(201);
+
+      const res = await staffDoc(grn.id).expect(200);
+      const [fac, ser] = res.body.lines as Record<string, unknown>[];
+      expect(fac).toMatchObject({ batchCode: 'FX-1', mfgDate: '2026-09-01', expiryDate: '2027-08-31', expirySource: 'typed', excess: { pendingQty: 0, approvedQty: 2, rejectedQty: 0 }, photoCount: 1 });
+      expect(ser).toMatchObject({ serialCount: 1, unreadableSerialCount: 1, rejectedSerialCount: 1, excess: { pendingQty: 0, approvedQty: 0, rejectedQty: 1 } });
+      const text = (await pdfText((await staffFile(grn.id, '?format=pdf').expect(200)).body as Buffer)).split('\n').join(' ');
+      expect(text).toContain('2026-09-01');
+      expect(text).toContain('2027-08-31');
+      expect(text).toContain('2 approved');
+      expect(text).toContain('1 rejected');
+      expect(text).toContain('Serials captured: 1 (1 unreadable, 1 rejected excess)');
+      expect(text).toContain('1 photo(s) — view in the client portal');
+      const portal = await portalDetail(grn.id).expect(200);
+      expect(portal.body.lines[0]).toMatchObject({ mfgDate: '2026-09-01', expiryDate: '2027-08-31' });
+    });
+  });
+
+  // ── the arrival arms (review additions) ────────────────────────────────────
+
+  describe('arrival documents naming an ASN or a predecessor PO', () => {
+    it('an ASN receipt: document kind asn, expected from the ASN line, the gate-in document naming the ASN printed', async () => {
+      const asn = (
+        await http().post(`${API}/${tenantId}/inbound/asns`).set(auth(opsToken)).set(KEY_HEADER, ulid())
+          .send({ clientId: acme, warehouseId, asnCode: `ASN-${ulid().slice(18)}`, lines: [{ skuId: sku.get('A-TEE'), announcedQty: 8 }] }).expect(201)
+      ).body.asn as { id: string; code: string; lines: { id: string }[] };
+      const today = new Date().toISOString().slice(0, 10);
+      const truck = await gateIn([{ kind: 'challan', number: 'DC-ASN', documentDate: today, asnId: asn.id }]);
+      const grn = await receive({ poId: null, asnId: asn.id, gateInId: truck.id, lines: [{ poLineId: null, asnLineId: asn.lines[0]!.id, skuId: sku.get('A-TEE'), batchCode: null, mfgDate: null, qty: 6 }] });
+      const res = await staffDoc(grn.id).expect(200);
+      expect(res.body.document).toMatchObject({ kind: 'asn', code: asn.code });
+      expect(res.body.lines[0]).toMatchObject({ expectedQty: 8, goodQty: 6 });
+      expect(res.body.arrival).toMatchObject({ documentsOmitted: false, documents: [{ number: 'DC-ASN' }] });
+      expect(res.body.parties.vendor).toBeNull();
+      expect(res.body.parties.supplierNote).toBe(`As announced by the client — ASN ${asn.code}`);
+    });
+
+    it('a GRN on a carried-forward PO prints the gate-in invoice that names the predecessor PO', async () => {
+      const p1 = await purchaseOrder(vendorId, [{ code: 'A-TEE', qty: 10 }]);
+      await receive({ poId: p1.id, lines: [{ poLineId: p1.lineIds[0], skuId: sku.get('A-TEE'), batchCode: null, mfgDate: null, qty: 4 }] });
+      const closed = await http().post(`${API}/${tenantId}/inbound/purchase-orders/${p1.id}/close`).set(auth(ownerToken)).set(KEY_HEADER, ulid())
+        .send({ lines: [{ lineId: p1.lineIds[0], disposition: 'carried' }] }).expect(200);
+      const p2 = closed.body.successor as { id: string; lines: { id: string }[] };
+      const today = new Date().toISOString().slice(0, 10);
+      const truck = await gateIn([{ kind: 'invoice', number: 'INV-P1', documentDate: today, poId: p1.id }]);
+      const grn = await receive({ poId: p2.id, gateInId: truck.id, lines: [{ poLineId: p2.lines[0]!.id, skuId: sku.get('A-TEE'), batchCode: null, mfgDate: null, qty: 6 }] });
+      const res = await staffDoc(grn.id).expect(200);
+      expect(res.body.arrival).toMatchObject({ documentsOmitted: false, documents: [{ number: 'INV-P1' }] });
+    });
+  });
+
+  it('the email body’s file name is the document’s file name (mail and inbound share the rule)', () => {
+    for (const code of ['GRN-0042', 'GRN 42/é—x', '/// ', '']) {
+      expect(attachedFileName(code)).toBe(grnDocumentFilename(code, 'pdf'));
+    }
   });
 
   // ── the receipt email ──────────────────────────────────────────────────────
@@ -621,7 +758,16 @@ describe('the GRN document (e2e, story 2-9a)', () => {
     it('A16: above the size bound the email goes without the file ("too large to attach")', async () => {
       const grn = await recordAndQueue();
       const gateway = new RecordingGateway();
-      await new MailSender(db, gateway, registry, { attachmentMaxBytes: 1 }).sendDue(tenantId, 50);
+      const spy = jest.spyOn(registry, 'render');
+      let renders: number;
+      try {
+        await new MailSender(db, gateway, registry, { attachmentMaxBytes: 1 }).sendDue(tenantId, 50);
+        renders = spy.mock.calls.filter((call) => call[3] === grn.id).length;
+      } finally {
+        spy.mockRestore();
+      }
+      // Two recipients of one too-large GRN cost ONE render (the outcome is memoised).
+      expect(renders).toBe(1);
       const sent = gateway.calls.filter((email) => email.text.includes(grn.code));
       expect(sent).toHaveLength(2);
       expect(sent.every((email) => email.attachments === undefined && email.text.includes('too large to attach'))).toBe(true);

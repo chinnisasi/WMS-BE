@@ -73,6 +73,18 @@ describe('the SES email gateway (story 5-1a, mocked SDK)', () => {
     });
   });
 
+  it('story 2-9a: one attachment maps to Content.Simple.Attachments; none adds no Attachments key', async () => {
+    notSuppressed(ses);
+    ses.on(SendEmailCommand).resolves({ MessageId: 'm' });
+    const content = new Uint8Array([0x25, 0x50, 0x44, 0x46]);
+    await gateway().send({ ...EMAIL, attachments: [{ filename: 'GRN-0042.pdf', contentType: 'application/pdf', content }] });
+    expect(ses.commandCalls(SendEmailCommand)[0]!.args[0].input.Content!.Simple!.Attachments).toEqual([
+      { FileName: 'GRN-0042.pdf', ContentType: 'application/pdf', RawContent: content, ContentDisposition: 'ATTACHMENT' },
+    ]);
+    await gateway().send(EMAIL);
+    expect(ses.commandCalls(SendEmailCommand)[1]!.args[0].input.Content!.Simple!).not.toHaveProperty('Attachments');
+  });
+
   it('falls back to EMAIL_REPLY_TO when the message has no Reply-To of its own', async () => {
     notSuppressed(ses);
     ses.on(SendEmailCommand).resolves({ MessageId: 'm' });

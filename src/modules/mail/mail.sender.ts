@@ -303,7 +303,7 @@ export class MailSender {
     // Story 2-9a (A15) — the attachment step's per-call state: the memo
     // (successes only, keyed kind|client|ref — two recipients, one render) and
     // the shared render budget.
-    const memo = new Map<string, EmailAttachment>();
+    const memo = new Map<string, EmailAttachment | null>();
     const budget = { spentMs: 0 };
     for (const inFlight of claim.inFlight) {
       let claimed = inFlight;
@@ -381,7 +381,7 @@ export class MailSender {
   private async attachStep(
     tenantId: string,
     claimed: Claimed,
-    memo: Map<string, EmailAttachment>,
+    memo: Map<string, EmailAttachment | null>,
     budget: { spentMs: number },
   ): Promise<
     | { kind: 'send'; claimed: Claimed }
@@ -399,10 +399,15 @@ export class MailSender {
       );
       return { kind: 'outcome', outcome };
     }
+    // The memo holds the render OUTCOME per kind|client|ref — the file (an
+    // oversize one included) or null — so two recipients of one GRN cost one
+    // render whatever it answered. A thrown render is never memoised.
     const key = `${kind}|${clientId}|${ref}`;
-    let file: EmailAttachment | null | undefined = memo.get(key);
-    let state: ClientReceiptAttachmentState = 'none';
-    if (file === undefined) {
+    let file: EmailAttachment | null;
+    let threw = false;
+    if (memo.has(key)) {
+      file = memo.get(key)!;
+    } else {
       if (budget.spentMs >= this.renderBudgetMs) {
         await withTenantTransaction(this.db, tenantId, (tx) =>
           tx
@@ -415,9 +420,10 @@ export class MailSender {
       const started = Date.now();
       try {
         file = await registry.render(kind, tenantId, clientId, ref);
+        memo.set(key, file);
       } catch (err) {
-        budget.spentMs += Date.now() - started;
         if (row.attempts + 1 < EMAIL_MAX_ATTEMPTS) {
+          budget.spentMs += Date.now() - started;
           this.logger.warn(`client-email.attachment-failed message=${row.id} attempt=${row.attempts + 1} error=${(err as Error).name}`);
           const outcome = await withTenantTransaction(this.db, tenantId, (tx) =>
             this.writeOutcome(tx, claimed, { ok: false, code: 'attachment-failed' }),
@@ -426,19 +432,20 @@ export class MailSender {
         }
         this.logger.error(`client-email.attachment-failed message=${row.id} attempt=${row.attempts + 1} — the last attempt: sent without the file`);
         file = null;
-        state = 'failed';
+        threw = true;
       }
+      // Exactly once on every path that reaches here (the retry path added its own above).
       budget.spentMs += Date.now() - started;
     }
+    let state: ClientReceiptAttachmentState;
     if (file === null) {
-      if (state !== 'failed') this.logger.error(`client-email.attachment-missing message=${row.id} — sent without the file`);
+      if (!threw) this.logger.error(`client-email.attachment-missing message=${row.id} — sent without the file`);
       state = 'failed';
-    } else if (file !== undefined && file.content.byteLength > this.attachmentMaxBytes) {
+    } else if (file.content.byteLength > this.attachmentMaxBytes) {
       state = 'too-large';
       this.logger.warn(`client-email.attachment-too-large message=${row.id} bytes=${file.content.byteLength} — sent without the file`);
     } else {
       state = 'attached';
-      memo.set(key, file!);
     }
     const config = mailConfigFromEnv();
     let rendered;

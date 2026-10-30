@@ -19,6 +19,10 @@ describe('document text (story 2-9a)', () => {
     expect(winAnsiFold('Box 📦 ok', regular)).toBe('Box ? ok');
   });
 
+  it('NFC first: a decomposed é (e + U+0301) prints as é, not e?', () => {
+    expect(documentText('Cafe\u0301', regular)).toBe('Café');
+  });
+
   it('control characters fold to ?; \\r\\n, \\n and \\t become a space and runs collapse', () => {
     expect(winAnsiFold('a\u0000b\u007f', regular)).toBe('a?b?');
     expect(normaliseDocumentText('  Line one\r\nLine two\n\tthree   four ')).toBe('Line one Line two three four');
@@ -37,9 +41,10 @@ describe('document text (story 2-9a)', () => {
     expect(pdf.subarray(0, 5).toString('latin1')).toBe('%PDF-');
   });
 
-  it('every folded string is drawable: the fold over every BMP code point never yields one pdf-lib refuses', async () => {
+  it('every folded string is drawable: the fold over every BMP code unit (lone surrogates included) never yields one pdf-lib refuses', async () => {
     let all = '';
-    for (let code = 0; code < 0x3000; code += 1) all += String.fromCodePoint(code);
+    for (let code = 0; code <= 0xffff; code += 1) all += String.fromCharCode(code);
+    all += '\ud800'; // a lone surrogate
     const folded = documentText(all, regular);
     await expect(
       drawDocumentPdf([{ runs: [{ x: 0, y: 0, size: 4, font: 'regular', text: folded }], rules: [] }], { title: 't', creationDate: '2026-10-30T00:00:00.000Z' }),

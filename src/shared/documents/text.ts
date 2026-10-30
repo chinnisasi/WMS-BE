@@ -35,9 +35,10 @@ function characterSetOf(font: FoldableFont): ReadonlySet<number> {
   return set;
 }
 
-/** Line breaks and tabs become a space; runs of whitespace collapse; the ends are trimmed. */
+/** NFC-composed; line breaks and tabs become a space; runs of whitespace collapse; the ends are trimmed. */
 export function normaliseDocumentText(text: string): string {
-  return text.replace(/\r\n|[\r\n\t]/g, ' ').replace(/\s+/g, ' ').trim();
+  // NFC first: a decomposed "é" (e + U+0301) composes to the one WinAnsi glyph, not "e?".
+  return text.normalize('NFC').replace(/\r\n|[\r\n\t]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 /**

@@ -299,7 +299,7 @@ export class InboundFacade {
         const doc = await this.grnDocuments.readInTx(tx, tenantId, grnId, { clientId }, printedAt);
         return doc === null ? null : { minimal, view: grnDocumentView(doc) };
       },
-      { clientId },
+      { accessMode: 'read only', clientId },
     );
     if (both === null) return null;
     const read = both.minimal;
