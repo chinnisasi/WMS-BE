@@ -3982,6 +3982,8 @@ describe('architecture: the client-emails module (story 5-2b)', () => {
       '../attachments/attachments.module',
       // Story 4-6a (A12, A47) — the consignment record's free-function seam (the stamped version the dispatch email names).
       '../invoicing/consignment-seam',
+      // Story 4-9a (A27, A69) — the freight facts' free-function seam (the frozen carriage, the delivered order's label).
+      '../outbound/freight-carriage.read',
     ]);
     const offenders: string[] = [];
     for (const file of moduleFiles) {
@@ -3994,6 +3996,15 @@ describe('architecture: the client-emails module (story 5-2b)', () => {
     const enqueue = readFileSync(ENQUEUE, 'utf8');
     expect(enqueue).toMatch(/from '\.\.\/outbound\/outbound\.facade'/);
     expect(enqueue).toMatch(/from '\.\.\/mail\/mail\.facade'/);
+  });
+
+  it('story 4-9a (A27): outbound/freight-carriage.read.ts imports only drizzle-orm and shared/ (a free-function seam) and never reads the staff-only freight tables', () => {
+    const source = readFileSync(join(SRC_ROOT, 'modules', 'outbound', 'freight-carriage.read.ts'), 'utf8');
+    const targets = [...source.matchAll(/from\s+['"]([^'"]+)['"]/g)].map((match) => match[1]!);
+    expect(targets.length).toBeGreaterThan(0);
+    expect(targets.filter((target) => target !== 'drizzle-orm' && !target.startsWith('../../shared/'))).toEqual([]);
+    expect(source).not.toMatch(/freightLoads|freightLoadScans|freight_loads|freight_load_scans/);
+    expect(readFileSync(ENQUEUE, 'utf8')).toContain(`from '../outbound/freight-carriage.read'`);
   });
 
   it('the payload decoders are ONE copy, in shared/primitives (D2): no module defines decodeReceipt / decodeDispatch', () => {

@@ -1,5 +1,6 @@
+import { createHash } from 'node:crypto';
 import { toMilli } from '../../shared/primitives/quantity';
-import { formatBaseQuantity, formatQuantity, type DispatchFact, type ReceiptFact, type SkuLabel } from '../../shared/primitives/client-event-facts';
+import { formatBaseQuantity, formatQuantity, type DeliveryFact, type DispatchFact, type ReceiptFact, type SkuLabel } from '../../shared/primitives/client-event-facts';
 import { WEBHOOK_BODY_MAX_BYTES, type WebhookEventType, type WebhookSchemaVersion } from './webhook-rules';
 
 /**
@@ -24,8 +25,10 @@ import { WEBHOOK_BODY_MAX_BYTES, type WebhookEventType, type WebhookSchemaVersio
 // formatters live in `shared/primitives/client-event-facts.ts` (shared with
 // the client emails); re-exported here unchanged.
 export {
+  decodeDelivery,
   decodeDispatch,
   decodeReceipt,
+  type DeliveryFact,
   formatBaseQuantity,
   formatQuantity,
   type DispatchFact,
@@ -154,12 +157,75 @@ export function dispatchData(fact: DispatchFact, labels: DispatchLabels): { data
   };
 }
 
+/** The labels a delivery body reads beside its payload. */
+export interface DeliveryLabels {
+  readonly warehouseCode: string;
+  readonly clientOrderRef: string | null;
+  readonly channelOrderRef: string | null;
+}
+
+/**
+ * Story 4-9a (A28, A67) — `order.delivered` v1 data: a freight consignment's
+ * proof of delivery, every fact from the frozen payload but the order's two
+ * references and the warehouse code. No lines (the body is never trimmed),
+ * no receiver phone, no consignee. `deliverySeq` orders the versions of one
+ * consignment: the highest wins (an amendment is a new event, `amended: true`).
+ * `recordedAt` is the server time of the record (the payload's; the event's
+ * own time when an older payload lacks it).
+ */
+export function deliveryData(fact: DeliveryFact, labels: DeliveryLabels, occurredAt: string): { data: Record<string, unknown>; lines: Record<string, unknown>[] } {
+  return {
+    data: {
+      orderId: fact.orderId,
+      clientOrderRef: labels.clientOrderRef,
+      channelOrderRef: labels.channelOrderRef,
+      warehouseCode: labels.warehouseCode,
+      consignmentRef: fact.consignmentRef,
+      dispatchedAt: fact.dispatchedAt,
+      deliveredAt: fact.deliveredAt,
+      outcome: fact.outcome,
+      transporterName: fact.transporterName,
+      lrNumber: fact.lrNumber,
+      vehicleNumber: fact.vehicleNumber,
+      receiverName: fact.receiverName,
+      shortPackages: fact.shortPackageCount ?? 0,
+      damagedPackages: fact.damagedPackageCount ?? 0,
+      note: fact.note,
+      amended: fact.amended,
+      deliverySeq: fact.deliverySeq,
+      recordedAt: fact.recordedAt ?? occurredAt,
+    },
+    lines: [],
+  };
+}
+
+/**
+ * Story 4-9a (A28) — the `order.delivered` event's SUBJECT: one per recorded
+ * version of a consignment, so an amendment is a new event while a relay
+ * redelivery of the same version dedupes on `webhook_events_subject_unique`
+ * (an order-id subject would drop every amendment). A deterministic uuid
+ * (version 5 layout) over `order.delivered:{consignmentId}:{deliverySeq}`;
+ * the body's `orderId` names the order.
+ */
+export function deliverySubjectUuid(consignmentId: string, deliverySeq: number): string {
+  const hex = createHash('sha256').update(`order.delivered:${consignmentId}:${deliverySeq}`).digest('hex').slice(0, 32).split('');
+  hex[12] = '5';
+  hex[16] = ((parseInt(hex[16]!, 16) & 0x3) | 0x8).toString(16);
+  const h = hex.join('');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+}
+
 /**
  * The stored body: the envelope with `data.lines`, or — past the byte limit
  * — without them, carrying `linesOmitted: true, lineCount: N`. Null only when
  * even that does not fit (it always does: the head is bounded).
  */
 export function buildWebhookBody(head: WebhookEnvelopeHead, built: { data: Record<string, unknown>; lines: Record<string, unknown>[] }): string | null {
+  // Story 4-9a — a body without lines (order.delivered) carries no `lines` key at all.
+  if (head.type === 'order.delivered') {
+    const body = serialiseEnvelope(head, built.data);
+    return Buffer.byteLength(body, 'utf8') <= WEBHOOK_BODY_MAX_BYTES ? body : null;
+  }
   const full = serialiseEnvelope(head, { ...built.data, lines: built.lines });
   if (Buffer.byteLength(full, 'utf8') <= WEBHOOK_BODY_MAX_BYTES) return full;
   const omitted = serialiseEnvelope(head, { ...built.data, linesOmitted: true, lineCount: built.lines.length });

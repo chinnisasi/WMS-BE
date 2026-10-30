@@ -650,7 +650,7 @@ describe('receipt and dispatch emails (e2e, story 5-2b)', () => {
       await seedClientRows(edge, 'client-dispatch', 2, midnight, 'cancelled');
       await seedClientRows(edge, 'client-receipt', 1, midnight, 'failed');
       const counts = await withTenantTransaction(db, tenantId, (tx: TenantTx) => clientEmailCountsTodayInTx(tx, tenantId, edge));
-      expect(counts).toEqual({ 'client-dispatch': 2, 'client-receipt': 1, 'client-shipment-document': 0, 'client-documents-needed': 0 });
+      expect(counts).toEqual({ 'client-dispatch': 2, 'client-receipt': 1, 'client-shipment-document': 0, 'client-documents-needed': 0, 'client-delivery-update': 0 });
     });
 
     it('AC: 500 ACME dispatch rows today → another ACME order dispatches, no row is written; the log answers capReachedToday.dispatch', async () => {
@@ -733,6 +733,120 @@ describe('receipt and dispatch emails (e2e, story 5-2b)', () => {
       } finally {
         fault.mockRestore();
       }
+    });
+  });
+
+  // ── story 4-9a: freight — the truck line and the delivery update ─────────
+
+  describe('story 4-9a (A27): the dispatch email’s truck line and the client-delivery-update notice', () => {
+    let deliveryContact: string;
+    beforeAll(async () => {
+      deliveryContact = (await addContact(acme, { name: 'D', email: 'd@acme.example', emailEvents: ['delivery.recorded'] }).expect(201)).body.contact.id as string;
+    });
+    afterEach(() => wipeMail(acme));
+
+    /** A dispatched freight consignment of the order, as the departure writes it (staff data the suite seeds directly). */
+    async function seedDispatchedConsignment(orderId: string): Promise<string> {
+      const id = uuidv7();
+      await sql`insert into freight_consignments (id, tenant_id, warehouse_id, load_id, order_id, client_id, status, stop_seq, dispatched_at, package_count, pallet_count, loaded_package_count, client_snapshot, carriage_snapshot, added_by)
+        values (${id}, ${tenantId}, ${warehouseId}, ${uuidv7()}, ${orderId}, ${acme}, 'dispatched', 3, now(), 15, 15, 15, ${sql.json({ v: 1, code: 'ACME' })},
+                ${sql.json({ v: 1, loadCode: 'LD-0007', consignmentRef: 'LD-0007/03', mode: 'ltl', transporterName: 'VRL Logistics', vehicleNumber: 'KA01AB1234', seals: ['S-991'], dispatchedAt: new Date().toISOString() })}, ${ownerId})`;
+      return id;
+    }
+
+    function deliveryEvent(orderId: string, consignmentId: string, extra: Record<string, unknown> = {}): DomainEvent {
+      return {
+        eventId: uuidv7(),
+        type: 'freight_consignment.delivered',
+        tenantId,
+        occurredAt: new Date().toISOString(),
+        payload: {
+          consignmentId,
+          orderId,
+          clientId: acme,
+          warehouseId,
+          deliverySeq: 1,
+          outcome: 'delivered-with-exceptions',
+          deliveredAt: '2026-11-02T05:50:00.000Z',
+          receiverName: 'A. Kumar',
+          shortPackageCount: 0,
+          damagedPackageCount: 1,
+          note: 'pallet 4 crushed corner',
+          lrNumber: '4410',
+          transporterName: 'VRL Logistics',
+          vehicleNumber: 'KA01AB1234',
+          dispatchedAt: new Date().toISOString(),
+          consignmentRef: 'LD-0007/03',
+          amended: false,
+          recordedAt: new Date().toISOString(),
+          ...extra,
+        },
+      };
+    }
+
+    it('an order that left on a truck: its dispatch email carries the frozen truck facts and one line; no other order’s does', async () => {
+      const ref = `PO-${ulid().slice(18)}`;
+      const orderId = await dispatchOrder([{ skuId: sku.get('A-TEE')!, quantity: 1 }], { carrierName: 'VRL Logistics', trackingNumber: '4410' }, { clientOrderRef: ref });
+      await seedDispatchedConsignment(orderId);
+      await drain();
+      const rows = (await mailRows(acme)).filter((row) => row.template === 'client-dispatch');
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.params.freight).toEqual({ consignmentRef: 'LD-0007/03', vehicleNumber: 'KA01AB1234', packageCount: 15 });
+      const before = captured.captured.length;
+      await mail.sendDue(tenantId);
+      const [sent] = captured.captured.slice(before).filter((email) => email.template === 'client-dispatch');
+      expect(sent!.text).toContain('By truck KA01AB1234 — 15 packages, freight note LD-0007/03');
+
+      await wipeMail(acme);
+      await dispatchOrder([{ skuId: sku.get('A-TEE')!, quantity: 1 }]);
+      await drain();
+      const plain = (await mailRows(acme)).filter((row) => row.template === 'client-dispatch');
+      expect(plain).toHaveLength(1);
+      expect(plain[0]!.params).not.toHaveProperty('freight');
+    });
+
+    it('a recorded delivery: one row per delivery.recorded contact, keyed by consignment and version; none for others; a redelivery dedupes; an amendment is a second row "Updated: …"', async () => {
+      const ref = `PO-${ulid().slice(18)}`;
+      const orderId = await dispatchOrder([{ skuId: sku.get('A-TEE')!, quantity: 1 }], {}, { clientOrderRef: ref, destination: testAddress({ city: 'Pune' }) });
+      await drain();
+      await wipeMail(acme);
+      const consignmentId = await seedDispatchedConsignment(orderId);
+      const first = deliveryEvent(orderId, consignmentId);
+      expect(await handler.deliver(first)).toEqual({ kind: 'queued', queued: 1, deduped: 0 });
+      expect(await handler.deliver({ ...first, eventId: uuidv7() })).toEqual({ kind: 'queued', queued: 0, deduped: 1 });
+      let rows = await mailRows(acme);
+      expect(rows.map((r) => [r.template, r.to_email, r.dedupe_key, r.priority])).toEqual([
+        ['client-delivery-update', 'd@acme.example', `client-delivery-update:${consignmentId}:1:d@acme.example`, 1],
+      ]);
+      expect(rows[0]!.params).toMatchObject({ orderId, orderRef: ref, consigneeCity: 'Pune', consignmentRef: 'LD-0007/03', outcome: 'delivered-with-exceptions', damagedPackageCount: 1, amended: false });
+      expect(JSON.stringify(rows[0]!.params)).not.toMatch(/driver|phone|line1|pincode|consigneeName/i);
+
+      expect(await handler.deliver(deliveryEvent(orderId, consignmentId, { deliverySeq: 2, amended: true, outcome: 'delivered', damagedPackageCount: 0, note: null }))).toEqual({
+        kind: 'queued',
+        queued: 1,
+        deduped: 0,
+      });
+      rows = await mailRows(acme);
+      expect(rows.map((r) => r.dedupe_key)).toEqual([`client-delivery-update:${consignmentId}:1:d@acme.example`, `client-delivery-update:${consignmentId}:2:d@acme.example`]);
+      const before = captured.captured.length;
+      await mail.sendDue(tenantId);
+      const sent = captured.captured.slice(before).filter((email) => email.template === 'client-delivery-update');
+      expect(sent.map((email) => email.subject).sort()).toEqual([`ACME Brand: order ${ref} delivered with exceptions`, `Updated: ACME Brand: order ${ref} delivered`].sort());
+      const withExceptions = sent.find((email) => email.subject.endsWith('with exceptions'))!;
+      expect(withExceptions.text).toContain('Exceptions: 1 package damaged');
+      expect(withExceptions.text).toContain(`/portal/orders?order=${orderId}`);
+    });
+
+    it('a contact that drops delivery.recorded hears nothing; an unknown order is skipped order-gone; a malformed payload is acked', async () => {
+      await editContact(acme, deliveryContact, { emailEvents: [] }).expect(200);
+      try {
+        expect(await handler.deliver(deliveryEvent(uuidv7(), uuidv7()))).toEqual({ kind: 'skipped', reason: 'no-subscriber' });
+      } finally {
+        await editContact(acme, deliveryContact, { emailEvents: ['delivery.recorded'] }).expect(200);
+      }
+      expect(await handler.deliver(deliveryEvent(uuidv7(), uuidv7()))).toEqual({ kind: 'skipped', reason: 'order-gone' });
+      expect(await handler.deliver({ ...deliveryEvent(uuidv7(), uuidv7()), payload: { consignmentId: 'x' } })).toEqual({ kind: 'malformed' });
+      expect(await mailRows(acme)).toHaveLength(0);
     });
   });
 

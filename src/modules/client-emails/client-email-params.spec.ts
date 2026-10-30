@@ -3,6 +3,7 @@ import {
   buildDispatchEmailParams,
   buildReceiptEmailParams,
   clientEmailDedupeKey,
+  deliverySubjectId,
   dispatchOrderRefOf,
   qcHeldLinesOf,
 } from './client-email-params';
@@ -191,7 +192,11 @@ describe('client email params (story 5-2b)', () => {
       'shipment.document-shared': 'shipment.documents',
       // Story 4-6a (A47) — a packed order still waiting for the brand's documents.
       'order.packed': 'consignment.documents-needed',
+      // Story 4-9a (A27) — a freight consignment's delivery recorded or amended.
+      'freight_consignment.delivered': 'delivery.recorded',
     });
+    // Story 4-9a (A27) — one row per (consignment, delivery version, recipient).
+    expect(clientEmailDedupeKey('client-delivery-update', deliverySubjectId({ consignmentId: GRN, deliverySeq: 2 }), 'a@x.in')).toBe(`client-delivery-update:${GRN}:2:a@x.in`);
     expect(CLIENT_EMAIL_DAILY_CAP).toBe(500);
     expect(CLIENT_EMAIL_STALE_EVENT_MS).toBe(24 * 60 * 60 * 1000);
     expect(clientEmailEnabled({})).toBe(false);

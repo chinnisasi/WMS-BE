@@ -7,6 +7,7 @@ import { decodeClientReceiptParams, renderClientReceiptEmail, type ClientAttachm
 import { decodeClientShipmentDocumentParams, renderClientShipmentDocumentEmail } from './client-shipment-document';
 import { decodeClientDispatchParams, renderClientDispatchEmail } from './client-dispatch';
 import { decodeClientDocumentsNeededParams, renderClientDocumentsNeededEmail } from './client-documents-needed';
+import { decodeClientDeliveryUpdateParams, renderClientDeliveryUpdateEmail } from './client-delivery-update';
 
 export type { RenderedEmail } from './invite';
 export type { InviteEmailParams } from './invite';
@@ -18,6 +19,8 @@ export { SHIPMENT_DOCUMENT_KINDS, SHEET_PARCELS_SHOWN } from './client-shipment-
 export type { ClientDispatchEmailParams, ClientDispatchLineParams } from './client-dispatch';
 export type { ClientDocumentsNeededEmailParams, DocumentsNeededKind, DocumentsNeededReason } from './client-documents-needed';
 export { DOCUMENTS_NEEDED_KINDS, DOCUMENTS_NEEDED_REASONS } from './client-documents-needed';
+export type { ClientDeliveryUpdateEmailParams, DeliveryUpdateOutcome } from './client-delivery-update';
+export { DELIVERY_UPDATE_OUTCOMES } from './client-delivery-update';
 export { CLIENT_EMAIL_MAX_LINES } from './client-notice';
 
 /** What a template may use besides its stored parameters: the row's tenant, its recipient, the base URL and the opened secret. */
@@ -101,6 +104,15 @@ export function renderEmail(template: EmailTemplate, params: unknown, context: R
       return renderClientDocumentsNeededEmail(
         needed,
         webLinkFrom(context.webBaseUrl, '/portal/orders', { order: needed.orderId, tab: 'documents' }),
+        context.fallbackReplyTo ?? null,
+      );
+    }
+    // Story 4-9a (A27) — a truck consignment's delivery; the link opens the order.
+    case 'client-delivery-update': {
+      const delivery = decodeClientDeliveryUpdateParams(params);
+      return renderClientDeliveryUpdateEmail(
+        delivery,
+        webLinkFrom(context.webBaseUrl, '/portal/orders', { order: delivery.orderId }),
         context.fallbackReplyTo ?? null,
       );
     }

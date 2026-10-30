@@ -200,7 +200,7 @@ export class WebhookDeliveryDto {
   @ApiProperty({ format: 'uuid' }) endpointId!: string;
   @ApiProperty({ format: 'uuid', description: 'The webhook event id — the `webhook-id` header and the body’s `id`' }) eventId!: string;
   @ApiProperty({ enum: [...WEBHOOK_EVENT_TYPES] }) eventType!: WebhookEventType;
-  @ApiProperty({ format: 'uuid', description: 'The receipt (GRN) id or the order id' }) subjectId!: string;
+  @ApiProperty({ format: 'uuid', description: 'The receipt (GRN) id, the order id, or (order.delivered) the id of the recorded delivery version' }) subjectId!: string;
   @ApiProperty({ enum: [...WEBHOOK_DELIVERY_STATUSES] }) status!: WebhookDeliveryStatus;
   @ApiProperty() attempts!: number;
   @ApiProperty({ type: String, nullable: true, format: 'date-time', description: 'A pending delivery’s next try' }) nextAttemptAt!: string | null;

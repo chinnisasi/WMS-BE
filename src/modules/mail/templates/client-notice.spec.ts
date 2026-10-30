@@ -48,7 +48,7 @@ const dispatch: ClientDispatchEmailParams = {
 const context = { tenantId: 't', to: 'a@acme.example', webBaseUrl: 'https://app.wms.test', secret: null };
 
 describe('client notices (story 5-2b)', () => {
-  it('the vocabulary: seven templates (story 4-4a added the shipping document, 4-6a the documents-needed reminder), the four client ones at priority 1, account mail at 0', () => {
+  it('the vocabulary: eight templates (story 4-4a added the shipping document, 4-6a the documents-needed reminder, 4-9a the delivery update), the five client ones at priority 1, account mail at 0', () => {
     expect([...EMAIL_TEMPLATES]).toEqual([
       'user-invite',
       'password-reset',
@@ -57,8 +57,9 @@ describe('client notices (story 5-2b)', () => {
       'client-dispatch',
       'client-shipment-document',
       'client-documents-needed',
+      'client-delivery-update',
     ]);
-    expect([...CLIENT_EMAIL_TEMPLATES]).toEqual(['client-receipt', 'client-dispatch', 'client-shipment-document', 'client-documents-needed']);
+    expect([...CLIENT_EMAIL_TEMPLATES]).toEqual(['client-receipt', 'client-dispatch', 'client-shipment-document', 'client-documents-needed', 'client-delivery-update']);
     expect(EMAIL_TEMPLATE_PRIORITY).toEqual({
       'user-invite': 0,
       'password-reset': 0,
@@ -67,6 +68,7 @@ describe('client notices (story 5-2b)', () => {
       'client-dispatch': 1,
       'client-shipment-document': 1,
       'client-documents-needed': 1,
+      'client-delivery-update': 1,
     });
   });
 

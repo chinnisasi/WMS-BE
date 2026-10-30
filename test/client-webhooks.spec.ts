@@ -8,7 +8,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import type { Database } from '../src/shared/db/db';
 import { EVENT_BUS } from '../src/shared/events/event-bus';
 import type { DomainEvent } from '../src/shared/events/event-bus.seam';
-import { OUTBOX_RELAY, type OutboxRelay } from '../src/shared/events/outbox.seam';
+import { OUTBOX_RELAY, OUTBOX_SINK, type OutboxRelay, type OutboxSink } from '../src/shared/events/outbox.seam';
 import { OUTBOX_MAX_ATTEMPTS, OUTBOX_OPERATOR_REPLAY_SQL } from '../src/shared/events/outbox';
 import { withTenantTransaction } from '../src/shared/db/tenant-scope';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
@@ -16,6 +16,7 @@ import { InvoiceDeliveryHandler } from '../src/modules/invoicing/delivery';
 import { ClientWebhooksFacade } from '../src/modules/client-webhooks/client-webhooks.facade';
 import { WebhookSender, newWebhookTick } from '../src/modules/client-webhooks/webhook.sender';
 import { WebhookEnqueue, WebhookEnqueueHandler } from '../src/modules/client-webhooks/webhook.enqueue';
+import { deliverySubjectUuid } from '../src/modules/client-webhooks/webhook-payloads';
 import type { WebhookTransport } from '../src/modules/client-webhooks/webhook-http';
 import { resealTenantSecretsInTx } from '../src/modules/client-webhooks/webhook-reseal';
 import { openSigningSecret } from '../src/modules/client-webhooks/webhook-secrets';
@@ -567,6 +568,106 @@ describe('client webhooks (e2e, story 5-2a)', () => {
       const orderId = await dispatchOrder([{ skuId: sku.get('B-1')!, quantity: 1 }]);
       await drain();
       expect(await eventsOf(orderId)).toHaveLength(0);
+    });
+  });
+
+  // ── story 4-9a: order.delivered ────────────────────────────────────────────
+
+  describe('order.delivered end to end (story 4-9a, A28, A67)', () => {
+    afterAll(() => wipeEndpoints(acme));
+
+    function deliveredPayload(orderId: string, consignmentId: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+      return {
+        consignmentId,
+        orderId,
+        clientId: acme,
+        warehouseId,
+        deliverySeq: 1,
+        outcome: 'delivered',
+        deliveredAt: '2026-11-02T05:50:00.000Z',
+        receiverName: 'A. Kumar',
+        shortPackageCount: null,
+        damagedPackageCount: null,
+        note: null,
+        lrNumber: '4410',
+        transporterName: 'VRL Logistics',
+        vehicleNumber: 'KA01AB1234',
+        dispatchedAt: '2026-10-30T10:35:00.000Z',
+        consignmentRef: 'LD-0007/03',
+        amended: false,
+        recordedAt: '2026-11-02T06:00:00.000Z',
+        ...extra,
+      };
+    }
+
+    async function appendDelivered(payload: Record<string, unknown>): Promise<void> {
+      const outbox = app.get<OutboxSink>(OUTBOX_SINK);
+      await withTenantTransaction(db, tenantId, (tx) =>
+        outbox.append(tx, { messageId: uuidv7(), tenantId, type: 'freight_consignment.delivered', occurredAt: new Date().toISOString(), payload }),
+      );
+    }
+
+    it('a freight_consignment.delivered outbox row → one order.delivered event for the payload’s client, subject per version, signed and sent; an amendment is a second event', async () => {
+      await wipeEndpoints(acme);
+      const { endpoint: e } = await endpoint(acme, 'https://hooks.acme.example/delivered', ['order.delivered']);
+      const orderId = await dispatchOrder([{ skuId: sku.get('A-TEE')!, quantity: 1 }]);
+      await drain();
+      // The endpoint is not subscribed to order.dispatched: the dispatch made no event.
+      expect(await eventsOf(orderId)).toHaveLength(0);
+      const consignmentId = uuidv7();
+      await appendDelivered(deliveredPayload(orderId, consignmentId));
+      await drain();
+      const [first] = await eventsOf(deliverySubjectUuid(consignmentId, 1));
+      expect(first).toMatchObject({ event_type: 'order.delivered', client_id: acme });
+      const body = JSON.parse(first!.body) as { type: string; client: { code: string }; data: Record<string, unknown> };
+      expect(body).toMatchObject({ type: 'order.delivered', client: { code: 'ACME' } });
+      expect(body.data).toEqual({
+        orderId,
+        clientOrderRef: expect.stringMatching(/^CO-/),
+        channelOrderRef: null,
+        warehouseCode,
+        consignmentRef: 'LD-0007/03',
+        dispatchedAt: '2026-10-30T10:35:00.000Z',
+        deliveredAt: '2026-11-02T05:50:00.000Z',
+        outcome: 'delivered',
+        transporterName: 'VRL Logistics',
+        lrNumber: '4410',
+        vehicleNumber: 'KA01AB1234',
+        receiverName: 'A. Kumar',
+        shortPackages: 0,
+        damagedPackages: 0,
+        note: null,
+        amended: false,
+        deliverySeq: 1,
+        recordedAt: '2026-11-02T06:00:00.000Z',
+      });
+      expect(first!.body).not.toContain('"lines"');
+      expect(await deliveriesOf(e.id)).toHaveLength(1);
+      expect(await send()).toMatchObject({ attempted: 1, succeeded: 1 });
+
+      // An amendment: a new version, a new event; a redelivery of a version is one event.
+      await appendDelivered(deliveredPayload(orderId, consignmentId, { deliverySeq: 2, amended: true, outcome: 'refused', note: 'wrong item' }));
+      await appendDelivered(deliveredPayload(orderId, consignmentId, { deliverySeq: 2, amended: true, outcome: 'refused', note: 'wrong item' }));
+      await drain();
+      const [second] = await eventsOf(deliverySubjectUuid(consignmentId, 2));
+      expect(JSON.parse(second!.body).data).toMatchObject({ outcome: 'refused', amended: true, deliverySeq: 2, note: 'wrong item' });
+      expect(await eventsOf(deliverySubjectUuid(consignmentId, 2))).toHaveLength(1);
+      expect(await deliveriesOf(e.id)).toHaveLength(2);
+    });
+
+    it('the client is the payload’s (never looked up through the order); a client without an endpoint gets none; a malformed payload is acked', async () => {
+      const consignmentId = uuidv7();
+      const outcome = await handler.deliver({
+        eventId: uuidv7(),
+        type: 'freight_consignment.delivered',
+        tenantId,
+        occurredAt: new Date().toISOString(),
+        payload: deliveredPayload(uuidv7(), consignmentId, { clientId: beta }),
+      });
+      expect(outcome).toEqual({ kind: 'skipped', reason: 'no-endpoint' });
+      expect(
+        await handler.deliver({ eventId: uuidv7(), type: 'freight_consignment.delivered', tenantId, occurredAt: new Date().toISOString(), payload: { consignmentId: 'x' } }),
+      ).toEqual({ kind: 'malformed' });
     });
   });
 

@@ -59,6 +59,12 @@ export interface ClientDispatchEmailParams {
   readonly taxDocument?: { readonly label: string; readonly number: string; readonly date: string } | null;
   /** Story 4-6a (A20) — the e-way bill (number as recorded, its last valid day). */
   readonly ewayBill?: { readonly number: string; readonly validUntil: string | null } | null;
+  /**
+   * Story 4-9a (A27) — the truck the order left on, from its freight
+   * consignment's frozen carriage snapshot. Optional: present only for an
+   * order dispatched on a freight load (every other row keeps its bytes).
+   */
+  readonly freight?: { readonly consignmentRef: string; readonly vehicleNumber: string; readonly packageCount: number } | null;
 }
 
 const WHAT = 'client-dispatch params';
@@ -90,7 +96,23 @@ export function decodeClientDispatchParams(raw: unknown): ClientDispatchEmailPar
     // Story 4-6a — optional keys, decoded only when present (an older row has none).
     ...(value.taxDocument === undefined || value.taxDocument === null ? {} : { taxDocument: decodeTaxDocument(value.taxDocument) }),
     ...(value.ewayBill === undefined || value.ewayBill === null ? {} : { ewayBill: decodeEwayBill(value.ewayBill) }),
+    // Story 4-9a — optional, decoded only when present.
+    ...(value.freight === undefined || value.freight === null ? {} : { freight: decodeFreight(value.freight) }),
   };
+}
+
+function decodeFreight(raw: unknown): { consignmentRef: string; vehicleNumber: string; packageCount: number } {
+  const value = asRecord(raw, `${WHAT} freight`);
+  const packageCount = value.packageCount;
+  if (typeof packageCount !== 'number' || !Number.isSafeInteger(packageCount) || packageCount < 1) throw new Error(`${WHAT}: freight.packageCount is not a count`);
+  return { consignmentRef: textField(value, 'consignmentRef', WHAT), vehicleNumber: textField(value, 'vehicleNumber', WHAT), packageCount };
+}
+
+/** Story 4-9a (A27) — "By truck KA01AB1234 — 15 packages, freight note LD-0007/03", or null for an order that left by no truck. */
+export function dispatchFreightLine(params: Pick<ClientDispatchEmailParams, 'freight'>): string | null {
+  const freight = params.freight ?? null;
+  if (freight === null) return null;
+  return `By truck ${plainText(freight.vehicleNumber)} — ${freight.packageCount} ${freight.packageCount === 1 ? 'package' : 'packages'}, freight note ${plainText(freight.consignmentRef)}`;
 }
 
 function decodeTaxDocument(raw: unknown): { label: string; number: string; date: string } {
@@ -169,6 +191,8 @@ export function renderClientDispatchEmail(
   const opening = `${tenant} dispatched order ${ref} for ${client} from ${warehouse}.`;
   // Story 4-6a — one line when the brand's document was recorded; none on an older row.
   const documents = dispatchDocumentsLine(params);
+  // Story 4-9a — one line for an order that left on a truck; none otherwise.
+  const truck = dispatchFreightLine(params);
   // Story 4-5a — one sentence about the slip; none at all on a pre-4-5a row.
   const fileNote =
     attachment === 'attached'
@@ -184,6 +208,7 @@ export function renderClientDispatchEmail(
     '',
     ...facts.map(([label, value]) => `${label}: ${value}`),
     ...(documents === null ? [] : [documents]),
+    ...(truck === null ? [] : [truck]),
     '',
     ...rows.map(([code, name, ordered, dispatched, short]) => `- ${code} ${name}: ordered ${ordered}, dispatched ${dispatched}, short ${short}`),
     ...(more === null ? [] : [more]),
@@ -202,6 +227,7 @@ export function renderClientDispatchEmail(
       `<p>${html(opening)}</p>`,
       `<p>${facts.map(([label, value]) => `${html(label)}: <strong>${html(value)}</strong>`).join('<br>')}</p>`,
       ...(documents === null ? [] : [`<p>${html(documents)}</p>`]),
+      ...(truck === null ? [] : [`<p>${html(truck)}</p>`]),
       htmlTable(['SKU', 'Name', 'Ordered', 'Dispatched', 'Short'], rows, new Set([2, 3, 4])),
       ...(more === null ? [] : [`<p>${html(more)}</p>`]),
       ...(params.shortShipped ? [`<p><strong>${html(DISPATCH_SHORT_NOTE)}</strong></p>`] : []),

@@ -196,3 +196,96 @@ export function decodeDispatch(payload: unknown): DispatchFact | null {
     lines,
   };
 }
+
+// ── story 4-9a: a freight consignment's proof of delivery ─────────────────
+
+/** The outcomes a delivery records (`DELIVERY_OUTCOMES`, shared/primitives/freight.ts). */
+const DELIVERY_OUTCOME_VALUES = ['delivered', 'delivered-with-exceptions', 'refused'] as const;
+export type DeliveryOutcomeFact = (typeof DELIVERY_OUTCOME_VALUES)[number];
+
+/**
+ * Story 4-9a (A17, A27, A28) — the `freight_consignment.delivered` payload:
+ * every fact the delivery email and the `order.delivered` webhook carry,
+ * frozen at the event (5-2b A1). `recordedAt` (the server time of the
+ * record) and `consigneeCity` are read when present.
+ */
+export interface DeliveryFact {
+  readonly consignmentId: string;
+  readonly orderId: string;
+  readonly clientId: string;
+  readonly warehouseId: string;
+  readonly deliverySeq: number;
+  readonly outcome: DeliveryOutcomeFact;
+  readonly deliveredAt: string;
+  readonly receiverName: string | null;
+  readonly shortPackageCount: number | null;
+  readonly damagedPackageCount: number | null;
+  readonly note: string | null;
+  readonly lrNumber: string | null;
+  readonly transporterName: string;
+  readonly vehicleNumber: string | null;
+  readonly dispatchedAt: string;
+  readonly consignmentRef: string;
+  readonly amended: boolean;
+  readonly recordedAt: string | null;
+  readonly consigneeCity: string | null;
+}
+
+function countOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/** `freight_consignment.delivered` (freight-consignment.command.ts) → the facts, or null when malformed. */
+export function decodeDelivery(payload: unknown): DeliveryFact | null {
+  const value = record(payload);
+  if (value === null) return null;
+  const consignmentId = uuidOf(value.consignmentId);
+  const orderId = uuidOf(value.orderId);
+  const clientId = uuidOf(value.clientId);
+  const warehouseId = uuidOf(value.warehouseId);
+  const deliverySeq = countOrNull(value.deliverySeq);
+  const outcome = value.outcome;
+  const deliveredAt = stringOrNull(value.deliveredAt);
+  const dispatchedAt = stringOrNull(value.dispatchedAt);
+  const transporterName = stringOrNull(value.transporterName);
+  const consignmentRef = stringOrNull(value.consignmentRef);
+  if (
+    consignmentId === null ||
+    orderId === null ||
+    clientId === null ||
+    warehouseId === null ||
+    deliverySeq === null ||
+    deliverySeq < 1 ||
+    typeof outcome !== 'string' ||
+    !(DELIVERY_OUTCOME_VALUES as readonly string[]).includes(outcome) ||
+    deliveredAt === null ||
+    Number.isNaN(Date.parse(deliveredAt)) ||
+    dispatchedAt === null ||
+    transporterName === null ||
+    consignmentRef === null ||
+    typeof value.amended !== 'boolean'
+  ) {
+    return null;
+  }
+  return {
+    consignmentId,
+    orderId,
+    clientId,
+    warehouseId,
+    deliverySeq,
+    outcome: outcome as DeliveryOutcomeFact,
+    deliveredAt,
+    receiverName: stringOrNull(value.receiverName),
+    shortPackageCount: countOrNull(value.shortPackageCount),
+    damagedPackageCount: countOrNull(value.damagedPackageCount),
+    note: stringOrNull(value.note),
+    lrNumber: stringOrNull(value.lrNumber),
+    transporterName,
+    vehicleNumber: stringOrNull(value.vehicleNumber),
+    dispatchedAt,
+    consignmentRef,
+    amended: value.amended,
+    recordedAt: stringOrNull(value.recordedAt),
+    consigneeCity: stringOrNull(value.consigneeCity),
+  };
+}
