@@ -353,6 +353,8 @@ export class HandoverRefusedParcelDto {
   @ApiProperty({ format: 'uuid' }) orderId!: string;
   @ApiProperty({ enum: [...HANDOVER_PARCEL_REFUSALS] }) code!: string;
   @ApiProperty() detail!: string;
+  @ApiProperty({ required: false, description: 'The order’s status as read under its lock (e.g. cancelled vs accepted for order-not-ready); absent when the order was not found' })
+  orderStatus?: string;
 }
 
 export class HandoverResponse {
@@ -483,6 +485,7 @@ export class PortalFileDto {
 }
 
 export class PortalOrderShippingResponse {
+  @ApiProperty({ description: 'The client may record a label or AWB now (Upload / Replace / Send AWB): the order is open and has no live shipment, or a client-arranged one not yet handed over' }) canRecord!: boolean;
   @ApiProperty({ enum: [...PORTAL_SHIPPING_STATUSES] }) status!: string;
   @ApiProperty({ type: String, nullable: true }) courierName!: string | null;
   @ApiProperty({ type: String, nullable: true }) awb!: string | null;

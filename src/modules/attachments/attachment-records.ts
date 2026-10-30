@@ -869,3 +869,12 @@ export async function attachmentByIdInTx(tx: TenantTx, tenantId: string, attachm
     .limit(1);
   return rows[0] ?? null;
 }
+
+/** Story 4-4a (A29, FA29) — the live (`staged` / `attached`) rows of these photo refs. */
+export async function liveRowsByRefsInTx(tx: TenantTx, tenantId: string, refs: readonly string[]): Promise<AttachmentRow[]> {
+  if (refs.length === 0) return [];
+  return tx
+    .select()
+    .from(attachments)
+    .where(and(eq(attachments.tenantId, tenantId), inArray(attachments.clientRef, [...refs]), inArray(attachments.status, ['staged', 'attached'])));
+}

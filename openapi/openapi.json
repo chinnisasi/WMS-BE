@@ -51084,6 +51084,28 @@
           "rows"
         ]
       },
+      "RejectedOpPhotoDto": {
+        "type": "object",
+        "properties": {
+          "ref": {
+            "type": "string",
+            "description": "The photo ULID"
+          },
+          "url": {
+            "type": "string",
+            "nullable": true
+          },
+          "urlExpiresAt": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "ref",
+          "url",
+          "urlExpiresAt"
+        ]
+      },
       "RejectedOpResponse": {
         "type": "object",
         "properties": {
@@ -51202,6 +51224,13 @@
                 "recount",
                 "discard"
               ]
+            }
+          },
+          "photos": {
+            "description": "Story 4-4a — a handover.create row’s sheet photos still staged or attached, each with a short-lived link (null when unsigned). Absent on other rows",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RejectedOpPhotoDto"
             }
           }
         },
@@ -58369,6 +58398,10 @@
           },
           "detail": {
             "type": "string"
+          },
+          "orderStatus": {
+            "type": "string",
+            "description": "The order’s status as read under its lock (e.g. cancelled vs accepted for order-not-ready); absent when the order was not found"
           }
         },
         "required": [
@@ -78628,6 +78661,10 @@
       "PortalOrderShippingResponse": {
         "type": "object",
         "properties": {
+          "canRecord": {
+            "type": "boolean",
+            "description": "The client may record a label or AWB now (Upload / Replace / Send AWB): the order is open and has no live shipment, or a client-arranged one not yet handed over"
+          },
           "status": {
             "type": "string",
             "enum": [
@@ -78693,6 +78730,7 @@
           }
         },
         "required": [
+          "canRecord",
           "status",
           "courierName",
           "awb",

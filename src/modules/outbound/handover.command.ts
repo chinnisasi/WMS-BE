@@ -125,6 +125,8 @@ export interface HandoverRefusedParcel {
   readonly orderId: string;
   readonly code: HandoverParcelRefusal;
   readonly detail: string;
+  /** FB11 — the order's status under its lock; absent when the order was not found. */
+  readonly orderStatus?: string;
 }
 
 export interface HandoverSnapshot {
@@ -292,7 +294,10 @@ export class HandoverCommand {
       // ── the per-parcel classification, in body order ─────────────────────
       const passing: { parcel: (typeof input.parcels)[number]; order: Order; shipment: Shipment | null }[] = [];
       const refused: HandoverRefusedParcel[] = [];
-      const refuse = (orderId: string, code: HandoverParcelRefusal, detail: string) => refused.push({ orderId, code, detail });
+      const refuse = (orderId: string, code: HandoverParcelRefusal, detail: string) => {
+        const status = orderById.get(orderId)?.status;
+        refused.push({ orderId, code, detail, ...(status === undefined ? {} : { orderStatus: status }) });
+      };
       const awbsTaken = new Set<string>();
       for (const parcel of input.parcels) {
         const order = orderById.get(parcel.orderId);
@@ -354,7 +359,7 @@ export class HandoverCommand {
           409,
           'Some parcels cannot be handed over',
           `${refused.length} of ${input.parcels.length} parcels cannot be handed over: ${refused.map((r) => r.code).join(', ')} — nothing was written.`,
-          { parcels: refused.map((r) => ({ orderId: r.orderId, code: r.code, detail: r.detail })) },
+          { parcels: refused.map((r) => ({ orderId: r.orderId, code: r.code, detail: r.detail, ...(r.orderStatus === undefined ? {} : { orderStatus: r.orderStatus }) })) },
         );
       }
 
@@ -386,7 +391,7 @@ export class HandoverCommand {
             ...header,
             parcels: refused.map((r) => ({ ...input.parcels.find((p) => p.orderId === r.orderId)! })),
             photoRefs: [...input.photoRefs],
-            refusals: refused.map((r) => ({ orderId: r.orderId, code: r.code, detail: r.detail })),
+            refusals: refused.map((r) => ({ orderId: r.orderId, code: r.code, detail: r.detail, ...(r.orderStatus === undefined ? {} : { orderStatus: r.orderStatus }) })),
           },
           occurredAt: handedOverAt,
         });

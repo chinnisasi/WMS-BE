@@ -407,6 +407,12 @@ export interface RejectedOpEntry {
    * before 13-2 replays without it.
    */
   readonly decisions?: readonly RejectedOpDecision[];
+  /**
+   * FA29 (story 4-4a, A29) — a `handover.create` row's sheet photos still
+   * staged or attached, each with a short-lived link (null when unsigned).
+   * Only on the list read of such a row.
+   */
+  readonly photos?: readonly { readonly ref: string; readonly url: string | null; readonly urlExpiresAt: string | null }[];
 }
 
 /** The resolve command (story 5-6, `review.decide`): the per-row decision. */
@@ -1188,7 +1194,16 @@ export class SyncReportCommand {
         .orderBy(desc(rejectedOps.createdAt), desc(rejectedOps.id))
         .limit(pageSize + 1);
     });
-    return buildPage(rows.map(rejectedOpEntry), pageSize);
+    const page = buildPage(rows.map(rejectedOpEntry), pageSize);
+    // FA29 — the handover rows' kept sheet photos, presigned after the read.
+    const items = await Promise.all(
+      page.items.map(async (entry) => {
+        const refs = entry.opType === 'handover.create' && Array.isArray(entry.payload.photoRefs) ? (entry.payload.photoRefs as unknown[]).filter((ref): ref is string => typeof ref === 'string') : [];
+        if (refs.length === 0) return entry;
+        return { ...entry, photos: await this.outbound.handoverPhotoLinks(tenantId, refs) };
+      }),
+    );
+    return { ...page, items };
   }
 
   // ── resolveRejectedOp (review.decide — owner + ops_manager) ─────────────

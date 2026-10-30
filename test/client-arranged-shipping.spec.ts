@@ -606,7 +606,7 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
     const lot = (await sql`select id from batches where tenant_id = ${tenantId} and sku_id = ${sku.get('A-LOT')!} and code = 'LOT-RCL-1'`)[0]!.id as string;
     await http().post(`${API}/${tenantId}/inventory/recalls`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({ batchIds: [lot], reasonNote: 'handover suite', mode: 'live' }).expect(201);
     const web = await handOver({ parcels: [{ orderId: clean, awb: 'AWBRCL0001' }, { orderId: recalledOrder, awb: 'AWBRCL0002' }] }).expect(409);
-    expect(web.body.parcels).toEqual([{ orderId: recalledOrder, code: 'order-holds-recalled-batch', detail: expect.stringContaining('recall') }]);
+    expect(web.body.parcels).toEqual([{ orderId: recalledOrder, code: 'order-holds-recalled-batch', detail: expect.stringContaining('recall'), orderStatus: 'ready_to_dispatch' }]);
     const device = await handOver({ occurredAt: new Date().toISOString(), parcels: [{ orderId: clean, awb: 'AWBRCL0001' }, { orderId: recalledOrder, awb: 'AWBRCL0002' }] }, operatorToken).expect(201);
     expect(device.body.parcels.map((p: { orderId: string }) => p.orderId)).toEqual([clean]);
     expect(device.body.refused.map((r: { code: string }) => r.code)).toEqual(['order-holds-recalled-batch']);
@@ -662,7 +662,7 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
       }
     }
     expect(res.body.parcels).toHaveLength(3);
-    expect(res.body.refused).toEqual([{ orderId: cancelled, code: 'order-not-ready', detail: expect.any(String) }]);
+    expect(res.body.refused).toEqual([{ orderId: cancelled, code: 'order-not-ready', detail: expect.any(String), orderStatus: 'cancelled' }]);
     expect(res.body.rejectedOpId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
     const review = (await sql`select op_type, problem_code, payload from rejected_ops where tenant_id = ${tenantId} and op_id = ${res.body.rejectedOpId as string}`)[0]!;
     expect(review).toMatchObject({ op_type: 'handover.create', problem_code: 'handover-parcels-refused' });
@@ -1141,6 +1141,79 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
     for (const uploaded of rows) {
       expect(listed.find((item) => item.opId === uploaded.opId)).toMatchObject({ opType: uploaded.opType, decisions: ['discard'] });
     }
+  });
+
+  it('FB9 — the portal body says whether the client may record a label or AWB now (canRecord)', async () => {
+    const read = async (orderId: string) => (await http().get(`${API}/${tenantId}/portal/orders/${orderId}/shipping`).set('Authorization', `Bearer ${acmePortal}`).expect(200)).body as { canRecord: boolean };
+    const none = await acceptedOrder();
+    expect((await read(none)).canRecord).toBe(true);
+    const clientLabel = await acceptedOrder();
+    await portalLabel(clientLabel, { awb: 'AWBCAN0001', courierName: 'X' }, await labelPdf(1)).expect(201);
+    expect((await read(clientLabel)).canRecord).toBe(true);
+    const courier = await acceptedOrder();
+    await awbAdvice(courier, { awb: 'AWBCAN0002', courierName: 'X' }).expect(201);
+    expect((await read(courier)).canRecord).toBe(true);
+    const carrier = await packedOrder();
+    await http().post(`${API}/${tenantId}/outbound/orders/${carrier}/label`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+      .send({ carrierConnectionId: sandboxConnectionId }).expect(201);
+    expect((await read(carrier)).canRecord).toBe(false);
+    const handed = await packedOrder();
+    await handOver({ parcels: [{ orderId: handed, awb: 'AWBCAN0003' }] }).expect(201);
+    expect((await read(handed)).canRecord).toBe(false);
+  });
+
+  it('FB11 — each refused parcel names its order’s status (cancelled vs accepted; absent when not found), in the response and the review row', async () => {
+    const good = await packedOrder();
+    const cancelled = await acceptedOrder();
+    await http().post(`${API}/${tenantId}/outbound/orders/${cancelled}/cancel`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({});
+    const unpacked = await acceptedOrder();
+    const unknown = uuidv7();
+    const res = await handOver(
+      { occurredAt: new Date().toISOString(), parcels: [{ orderId: good, awb: 'AWBSTAT001' }, { orderId: cancelled, awb: 'AWBSTAT002' }, { orderId: unpacked, awb: 'AWBSTAT003' }, { orderId: unknown, awb: 'AWBSTAT004' }] },
+      operatorToken,
+    ).expect(201);
+    const byOrder = new Map((res.body.refused as { orderId: string; code: string; orderStatus?: string }[]).map((r) => [r.orderId, r]));
+    expect(byOrder.get(cancelled)).toMatchObject({ code: 'order-not-ready', orderStatus: 'cancelled' });
+    expect(byOrder.get(unpacked)).toMatchObject({ code: 'order-not-ready', orderStatus: 'accepted' });
+    expect(byOrder.get(unknown)!.code).toBe('order-not-found');
+    expect('orderStatus' in byOrder.get(unknown)!).toBe(false);
+    const review = (await sql`select payload from rejected_ops where tenant_id = ${tenantId} and op_id = ${res.body.rejectedOpId as string}`)[0]!.payload as { refusals: { orderId: string; orderStatus?: string }[] };
+    expect(review.refusals.find((r) => r.orderId === cancelled)!.orderStatus).toBe('cancelled');
+    expect(review.refusals.find((r) => r.orderId === unpacked)!.orderStatus).toBe('accepted');
+    expect('orderStatus' in review.refusals.find((r) => r.orderId === unknown)!).toBe(false);
+    // The web 409 carries it too.
+    const web = await handOver({ parcels: [{ orderId: unpacked, awb: 'AWBSTAT003' }] }).expect(409);
+    expect(web.body.parcels[0]).toMatchObject({ code: 'order-not-ready', orderStatus: 'accepted' });
+  });
+
+  it('FA29 — the review list shows a handover row’s kept sheet photos with links', async () => {
+    const refs = [ulid(), ulid()];
+    for (const ref of refs) {
+      await http().post(`${API}/${tenantId}/outbound/handover-photos`).set('Authorization', `Bearer ${deviceToken}`).set(KEY_HEADER, ref)
+        .set('x-op-operator', operatorId).field('capturedAt', new Date().toISOString()).attach('file', JPEG, { filename: 'sheet.jpg', contentType: 'image/jpeg' }).expect(201);
+    }
+    const opId = ulid();
+    await http().post(`${API}/${tenantId}/devices/sync-reports`).set('Authorization', `Bearer ${operatorToken}`).set(KEY_HEADER, ulid())
+      .send({
+        rows: [
+          {
+            opId,
+            opType: 'handover.create',
+            classification: 'rejected',
+            problemCode: 'handover-client-mismatch',
+            problemDetail: 'mixed',
+            payload: { warehouseId, clientId: acme, courier: { courierName: 'VRL' }, pickupPersonName: 'Ravi', parcels: [{ orderId: uuidv7(), awb: 'AWBPHOTO1' }], photoRefs: [...refs, ulid()] },
+            attribution: { deviceLabel: 'Dock scanner', operatorEmail: 'op@example.com' },
+            opEnqueuedAt: new Date().toISOString(),
+            opOccurredAt: null,
+          },
+        ],
+      })
+      .expect(201);
+    const listed = (await http().get(`${API}/${tenantId}/rejected-ops?status=open`).set('Authorization', `Bearer ${ownerToken}`).expect(200)).body.items as { opId: string; photos?: { ref: string; url: string | null }[] }[];
+    const row = listed.find((item) => item.opId === opId)!;
+    expect(row.photos!.map((photo) => photo.ref)).toEqual(refs);
+    for (const photo of row.photos!) expect(photo.url).toContain('https://files.example/');
   });
 
   it('A44 — the portal status derivation', () => {

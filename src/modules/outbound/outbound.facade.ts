@@ -742,6 +742,11 @@ export class OutboundFacade {
     return this.shipping.dispatchParcelsInTx(tx, tenantId, warehouseId);
   }
 
+  /** FA29 — presigned links to a handover review row's still-live sheet photos. */
+  async handoverPhotoLinks(tenantId: string, refs: readonly string[]): Promise<{ ref: string; url: string | null; urlExpiresAt: string | null }[]> {
+    return this.shipping.photoLinksByRefs(tenantId, refs);
+  }
+
   /** D8 — the derived file name of a shareable shipping file (the mail renderer, in its stamped transaction). */
   async shippingFileNameInTx(tx: TenantTx, tenantId: string, clientId: string, row: AttachmentRow): Promise<string | null> {
     return this.shipping.shippingFileNameInTx(tx, tenantId, clientId, row);

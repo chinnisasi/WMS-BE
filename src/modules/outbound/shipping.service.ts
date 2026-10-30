@@ -14,7 +14,7 @@ import { getClientsInTx } from '../clients/clients.facade';
 import { ROLE_CAPABILITIES } from '../tenancy/permissions';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
 import { AttachmentsFacade } from '../attachments/attachments.facade';
-import { fileOrdinalsInTx } from '../attachments/attachment-records';
+import { fileOrdinalsInTx, liveRowsByRefsInTx } from '../attachments/attachment-records';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import { ClientLabelCommand } from './client-label.command';
 import { ShippingFilesCommand } from './shipping-files.command';
@@ -103,6 +103,8 @@ export interface OrderShippingView {
 }
 
 export interface PortalOrderShippingView {
+  /** FB9 — the client may record a label or AWB now (Upload / Replace / Send AWB). */
+  readonly canRecord: boolean;
   readonly status: PortalShippingStatus;
   readonly courierName: string | null;
   readonly awb: string | null;
@@ -252,7 +254,11 @@ export class ShippingService {
       Promise.all(shipping.documents.map((file) => portalFile(file, file.row.docKind ?? 'other'))),
       Promise.all(shipping.sheet.map((file) => portalFile(file, 'signed-sheet'))),
     ]);
+    const openOrder = shipping.order.status === 'accepted' || shipping.order.status === 'ready_to_dispatch';
     return {
+      // FB9 — what `assertLabellable` admits for the portal (with or without
+      // replace): an open order with no live shipment, or a client-arranged one still `labelled`.
+      canRecord: openOrder && (live === null || (live.kind !== 'carrier' && live.status === 'labelled')),
       status: portalShippingStatus(
         shipping.order.status,
         live === null ? null : { kind: live.kind, status: live.status, labelVerified: live.labelVerifiedAt !== null },
@@ -372,6 +378,25 @@ export class ShippingService {
     return format === 'zpl'
       ? { body: Buffer.from(renderParcelTagZpl(tag), 'utf8'), contentType: 'text/plain; charset=utf-8', fileName: `${base}.zpl` }
       : { body: await renderParcelTagPdf(tag), contentType: 'application/pdf', fileName: `${base}.pdf` };
+  }
+
+  /**
+   * FA29 (spec A29) — presigned links to a review row's sheet photos still
+   * `staged` / `attached`; a null URL when unsigned (never a failure).
+   */
+  async photoLinksByRefs(tenantId: string, refs: readonly string[]): Promise<{ ref: string; url: string | null; urlExpiresAt: string | null }[]> {
+    const valid = refs.filter((ref) => /^[0-9A-HJKMNP-TV-Z]{26}$/.test(ref));
+    if (valid.length === 0) return [];
+    const rows = await withTenantTransaction(this.db, tenantId, (tx) => liveRowsByRefsInTx(tx, tenantId, valid));
+    const byRef = new Map(rows.map((row) => [row.clientRef!, row]));
+    const out: { ref: string; url: string | null; urlExpiresAt: string | null }[] = [];
+    for (const ref of valid) {
+      const row = byRef.get(ref);
+      if (row === undefined) continue;
+      const signed = await this.attachments.presign(row, `sheet-photo-${ref}.${row.contentType === 'image/png' ? 'png' : row.contentType === 'image/webp' ? 'webp' : 'jpg'}`);
+      out.push({ ref, url: signed?.url ?? null, urlExpiresAt: signed?.expiresAt ?? null });
+    }
+    return out;
   }
 
   async dispatchParcelsInTx(tx: TenantTx, tenantId: string, warehouseId: string): Promise<{ parcels: DispatchParcel[]; truncated: boolean }> {
