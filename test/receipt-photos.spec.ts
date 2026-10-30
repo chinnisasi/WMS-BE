@@ -1341,7 +1341,8 @@ describe('story 2-5a: damage photos on a receipt line (e2e)', () => {
       expect(literals('attachments_status_check').sort()).toEqual([...ATTACHMENT_STATUSES].sort());
       expect(literals('attachments_source_check').sort()).toEqual([...ATTACHMENT_SOURCES].sort());
       expect(literals('attachments_purpose_check').sort()).toEqual([...ATTACHMENT_PURPOSES].sort());
-      expect(checks.length).toBe(21);
+      // Story 4-4a (0116) — four more: doc_kind, page_count, purpose_owner, label_is_pdf.
+      expect(checks.length).toBe(25);
     });
 
     it('the OpenAPI document lists the six new routes with their methods', () => {

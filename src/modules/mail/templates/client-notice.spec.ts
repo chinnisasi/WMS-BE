@@ -46,15 +46,16 @@ const dispatch: ClientDispatchEmailParams = {
 const context = { tenantId: 't', to: 'a@acme.example', webBaseUrl: 'https://app.wms.test', secret: null };
 
 describe('client notices (story 5-2b)', () => {
-  it('the vocabulary: five templates, the two client ones at priority 1, account mail at 0', () => {
-    expect([...EMAIL_TEMPLATES]).toEqual(['user-invite', 'password-reset', 'password-changed', 'client-receipt', 'client-dispatch']);
-    expect([...CLIENT_EMAIL_TEMPLATES]).toEqual(['client-receipt', 'client-dispatch']);
+  it('the vocabulary: six templates (story 4-4a added the shipping document), the three client ones at priority 1, account mail at 0', () => {
+    expect([...EMAIL_TEMPLATES]).toEqual(['user-invite', 'password-reset', 'password-changed', 'client-receipt', 'client-dispatch', 'client-shipment-document']);
+    expect([...CLIENT_EMAIL_TEMPLATES]).toEqual(['client-receipt', 'client-dispatch', 'client-shipment-document']);
     expect(EMAIL_TEMPLATE_PRIORITY).toEqual({
       'user-invite': 0,
       'password-reset': 0,
       'password-changed': 0,
       'client-receipt': 1,
       'client-dispatch': 1,
+      'client-shipment-document': 1,
     });
   });
 

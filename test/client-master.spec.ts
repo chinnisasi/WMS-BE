@@ -428,6 +428,10 @@ describe('story 1-2a: the client master record', () => {
       expect(opTypes.filter((type) => !(SKU_NAMING_OP_TYPES as readonly string[]).includes(type)).sort()).toEqual([
         'excursion.record',
         'gate-in.unload',
+        // Story 4-4a — a handover names orders and AWBs (one client's, in its
+        // header), a sheet photo its ref, a label scan its order: no SKU.
+        'handover-photo.stage',
+        'handover.create',
         // Story 2-5a — a refused damage photo names no SKU (its payload is the
         // photo's ref and the receipt op it belongs to).
         'receipt-photo.stage',
@@ -436,6 +440,7 @@ describe('story 1-2a: the client master record', () => {
         // Story 4-7c — and the RTC pick, likewise (the RTC is its own blocker).
         'rtc.pick',
         'rtv.pick',
+        'shipment.verify-label',
         'transfer.confirm',
       ]);
     });
