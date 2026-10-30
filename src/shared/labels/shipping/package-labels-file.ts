@@ -86,6 +86,19 @@ export function resolvePackageRange(
 }
 
 /** A45 — a consignee with no address of the kind: print by hand. */
+/**
+ * The state line both return labels print (review): the state's name when the frozen address
+ * carries one, else its GST state code — one rule, so an RTV and an RTC to one place print alike.
+ * (A vendor snapshot's address holds only the code; the CBIC names are invoicing's, read through
+ * its facade, which these modules do not import.)
+ */
+export function labelStateOf(address: { readonly state?: string | null; readonly stateCode?: string | null }): string {
+  const name = address.state?.trim() ?? '';
+  if (name !== '') return name;
+  const code = address.stateCode?.trim() ?? '';
+  return code === '' ? '' : `State code ${code}`;
+}
+
 export function consigneeAddressMissing(documentCode: string, party: string): ProblemException {
   return new ProblemException(
     'consignee-address-missing',

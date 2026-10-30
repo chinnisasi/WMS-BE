@@ -8,6 +8,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
 import { cartonCode } from '../src/shared/primitives/carton-code';
+import { orderLabelOf } from '../src/shared/primitives/order-label';
 import { parcelTagCode } from '../src/shared/primitives/parcel-tag';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
@@ -829,6 +830,7 @@ describe('packing documents: labels, slips, portal and email (e2e, story 4-5a)',
   let beta: string;
   let acmePortal: string;
   let betaPortal: string;
+  let cwCases: string[];
   const sku = new Map<string, string>();
   const http = () => request(app.getHttpServer());
   const fixtures = dispatchedOrderFixtures(() => ({ app, tenantId, warehouseId, opsToken, ownerToken, operatorToken }));
@@ -869,7 +871,21 @@ describe('packing documents: labels, slips, portal and email (e2e, story 4-5a)',
     await http().patch(`${API}/${tenantId}/clients/${acme}/tax-details`).set('Authorization', `Bearer ${accountantToken}`).set(KEY_HEADER, ulid()).send({ legalName: 'Acme Brand Private Limited' }).expect(200);
     const csv = (rows: string[]) => ['sku_code,name,uom,gst_rate,barcode,batch_tracked,serial_tracked', ...rows].join('\n');
     for (const [clientId, rows] of [
-      [acme, ['A-TEE,Acme tee,pcs,1800,,false,false', 'A-CAP,Acme cap,pcs,1800,,false,false', 'A-LOT,Acme lot tee,pcs,1800,,true,false']],
+      [
+        acme,
+        [
+          'A-TEE,Acme tee,pcs,1800,,false,false',
+          'A-CAP,Acme cap,pcs,1800,,false,false',
+          'A-LOT,Acme lot tee,pcs,1800,,true,false',
+          // Review: a kit, a serial-tracked line, a short line and catch-weight cases.
+          'A-KIT,Acme gift kit,pcs,1800,,false,false',
+          'A-KA,Acme kit part A,pcs,1800,,false,false',
+          'A-KB,Acme kit part B,pcs,1800,,false,false',
+          'A-SER,Acme serial watch,pcs,1800,,false,true',
+          'A-SHT,Acme short tee,pcs,1800,,false,false',
+          'A-CW,Acme cheese case,pcs,1800,,false,false',
+        ],
+      ],
       [beta, ['B-TEE,Beta tee,pcs,1800,,false,false']],
     ] as const) {
       await http().post(`${API}/${tenantId}/catalog/imports`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid())
@@ -878,11 +894,18 @@ describe('packing documents: labels, slips, portal and email (e2e, story 4-5a)',
     }
     const listed = await http().get(`${API}/${tenantId}/catalog/skus?limit=200`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
     for (const item of listed.body.items as { code: string; id: string }[]) sku.set(item.code, item.id);
-    for (const code of ['A-TEE', 'A-CAP', 'B-TEE']) {
+    await http().post(`${API}/${tenantId}/catalog/skus/${sku.get('A-KIT')!}/kit`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+      .send({ components: [{ skuId: sku.get('A-KA'), quantity: 1 }, { skuId: sku.get('A-KB'), quantity: 2 }] }).expect(201);
+    await sql`update skus set catch_weight_tracked = true where id = ${sku.get('A-CW')!}`;
+    for (const code of ['A-TEE', 'A-CAP', 'B-TEE', 'A-KA', 'A-KB']) {
       await http().post(`${API}/${tenantId}/inventory/adjustments`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid())
         .send({ warehouseId, skuId: sku.get(code), binId, quantityDelta: 100_000, reasonCode: 'stock-count', note: 'seed' }).expect(201);
     }
     await fixtures.seedBatchStock(sku.get('A-LOT')!, binId, 1_000, 'LOT-2026-A');
+    await http().post(`${API}/${tenantId}/inventory/adjustments`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+      .send({ warehouseId, skuId: sku.get('A-SER'), binId, quantityDelta: 2, reasonCode: 'stock-count', note: 'serial seed', serials: ['SN-0001', 'SN-0002'] }).expect(201);
+    await http().post(`${API}/${tenantId}/inventory/adjustments`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid())
+      .send({ warehouseId, skuId: sku.get('A-SHT'), binId, quantityDelta: 2, reasonCode: 'stock-count', note: 'short seed' }).expect(201);
     await app.get(InventoryFacade).rebuildReservationCounters(tenantId, warehouseId);
 
     const minted = await http().post(`${API}/${tenantId}/devices/enrollment-codes`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid()).expect(201);
@@ -891,6 +914,8 @@ describe('packing documents: labels, slips, portal and email (e2e, story 4-5a)',
       await http().post(`${API}/${tenantId}/devices/badge-in`).set('Authorization', `Bearer ${enrolled.body.deviceToken as string}`).send({ operatorEmail: floor.email, pin: '2468' }).expect(200)
     ).body.accessToken as string;
 
+    cwCases = await fixtures.seedCatchWeightCases(sku.get('A-CW')!, binId, [2_100, 2_200], 'operator-preference');
+    await app.get(InventoryFacade).rebuildReservationCounters(tenantId, warehouseId);
     acmePortal = await portalUser(acme);
     betaPortal = await portalUser(beta);
     await http().post(`${API}/${tenantId}/clients/${acme}/contacts`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid())
@@ -1137,5 +1162,102 @@ describe('packing documents: labels, slips, portal and email (e2e, story 4-5a)',
     } finally {
       spy.mockRestore();
     }
+  });
+
+  /** A released single-order wave over an EXISTING order (a follow-on), and its one picklist. */
+  async function waveOf(orderId: string): Promise<Picklist> {
+    const policyId = (
+      await http().post(`${API}/${tenantId}/outbound/wave-policies`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+        .send({ warehouseId, name: `fo-${ulid().slice(10, 18)}`, grouping: 'single' }).expect(201)
+    ).body.policy.id as string;
+    const waveId = (
+      await http().post(`${API}/${tenantId}/outbound/waves`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+        .send({ warehouseId, policyId, orderIds: [orderId] }).expect(201)
+    ).body.wave.id as string;
+    await http().post(`${API}/${tenantId}/outbound/waves/${waveId}/release`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({}).expect(200);
+    const wave = (await http().get(`${API}/${tenantId}/outbound/waves/${waveId}`).set('Authorization', `Bearer ${ownerToken}`).expect(200)).body.wave as { picklists: Picklist[] };
+    return wave.picklists[0]!;
+  }
+
+  it('review — a real short order with a kit and a serial line: the short figure and "will follow separately" before dispatch, the follow-on named after; the kit heading with its components; serials; the packer on the staff copy only', async () => {
+    const label = `SO-${ulid().slice(18)}`;
+    const ready = await fixtures.releasedWave(
+      [
+        { skuId: sku.get('A-KIT')!, quantity: 1 },
+        { skuId: sku.get('A-SER')!, quantity: 2 },
+        { skuId: sku.get('A-SHT')!, quantity: 5 },
+      ],
+      { clientOrderRef: label },
+    );
+    const serialLines = ready.picklist.lines.filter((line) => line.skuId === sku.get('A-SER'));
+    const serials = ['SN-0001', 'SN-0002'];
+    const serialsByLine = new Map(serialLines.map((line) => [line.id, serials.splice(0, line.qty)]));
+    await fixtures.pickAllLines(ready.picklist, undefined, serialsByLine);
+    await pack(ready.orderId, { scanned: scannedOf(ready.picklist) }).expect(201);
+
+    const before = await text((await file(`/outbound/orders/${ready.orderId}/packing-slip`).expect(200)).body as Buffer);
+    expect(before).toContain('Kit: Acme gift kit');
+    expect(before).toContain('A-KA');
+    expect(before).toContain('A-KB');
+    expect(before).toContain('Serials: SN-0001, SN-0002');
+    expect(before).toMatch(/Items not in this shipment will follow separately \(short: 3 \w+\)\./);
+    expect(before).toContain('Packed by');
+    const portalCopy = await text((await file(`/portal/orders/${ready.orderId}/packing-slip`, acmePortal).expect(200)).body as Buffer);
+    expect(portalCopy).toContain('Serials: SN-0001, SN-0002');
+    expect(portalCopy).not.toContain('Packed by');
+
+    const dispatched = await http().post(`${API}/${tenantId}/outbound/orders/${ready.orderId}/dispatch`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({}).expect(201);
+    expect(dispatched.body.dispatch.followOnOrderId).toEqual(expect.any(String));
+    const after = await text((await file(`/outbound/orders/${ready.orderId}/packing-slip`).expect(200)).body as Buffer);
+    expect(after).toMatch(new RegExp(`3 \\w+ on backorder will follow as order ${label}-BO1\\.`));
+    expect(after).not.toContain('will follow separately');
+  });
+
+  it('review — a follow-on order\'s dispatch email names exactly the attached file (one label source for the body and the file)', async () => {
+    // An UNNAMED order (no client ref), so its follow-on's label is the root id's tail + -BO1.
+    await http().post(`${API}/${tenantId}/inventory/adjustments`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid())
+      .send({ warehouseId, skuId: sku.get('A-SHT'), binId, quantityDelta: 2, reasonCode: 'stock-count', note: 'root' }).expect(201);
+    const root = await fixtures.releasedWave([{ skuId: sku.get('A-SHT')!, quantity: 4 }]);
+    await fixtures.pickAllLines(root.picklist);
+    await pack(root.orderId, { scanned: scannedOf(root.picklist) }).expect(201);
+    // Stock for the follow-on, free before the root's dispatch allocates it.
+    await http().post(`${API}/${tenantId}/inventory/adjustments`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid())
+      .send({ warehouseId, skuId: sku.get('A-SHT'), binId, quantityDelta: 2, reasonCode: 'stock-count', note: 'follow-on' }).expect(201);
+    const shipped = await http().post(`${API}/${tenantId}/outbound/orders/${root.orderId}/dispatch`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({}).expect(201);
+    const followOnId = shipped.body.dispatch.followOnOrderId as string;
+    const picklist = await waveOf(followOnId);
+    await fixtures.pickAllLines(picklist);
+    await pack(followOnId, { scanned: scannedOf(picklist) }).expect(201);
+    await http().post(`${API}/${tenantId}/outbound/orders/${followOnId}/dispatch`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({}).expect(201);
+    await relay.drain(500);
+    const [row] = (await sql`select id, client_order_ref, external_event_id, follow_on_root_order_id, follow_on_seq from orders where id = ${followOnId}`) as unknown as {
+      id: string; client_order_ref: string | null; external_event_id: string | null; follow_on_root_order_id: string | null; follow_on_seq: number | null;
+    }[];
+    const followOnLabel = orderLabelOf({ id: row!.id, clientOrderRef: row!.client_order_ref, externalEventId: row!.external_event_id, followOnRootOrderId: row!.follow_on_root_order_id, followOnSeq: row!.follow_on_seq });
+    expect(followOnLabel).toBe(`${root.orderId.slice(-8)}-BO1`);
+    const sent = await sendUntil(`ACME Brand: order ${followOnLabel} dispatched`);
+    expect(sent).toBeDefined();
+    const attached = sent!.attachments![0]!.filename;
+    expect(attached).toBe(`${followOnLabel}-packing-slip.pdf`);
+    expect(sent!.text).toContain(`The packing slip is attached (${attached}).`);
+  });
+
+  it('review — the cartons read names each catch-weight case by its label code and weight (the re-carton editor lists cases by label)', async () => {
+    const ready = await fixtures.releasedWave([{ skuId: sku.get('A-CW')!, quantity: 2 }]);
+    await fixtures.pickAllLines(ready.picklist);
+    const cw = sku.get('A-CW')!;
+    await pack(ready.orderId, {
+      scanned: [{ skuId: cw, qty: 2, handlingUnitIds: cwCases }],
+      cartons: [
+        { scanned: [{ skuId: cw, qty: 1, handlingUnitIds: [cwCases[0]!] }] },
+        { scanned: [{ skuId: cw, qty: 1, handlingUnitIds: [cwCases[1]!] }] },
+      ],
+    }).expect(201);
+    const read = await http().get(`${API}/${tenantId}/outbound/orders/${ready.orderId}/cartons`).set('Authorization', `Bearer ${opsToken}`).expect(200);
+    const lines = (read.body.pack.cartons as { lines: { handlingUnitIds: string[]; handlingUnits: { id: string; code: string; weightGrams: number }[] }[] }[]).map((carton) => carton.lines[0]!);
+    expect(lines.map((line) => line.handlingUnits)).toEqual([
+      [{ id: cwCases[0], code: cwCases[0], weightGrams: 2_100 }],
+      [{ id: cwCases[1], code: cwCases[1], weightGrams: 2_200 }],
+    ]);
   });
 });

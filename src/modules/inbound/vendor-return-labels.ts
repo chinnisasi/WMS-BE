@@ -5,6 +5,7 @@ import { documentWarehousePartyOf } from '../../shared/documents/parties';
 import { labelShipperOf, type LabelConsignee } from '../../shared/labels/shipping/carton-label';
 import {
   consigneeAddressMissing,
+  labelStateOf,
   packageLabelsFile,
   resolvePackageRange,
   type PackageLabelQuery,
@@ -65,7 +66,7 @@ export async function vendorReturnPackageLabelsInTx(tx: TenantTx, tenantId: stri
     line1: address.line1,
     line2: address.line2,
     city: address.city,
-    state: `State code ${address.stateCode}`,
+    state: labelStateOf(address),
     pincode: address.pincode,
     phone: null,
     gstin: vendor.gstin,

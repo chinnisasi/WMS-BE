@@ -440,7 +440,26 @@ export interface PackCartonLineView {
   /** Base units. */
   readonly qty: number;
   readonly handlingUnitIds: readonly string[] | null;
+  /**
+   * Catch weight — each case as a person finds it: `code`, the case label's barcode text (a case
+   * label encodes its handling-unit id), and its receipt weight. Absent when the reader is not given.
+   */
+  readonly handlingUnits?: readonly CartonCaseView[];
 }
+
+export interface CartonCaseView {
+  readonly id: string;
+  readonly code: string;
+  /** Null when the case is no longer on record. */
+  readonly weightGrams: number | null;
+}
+
+/** The catalog seam for a case's weight (`CatalogFacade.handlingUnitsByIdsInTx` — outbound reads no catalog table). */
+export type CaseFactsReader = (
+  tx: TenantTx,
+  tenantId: string,
+  ids: readonly string[],
+) => Promise<readonly { readonly id: string; readonly weightGrams: number }[]>;
 
 export interface UomTotalView {
   readonly uom: string;
@@ -494,12 +513,17 @@ export function uomTotalsOf(lines: readonly { readonly uom: string; readonly qty
     .map(([uom, qty]) => ({ uom, qty: fromMilli(qty) }));
 }
 
-export async function packViewInTx(tx: TenantTx, tenantId: string, record: PackRecord): Promise<PackView> {
+export async function packViewInTx(tx: TenantTx, tenantId: string, record: PackRecord, caseFacts?: CaseFactsReader): Promise<PackView> {
   const facts = await skuFactsByIdInTx(
     tx,
     tenantId,
     record.cartons.flatMap((carton) => carton.lines.map((line) => line.skuId)),
   );
+  const caseIds = record.cartons.flatMap((carton) => carton.lines.flatMap((line) => line.handlingUnitIds ?? []));
+  const caseWeights =
+    caseFacts === undefined || caseIds.length === 0
+      ? null
+      : new Map((await caseFacts(tx, tenantId, caseIds)).map((unit) => [unit.id, unit.weightGrams] as const));
   return {
     packSeq: record.seq,
     status: record.status,
@@ -519,6 +543,9 @@ export async function packViewInTx(tx: TenantTx, tenantId: string, record: PackR
           uom: sku?.uom ?? '',
           qty: fromMilli(line.qty),
           handlingUnitIds: line.handlingUnitIds,
+          ...(caseWeights === null || line.handlingUnitIds === null
+            ? {}
+            : { handlingUnits: line.handlingUnitIds.map((id) => ({ id, code: id, weightGrams: caseWeights.get(id) ?? null })) }),
         };
       });
       return {

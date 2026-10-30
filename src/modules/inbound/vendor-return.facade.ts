@@ -114,7 +114,7 @@ export class VendorReturnFacade {
 
   /** Story 4-5a (A22, A43) — the RTV's 4×6 package labels (a file read; no key, no audit). */
   packageLabels(tenantId: string, id: string, query: PackageLabelQuery): Promise<PackageLabelsFile> {
-    return withTenantTransaction(this.db, tenantId, (tx) => vendorReturnPackageLabelsInTx(tx, tenantId, id, query));
+    return withTenantTransaction(this.db, tenantId, (tx) => vendorReturnPackageLabelsInTx(tx, tenantId, id, query), { accessMode: 'read only' });
   }
 
   get(tenantId: string, id: string): Promise<VendorReturnView> {

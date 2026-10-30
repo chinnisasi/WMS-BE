@@ -178,9 +178,14 @@ interface PackedDocRef {
   readonly packedQty?: number;
 }
 
+/** The serial-number seam (`CatalogFacade.serialNumbersByIdsInTx`): a ledger `serial_ref` is a catalog id, never the printed number. */
+export type SerialNumbersReader = (tx: TenantTx, tenantId: string, ids: readonly string[]) => Promise<ReadonlyMap<string, string>>;
+
 export interface PackDocumentDeps {
   readonly ledgerEvents: OrderLedgerEventsReader;
   readonly batchFacts: BatchFactsReader;
+  /** Review — the slip prints the number on the unit; an id the catalog does not know prints as itself. */
+  readonly serialNumbers: SerialNumbersReader;
 }
 
 /**
@@ -257,6 +262,7 @@ export async function packDocumentInTx(
     batchIdsByLine.set(row.orderLineId, [...(batchIdsByLine.get(row.orderLineId) ?? []), row.batchId]);
   }
   const batchFacts = await deps.batchFacts(tx, tenantId, pickBatchRows.flatMap((row) => (row.batchId === null ? [] : [row.batchId])));
+  const serialNumbers = await deps.serialNumbers(tx, tenantId, [...serialsByLine.values()].flat());
   const skuFacts = await skuFactsByIdInTx(tx, tenantId, [
     ...lineRows.map((line) => line.skuId),
     ...record.cartons.flatMap((carton) => carton.lines.map((line) => line.skuId)),
@@ -281,7 +287,7 @@ export async function packDocumentInTx(
       .filter((fact): fact is { code: string; expiryDate: string | null } => fact !== undefined)
       .map((fact) => ({ code: fact.code, expiryDate: fact.expiryDate === null ? null : istDateOf(fact.expiryDate) }))
       .sort((left, right) => (left.code < right.code ? -1 : left.code > right.code ? 1 : 0));
-    const serials = [...(serialsByLine.get(line.id) ?? [])].sort();
+    const serials = (serialsByLine.get(line.id) ?? []).map((ref) => serialNumbers.get(ref) ?? ref).sort();
     return {
       lineNo: index + 1,
       kind: kit ? 'kit' : line.parentLineId !== null ? 'component' : 'line',

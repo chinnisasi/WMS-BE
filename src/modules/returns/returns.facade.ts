@@ -352,7 +352,7 @@ export class ReturnsFacade {
 
   /** Story 4-5a (A22, A43) — the RTC's 4×6 package labels (a file read; no key, no audit). */
   clientReturnPackageLabels(tenantId: string, id: string, query: PackageLabelQuery): Promise<PackageLabelsFile> {
-    return withTenantTransaction(this.db, tenantId, (tx) => clientReturnPackageLabelsInTx(tx, tenantId, canonicalUuid(id), query));
+    return withTenantTransaction(this.db, tenantId, (tx) => clientReturnPackageLabelsInTx(tx, tenantId, canonicalUuid(id), query), { accessMode: 'read only' });
   }
 
   /** Story 4-7c — one return to client (404 `not-found` when absent). */

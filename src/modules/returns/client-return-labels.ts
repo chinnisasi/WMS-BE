@@ -3,7 +3,7 @@ import { clientReturns } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { documentWarehousePartyOf, type WarehouseSnapshotInput } from '../../shared/documents/parties';
 import { labelShipperOf, type LabelConsignee } from '../../shared/labels/shipping/carton-label';
-import { packageLabelsFile, resolvePackageRange, type PackageLabelQuery, type PackageLabelsFile } from '../../shared/labels/shipping/package-labels-file';
+import { labelStateOf, packageLabelsFile, resolvePackageRange, type PackageLabelQuery, type PackageLabelsFile } from '../../shared/labels/shipping/package-labels-file';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
@@ -57,7 +57,7 @@ export async function clientReturnPackageLabelsInTx(tx: TenantTx, tenantId: stri
     line1: address.line1,
     line2: address.line2,
     city: address.city,
-    state: address.state ?? (address.stateCode === null ? '' : `State code ${address.stateCode}`),
+    state: labelStateOf(address),
     pincode: address.pincode,
     phone: address.phone,
     gstin: row.consigneeGstin ?? client.gstin,

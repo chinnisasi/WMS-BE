@@ -1924,6 +1924,24 @@ export class PackCartonLineViewDto {
 
   @ApiProperty({ type: [String], nullable: true, description: 'Catch weight — the cases in this carton, sorted; null otherwise' })
   handlingUnitIds!: string[] | null;
+
+  @ApiProperty({
+    type: () => [CartonCaseViewDto],
+    required: false,
+    description: 'Catch weight — each case as a person finds it (beside handlingUnitIds, same order): its label’s barcode text and its receipt weight',
+  })
+  handlingUnits?: CartonCaseViewDto[];
+}
+
+export class CartonCaseViewDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ description: 'The case label’s barcode text (a case label encodes its handling-unit id)' })
+  code!: string;
+
+  @ApiProperty({ type: Number, nullable: true, description: 'Grams captured at receipt; null when the case is no longer on record' })
+  weightGrams!: number | null;
 }
 
 export class UomTotalDto {

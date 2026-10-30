@@ -187,6 +187,7 @@ export class HandoverParcelDto {
   })
   @IsOptional()
   @IsArray()
+  // One past the limit on purpose: the DTO only stops an absurd body; 201 codes reach the command, whose 400 names the parcel and the limit.
   @ArrayMaxSize(MAX_HANDOVER_CARTON_CODES + 1)
   @IsString({ each: true })
   cartonCodes?: string[];

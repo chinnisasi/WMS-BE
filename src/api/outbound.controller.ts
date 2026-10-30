@@ -608,7 +608,7 @@ export class OutboundController {
   })
   @ApiResponse({ status: 400, ...problemJsonResponse('A malformed orderId, format, layout or cartons list, or zpl with the a4 layout (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
-  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks labels.execute (role-denied) — checked before anything it sent') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks labels.execute (role-denied) — checked before every path and query value the handler judges (an unknown query key is 400 first, at the ValidationPipe)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Order does not exist in this tenant, or a listed carton number is above the pack’s count (not-found)') })
   @ApiResponse({ status: 409, ...problemJsonResponse('The order is not ready to dispatch (order-not-packed, naming its status)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
@@ -621,7 +621,10 @@ export class OutboundController {
     @Res() res: Response,
   ): Promise<void> {
     assertOwnTenant(session, tenantId);
-    // Authority before every path and query 400 (the 2-10b shape).
+    // labels.execute is judged before every value the handler judges (the path id, format, layout,
+    // count/from/to/cartons), so a role without it gets 403 whatever those carry — the 2-10b shape.
+    // An unknown or repeated query key is answered 400 earlier, by the global ValidationPipe
+    // (forbidNonWhitelisted), before this handler runs.
     await this.outbound.assertCanPrintCartonLabels(tenantId, session.userId);
     assertUuidParam(orderId, 'orderId');
     const query = parsePackFileQuery(fileQuery, { format: 'zpl', layout: 'label' });
@@ -1608,6 +1611,9 @@ function packViewBody(view: PackView): PackViewDto {
         uom: line.uom,
         qty: line.qty,
         handlingUnitIds: line.handlingUnitIds === null ? null : [...line.handlingUnitIds],
+        ...(line.handlingUnits === undefined
+          ? {}
+          : { handlingUnits: line.handlingUnits.map((unit) => ({ id: unit.id, code: unit.code, weightGrams: unit.weightGrams })) }),
       })),
     })),
   };

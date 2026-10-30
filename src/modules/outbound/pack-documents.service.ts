@@ -195,6 +195,7 @@ export class PackDocumentsService {
       {
         ledgerEvents: (t, tenant, warehouse, id) => this.inventory.ledgerEventsByOrderRefInTx(t, tenant, warehouse, id),
         batchFacts: (t, tenant, ids) => this.catalog.batchFactsByIdsInTx(t, tenant, ids),
+        serialNumbers: (t, tenant, ids) => this.catalog.serialNumbersByIdsInTx(t, tenant, ids),
       },
       options,
     );

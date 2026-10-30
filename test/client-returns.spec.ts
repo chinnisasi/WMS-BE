@@ -275,7 +275,7 @@ describe('story 4-7c: the return to client (e2e)', () => {
     for (const row of stored) skuIds.set(row.code, row.id);
   }
 
-  async function createMember(role: 'ops_manager' | 'operator'): Promise<{ email: string }> {
+  async function createMember(role: 'ops_manager' | 'operator' | 'accountant'): Promise<{ email: string }> {
     const email = `${role}-${ulid().toLowerCase()}@example.com`;
     const invited = await asOwner('post', '/users').send({ email, role }).expect(201);
     await http().post(`${API}/${tenantId}/accept-invite`).set(KEY_HEADER, ulid()).send({ token: invited.body.inviteToken as string, password: 'correct-horse-battery' }).expect(200);
@@ -1113,6 +1113,15 @@ describe('story 4-7c: the return to client (e2e)', () => {
       ['AWB777', `${rtc.code}.2`],
     ]);
     expect(problem(await labels('?count=3').expect(409)).code).toBe('package-count-mismatch');
+    // Review — labels.execute is judged before any value the handler judges: an accountant sending a
+    // bad format still gets 403 role-denied, never the 400.
+    const accountant = await createMember('accountant');
+    const accountantToken = (await mintSignIn(app, { email: accountant.email, password: 'correct-horse-battery' })).body.accessToken as string;
+    const denied = await http()
+      .get(`${API}/${tenantId}/client-returns/${rtc.id}/package-labels?format=nope`)
+      .set('Authorization', `Bearer ${accountantToken}`)
+      .expect(403);
+    expect(denied.body.code).toBe('role-denied');
   });
 
   it('the tuples mirror their DB CHECKs; an old receipt-line read keeps its bytes (A6)', async () => {

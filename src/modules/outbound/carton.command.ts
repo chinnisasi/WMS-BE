@@ -15,6 +15,7 @@ import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { assertPermission } from '../tenancy/permissions';
 import { getMemberRoleIn } from '../tenancy/tenancy.service';
 import { InventoryFacade } from '../inventory/inventory.facade';
+import { CatalogFacade } from '../catalog/catalog.facade';
 import {
   MAX_PACK_SEQ,
   aggregateCartons,
@@ -87,7 +88,11 @@ export class CartonCommandService {
     @Inject(DATABASE) private readonly db: Database,
     @Inject(OUTBOX_SINK) private readonly outbox: OutboxSink,
     @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
+    @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
   ) {}
+
+  /** The cases' weights for the pack view (the catalog seam). */
+  private readonly caseFacts = (tx: TenantTx, tenantId: string, ids: readonly string[]) => this.catalog.handlingUnitsByIdsInTx(tx, tenantId, ids);
 
   async recartonOrder(command: RecartonOrderCommand, idempotencyKey: string): Promise<RecartonSnapshot> {
     // ── shape, above the transaction (400) ─────────────────────────────────
@@ -191,7 +196,7 @@ export class CartonCommandService {
       // 9. the unchanged split: a no-op that stores the key
       if (sameSplit(aggregatedOf(record), cartons)) {
         const snapshot: RecartonSnapshot = {
-          pack: await packViewInTx(tx, command.tenantId, record),
+          pack: await packViewInTx(tx, command.tenantId, record, this.caseFacts),
           unchanged: true,
           clientLabelReverify: false,
         };
@@ -268,7 +273,7 @@ export class CartonCommandService {
         this.inventory.ledgerEventsByOrderRefInTx(t, tenant, warehouse, orderId),
       );
       const snapshot: RecartonSnapshot = {
-        pack: await packViewInTx(tx, command.tenantId, next!),
+        pack: await packViewInTx(tx, command.tenantId, next!, this.caseFacts),
         unchanged: false,
         clientLabelReverify,
       };
@@ -341,7 +346,7 @@ export class CartonCommandService {
       const history = await packHistoryOfOrderInTx(tx, tenantId, order, (t, tenant, warehouse, id) =>
         this.inventory.ledgerEventsByOrderRefInTx(t, tenant, warehouse, id),
       );
-      return { pack: await packViewInTx(tx, tenantId, record), history };
+      return { pack: await packViewInTx(tx, tenantId, record, this.caseFacts), history };
     });
   }
 

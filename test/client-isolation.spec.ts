@@ -2052,7 +2052,7 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
         probeDb,
         tenantId,
         async (tx) => ({
-          doc: await packDocumentInTx(tx, tenantId, orderA, { ledgerEvents: async () => [], batchFacts: async () => new Map() }, { printedAt: new Date().toISOString() }),
+          doc: await packDocumentInTx(tx, tenantId, orderA, { ledgerEvents: async () => [], batchFacts: async () => new Map(), serialNumbers: async () => new Map() }, { printedAt: new Date().toISOString() }),
           packs: (await tx.execute(dsql`select count(*)::int as n from order_packs where order_id = ${orderA}`)) as unknown as { n: number }[],
           cartons: (await tx.execute(dsql`select count(*)::int as n from order_cartons where order_id = ${orderA}`)) as unknown as { n: number }[],
           lines: (await tx.execute(dsql`select count(*)::int as n from order_carton_lines where order_id = ${orderA}`)) as unknown as { n: number }[],

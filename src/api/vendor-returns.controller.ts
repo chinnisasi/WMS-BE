@@ -179,7 +179,7 @@ export class VendorReturnsController {
   })
   @ApiResponse({ status: 400, ...problemJsonResponse('A malformed id, format, layout, count, from or to; zpl with the a4 layout; no count before dispatch (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
-  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks labels.execute (role-denied) — checked before anything it sent') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks labels.execute (role-denied) — checked before every path and query value the handler judges (an unknown query key is 400 first, at the ValidationPipe)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('No such return to vendor in this tenant (not-found)') })
   @ApiResponse({ status: 409, ...problemJsonResponse('Not picked or dispatched (rtv-not-picked); a count other than the dispatched one (package-count-mismatch); the vendor has no address of the consignee kind (consignee-address-missing)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('More than 1,000 labels in one print (too-many-labels — ask for a from/to range)') })
@@ -193,7 +193,10 @@ export class VendorReturnsController {
     @Res() res: Response,
   ): Promise<void> {
     assertOwnTenantToken(session.tenantId, tenantId);
-    // Authority before every path and query 400 (the 2-10b shape).
+    // labels.execute is judged before every value the handler judges (the path id, format, layout,
+    // count/from/to/cartons), so a role without it gets 403 whatever those carry — the 2-10b shape.
+    // An unknown or repeated query key is answered 400 earlier, by the global ValidationPipe
+    // (forbidNonWhitelisted), before this handler runs.
     await this.rtv.assertCanPrintPackageLabels(tenantId, session.userId);
     assertUuidParam(vendorReturnId);
     const file = await this.rtv.packageLabels(tenantId, vendorReturnId, parsePackageLabelQuery(labelQuery));
