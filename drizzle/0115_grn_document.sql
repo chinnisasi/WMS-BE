@@ -21,6 +21,10 @@
 --  - the three email_messages CHECKs are added validated: the table is small
 --    (0114's 200,000-row guard precedes them; final rows purge at 90 days)
 --    and every existing row satisfies them by construction (both columns NULL);
+--  - re-runnable (the migration proof re-applies it by hand): every column and
+--    the index is IF NOT EXISTS, and each CHECK is dropped IF EXISTS before it
+--    is added (a re-run re-validates; the parties CHECK stays NOT VALID →
+--    VALIDATE, so the re-run's scan is SHARE UPDATE EXCLUSIVE as well);
 --  - `over_receipts_tenant_grn_line_idx` (D8) is a plain build: over_receipts
 --    holds excesses only, so it is small (DEPLOY §5).
 ALTER TABLE "email_messages" ADD COLUMN IF NOT EXISTS "attachment_kind" text;--> statement-breakpoint
@@ -33,6 +37,7 @@ CREATE INDEX IF NOT EXISTS "over_receipts_tenant_grn_line_idx" ON "over_receipts
 -- (`GrnPartiesSnapshotV1`, inbound/grn-document.types.ts).
 -- `coalesce(…, false)`: a missing key makes a comparison NULL, and a CHECK
 -- passes on NULL — so absence must read as a refusal (probed below).
+ALTER TABLE "goods_receipt_notes" DROP CONSTRAINT IF EXISTS "goods_receipt_notes_document_parties_shape";--> statement-breakpoint
 ALTER TABLE "goods_receipt_notes" ADD CONSTRAINT "goods_receipt_notes_document_parties_shape" CHECK (
 	"document_parties" IS NULL OR coalesce((
 		jsonb_typeof("document_parties") = 'object'
@@ -46,12 +51,15 @@ ALTER TABLE "goods_receipt_notes" VALIDATE CONSTRAINT "goods_receipt_notes_docum
 -- ── hand-amended: the email attachment (decision 17) ──────────────────────
 -- Both or neither; one kind (`EMAIL_ATTACHMENT_KINDS`, modules/mail/mail-rules.ts
 -- — pinned by test/mail.spec.ts); only on the receipt notice.
+ALTER TABLE "email_messages" DROP CONSTRAINT IF EXISTS "email_messages_attachment_pairing";--> statement-breakpoint
 ALTER TABLE "email_messages" ADD CONSTRAINT "email_messages_attachment_pairing" CHECK (
 	("attachment_kind" IS NULL) = ("attachment_ref" IS NULL)
 );--> statement-breakpoint
+ALTER TABLE "email_messages" DROP CONSTRAINT IF EXISTS "email_messages_attachment_kind_check";--> statement-breakpoint
 ALTER TABLE "email_messages" ADD CONSTRAINT "email_messages_attachment_kind_check" CHECK (
 	"attachment_kind" IS NULL OR "attachment_kind" IN ('grn-pdf')
 );--> statement-breakpoint
+ALTER TABLE "email_messages" DROP CONSTRAINT IF EXISTS "email_messages_attachment_template_check";--> statement-breakpoint
 ALTER TABLE "email_messages" ADD CONSTRAINT "email_messages_attachment_template_check" CHECK (
 	"attachment_kind" IS NULL OR "template" = 'client-receipt'
 );--> statement-breakpoint

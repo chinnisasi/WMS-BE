@@ -6,7 +6,8 @@ import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import type { Database } from '../src/shared/db/db';
-import { withTenantTransaction } from '../src/shared/db/tenant-scope';
+import { withTenantTransaction, type TenantTx } from '../src/shared/db/tenant-scope';
+import { qcHeldTotalsQuery } from '../src/modules/inventory/inventory.facade';
 import { OUTBOX_RELAY, type OutboxRelay } from '../src/shared/events/outbox.seam';
 import { MailFacade, MailAttachmentRegistry } from '../src/modules/mail/mail.facade';
 import { MailSender } from '../src/modules/mail/mail.sender';
@@ -498,6 +499,18 @@ describe('the GRN document (e2e, story 2-9a)', () => {
       // And the 200-line PDF paginates (the layout spec pins the per-page invariants).
       const text = await pdfText((await staffFile(grn.id, '?format=pdf').expect(200)).body as Buffer);
       expect(text).toMatch(/Page 1 of [2-9]/);
+    });
+  });
+
+  describe('the grouped qc.held read (A12)', () => {
+    it('EXPLAIN: the REAL qcHeldTotalsQuery statement rides ledger_events_hold_ref_idx', async () => {
+      const holdIds = Array.from({ length: 40 }, () => uuidv7());
+      const statement = qcHeldTotalsQuery(db as unknown as TenantTx, tenantId, [warehouseId], holdIds).toSQL();
+      const plan = await sql.begin(async (q) => {
+        await q`set local enable_seqscan = off`;
+        return (await q.unsafe(`explain ${statement.sql}`, statement.params as never[])) as unknown as Record<string, string>[];
+      });
+      expect(plan.map((row) => Object.values(row)[0]).join('\n')).toContain('ledger_events_hold_ref_idx');
     });
   });
 
