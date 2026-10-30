@@ -499,12 +499,6 @@ function invalidCursor(): ProblemException {
 }
 
 /**
- * The inventory module's public surface (Story 2.1): the ONLY way any other
- * module — or the api shell — consumes stock state. The stock/ledger tables
- * are module-exclusive; the architecture test fails any write from outside
- * this module.
- */
-/**
  * Story 1-2b (exported by 2-9a, A12) — the grouped `qc.held` read behind
  * `InventoryFacade.qcHeldTotalsInTx`: per hold and batch ref, the quantity
  * its own events moved. Exported so `test/grn-document.spec.ts` EXPLAINs the
@@ -532,6 +526,12 @@ export function qcHeldTotalsQuery(tx: TenantTx, tenantId: string, warehouseIds: 
     .groupBy(sql`${ledgerEvents.referenceDoc}->>'holdId'`, ledgerEvents.batchRef);
 }
 
+/**
+ * The inventory module's public surface (Story 2.1): the ONLY way any other
+ * module — or the api shell — consumes stock state. The stock/ledger tables
+ * are module-exclusive; the architecture test fails any write from outside
+ * this module.
+ */
 @Injectable()
 export class InventoryFacade {
   constructor(
