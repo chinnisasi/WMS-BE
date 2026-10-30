@@ -147,7 +147,16 @@ export type QueueClientEmailInput = {
        */
       readonly attachment?: { readonly kind: EmailAttachmentKind; readonly ref: string };
     }
-  | { readonly template: 'client-dispatch'; readonly params: ClientDispatchEmailParams }
+  | {
+      readonly template: 'client-dispatch';
+      readonly params: ClientDispatchEmailParams;
+      /**
+       * Story 4-5a (A20) — the order's packing slip, rendered at SEND time
+       * (`packing-slip-pdf` with the order id). Omitted, the row's attachment
+       * columns are NULL — a 5-2b row unchanged.
+       */
+      readonly attachment?: { readonly kind: 'packing-slip-pdf'; readonly ref: string };
+    }
   | {
       readonly template: 'client-shipment-document';
       readonly params: ClientShipmentDocumentEmailParams;
@@ -189,9 +198,9 @@ export async function queueClientEmailInTx(tx: TenantTx, input: QueueClientEmail
       status,
       nextAttemptAt: sql`now()`,
       errorCode: skipCode,
-      // Story 4-4a (D3) — either attachment-carrying template writes the columns.
-      attachmentKind: input.template === 'client-dispatch' ? null : (input.attachment?.kind ?? null),
-      attachmentRef: input.template === 'client-dispatch' ? null : (input.attachment?.ref ?? null),
+      // Story 4-4a (D3) / 4-5a (A20) — every attachment-carrying template writes the columns.
+      attachmentKind: input.attachment?.kind ?? null,
+      attachmentRef: input.attachment?.ref ?? null,
     })
     .onConflictDoNothing({ target: [emailMessages.tenantId, emailMessages.dedupeKey], where: sql`dedupe_key IS NOT NULL` })
     .returning({ id: emailMessages.id });

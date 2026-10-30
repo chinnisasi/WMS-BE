@@ -90,6 +90,7 @@ export function renderEmail(template: EmailTemplate, params: unknown, context: R
         decodeClientDispatchParams(params),
         webLinkFrom(context.webBaseUrl, '/portal/orders', {}),
         context.fallbackReplyTo ?? null,
+        context.attachment ?? 'none',
       );
     default: {
       const unreachable: never = template;

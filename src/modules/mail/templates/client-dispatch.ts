@@ -14,6 +14,7 @@ import {
   quantityField,
   textField,
 } from './client-notice';
+import type { ClientAttachmentState } from './client-receipt';
 
 /**
  * Story 5-2b — the `client-dispatch` notice: one email per opted-in contact
@@ -91,8 +92,25 @@ export function clientDispatchSubject(params: Pick<ClientDispatchEmailParams, 'c
 
 export const DISPATCH_SHORT_NOTE = 'Short-shipped: some lines were dispatched short of the ordered quantity.';
 
-/** Renders the dispatch notice. `portalUrl` is `{WEB_BASE_URL}/portal/orders`. */
-export function renderClientDispatchEmail(params: ClientDispatchEmailParams, portalUrl: string, fallbackReplyTo: string | null): RenderedEmail {
+/** Story 4-5a (A20) — the attachment's name in the body: the SAME fold as outbound's `packDocumentFileStem` (mail imports nothing from outbound). */
+export function packingSlipFileName(orderRef: string): string {
+  return `${orderRef.replace(/[^A-Za-z0-9._-]/g, '_') || 'order'}-packing-slip.pdf`;
+}
+
+export const DISPATCH_SLIP_TOO_LARGE = 'The packing slip is too large to attach — download it from the client portal.';
+export const DISPATCH_SLIP_FAILED = 'The packing slip could not be attached — download it from the client portal.';
+
+/**
+ * Renders the dispatch notice. `portalUrl` is `{WEB_BASE_URL}/portal/orders`.
+ * Story 4-5a (A20, D9) — `attachment` is what the sender attached: `none`
+ * (a 5-2b row — its bytes exactly), `attached`, or sent without the file.
+ */
+export function renderClientDispatchEmail(
+  params: ClientDispatchEmailParams,
+  portalUrl: string,
+  fallbackReplyTo: string | null,
+  attachment: ClientAttachmentState = 'none',
+): RenderedEmail {
   const tenant = plainText(params.tenantName);
   const client = plainText(params.clientName);
   const warehouse = plainText(params.warehouseName);
@@ -117,6 +135,15 @@ export function renderClientDispatchEmail(params: ClientDispatchEmailParams, por
   });
   const more = moreLinesNote(params.moreLines);
   const opening = `${tenant} dispatched order ${ref} for ${client} from ${warehouse}.`;
+  // Story 4-5a — one sentence about the slip; none at all on a pre-4-5a row.
+  const fileNote =
+    attachment === 'attached'
+      ? `The packing slip is attached (${plainText(packingSlipFileName(params.orderRef))}).`
+      : attachment === 'too-large'
+        ? DISPATCH_SLIP_TOO_LARGE
+        : attachment === 'failed'
+          ? DISPATCH_SLIP_FAILED
+          : null;
 
   const text = [
     opening,
@@ -127,6 +154,7 @@ export function renderClientDispatchEmail(params: ClientDispatchEmailParams, por
     ...(more === null ? [] : [more]),
     ...(params.shortShipped ? ['', DISPATCH_SHORT_NOTE] : []),
     '',
+    ...(fileNote === null ? [] : [fileNote, '']),
     `If you have portal access, your orders are at ${portalUrl}`,
     '',
     footer,
@@ -141,6 +169,7 @@ export function renderClientDispatchEmail(params: ClientDispatchEmailParams, por
       htmlTable(['SKU', 'Name', 'Ordered', 'Dispatched', 'Short'], rows, new Set([2, 3, 4])),
       ...(more === null ? [] : [`<p>${html(more)}</p>`]),
       ...(params.shortShipped ? [`<p><strong>${html(DISPATCH_SHORT_NOTE)}</strong></p>`] : []),
+      ...(fileNote === null ? [] : [`<p>${html(fileNote)}</p>`]),
       `<p>If you have portal access, <a href="${html(portalUrl)}">see your orders in the portal</a>.</p>`,
     ],
     footer,

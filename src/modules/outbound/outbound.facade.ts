@@ -107,6 +107,9 @@ import type { PackOrderCommand, PackSnapshot } from './pack.command';
 import { CartonCommandService } from './carton.command';
 import type { RecartonOrderCommand, RecartonSnapshot } from './carton.command';
 import { liveCartonsOfOrdersInTx, livePackFactsOfOrdersInTx } from './cartons.read';
+import { PackDocumentsService, type PackDocumentFile, type PackFileQuery } from './pack-documents.service';
+export { parsePackFileQuery } from './pack-documents.service';
+export type { PackDocumentFile, PackFileQuery } from './pack-documents.service';
 import type { LiveCartonFacts, LivePackFacts, PackHistoryRecord, PackRecord, PackView } from './cartons.read';
 export type { RecartonOrderCommand, RecartonSnapshot } from './carton.command';
 export type { LiveCartonFacts, LivePackFacts, PackCartonView, PackHistoryRecord, PackRecord, PackView } from './cartons.read';
@@ -620,6 +623,7 @@ export class OutboundFacade {
     @Inject(PackCommandService) private readonly packCommand: PackCommandService,
     // Story 4-5a — the re-carton and the pack/carton reads.
     @Inject(CartonCommandService) private readonly cartonCommand: CartonCommandService,
+    @Inject(PackDocumentsService) private readonly packDocuments: PackDocumentsService,
     @Inject(DispatchCommandService) private readonly dispatchCommand: DispatchCommandService,
     @Inject(ShipmentCommandService) private readonly shipmentCommand: ShipmentCommandService,
     @Inject(ManifestCommandService) private readonly manifestCommand: ManifestCommandService,
@@ -1800,6 +1804,42 @@ export class OutboundFacade {
     orderIds: readonly string[],
   ): Promise<Map<string, { readonly packSeq: number; readonly cartons: readonly LiveCartonFacts[] }>> {
     return liveCartonsOfOrdersInTx(tx, tenantId, orderIds);
+  }
+
+  // ── story 4-5a: the packing documents ───────────────────────────────────
+
+  /** A13 — `GET …/outbound/orders/{orderId}/packing-slip` (ungated): the A4 slip or the 4×6 carton slips. */
+  async packingSlipFile(tenantId: string, orderId: string, query: PackFileQuery): Promise<PackDocumentFile> {
+    return this.packDocuments.packingSlipFile(tenantId, orderId, query);
+  }
+
+  /** A14 — `labels.execute` alone, before any query 400 (the 2-10b shape). */
+  async assertCanPrintCartonLabels(tenantId: string, actorUserId: string): Promise<void> {
+    return this.packDocuments.assertCanPrintCartonLabels(tenantId, actorUserId);
+  }
+
+  /** A14 — `GET …/outbound/orders/{orderId}/carton-labels` (`labels.execute`). */
+  async cartonLabelsFile(tenantId: string, actorUserId: string, orderId: string, query: PackFileQuery): Promise<PackDocumentFile> {
+    return this.packDocuments.cartonLabelsFile(tenantId, actorUserId, orderId, query);
+  }
+
+  /** A19 — the portal's packing slip (client audience); null = 404 (unknown, another client's, not packed). */
+  async portalPackingSlip(tenantId: string, clientId: string, orderId: string): Promise<PackDocumentFile | null> {
+    const doc = await withTenantTransaction(this.db, tenantId, (tx) => this.packDocuments.portalPackingSlipDocumentInTx(tx, tenantId, clientId, orderId), {
+      accessMode: 'read only',
+      clientId,
+    });
+    return doc === null ? null : this.packDocuments.clientPackingSlipFile(doc);
+  }
+
+  /** A20 — the dispatch email's `packing-slip-pdf` renderer, on the mail registry's stamped read-only transaction. */
+  async packingSlipPdfInTx(
+    tx: TenantTx,
+    tenantId: string,
+    clientId: string,
+    orderId: string,
+  ): Promise<{ filename: string; contentType: string; content: Uint8Array } | null> {
+    return this.packDocuments.packingSlipPdfInTx(tx, tenantId, clientId, orderId);
   }
 
   // ── dispatch (Story 4.6) ──────────────────────────────────────────────────

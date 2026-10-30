@@ -2636,7 +2636,7 @@ describe('architecture: the client portal (story 21-7)', () => {
   const PORTAL_READS: readonly { file: string; methods: readonly string[] }[] = [
     { file: join(SRC_ROOT, 'modules', 'inventory', 'inventory.facade.ts'), methods: ['portalStock'] },
     // Story 4-4a — the order's Shipping section.
-    { file: join(SRC_ROOT, 'modules', 'outbound', 'outbound.facade.ts'), methods: ['portalOrders', 'portalOrder', 'portalOrderShipping'] },
+    { file: join(SRC_ROOT, 'modules', 'outbound', 'outbound.facade.ts'), methods: ['portalOrders', 'portalOrder', 'portalOrderShipping', 'portalPackingSlip'] },
     { file: join(SRC_ROOT, 'modules', 'inbound', 'inbound.facade.ts'), methods: ['portalAsns', 'portalAsn', 'portalPurchaseOrders', 'portalPurchaseOrder', 'portalGoodsReceipts', 'portalGoodsReceipt', 'portalGoodsReceiptFile'] },
     { file: join(SRC_ROOT, 'modules', 'billing', 'billing.facade.ts'), methods: ['portalInvoices', 'portalInvoice', 'portalInvoiceNotes', 'portalInvoiceNote'] },
     { file: join(SRC_ROOT, 'modules', 'clients', 'clients.facade.ts'), methods: ['portalMeIn'] },
@@ -2693,6 +2693,8 @@ describe('architecture: the client portal (story 21-7)', () => {
         'portalOrder',
         // Story 4-4a — the order's Shipping section.
         'portalOrderShipping',
+        // Story 4-5a — the order's packing slip.
+        'portalPackingSlip',
         'portalAsns',
         'portalAsn',
         'portalPurchaseOrders',

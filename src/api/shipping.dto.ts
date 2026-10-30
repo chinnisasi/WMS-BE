@@ -484,6 +484,19 @@ export class PortalFileDto {
   @ApiProperty({ type: String, nullable: true }) urlExpiresAt!: string | null;
 }
 
+/** Story 4-5a (A19, A36) — one UoM's total in a carton (base units). */
+export class PortalCartonTotalDto {
+  @ApiProperty() uom!: string;
+  @ApiProperty({ description: 'Base units of this UoM in the carton' }) qty!: number;
+}
+
+/** Story 4-5a (A19) — one carton as the client sees it: no carton code, no handling units, no packer. */
+export class PortalCartonDto {
+  @ApiProperty({ description: 'Carton number, 1..N' }) seq!: number;
+  @ApiProperty({ type: Number, nullable: true, description: 'Grams, when weighed' }) weightGrams!: number | null;
+  @ApiProperty({ type: [PortalCartonTotalDto], description: 'Units per UoM — never a cross-UoM total (A36)' }) totals!: PortalCartonTotalDto[];
+}
+
 export class PortalOrderShippingResponse {
   @ApiProperty({ description: 'The client may record a label or AWB now (Upload / Replace / Send AWB): the order is open and has no live shipment, or a client-arranged one not yet handed over' }) canRecord!: boolean;
   @ApiProperty({ enum: [...PORTAL_SHIPPING_STATUSES] }) status!: string;
@@ -497,6 +510,8 @@ export class PortalOrderShippingResponse {
   @ApiProperty({ type: PortalFileDto, nullable: true }) label!: PortalFileDto | null;
   @ApiProperty({ type: [PortalFileDto] }) documents!: PortalFileDto[];
   @ApiProperty({ type: [PortalFileDto] }) handoverSheet!: PortalFileDto[];
+  @ApiProperty({ type: [PortalCartonDto], nullable: true, description: 'Story 4-5a — the cartons of the pack, once packed (null before)' }) cartons!: PortalCartonDto[] | null;
+  @ApiProperty({ description: 'Story 4-5a — the packing slip can be downloaded (packed or dispatched)' }) packingSlipAvailable!: boolean;
 }
 
 /** The portal's document kinds, for the upload form. */

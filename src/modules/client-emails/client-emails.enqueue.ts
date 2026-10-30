@@ -255,7 +255,17 @@ export class ClientEmailsEnqueueHandler implements OnModuleInit {
                 // Story 4-4a (D3) — the stored file, read and attached at send time.
                 attachment: { kind: 'stored-file', ref: subjectId },
               })
-            : await queueClientEmailInTx(tx, { tenantId, clientId, template, to: recipient.email, dedupeKey, params: params as ClientDispatchEmailParams });
+            : await queueClientEmailInTx(tx, {
+                tenantId,
+                clientId,
+                template,
+                to: recipient.email,
+                dedupeKey,
+                params: params as ClientDispatchEmailParams,
+                // Story 4-5a (A20) — every dispatch email carries the order's
+                // packing slip, rendered at send time (client audience).
+                attachment: { kind: 'packing-slip-pdf', ref: subjectId },
+              });
       if (row === null) {
         deduped += 1;
       } else {

@@ -20,6 +20,8 @@ import { ClientLabelCommand } from './client-label.command';
 import { ShippingFilesCommand } from './shipping-files.command';
 import { HandoverCommand, handoverViewOf, type HandOverCommand, type HandoverSnapshot, type HandoverView } from './handover.command';
 import { DispatchCommandService } from './dispatch.command';
+import { packRecordOfOrderInTx, skuFactsByIdInTx, uomTotalsOf } from './cartons.read';
+import { fromMilli } from '../../shared/primitives/quantity';
 import { AllocationCommandService } from './allocation.command';
 import { clientShipmentViewOf, type ClientShipmentView } from './shipping-views';
 import { LABEL_OPEN_STATUSES, orderNotFound, orderNotOpen } from './shipping-support';
@@ -116,12 +118,18 @@ export interface PortalOrderShippingView {
   readonly label: PortalFile | null;
   readonly documents: readonly PortalFile[];
   readonly handoverSheet: readonly PortalFile[];
+  /** Story 4-5a (A19, A36) — the pack's cartons (no code, no handling unit, no packer); null before packing. */
+  readonly cartons: readonly { readonly seq: number; readonly weightGrams: number | null; readonly totals: readonly { readonly uom: string; readonly qty: number }[] }[] | null;
+  /** Story 4-5a (A19) — packed or dispatched: the slip downloads. */
+  readonly packingSlipAvailable: boolean;
 }
 
 export interface PortalShippingRead {
   readonly shipping: NonNullable<Awaited<ReturnType<typeof orderShippingInTx>>>;
   readonly hasDispatchRecord: boolean;
   readonly dispatchRecord: { readonly carrierName: string | null; readonly trackingNumber: string | null } | null;
+  /** Story 4-5a — the pack's cartons with their per-UoM totals (base units); null when never packed. */
+  readonly cartons: PortalOrderShippingView['cartons'];
 }
 
 export interface HandoverDetailView extends HandoverView {
@@ -222,8 +230,23 @@ export class ShippingService {
     const dispatched = shipping.order.status === 'dispatched' ? await this.inventory.firstDispatchByOrderInTx(tx, tenantId, [shipping.order.id]) : new Map();
     const first = dispatched.get(shipping.order.id) ?? null;
     const dispatchRecord = first === null ? null : { carrierName: first.carrierName ?? null, trackingNumber: first.trackingNumber ?? null };
+    // Story 4-5a (A19) — the pack (live, latest or virtual), reached through
+    // the client-filtered order read above (and the stamp on every row).
+    const record = await packRecordOfOrderInTx(tx, tenantId, shipping.order, (t, tenant, warehouse, id) =>
+      this.inventory.ledgerEventsByOrderRefInTx(t, tenant, warehouse, id),
+    );
+    let cartons: PortalOrderShippingView['cartons'] = null;
+    if (record !== null) {
+      const skus = await skuFactsByIdInTx(tx, tenantId, record.cartons.flatMap((carton) => carton.lines.map((line) => line.skuId)));
+      cartons = record.cartons.map((carton) => ({
+        seq: carton.seq,
+        weightGrams: carton.weightGrams,
+        totals: uomTotalsOf(carton.lines.map((line) => ({ uom: skus.get(line.skuId)?.uom ?? '', qty: fromMilli(line.qty) }))),
+      }));
+    }
     return {
       shipping,
+      cartons,
       // E2 — "the dispatch record names a carrier or a tracking number".
       hasDispatchRecord: dispatchRecord !== null && (dispatchRecord.carrierName !== null || dispatchRecord.trackingNumber !== null),
       dispatchRecord,
@@ -276,6 +299,8 @@ export class ShippingService {
       label,
       documents,
       handoverSheet,
+      cartons: read.cartons === null ? null : read.cartons.map((carton) => ({ seq: carton.seq, weightGrams: carton.weightGrams, totals: carton.totals.map((total) => ({ uom: total.uom, qty: total.qty })) })),
+      packingSlipAvailable: read.cartons !== null && (shipping.order.status === 'ready_to_dispatch' || shipping.order.status === 'dispatched'),
     };
   }
 

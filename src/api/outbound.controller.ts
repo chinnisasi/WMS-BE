@@ -3,7 +3,7 @@ import { FileInterceptor } from '@nestjs/platform-express';
 // The global `Express.Multer.File` type (FileInterceptor's upload) lives in @types/multer.
 import type {} from 'multer';
 import type { Response } from 'express';
-import { ApiBearerAuth, ApiBody, ApiConsumes, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiBody, ApiConsumes, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiProduces, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { MAX_SHEET_UPLOAD_BYTES } from '../shared/import/sheet-reader';
 import { SheetUploadFilter } from '../shared/import/upload-filter';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
@@ -14,7 +14,7 @@ import { DeviceSessionGuard, CurrentDeviceSession } from '../modules/tenancy/dev
 import type { DeviceSession, TenantSession } from '../modules/tenancy/jwt-session';
 import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/idempotency-guard';
 import { UUID_RE } from '../shared/primitives/ids';
-import { OutboundFacade } from '../modules/outbound/outbound.facade';
+import { OutboundFacade, parsePackFileQuery } from '../modules/outbound/outbound.facade';
 import type { ListOrdersFilter, PackCartonInput, PackView } from '../modules/outbound/outbound.facade';
 import { assertInstantRange } from '../shared/primitives/instant-range';
 import type { OrderLineDto } from '../modules/outbound/outbound.dto';
@@ -552,6 +552,89 @@ export class OutboundController {
         endReason: entry.endReason,
       })),
     };
+  }
+
+  @Get(':tenantId/outbound/orders/:orderId/packing-slip')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Story 4-5a — the packing slip of a packed or dispatched order: `layout=a4` (default) is the A4 PDF of the whole order — the frozen parties (brand, warehouse, consignee), the lines with batches and serials, the carton breakdown, and "This is not a tax invoice"; `layout=label` is the 4×6 thermal slip per carton (ZPL or PDF), a carton of more than 12 SKUs continuing on further labels. A document read — no capability beyond the session',
+    description:
+      '`format=pdf|zpl` (default pdf), `layout=a4|label` (default a4; a4 is PDF only), `cartons=1,3` (the label layout only: unique carton numbers, default every carton). One print renders at most 1000 labels. `Content-Disposition: attachment` — `{order label}-packing-slip.pdf` or `{order label}-carton-slips.{zpl|pdf}`; the name is not readable cross-origin, so a client builds it itself.',
+  })
+  @ApiProduces('text/plain', 'application/pdf')
+  @ApiResponse({
+    status: 200,
+    description: 'The slip: a PDF, or ZPL as `text/plain; charset=us-ascii`',
+    content: { 'text/plain': { schema: { type: 'string', format: 'binary' } }, 'application/pdf': { schema: { type: 'string', format: 'binary' } } },
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed orderId, format, layout or cartons list (a zero, a duplicate, above 200), or zpl with the a4 layout (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Order does not exist in this tenant, or a listed carton number is above the pack’s count (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The order is neither packed nor dispatched (order-not-packed, naming its status)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('More than 1000 labels in one print (too-many-labels, naming the cartons to ask for)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  @ApiQuery({ name: 'format', required: false, enum: ['pdf', 'zpl'] })
+  @ApiQuery({ name: 'layout', required: false, enum: ['a4', 'label'] })
+  @ApiQuery({ name: 'cartons', required: false, description: 'Comma-separated carton numbers (the label layout)' })
+  async packingSlip(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @Query('format') format: string | undefined,
+    @Query('layout') layout: string | undefined,
+    @Query('cartons') cartons: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Res() res: Response,
+  ): Promise<void> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const query = parsePackFileQuery({ format, layout, cartons }, { format: 'pdf', layout: 'a4' });
+    sendDocumentFile(res, await this.outbound.packingSlipFile(tenantId, orderId, query));
+  }
+
+  @Get(':tenantId/outbound/orders/:orderId/carton-labels')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Story 4-5a — labels.execute: the 4×6 carton labels of a packed order, one per carton — FROM the brand c/o the warehouse, TO the consignee, CARTON n/N, the order, weight and size, the payment (COD on carton 1 only), the courier and AWB with its barcode when a live shipment holds one, and the carton code’s barcode. ZPL (203 dpi) first; PDF one 4×6 page per carton, or two per landscape A4 sheet',
+    description:
+      '`format=zpl|pdf` (default zpl), `layout=label|a4` (default label; a4 is PDF only), `cartons=1,3` (default every carton). Only a `ready_to_dispatch` order prints (a dispatched order has left; a cancelled one has no live pack). `Content-Disposition: attachment` — `{order label}-carton-labels.{zpl|pdf}`.',
+  })
+  @ApiProduces('text/plain', 'application/pdf')
+  @ApiResponse({
+    status: 200,
+    description: 'The labels: ZPL as `text/plain; charset=us-ascii`, or a PDF',
+    content: { 'text/plain': { schema: { type: 'string', format: 'binary' } }, 'application/pdf': { schema: { type: 'string', format: 'binary' } } },
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed orderId, format, layout or cartons list, or zpl with the a4 layout (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks labels.execute (role-denied) — checked before anything it sent') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Order does not exist in this tenant, or a listed carton number is above the pack’s count (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The order is not ready to dispatch (order-not-packed, naming its status)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  @ApiQuery({ name: 'format', required: false, enum: ['zpl', 'pdf'] })
+  @ApiQuery({ name: 'layout', required: false, enum: ['label', 'a4'] })
+  @ApiQuery({ name: 'cartons', required: false, description: 'Comma-separated carton numbers' })
+  async cartonLabels(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @Query('format') format: string | undefined,
+    @Query('layout') layout: string | undefined,
+    @Query('cartons') cartons: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Res() res: Response,
+  ): Promise<void> {
+    assertOwnTenant(session, tenantId);
+    // Authority before every path and query 400 (the 2-10b shape).
+    await this.outbound.assertCanPrintCartonLabels(tenantId, session.userId);
+    assertUuidParam(orderId, 'orderId');
+    const query = parsePackFileQuery({ format, layout, cartons }, { format: 'zpl', layout: 'label' });
+    sendDocumentFile(res, await this.outbound.cartonLabelsFile(tenantId, session.userId, orderId, query));
   }
 
   @Post(':tenantId/outbound/orders/:orderId/dispatch')
@@ -1458,6 +1541,16 @@ function orderNotFound(orderId: string): ProblemException {
     'Order not found',
     `No order with id "${orderId}" exists in this tenant.`,
   );
+}
+
+/** Story 4-5a — a document file: every refusal was thrown before the first header (problem+json), then the headers and the bytes. */
+function sendDocumentFile(res: Response, file: { readonly filename: string; readonly contentType: string; readonly body: Buffer }): void {
+  res.status(200);
+  res.setHeader('Content-Type', file.contentType);
+  res.setHeader('Content-Length', String(file.body.length));
+  res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
+  res.setHeader('Cache-Control', 'no-store');
+  res.end(file.body);
 }
 
 function assertOwnTenant(session: TenantSession, tenantId: string): void {
