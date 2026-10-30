@@ -5,6 +5,8 @@ import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import * as schema from '../src/shared/db/schema';
 import { withTenantTransaction, type TenantTx } from '../src/shared/db/tenant-scope';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { orderShippingInTx, handoverDetailInTx, dispatchParcelsInTx } from '../src/modules/outbound/shipping.read';
+import { listByOwnerInTx } from '../src/modules/attachments/attachment-records';
 
 // The suite talks to the real Postgres (docker-compose dev DB by default; CI
 // provides the service container). No app boots here — this suite is about
@@ -1894,6 +1896,124 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
   // shape reaches the rest (placements, GRNs, picklist lines, pack failures)
   // only through one of them. The RLS layer alone must return A's rows only.
   // ──────────────────────────────────────────────────────────────────────────
+  describe('story 4-4a (A25): the client-arranged shipping reads and the portal write set under a client stamp', () => {
+    let probe: postgres.Sql<Record<string, unknown>>;
+    let probeDb: PostgresJsDatabase<typeof schema>;
+    const ROLLBACK = 'probe-rollback-4-4a';
+    const orderA = uuidv7();
+    const handedA = uuidv7();
+    const labelA = uuidv7();
+    const docA = uuidv7();
+    const sheetA = uuidv7();
+    const handoverA = uuidv7();
+
+    async function seedOrder(id: string, status: string): Promise<void> {
+      await sql`insert into orders (id, tenant_id, client_id, warehouse_id, status, source, destination_contact_name, destination_phone, destination_line1, destination_city, destination_state, destination_pincode)
+        values (${id}, ${tenantId}, ${clientA}, ${warehouseId}, ${status}, 'manual', 'Ravi', '9876543210', '1 Road', 'Bengaluru', 'KA', '560001')`;
+    }
+
+    async function seedFile(id: string, purpose: string, ownerType: string, ownerId: string, docKind: string | null): Promise<void> {
+      await sql`insert into attachments (id, tenant_id, client_id, warehouse_id, purpose, doc_kind, status, source, owner_type, owner_id, owner_parent_id, object_key, content_type, byte_size, sha256, width, height, page_count, uploaded_at, created_by)
+        values (${id}, ${tenantId}, ${clientA}, ${warehouseId}, ${purpose}, ${docKind}, 'attached', 'web', ${ownerType}, ${ownerId}, ${ownerId}, ${'iso/' + id}, 'application/pdf', 100, ${'a'.repeat(64)}, 288, 432, 1, now(), ${uuidv7()})`;
+    }
+
+    beforeAll(async () => {
+      await ensureProbeRole();
+      probe = postgres(probeUrl(), { max: 1 });
+      probeDb = drizzle(postgres(probeUrl(), { max: 1 }), { schema });
+      // A's open order with a verified client label and an invoice; A's
+      // dispatched order handed over on HO-ISO-1 with a signed-sheet page.
+      await seedOrder(orderA, 'ready_to_dispatch');
+      await seedOrder(handedA, 'dispatched');
+      await seedFile(labelA, 'shipping-label', 'order', orderA, null);
+      await seedFile(docA, 'shipping-document', 'order', orderA, 'invoice');
+      await sql`insert into shipments (id, tenant_id, warehouse_id, order_id, client_id, kind, status, carrier_name, tracking_number, label_attachment_id, labelled_by, labelled_at, recorded_surface)
+        values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${orderA}, ${clientA}, 'client-label', 'labelled', 'Delhivery', 'ISOAWB0001', ${labelA}, ${uuidv7()}, now(), 'portal')`;
+      await sql`insert into courier_handovers (id, tenant_id, warehouse_id, client_id, code, courier_name, pickup_person_name, handed_over_at, shipment_count, package_count, cod_shipment_count, cod_total_paise, client_snapshot, warehouse_snapshot, source, created_by)
+        values (${handoverA}, ${tenantId}, ${warehouseId}, ${clientA}, 'HO-9001', 'VRL', 'Ravi', now(), 1, 1, 0, 0, '{}', '{}', 'web', ${uuidv7()})`;
+      await sql`insert into shipments (id, tenant_id, warehouse_id, order_id, client_id, kind, status, carrier_name, tracking_number, labelled_by, labelled_at, recorded_surface, handover_id, handed_over_at, package_count)
+        values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${handedA}, ${clientA}, 'courier-label', 'handed_over', 'VRL', 'ISOAWB0002', ${uuidv7()}, now(), 'web', ${handoverA}, now(), 1)`;
+      await seedFile(sheetA, 'handover-sheet', 'courier_handover', handoverA, null);
+    });
+
+    afterAll(async () => {
+      await probe?.end();
+      await (probeDb as unknown as { $client: { end(): Promise<void> } } | undefined)?.$client.end();
+    });
+
+    /** The real read functions, the app's client predicate REMOVED (no clientId argument) — RLS alone. */
+    async function readAs(clientId: string) {
+      return withTenantTransaction(
+        probeDb,
+        tenantId,
+        async (tx) => ({
+          shipping: await orderShippingInTx(tx, tenantId, orderA),
+          handedShipping: await orderShippingInTx(tx, tenantId, handedA),
+          files: (await listByOwnerInTx(tx, { tenantId, ownerType: 'order', ownerIds: [orderA], purposes: ['shipping-label', 'shipping-document'] })).map((row) => row.id).sort(),
+          sheet: (await listByOwnerInTx(tx, { tenantId, ownerType: 'courier_handover', ownerIds: [handoverA], purposes: ['handover-sheet'] })).map((row) => row.id),
+          handover: await handoverDetailInTx(tx, tenantId, handoverA),
+          parcels: (await dispatchParcelsInTx(tx, tenantId, warehouseId)).parcels.map((parcel) => parcel.orderId).filter((id) => id === orderA),
+        }),
+        { clientId },
+      );
+    }
+
+    it('client B’s stamp sees none of A’s order shipping, label, documents, handover or its sheet, nor A’s parcel — and A’s stamp sees them all (the positive control)', async () => {
+      const asB = await readAs(clientB);
+      expect(asB).toEqual({ shipping: null, handedShipping: null, files: [], sheet: [], handover: null, parcels: [] });
+      const asA = await readAs(clientA);
+      expect(asA.shipping?.live?.trackingNumber).toBe('ISOAWB0001');
+      expect(asA.shipping?.label?.row.id).toBe(labelA);
+      expect(asA.shipping?.documents.map((file) => file.row.id)).toEqual([docA]);
+      expect(asA.handedShipping?.handover?.id).toBe(handoverA);
+      expect(asA.handedShipping?.sheet.map((file) => file.row.id)).toEqual([sheetA]);
+      expect(asA.files).toEqual([labelA, docA].sort());
+      expect(asA.sheet).toEqual([sheetA]);
+      expect(asA.handover?.handover.code).toBe('HO-9001');
+      expect(asA.parcels).toEqual([orderA]);
+    });
+
+    it('every statement of a portal label upload runs under A’s stamp — the reservation, its finalize, the shipment, a replace’s void and file removal, outbox, audit, key — and B’s shipment is refused (the control), all rolled back', async () => {
+      const orderId = uuidv7();
+      await seedOrder(orderId, 'accepted');
+      const attachmentId = uuidv7();
+      const shipmentId = uuidv7();
+      const actor = uuidv7();
+      const key = ulid();
+      let refused: unknown = null;
+      const run = probe.begin(async (tx) => {
+        await tx`select set_config('app.tenant_id', ${tenantId}, true)`;
+        await tx`select set_config('app.client_id', ${clientA}, true)`;
+        await tx`select status from clients where tenant_id = ${tenantId} and id = ${clientA} for share`;
+        await tx`insert into attachments (id, tenant_id, client_id, warehouse_id, purpose, status, source, upload_key, upload_hash, raw_sha256, object_key, content_type, byte_size, sha256, width, height, page_count, created_by)
+          values (${attachmentId}, ${tenantId}, ${clientA}, ${warehouseId}, 'shipping-label', 'uploading', 'portal', ${key}, ${'b'.repeat(64)}, ${'c'.repeat(64)}, ${'probe/' + attachmentId}, 'application/pdf', 100, ${'a'.repeat(64)}, 288, 432, 2, ${actor})`;
+        await tx`select id from attachments where id = ${attachmentId} for update`;
+        await tx`select id from orders where tenant_id = ${tenantId} and id = ${orderId} and client_id = ${clientA} for update`;
+        await tx`update attachments set status = 'attached', owner_type = 'order', owner_id = ${orderId}, owner_parent_id = ${orderId}, uploaded_at = now() where id = ${attachmentId}`;
+        await tx`insert into shipments (id, tenant_id, warehouse_id, order_id, client_id, kind, status, carrier_name, tracking_number, label_attachment_id, labelled_by, labelled_at, recorded_surface)
+          values (${shipmentId}, ${tenantId}, ${warehouseId}, ${orderId}, ${clientA}, 'client-label', 'labelled', 'Delhivery', 'ISOPROBE01', ${attachmentId}, ${actor}, now(), 'portal')`;
+        await tx`update shipments set status = 'voided', voided_at = now(), voided_by = ${actor}, void_reason = 'Replaced by the client' where id = ${shipmentId}`;
+        await tx`update attachments set status = 'removed', removed_by = ${actor}, removed_at = now(), removed_reason = 'Replaced by the client' where id = ${attachmentId}`;
+        await tx`insert into outbox_messages (id, tenant_id, type, payload, occurred_at) values (${uuidv7()}, ${tenantId}, 'shipment.recorded', ${tx.json({ shipmentId })}, now())`;
+        await tx`insert into audit_events (id, tenant_id, actor_user_id, action, target_type, target_id, reference, occurred_at)
+          values (${uuidv7()}, ${tenantId}, ${actor}, 'shipment.client_label_recorded', 'order', ${orderId}, ${key}, now())`;
+        await tx`insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot) values (${uuidv7()}, ${tenantId}, ${key}, 'probe', ${tx.json({ shipmentId })})`;
+        await tx
+          .savepoint(async (sp) => {
+            await sp`insert into shipments (id, tenant_id, warehouse_id, order_id, client_id, kind, status, carrier_name, tracking_number, labelled_by, labelled_at, recorded_surface)
+              values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${uuidv7()}, ${clientB}, 'courier-label', 'labelled', 'VRL', 'ISOPROBE02', ${actor}, now(), 'portal')`;
+          })
+          .catch((err: unknown) => {
+            refused = err;
+          });
+        throw new Error(ROLLBACK);
+      });
+      await expect(run).rejects.toThrow(ROLLBACK);
+      expect(String((refused as Error | null)?.message)).toMatch(/row-level security/);
+      expect(await sql`select count(*)::int as n from shipments where id = ${shipmentId}`).toEqual([{ n: 0 }]);
+    });
+  });
+
   describe('story 21-8: the service report shapes isolate with RLS alone (joins kept, client literal removed)', () => {
     let probe: postgres.Sql<Record<string, unknown>>;
     const from = new Date(Date.now() - 3 * 86_400_000).toISOString();

@@ -569,7 +569,7 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
 
   it('a recalled lot: the web refuses the whole handover (order-holds-recalled-batch); the handheld hands over the rest and refuses that parcel', async () => {
     await http().post(`${API}/${tenantId}/inventory/adjustments`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid())
-      .send({ warehouseId, skuId: sku.get('A-LOT'), binId, quantityDelta: 5, reasonCode: 'stock-count', note: 'lot seed', batch: { code: 'LOT-RCL-1' } }).expect(201);
+      .send({ warehouseId, skuId: sku.get('A-LOT'), binId, quantityDelta: 1, reasonCode: 'stock-count', note: 'lot seed', batch: { code: 'LOT-RCL-1' } }).expect(201);
     await app.get(InventoryFacade).rebuildReservationCounters(tenantId, warehouseId);
     const recalledOrder = await packedOrder('A-LOT');
     const clean = await packedOrder();
@@ -774,6 +774,10 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
     }).expect(200);
     expect(zpl.body as string).toContain(parcelTagCode(orderId));
     const pdfTag = await http().get(`${API}/${tenantId}/outbound/orders/${orderId}/parcel-tag?format=pdf`).set('Authorization', `Bearer ${opsToken}`).expect(200);
+    // D32 — the tag is 4×2 only: the route takes no size, and any size (or other) parameter is a 400.
+    for (const query of ['size=2x1', 'size=4x2', 'format=png']) {
+      expect((await http().get(`${API}/${tenantId}/outbound/orders/${orderId}/parcel-tag?${query}`).set('Authorization', `Bearer ${opsToken}`).expect(400)).body.code).toBe('validation-failed');
+    }
     expect(pdfTag.headers['content-type']).toContain('application/pdf');
     // The device snapshot carries the parcel.
     const snapshot = await http().get(`${API}/${tenantId}/devices/catalog-snapshot?warehouseId=${warehouseId}`).set('Authorization', `Bearer ${operatorToken}`).expect(200);
@@ -816,9 +820,11 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
         const second = fire();
         const deadline = Date.now() + 10_000;
         for (;;) {
+          // Both duplicates parked: one on the holder, the other on the holder
+          // or behind the first (an upload's second waits on the reservation row).
           const waiting = (await sql`select count(*)::int as n from pg_stat_activity where wait_event_type = 'Lock' and ${holderPid} = any(pg_blocking_pids(pid))`)[0]!.n as number;
-          const chained = (await sql`select count(*)::int as n from pg_stat_activity where wait_event_type = 'Lock' and state = 'active' and query ilike '%"orders"%'`)[0]!.n as number;
-          if (waiting >= 1 && chained >= 2) break;
+          const parked = (await sql`select count(*)::int as n from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock' and state = 'active'`)[0]!.n as number;
+          if (waiting >= 1 && parked >= 2) break;
           if (Date.now() > deadline) throw new Error('the duplicates never parked');
           await new Promise((resolve) => setTimeout(resolve, 50));
         }
@@ -840,6 +846,81 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
     expect(advices.map((res) => res.status)).toEqual([201, 201]);
     expect(advices[1]!.body).toEqual(advices[0]!.body);
     expect((await sql`select count(*)::int as n from shipments where order_id = ${adviceOrder}`)[0]!.n).toBe(1);
+    // The client-label upload: the duplicate reuses the reservation, parks on it, and re-serves.
+    const labelOrderId = await acceptedOrder();
+    const labelKey = ulid();
+    const pdf = await labelPdf(1);
+    const labels = await race(labelOrderId, () => staffLabel(labelOrderId, { awb: 'AWBRACE003', courierName: 'VRL' }, pdf, opsToken, labelKey).then((res) => res));
+    expect(labels.map((res) => res.status)).toEqual([201, 201]);
+    expect(labels[1]!.body).toEqual(labels[0]!.body);
+    expect((await sql`select count(*)::int as n from shipments where order_id = ${labelOrderId}`)[0]!.n).toBe(1);
+    expect((await sql`select count(*)::int as n from attachments where owner_id = ${labelOrderId} and status = 'attached'`)[0]!.n).toBe(1);
+    // The verify: both park on the order, the second re-serves the first's verification.
+    const verifyOrder = await packedOrder();
+    await staffLabel(verifyOrder, { awb: 'AWBRACE004', courierName: 'VRL' }, pdf).expect(201);
+    const verifyKey = ulid();
+    const verifies = await race(verifyOrder, () => verify(verifyOrder, { scannedCode: 'AWBRACE004', method: 'scan' }, opsToken, verifyKey).then((res) => res));
+    expect(verifies.map((res) => res.status)).toEqual([200, 200]);
+    expect(verifies[1]!.body).toEqual(verifies[0]!.body);
+    expect(verifies[0]!.body.verified).toBe(true);
+    expect((await sql`select count(*)::int as n from audit_events where tenant_id = ${tenantId} and reference = ${verifyKey}`)[0]!.n).toBe(1);
+  });
+
+  it('no deadlock: a recall opened while a handover is parked on its order, and a per-order dispatch drawing the same lot run beside a handover — every request completes, none is 40P01 or 500', async () => {
+    await http().post(`${API}/${tenantId}/inventory/adjustments`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid())
+      .send({ warehouseId, skuId: sku.get('A-LOT'), binId, quantityDelta: 20, reasonCode: 'stock-count', note: 'deadlock seed', batch: { code: 'LOT-DL-1' } }).expect(201);
+    await app.get(InventoryFacade).rebuildReservationCounters(tenantId, warehouseId);
+    const lot = (await sql`select id from batches where tenant_id = ${tenantId} and sku_id = ${sku.get('A-LOT')!} and code = 'LOT-DL-1'`)[0]!.id as string;
+    // 1. Two real connections interleaved: the handover parks on its order (a
+    // holder), the recall locks the lot FOR UPDATE and commits, then the
+    // handover resumes, key-shares the lot and sees the recall.
+    const parkedOrder = await packedOrder('A-LOT');
+    // Packed before the recall (a recalled lot is not reservable afterwards).
+    const other = await packedOrder('A-LOT');
+    const holder = postgres(process.env.DATABASE_URL!, { max: 1, onnotice: () => undefined });
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => (releaseHolder = resolve));
+    let holderPid = 0;
+    let holding!: Promise<unknown>;
+    await new Promise<void>((resolve) => {
+      holding = holder.begin(async (tx) => {
+        holderPid = Number((await tx`select pg_backend_pid() as pid`)[0]!.pid);
+        await tx`select id from orders where id = ${parkedOrder} for update`;
+        resolve();
+        await held;
+      });
+    });
+    const handover = handOver({ parcels: [{ orderId: parkedOrder, awb: 'AWBDEAD001' }] }).then((res) => res);
+    for (const deadline = Date.now() + 10_000; ; ) {
+      const n = (await sql`select count(*)::int as n from pg_stat_activity where ${holderPid} = any(pg_blocking_pids(pid))`)[0]!.n as number;
+      if (n >= 1) break;
+      if (Date.now() > deadline) throw new Error('the handover never parked');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const recall = await http().post(`${API}/${tenantId}/inventory/recalls`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+      .send({ batchIds: [lot], reasonNote: 'deadlock probe', mode: 'live' });
+    releaseHolder();
+    await holding;
+    await holder.end();
+    const handed = await handover;
+    expect(recall.status).toBe(201);
+    expect(handed.status).toBe(409);
+    expect(handed.body.parcels.map((p: { code: string }) => p.code)).toEqual(['order-holds-recalled-batch']);
+    // 2. Free-running: a handover and a per-order dispatch of another order
+    // holding the same (recalled) lot, and a recall close racing them.
+    const third = await packedOrder();
+    const results = await Promise.all([
+      handOver({ parcels: [{ orderId: third, awb: 'AWBDEAD002' }] }).then((res) => res),
+      http().post(`${API}/${tenantId}/outbound/orders/${other}/dispatch`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({}).then((res) => res),
+      handOver({ parcels: [{ orderId: parkedOrder, awb: 'AWBDEAD001' }] }).then((res) => res),
+    ]);
+    for (const res of results) {
+      expect(res.status).not.toBe(500);
+      expect(JSON.stringify(res.body)).not.toContain('40P01');
+    }
+    expect(results[0]!.status).toBe(201);
+    expect(results[1]!.body.code).toBe('order-holds-recalled-batch');
+    expect(results[2]!.body.code).toBe('handover-parcels-refused');
   });
 
   it('A44 — the portal status derivation', () => {
