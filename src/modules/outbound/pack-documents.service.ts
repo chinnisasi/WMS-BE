@@ -11,6 +11,7 @@ import type { ShippingLabel } from '../../shared/labels/shipping/fields';
 import { renderShippingLabelsPdf } from '../../shared/labels/shipping/pdf';
 import { thermalSlipLabelCount, thermalSlipLabels } from '../../shared/labels/shipping/thermal-slip';
 import { renderShippingLabelsZpl } from '../../shared/labels/shipping/zpl';
+import { UUID_RE } from '../../shared/primitives/ids';
 import { orderLabelOf } from '../../shared/primitives/order-label';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
@@ -22,7 +23,6 @@ import { orderNotPacked } from './cartons.read';
 import { packDocumentInTx, type PackDocument } from './pack-documents.read';
 import { layoutPackingSlip, packDocumentFileStem, type PackingSlipAudience } from './packing-slip.layout';
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type PackFileFormat = 'pdf' | 'zpl';
 export type PackFileLayout = 'a4' | 'label';
@@ -103,6 +103,23 @@ function tooManyLabels(count: number, firstCartons: string): ProblemException {
   );
 }
 
+/**
+ * A48 — the thermal slips of `cartons` print in one go only within `MAX_LABELS_PER_PRINT`; past it,
+ * 422 `too-many-labels` naming the leading cartons that fit (or the first carton alone).
+ */
+export function assertThermalSlipPrintFits(cartons: readonly { readonly seq: number; readonly lines: readonly unknown[] }[]): void {
+  const count = cartons.reduce((sum, carton) => sum + thermalSlipLabelCount(carton.lines.length), 0);
+  if (count <= MAX_LABELS_PER_PRINT) return;
+  let running = 0;
+  const fits: number[] = [];
+  for (const carton of cartons) {
+    running += thermalSlipLabelCount(carton.lines.length);
+    if (running > MAX_LABELS_PER_PRINT) break;
+    fits.push(carton.seq);
+  }
+  throw tooManyLabels(count, fits.length === 0 ? String(cartons[0]!.seq) : fits.join(','));
+}
+
 /** The 4×6 carton label of each selected carton (A16; COD on carton 1 only — decision 6). */
 export function cartonLabelsOf(doc: PackDocument, cartons: PackDocument['cartons']): ShippingLabel[] {
   const shipper = labelShipperOf(doc.client.name, doc.warehouse);
@@ -136,7 +153,8 @@ export function thermalSlipsOf(doc: PackDocument, cartons: PackDocument['cartons
       consigneeName: doc.consignee.contactName,
       city: doc.consignee.city,
       pincode: doc.consignee.pincode,
-      rows: carton.lines.map((line) => ({ skuCode: line.skuCode, skuName: line.skuName, qty: line.qty, uom: line.uom })),
+      rows: carton.lines.map((line) => ({ skuCode: line.skuCode, skuName: line.skuName, qty: line.qty, qtyText: line.qtyText, uom: line.uom })),
+      totalsText: carton.totals,
     }),
   );
 }
@@ -208,21 +226,14 @@ export class PackDocumentsService {
     const doc = await this.staffDocument(tenantId, orderId, PACKED_STATUSES);
     const stem = packDocumentFileStem(doc.orderLabel);
     if (query.layout === 'a4') {
+      // The A4 slip is the whole order — a carton subset is a thermal-slip filter only (never silently ignored).
+      if (query.cartons !== null) {
+        throw new ProblemException('validation-failed', 400, 'Invalid query', 'cartons selects thermal slips — send layout=label, or drop cartons for the A4 slip.');
+      }
       return { filename: `${stem}-packing-slip.pdf`, contentType: 'application/pdf', body: await packingSlipPdf(doc, 'staff') };
     }
     const cartons = selectCartons(doc, query.cartons);
-    const count = cartons.reduce((sum, carton) => sum + thermalSlipLabelCount(carton.lines.length), 0);
-    if (count > MAX_LABELS_PER_PRINT) {
-      // Name the leading cartons that fit in one print.
-      let running = 0;
-      const fits: number[] = [];
-      for (const carton of cartons) {
-        running += thermalSlipLabelCount(carton.lines.length);
-        if (running > MAX_LABELS_PER_PRINT) break;
-        fits.push(carton.seq);
-      }
-      throw tooManyLabels(count, fits.length === 0 ? String(cartons[0]!.seq) : fits.join(','));
-    }
+    assertThermalSlipPrintFits(cartons);
     const labels = thermalSlipsOf(doc, cartons);
     return query.format === 'zpl'
       ? { filename: `${stem}-carton-slips.zpl`, contentType: 'text/plain; charset=us-ascii', body: Buffer.from(renderShippingLabelsZpl(labels), 'ascii') }
@@ -244,8 +255,8 @@ export class PackDocumentsService {
   async cartonLabelsFile(tenantId: string, actorUserId: string, orderId: string, query: PackFileQuery): Promise<PackDocumentFile> {
     await this.assertCanPrintCartonLabels(tenantId, actorUserId);
     const doc = await this.staffDocument(tenantId, orderId, new Set(['ready_to_dispatch']));
+    // One label per carton, at most 200 cartons — always within MAX_LABELS_PER_PRINT.
     const cartons = selectCartons(doc, query.cartons);
-    if (cartons.length > MAX_LABELS_PER_PRINT) throw tooManyLabels(cartons.length, '1');
     const labels = cartonLabelsOf(doc, cartons);
     const stem = packDocumentFileStem(doc.orderLabel);
     return query.format === 'zpl'

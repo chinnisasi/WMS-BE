@@ -81,6 +81,8 @@ export interface PackDocumentCartonLine {
   readonly uom: string;
   /** Base units. */
   readonly qty: number;
+  /** The quantity at its UoM's precision — the one formatter every printed quantity uses (`formatQuantity`). */
+  readonly qtyText: string;
   readonly handlingUnitIds: readonly string[] | null;
 }
 
@@ -94,11 +96,16 @@ export interface PackDocumentCarton {
   readonly totals: string;
 }
 
-/** The order's shortfall: none, still to follow (before dispatch), or the named follow-on (after it — A36). */
+/**
+ * The order's shortfall: none; still to follow (before dispatch); the named live follow-on (after it —
+ * A36); or, after dispatch with no live follow-on (a remainder below the follow-on minimum, a partial
+ * kit, a follow-on later cancelled), not shipped — the slip never promises goods that will not come.
+ */
 export type PackDocumentShortfall =
   | { readonly kind: 'none' }
   | { readonly kind: 'pending'; readonly totals: string }
-  | { readonly kind: 'follow-on'; readonly totals: string; readonly followOnLabel: string };
+  | { readonly kind: 'follow-on'; readonly totals: string; readonly followOnLabel: string }
+  | { readonly kind: 'not-shipped'; readonly totals: string };
 
 export interface PackDocument {
   readonly orderId: string;
@@ -309,12 +316,16 @@ export async function packDocumentInTx(
           and(
             eq(orders.tenantId, tenantId),
             eq(orders.followOnOfOrderId, order.id),
+            ne(orders.status, 'cancelled'),
             ...(options.clientId === undefined ? [] : [eq(orders.clientId, options.clientId)]),
           ),
         )
         .orderBy(asc(orders.followOnSeq))
         .limit(1);
-      if (followOn[0] !== undefined) shortfall = { kind: 'follow-on', totals: shortTotals, followOnLabel: orderLabelOf(followOn[0]) };
+      shortfall =
+        followOn[0] !== undefined
+          ? { kind: 'follow-on', totals: shortTotals, followOnLabel: orderLabelOf(followOn[0]) }
+          : { kind: 'not-shipped', totals: shortTotals };
     }
   }
 
@@ -331,7 +342,15 @@ export async function packDocumentInTx(
       code: carton.code,
       weightGrams: carton.weightGrams,
       dimensionsMm: carton.dimensionsMm,
-      lines: cartonLines.map((line) => ({ skuId: line.skuId, skuCode: line.skuCode, skuName: line.skuName, uom: line.uom, qty: line.qty, handlingUnitIds: line.handlingUnitIds })),
+      lines: cartonLines.map((line) => ({
+        skuId: line.skuId,
+        skuCode: line.skuCode,
+        skuName: line.skuName,
+        uom: line.uom,
+        qty: line.qty,
+        qtyText: formatQuantity(line.milli, uomPrecision(line.uom)),
+        handlingUnitIds: line.handlingUnitIds,
+      })),
       totals: milliTotalsPerUom(cartonLines),
     };
   });

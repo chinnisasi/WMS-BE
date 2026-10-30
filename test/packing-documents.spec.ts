@@ -747,11 +747,15 @@ describe('packing documents: cartons at pack and re-carton (e2e, story 4-5a)', (
     expect(res.body.pack).toMatchObject({ packSeq: 2, legacy: false, partiesFrozen: true });
     const packs = await packRows(orderId);
     expect(packs.map((row) => [row.seq, row.status])).toEqual([[2, 'live']]);
-    const history = (await cartonsRead(orderId).expect(200)).body.history as { packSeq: number; status: string }[];
+    const history = (await cartonsRead(orderId).expect(200)).body.history as { packSeq: number; status: string; endedAt: string | null; endedBy: string | null; endReason: string | null }[];
     expect(history.map((h) => [h.packSeq, h.status])).toEqual([
       [2, 'live'],
       [1, 'superseded'],
     ]);
+    // Review: the virtual pack's end is the re-carton that ended it — its instant, actor and reason.
+    const opsUser = (await sql`select id from users where tenant_id = ${tenantId} and email like 'ops_manager-%'`) as unknown as { id: string }[];
+    expect(history[1]).toMatchObject({ endedBy: opsUser[0]!.id, endReason: 'Box split at the dock' });
+    expect(history[1]!.endedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
   it('cancel with restock cancels the live pack; the cartons read shows it cancelled', async () => {

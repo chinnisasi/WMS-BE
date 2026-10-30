@@ -5,8 +5,8 @@ import { renderShippingLabelsZpl } from '../../shared/labels/shipping/zpl';
 import { pdfPagesText } from '../../../test/support/pdf-text';
 import { parseZplLabels, readPdfLabels, zplTexts } from '../../../test/support/labels';
 import type { PackDocument, PackDocumentLine } from './pack-documents.read';
-import { SLIP_FOOTER_TOP, SLIP_PARTIES_LIVE, layoutPackingSlip, packDocumentFileStem, shortfallSentence } from './packing-slip.layout';
-import { cartonLabelsOf, packingSlipPdf, parsePackFileQuery, thermalSlipsOf } from './pack-documents.service';
+import { SLIP_FOOTER_TOP, SLIP_PARTIES_LIVE, fittedList, layoutPackingSlip, packDocumentFileStem, shortfallSentence } from './packing-slip.layout';
+import { assertThermalSlipPrintFits, cartonLabelsOf, packingSlipPdf, parsePackFileQuery, thermalSlipsOf } from './pack-documents.service';
 
 /**
  * Story 4-5a (A17, A18, A35, A36, A48) — the packing slip's layout, golden per
@@ -93,7 +93,7 @@ function doc(over: Partial<PackDocument> = {}): PackDocument {
         code: `${TAG}.1.1`,
         weightGrams: 3200,
         dimensionsMm: { lengthMm: 400, widthMm: 300, heightMm: 200 },
-        lines: [{ skuId: 'a', skuCode: 'SKU-1', skuName: 'Item 1', uom: 'EA', qty: 6, handlingUnitIds: null }],
+        lines: [{ skuId: 'a', skuCode: 'SKU-1', skuName: 'Item 1', uom: 'EA', qty: 6, qtyText: '6', handlingUnitIds: null }],
         totals: '6 EA',
       },
       {
@@ -102,17 +102,17 @@ function doc(over: Partial<PackDocument> = {}): PackDocument {
         weightGrams: 2800,
         dimensionsMm: null,
         lines: [
-          { skuId: 'a', skuCode: 'SKU-1', skuName: 'Item 1', uom: 'EA', qty: 4, handlingUnitIds: null },
-          { skuId: 'b', skuCode: 'SKU-2', skuName: 'Item 2', uom: 'KG', qty: 2.5, handlingUnitIds: ['0190aaaa-0000-7000-8000-000000000001'] },
+          { skuId: 'a', skuCode: 'SKU-1', skuName: 'Item 1', uom: 'EA', qty: 4, qtyText: '4', handlingUnitIds: null },
+          { skuId: 'b', skuCode: 'SKU-2', skuName: 'Item 2', uom: 'KG', qty: 2.5, qtyText: '2.500', handlingUnitIds: ['0190aaaa-0000-7000-8000-000000000001'] },
         ],
-        totals: '4 EA, 2.5 KG',
+        totals: '4 EA, 2.500 KG',
       },
     ],
     lines: [
       line(1, { batches: [{ code: 'B-001', expiryDate: '2027-03-31' }] }),
-      line(2, { uom: 'KG', ordered: '2.5', packed: '2.5', serials: ['S1', 'S2'] }),
+      line(2, { uom: 'KG', ordered: '2.500', packed: '2.500', serials: ['S1', 'S2'] }),
     ],
-    totals: '10 EA, 2.5 KG',
+    totals: '10 EA, 2.500 KG',
     shortfall: { kind: 'none' },
     annotations: [],
     ...over,
@@ -156,7 +156,7 @@ describe('layoutPackingSlip (A17, A35)', () => {
     expect(text).toContain('Serials: S1, S2');
     expect(text).toContain('Payment COD Rs 1,250.00');
     expect(text).toContain('Courier Delhivery · AWB 123456789012');
-    expect(text).toContain('Packed 10 EA, 2.5 KG');
+    expect(text).toContain('Packed 10 EA, 2.500 KG');
     expect(text).not.toContain('9876543210');
   });
 
@@ -211,6 +211,12 @@ describe('layoutPackingSlip (A17, A35)', () => {
     expect(shortfallSentence(after)).toBe('4 EA on backorder will follow as order SO-1-BO1.');
     expect(allText(layoutPackingSlip(before, { audience: 'staff' }))).toContain('Items not in this shipment will follow separately');
     expect(allText(layoutPackingSlip(after, { audience: 'client' }))).toContain('will follow as order SO-1-BO1');
+    // Review: dispatched short with no live follow-on (below the minimum, a partial kit, or cancelled) — never promised.
+    const none = doc({ lines: shortLines, orderStatus: 'dispatched', shortfall: { kind: 'not-shipped', totals: '4 EA' } });
+    expect(shortfallSentence(none)).toBe('4 EA were not shipped.');
+    const noneText = allText(layoutPackingSlip(none, { audience: 'client' }));
+    expect(noneText).toContain('4 EA were not shipped.');
+    expect(noneText).not.toContain('will follow');
     expect(allText(layoutPackingSlip(before, { audience: 'staff' }))).not.toContain('SO-1-BO1');
   });
 
@@ -274,7 +280,7 @@ describe('the drawn files', () => {
   });
 
   it('a carton of 30 SKUs prints three thermal slips 1/3…3/3; rows per carton only', () => {
-    const lines = Array.from({ length: 30 }, (_, i) => ({ skuId: `s${i}`, skuCode: `SKU-${String(i).padStart(2, '0')}`, skuName: `Item ${i}`, uom: 'EA', qty: 1, handlingUnitIds: null }));
+    const lines = Array.from({ length: 30 }, (_, i) => ({ skuId: `s${i}`, skuCode: `SKU-${String(i).padStart(2, '0')}`, skuName: `Item ${i}`, uom: 'EA', qty: 1, qtyText: '1', handlingUnitIds: null }));
     const d = doc({ cartonCount: 1, cartons: [{ seq: 1, code: `${TAG}.1.1`, weightGrams: null, dimensionsMm: null, lines, totals: '30 EA' }] });
     const slips = thermalSlipsOf(d, d.cartons);
     expect(slips).toHaveLength(3);
@@ -319,7 +325,75 @@ describe('parsePackFileQuery (A48)', () => {
   });
 });
 
-const STAFF_GOLDEN = 'c4939bebdefdb99fdebea2803c110ddb9b50c661ab71e69868a3f8a3f88e30fd';
-const CLIENT_GOLDEN = 'c5b8bc29d169efaac5c513c6fbb42a23aa20bdc301f9d8e05e9f5f11bc1fdbdd';
-const KIT_SHORT_BEFORE_GOLDEN = '8d68b1c50f4f431a137483d70fb503feebe6cdad0598d08e93eba8fdbe9eb92a';
-const KIT_SHORT_AFTER_GOLDEN = '5d39a006987c46a382b9e3d9ad784d892932dfa8c87bde70b507a846054867b2';
+describe('review — what fits is printed, the remainder is counted', () => {
+  it('serials: as many as fit in two lines, then the TRUE remainder (never cut by an ellipsis)', () => {
+    const serials = Array.from({ length: 20 }, (_, i) => `SERIAL-NUMBER-${String(i).padStart(4, '0')}`);
+    const pages = layoutPackingSlip(doc({ lines: [line(1, { serials, moreSerials: 5 })] }), { audience: 'staff' });
+    const row = allText(pages)
+      .split('\n')
+      .filter((text) => text.startsWith('Serials:') || /^SERIAL-NUMBER|\(\+\d+ more\)$/.test(text))
+      .join(' ');
+    const shown = (row.match(/SERIAL-NUMBER-\d{4}/g) ?? []).length;
+    expect(shown).toBeGreaterThan(0);
+    expect(shown).toBeLessThan(20);
+    expect(row).toContain(`(+${20 - shown + 5} more)`);
+    expect(row).not.toContain('…');
+  });
+
+  it('fittedList keeps everything when it fits and names cases', () => {
+    expect(fittedList('Cases (A): ', ['c1', 'c2'], 0, (n) => `+${n} more cases`, 7, 275, 2)).toBe('Cases (A): c1, c2');
+    const ids = Array.from({ length: 40 }, (_, i) => `0190aaaa-0000-7000-8000-${String(i).padStart(12, '0')}`);
+    const text = fittedList('Cases (A): ', ids, 0, (n) => `+${n} more cases`, 7, 275, 2);
+    const shown = text.split(', ').length;
+    expect(text).toMatch(new RegExp(`\\+${40 - shown} more cases$`));
+  });
+
+  it('a long order label never overruns the title; multi-UoM carton totals wrap rather than cut', () => {
+    const longLabel = `${'R'.repeat(64)}-BO2`;
+    const pages = layoutPackingSlip(
+      doc({ orderLabel: longLabel, cartons: [{ ...doc().cartons[1]!, totals: '4 EA, 2.500 KG, 12.000 LTR, 7 BOX, 3 PAIR' }] , cartonCount: 1 }),
+      { audience: 'staff' },
+    );
+    const first = pages[0]!.runs;
+    const title = first.find((run) => run.text === 'Packing slip')!;
+    const labelRuns = first.filter((run) => run.size === 12 && run.y > title.y - 30);
+    expect(labelRuns.length).toBeGreaterThan(0);
+    for (const run of labelRuns) expect(run.x).toBeGreaterThan(title.x + 90);
+    const text = allText(pages);
+    for (const part of ['4 EA', '2.500 KG', '12.000 LTR', '7 BOX', '3 PAIR']) expect(text).toContain(part);
+  });
+});
+
+describe('assertThermalSlipPrintFits (A48)', () => {
+  const carton = (seq: number, rows: number) => ({ seq, lines: Array.from({ length: rows }) });
+  it('passes within the cap and refuses past it naming the leading cartons that fit', () => {
+    expect(() => assertThermalSlipPrintFits([carton(1, 12), carton(2, 24)])).not.toThrow();
+    // 200 cartons × 72 rows = 6 labels each = 1,200 labels; 166 cartons fit (996 labels).
+    const many = Array.from({ length: 200 }, (_, i) => carton(i + 1, 72));
+    let thrown: ProblemException | null = null;
+    try {
+      assertThermalSlipPrintFits(many);
+    } catch (err) {
+      thrown = err as ProblemException;
+    }
+    expect(thrown?.getStatus()).toBe(422);
+    const body = thrown!.getResponse() as { code: string; detail: string; extensions: { count: number } };
+    expect(body.code).toBe('too-many-labels');
+    expect(body.extensions.count).toBe(1200);
+    expect(body.detail).toContain(`cartons=${Array.from({ length: 166 }, (_, i) => i + 1).join(',')}`);
+  });
+  it('a single carton over the cap names that carton alone', () => {
+    let thrown: ProblemException | null = null;
+    try {
+      assertThermalSlipPrintFits([carton(7, 12_100)]);
+    } catch (err) {
+      thrown = err as ProblemException;
+    }
+    expect((thrown!.getResponse() as { detail: string }).detail).toContain('cartons=7.');
+  });
+});
+
+const STAFF_GOLDEN = 'b84081501a4fcc63f8eb53fd009df4d2ab651d3dbf403b473f597e53719e9cab';
+const CLIENT_GOLDEN = '7b56fbb499a915821862ebf928a175670b205aa5c36815171053dcc71dc3cec1';
+const KIT_SHORT_BEFORE_GOLDEN = '96ab92da025f57599119f80d03198b67765f0c0ff81946504cdcaf0c025e39c5';
+const KIT_SHORT_AFTER_GOLDEN = '9def05eb3115047cec2234553672915092cfedfcb639f9929930f02f162fb3d5';

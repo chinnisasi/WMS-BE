@@ -28,6 +28,8 @@ export interface ThermalSlipRow {
   readonly skuName: string;
   /** Base units. */
   readonly qty: number;
+  /** The quantity as the document prints it (its UoM's precision); else `qty` formatted here. */
+  readonly qtyText?: string;
   readonly uom: string;
 }
 
@@ -39,6 +41,8 @@ export interface ThermalSlipInput {
   readonly city: string;
   readonly pincode: string;
   readonly rows: readonly ThermalSlipRow[];
+  /** The carton's per-UoM totals as the document prints them (exact, from milli-units); else summed here. */
+  readonly totalsText?: string;
 }
 
 /** `12 EA, 2.5 KG` — one total per UoM, in first-seen (sorted-row) order. */
@@ -95,7 +99,7 @@ export function thermalSlipLabels(input: ThermalSlipInput): ShippingLabel[] {
       const y = 272 + index * ROW_PITCH;
       const code = singleText('rows', X, y, 32, QTY_X - X - 12, row.skuCode, true);
       if (code !== null) fields.push(code);
-      const qty = singleText('rows', QTY_X, y, 32, X + W - QTY_X, `${formatLabelQuantity(row.qty)} ${row.uom}`, true);
+      const qty = singleText('rows', QTY_X, y, 32, X + W - QTY_X, `${row.qtyText ?? formatLabelQuantity(row.qty)} ${row.uom}`, true);
       if (qty !== null) fields.push(qty);
       const name = singleText('rows', X, y + 36, 24, W, row.skuName);
       if (name !== null) fields.push(name);
@@ -109,7 +113,7 @@ export function thermalSlipLabels(input: ThermalSlipInput): ShippingLabel[] {
           1124,
           W,
           [
-            { h: 24, lines: fitText(`Total ${totalsPerUom(rows)}`, 24, W, 1), bold: true },
+            { h: 24, lines: fitText(`Total ${input.totalsText ?? totalsPerUom(rows)}`, 24, W, 1), bold: true },
             { h: 24, lines: fitText('Not a tax invoice', 24, W, 1) },
           ],
           FIELD_GAP_DOTS,

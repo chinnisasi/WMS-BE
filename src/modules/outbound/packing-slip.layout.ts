@@ -119,7 +119,6 @@ class Flow {
   }
 
   table(title: string, columns: readonly Column[], rows: readonly Row[]): void {
-    const lineHeight = TABLE * LEADING;
     const wrapRow = (cells: readonly string[], fontName: 'regular' | 'bold', size: number) =>
       cells.map((cell, index) => {
         const column = columns[index]!;
@@ -169,7 +168,6 @@ class Flow {
       }
       drawRow(row.cells, 'regular', size, ruled ? 0.25 : null);
     });
-    void lineHeight;
   }
 }
 
@@ -248,6 +246,7 @@ export function shortfallSentence(doc: Pick<PackDocument, 'shortfall'>): string 
   const { shortfall } = doc;
   if (shortfall.kind === 'none') return null;
   if (shortfall.kind === 'pending') return `${SLIP_SHORT_PENDING} (short: ${shortfall.totals}).`;
+  if (shortfall.kind === 'not-shipped') return `${shortfall.totals} were not shipped.`;
   return `${shortfall.totals} on backorder will follow as order ${shortfall.followOnLabel}.`;
 }
 
@@ -271,29 +270,67 @@ function lineRows(line: PackDocumentLine): Row[] {
   }
   if (line.moreBatches > 0) rows.push({ sub: true, cells: ['', '', `+${line.moreBatches} more batches`, '', '', '', ''] });
   if (line.serials.length > 0) {
-    const more = line.moreSerials > 0 ? ` … (+${line.moreSerials} more)` : '';
-    rows.push({ sub: true, cells: ['', '', `Serials: ${line.serials.join(', ')}${more}`, '', '', '', ''] });
+    const text = fittedList('Serials: ', line.serials, line.moreSerials, (n) => `(+${n} more)`, SMALL, ITEMS_DESCRIPTION_WIDTH - 4, ITEMS_DESCRIPTION_LINES);
+    rows.push({ sub: true, cells: ['', '', text, '', '', '', ''] });
   }
   return rows;
 }
 
+const ITEMS_DESCRIPTION_WIDTH = 225;
+const ITEMS_DESCRIPTION_LINES = 2;
+const CARTON_DESCRIPTION_WIDTH = 279;
+const CARTON_DESCRIPTION_LINES = 2;
+
+/**
+ * `{prefix}a, b, c {tail(N)}` with as many items as fit in `maxLines` lines of `width` uncut,
+ * N being the true remainder (the items left out plus `alreadyMore`) — never an ellipsis that
+ * swallows the count (review).
+ */
+export function fittedList(
+  prefix: string,
+  items: readonly string[],
+  alreadyMore: number,
+  tail: (remainder: number) => string,
+  size: number,
+  width: number,
+  maxLines: number,
+): string {
+  const compose = (kept: number) => {
+    const remainder = items.length - kept + alreadyMore;
+    const body = items.slice(0, kept).join(', ');
+    return `${prefix}${body}${remainder > 0 ? `${body === '' ? '' : ' '}${tail(remainder)}` : ''}`;
+  };
+  const fits = (text: string) => wrapText(documentText(text, regular), regular, size, width, maxLines + 1).length <= maxLines;
+  for (let kept = items.length; kept > 0; kept -= 1) {
+    const text = compose(kept);
+    if (fits(text)) return text;
+  }
+  return compose(0);
+}
+
 export function layoutPackingSlip(doc: PackDocument, options: { readonly audience: PackingSlipAudience }): DocumentPage[] {
   const staff = options.audience === 'staff';
-  const label = documentText(doc.orderLabel, bold);
+  const title = documentText('Packing slip', bold);
+  // The order label takes the room the title leaves (a 64-character ref + a -BO suffix wraps, then cuts).
+  const labelRoom = CONTENT_WIDTH - bold.widthOfTextAtSize(title, 16) - 12;
+  const labelLines = wrapText(documentText(doc.orderLabel, bold), bold, 12, labelRoom, 2);
+  // The staff stamp clears the parcel-tag barcode and its text, measured — not a hand-picked margin.
+  const barWidth = encodeCode128B(doc.parcelTag).reduce((sum, width) => sum + width, 0) * BAR_MODULE_PT;
+  const tagText = documentText(doc.parcelTag, regular);
+  const barClearance = Math.max(barWidth, regular.widthOfTextAtSize(tagText, SMALL)) + 12;
 
   // ── the header, on every page ────────────────────────────────────────────
   const header = (flow: Flow) => {
-    flow.run(MARGIN, flow.y - 16, 16, 'bold', documentText('Packing slip', bold));
-    flow.run(MARGIN + CONTENT_WIDTH - bold.widthOfTextAtSize(label, 12), flow.y - 14, 12, 'bold', label);
-    flow.gap(16 * LEADING + 2);
+    flow.run(MARGIN, flow.y - 16, 16, 'bold', title);
+    labelLines.forEach((line, index) => {
+      flow.run(MARGIN + CONTENT_WIDTH - bold.widthOfTextAtSize(line, 12), flow.y - 14 - index * 12 * LEADING, 12, 'bold', line);
+    });
+    flow.gap(Math.max(16 * LEADING, 14 + (labelLines.length - 1) * 12 * LEADING + 4) + 2);
     if (staff) {
       // The parcel tag's barcode, right-aligned, its quiet zones left free.
-      const modules = encodeCode128B(doc.parcelTag).reduce((sum, width) => sum + width, 0);
-      const width = modules * BAR_MODULE_PT;
-      const x = MARGIN + CONTENT_WIDTH - width;
+      const x = MARGIN + CONTENT_WIDTH - barWidth;
       flow.page.barcodes.push({ x, y: flow.y - BAR_HEIGHT_PT, height: BAR_HEIGHT_PT, moduleWidth: BAR_MODULE_PT, payload: doc.parcelTag });
-      const tag = documentText(doc.parcelTag, regular);
-      flow.run(MARGIN + CONTENT_WIDTH - regular.widthOfTextAtSize(tag, SMALL), flow.y - BAR_HEIGHT_PT - SMALL - 1, SMALL, 'regular', tag);
+      flow.run(MARGIN + CONTENT_WIDTH - regular.widthOfTextAtSize(tagText, SMALL), flow.y - BAR_HEIGHT_PT - SMALL - 1, SMALL, 'regular', tagText);
     }
     const stamp = [
       `Packed ${istLabel(doc.packedAt)}`,
@@ -303,7 +340,7 @@ export function layoutPackingSlip(doc: PackDocument, options: { readonly audienc
     ]
       .filter((part): part is string => part !== null)
       .join(' · ');
-    const stampLines = wrapText(documentText(stamp, regular), regular, BODY, staff ? CONTENT_WIDTH - 180 : CONTENT_WIDTH, 2);
+    const stampLines = wrapText(documentText(stamp, regular), regular, BODY, staff ? CONTENT_WIDTH - barClearance : CONTENT_WIDTH, 2);
     stampLines.forEach((line, index) => flow.run(MARGIN, flow.y - BODY - index * BODY * LEADING, BODY, 'regular', line));
     flow.gap(Math.max(stampLines.length * BODY * LEADING, staff ? BAR_HEIGHT_PT + SMALL + 3 : 0) + 6);
     flow.rule(MARGIN, flow.y, MARGIN + CONTENT_WIDTH, flow.y, 0.75);
@@ -354,7 +391,7 @@ export function layoutPackingSlip(doc: PackDocument, options: { readonly audienc
   const columns: Column[] = [
     { header: '#', width: 18, align: 'right', maxLines: 1 },
     { header: 'SKU', width: 80, align: 'left', maxLines: 3 },
-    { header: 'Description', width: 225, align: 'left', maxLines: 2 },
+    { header: 'Description', width: ITEMS_DESCRIPTION_WIDTH, align: 'left', maxLines: ITEMS_DESCRIPTION_LINES },
     { header: 'UoM', width: 34, align: 'left', maxLines: 1 },
     { header: 'Ordered', width: 56, align: 'right', maxLines: 1 },
     { header: 'Packed', width: 56, align: 'right', maxLines: 1 },
@@ -370,15 +407,25 @@ export function layoutPackingSlip(doc: PackDocument, options: { readonly audienc
   // ── the cartons ──────────────────────────────────────────────────────────
   const cartonColumns: Column[] = [
     { header: 'SKU', width: 98, align: 'left', maxLines: 3 },
-    { header: 'Description', width: 279, align: 'left', maxLines: 2 },
-    { header: 'Qty', width: CONTENT_WIDTH - 377, align: 'right', maxLines: 1 },
+    { header: 'Description', width: CARTON_DESCRIPTION_WIDTH, align: 'left', maxLines: CARTON_DESCRIPTION_LINES },
+    // Multi-UoM totals wrap rather than cut (review).
+    { header: 'Qty', width: CONTENT_WIDTH - 377, align: 'right', maxLines: 3 },
   ];
   for (const carton of doc.cartons) {
-    const rows: Row[] = carton.lines.map((line) => ({ cells: [line.skuCode, line.skuName, `${formatSlipQty(line.qty)} ${line.uom}`] }));
+    const rows: Row[] = carton.lines.map((line) => ({ cells: [line.skuCode, line.skuName, `${line.qtyText} ${line.uom}`] }));
     if (staff) {
       for (const line of carton.lines) {
         if (line.handlingUnitIds !== null && line.handlingUnitIds.length > 0) {
-          rows.push({ sub: true, cells: ['', `Cases (${line.skuCode}): ${line.handlingUnitIds.join(', ')}`, ''] });
+          const text = fittedList(
+            `Cases (${line.skuCode}): `,
+            line.handlingUnitIds,
+            0,
+            (n) => `+${n} more cases`,
+            SMALL,
+            CARTON_DESCRIPTION_WIDTH - 4,
+            CARTON_DESCRIPTION_LINES,
+          );
+          rows.push({ sub: true, cells: ['', text, ''] });
         }
       }
     }
@@ -410,11 +457,6 @@ export function layoutPackingSlip(doc: PackDocument, options: { readonly audienc
     page.runs.push({ x: MARGIN + CONTENT_WIDTH - regular.widthOfTextAtSize(pageNo, SMALL), y: FOOTER_BASELINE, size: SMALL, font: 'regular', text: pageNo });
   });
   return flow.pages.map((page) => (page.barcodes.length === 0 ? { runs: page.runs, rules: page.rules } : page));
-}
-
-/** Base units, at most three decimals, no trailing zeros. */
-function formatSlipQty(qty: number): string {
-  return String(Math.round(qty * 1000) / 1000);
 }
 
 /** `{order label, folded}-packing-slip.pdf` (the 2-10b fold to `[A-Za-z0-9._-]`). */

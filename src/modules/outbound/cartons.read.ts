@@ -12,9 +12,9 @@
  * Quantities in the record are milli-units; the views convert at the edge.
  */
 
-import { and, asc, desc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import type { TenantTx } from '../../shared/db/tenant-scope';
-import { orderCartonLines, orderCartons, orderPacks, skus } from '../../shared/db/schema';
+import { auditEvents, orderCartonLines, orderCartons, orderPacks, skus } from '../../shared/db/schema';
 import type { LedgerEvent, OrderCarton, OrderPack } from '../../shared/db/schema';
 import { cartonCode } from '../../shared/primitives/carton-code';
 import { canonicalInstant } from '../../shared/primitives/time';
@@ -253,6 +253,35 @@ export async function packRecordOfOrderInTx(
   return virtualPackOf(order.id, order.status, await ledgerEvents(tx, tenantId, order.warehouseId, order.id));
 }
 
+/** The end of a re-cartoned legacy order's virtual pack 1, from the `order.recartoned` audit row that ended it. */
+async function virtualPackEndInTx(
+  tx: TenantTx,
+  tenantId: string,
+  orderId: string,
+): Promise<{ endedAt: string | null; endedBy: string | null; endReason: string | null } | null> {
+  const [row] = await tx
+    .select({ occurredAt: auditEvents.occurredAt, actorUserId: auditEvents.actorUserId, changes: auditEvents.changes })
+    .from(auditEvents)
+    .where(
+      and(
+        eq(auditEvents.tenantId, tenantId),
+        eq(auditEvents.targetType, 'order'),
+        eq(auditEvents.targetId, orderId),
+        eq(auditEvents.action, 'order.recartoned'),
+        sql`${auditEvents.changes}->>'previousPackSeq' = '1'`,
+      ),
+    )
+    .orderBy(asc(auditEvents.occurredAt))
+    .limit(1);
+  if (row === undefined) return null;
+  const changes = (row.changes ?? {}) as { reason?: unknown };
+  return {
+    endedAt: instantOrNull(row.occurredAt),
+    endedBy: row.actorUserId,
+    endReason: typeof changes.reason === 'string' ? changes.reason : null,
+  };
+}
+
 /** The order's pack history, newest first: every stored pack, and the virtual pack 1 of a re-cartoned legacy order. */
 export async function packHistoryOfOrderInTx(
   tx: TenantTx,
@@ -277,13 +306,16 @@ export async function packHistoryOfOrderInTx(
     const virtual = virtualPackOf(order.id, order.status, await ledgerEvents(tx, tenantId, order.warehouseId, order.id));
     if (virtual !== null) {
       const superseded = rows.length > 0;
+      // A virtual pack has no row to carry its end: the re-carton that ended it (the one whose
+      // previous pack was 1) recorded its instant, actor and reason on its audit row.
+      const ended = superseded ? await virtualPackEndInTx(tx, tenantId, order.id) : null;
       history.push({
         seq: 1,
         status: superseded ? 'superseded' : virtual.status,
         cartonCount: 1,
-        endedAt: null,
-        endedBy: null,
-        endReason: null,
+        endedAt: ended?.endedAt ?? null,
+        endedBy: ended?.endedBy ?? null,
+        endReason: ended?.endReason ?? null,
       });
     }
   }

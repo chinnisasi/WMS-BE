@@ -24,9 +24,19 @@ describe('story 4-5a — the thermal slip (A18, A36)', () => {
     expect(t.indexOf('A')).toBeLessThan(t.indexOf('B'));
     expect(t).toContain('12 EA');
     expect(t).toContain('2.5 KG');
-    expect(t).toContain('Total 2.5 KG, 12 EA'.replace('2.5 KG, 12 EA', '12 EA, 2.5 KG'));
+    // Rows sort by SKU code (A before B), so the totals follow that order.
+    expect(t).toContain('Total 12 EA, 2.5 KG');
     expect(t).toContain('Not a tax invoice');
     expect(totalsPerUom([{ qty: 1, uom: 'EA' }, { qty: 0.1, uom: 'KG' }, { qty: 0.2, uom: 'KG' }])).toBe('1 EA, 0.3 KG');
+  });
+
+  it('prints the document’s own quantity and totals text when given (one formatter over milli-units — review)', () => {
+    const labels = thermalSlipLabels(
+      input(1, { rows: [{ skuCode: 'A', skuName: 'Ay', qty: 2.5, qtyText: '2.500', uom: 'KG' }], totalsText: '2.500 KG' }),
+    );
+    const t = texts(labels[0]!);
+    expect(t).toContain('2.500 KG');
+    expect(t).toContain('Total 2.500 KG');
   });
 
   it('30 rows print three continuation labels 1/3…3/3; only the last carries the total (the matrix row)', () => {
