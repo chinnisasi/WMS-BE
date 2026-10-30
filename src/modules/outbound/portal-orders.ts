@@ -57,6 +57,13 @@ export interface PortalOrderRow {
   /** Story 4-4a — the live shipment's AWB and courier; omitted when the order has none. */
   readonly awb?: string;
   readonly courierName?: string;
+  /** Story 4-9a (A22) — the order's truck: its LR, transporter and delivery; omitted when it rode none (or is only planned). */
+  readonly freight?: {
+    readonly lrNumber: string | null;
+    readonly transporterName: string;
+    readonly deliveredAt: string | null;
+    readonly outcome: string | null;
+  };
 }
 
 export interface PortalOrderComponent {
@@ -102,6 +109,10 @@ interface OrderHeaderRow {
   createdAtText: string;
   awb: string | null;
   courierName: string | null;
+  freightLr: string | null;
+  freightTransporter: string | null;
+  freightDeliveredAt: string | null;
+  freightOutcome: string | null;
 }
 
 function headerSelect(tenantId: string): ReturnType<typeof sql> {
@@ -131,8 +142,14 @@ function headerSelect(tenantId: string): ReturnType<typeof sql> {
               limit 1) as "awb",
            (select s.carrier_name from shipments s
               where s.tenant_id = o.tenant_id and s.order_id = o.id and s.client_id = o.client_id and s.status <> 'voided'
-              limit 1) as "courierName"
+              limit 1) as "courierName",
+           fc.lr_number as "freightLr",
+           fc.carriage_snapshot ->> 'transporterName' as "freightTransporter",
+           fc.delivered_at::text as "freightDeliveredAt",
+           fc.delivery_outcome as "freightOutcome"
     from orders o
+    left join freight_consignments fc
+      on fc.tenant_id = o.tenant_id and fc.order_id = o.id and fc.client_id = o.client_id and fc.status = 'dispatched'
     join warehouses w on w.tenant_id = o.tenant_id and w.id = o.warehouse_id
     where o.tenant_id = ${tenantId}::uuid`;
 }
@@ -161,6 +178,16 @@ function toRow(row: OrderHeaderRow): PortalOrderRow {
     createdAt: canonicalInstant(String(row.createdAt)),
     ...(row.awb === null || row.awb === undefined ? {} : { awb: row.awb }),
     ...(row.courierName === null || row.courierName === undefined ? {} : { courierName: row.courierName }),
+    ...(row.freightTransporter === null || row.freightTransporter === undefined
+      ? {}
+      : {
+          freight: {
+            lrNumber: row.freightLr,
+            transporterName: row.freightTransporter,
+            deliveredAt: row.freightDeliveredAt === null ? null : canonicalInstant(row.freightDeliveredAt),
+            outcome: row.freightOutcome,
+          },
+        }),
   };
 }
 

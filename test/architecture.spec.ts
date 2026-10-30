@@ -2666,7 +2666,7 @@ describe('architecture: the client portal (story 21-7)', () => {
     { file: join(SRC_ROOT, 'modules', 'inventory', 'inventory.facade.ts'), methods: ['portalStock'] },
     // Story 4-4a — the order's Shipping section.
     // Story 4-6a (A18) — the order's Tax documents and the needed list.
-    { file: join(SRC_ROOT, 'modules', 'outbound', 'outbound.facade.ts'), methods: ['portalOrders', 'portalOrder', 'portalOrderShipping', 'portalPackingSlip', 'portalOrderConsignment', 'portalConsignmentsNeeded'] },
+    { file: join(SRC_ROOT, 'modules', 'outbound', 'outbound.facade.ts'), methods: ['portalOrders', 'portalOrder', 'portalOrderShipping', 'portalPackingSlip', 'portalOrderConsignment', 'portalConsignmentsNeeded', 'portalFreightNote'] },
     { file: join(SRC_ROOT, 'modules', 'inbound', 'inbound.facade.ts'), methods: ['portalAsns', 'portalAsn', 'portalPurchaseOrders', 'portalPurchaseOrder', 'portalGoodsReceipts', 'portalGoodsReceipt', 'portalGoodsReceiptFile'] },
     { file: join(SRC_ROOT, 'modules', 'billing', 'billing.facade.ts'), methods: ['portalInvoices', 'portalInvoice', 'portalInvoiceNotes', 'portalInvoiceNote'] },
     { file: join(SRC_ROOT, 'modules', 'clients', 'clients.facade.ts'), methods: ['portalMeIn'] },

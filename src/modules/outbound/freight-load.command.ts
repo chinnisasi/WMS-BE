@@ -104,10 +104,10 @@ export interface RecordFreightScanCommand {
   readonly loadId: string;
   readonly packageCode: string | undefined;
   readonly action: string | undefined;
-  readonly occurredAt?: string | null;
-  readonly reason?: string | null;
+  readonly occurredAt?: string | null | undefined;
+  readonly reason?: string | null | undefined;
   /** A55 — the device names its warehouse (from its snapshot). */
-  readonly warehouseId?: string | null;
+  readonly warehouseId?: string | null | undefined;
 }
 
 export interface FreightScanSnapshot {

@@ -1,4 +1,5 @@
 // Story 4-6a (A12) — the record's seam (guide §7h): never the invoicing module.
+import { removeFromFreightOnCancelInTx } from './freight-support';
 import { withdrawConsignmentOnCancelInTx } from '../invoicing/consignment-seam';
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { and, eq, inArray, isNull, ne } from 'drizzle-orm';
@@ -1960,6 +1961,10 @@ export class OrderCommandService {
       const snapshot = await this.snapshotOf(tx, target);
 
       if (winner !== undefined) {
+        // Story 4-9a (A19, D16) — beside the withdrawal: the order's planned
+        // freight consignment is removed and its scans unloaded (order →
+        // consignment, the global lock order).
+        await removeFromFreightOnCancelInTx(tx, { tenantId: command.tenantId, orderId: order.id, actorUserId: command.actorUserId, at: nowIso(), idempotencyKey });
         // Story 4-6a (A21, A38) — the order's live consignment version is
         // withdrawn ("Order cancelled") so its e-way number is free for the
         // brand's re-issue: in THIS (phase-3) transaction, only on the winning

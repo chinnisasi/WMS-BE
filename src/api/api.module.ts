@@ -6,6 +6,7 @@ import { InventoryController } from './inventory.controller';
 import { InboundController } from './inbound.controller';
 import { OutboundController } from './outbound.controller';
 import { ShippingController } from './shipping.controller';
+import { FreightController } from './freight.controller';
 import { ConsignmentController } from './consignment.controller';
 import { ReceivingController } from './receiving.controller';
 import { GateInController } from './gate-in.controller';
@@ -111,6 +112,8 @@ import { RecallsModule } from '../modules/recalls/recalls.module';
     OutboundController,
     // Story 4-4a — client-arranged shipping (the staff and handheld routes).
     ShippingController,
+    // Story 4-9a — B2B freight dispatch.
+    FreightController,
     // Story 4-6a — the order consignment record (staff).
     ConsignmentController,
     ReceivingController,

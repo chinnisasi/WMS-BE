@@ -302,6 +302,9 @@ export class ReceivingController {
     // Story 4-4a (A18, A39): the parcels awaiting a courier — the pack-bench
     // verify and the handover match against them. Same sequential composition.
     const dispatchArm = await this.outbound.getDispatchParcels(tenantId, query.warehouseId);
+    // Story 4-9a (A23, A56, D15): the warehouse's open freight loads — the
+    // Truck loading task. Same sequential composition.
+    const freightArm = await this.outbound.getFreightLoadsForDevice(tenantId, query.warehouseId);
     // Story 1-1: every client a SKU or an open document references — the
     // names the device shows when a scan is another client's, and the blind
     // receipt's picker. Same sequential composition.
@@ -314,6 +317,8 @@ export class ReceivingController {
       ...openClientReturns.map((rtc) => rtc.clientId),
       // Story 4-4a (A39) — every dispatch parcel's client (the handover's "this parcel is BRAND-B's").
       ...dispatchArm.parcels.map((parcel) => parcel.clientId),
+      // Story 4-9a (A23) — every open load's consignments' clients.
+      ...freightArm.loads.flatMap((load) => load.consignments.map((consignment) => consignment.clientId)),
       // Story 1-5b: every bin's dedicated client, so the device can name the
       // client a dedicated bin belongs to when it refuses a scan against it.
       ...snapshot.bins.map((bin) => bin.dedicatedClientId).filter((id): id is string => id !== null),
@@ -355,6 +360,13 @@ export class ReceivingController {
       // Story 4-4a — copied key by key (a mutable DTO array).
       dispatchParcels: dispatchArm.parcels.map((parcel) => ({ ...parcel, shipment: parcel.shipment === null ? null : { ...parcel.shipment } })),
       dispatchParcelsTruncated: dispatchArm.truncated,
+      // Story 4-9a (A23, A56) — copied key by key (a mutable DTO array).
+      freightLoads: freightArm.loads.map((load) => ({
+        ...load,
+        consignments: load.consignments.map((consignment) => ({ ...consignment, ...(consignment.consignment === undefined ? {} : { consignment: { ...consignment.consignment } }) })),
+        loadedCodes: [...load.loadedCodes],
+      })),
+      freightLoadsTruncated: freightArm.truncated,
       // Story 4-5a (A32, D6) — this api records cartons on a pack.
       packCartons: true,
       // Story 2-3a — the open gate-ins, copied key by key (a mutable DTO array).

@@ -1,10 +1,17 @@
+import { FreightService, type DeviceFreightLoad, type FreightCandidate, type FreightCandidatesQuery, type FreightLoadListQuery, type FreightLoadListRow } from './freight.service';
+import type { CancelFreightLoadCommand, CreateFreightLoadCommand, FreightLoadSnapshot, FreightOrdersCommand, FreightScanSnapshot, RecordFreightScanCommand, RemoveFreightOrderCommand, UpdateFreightLoadCommand } from './freight-load.command';
+import type { DispatchFreightLoadCommand, FreightDispatchSnapshot } from './freight-dispatch.command';
+import type { FreightConsignmentSnapshot, RecordFreightDeliveryCommand, RecordFreightLrCommand } from './freight-consignment.command';
+import type { FreightLoadView } from './freight.read';
+import type { UploadLoadingSheetCommand } from './shipping-files.command';
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { and, asc, desc, eq, inArray, isNull, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNotNull, isNull, sql, type SQL } from 'drizzle-orm';
 import { warehouseFilter, type ClientCountScope } from '../../shared/db/warehouse-filter';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { getClientsInTx } from '../clients/clients.facade';
 import {
+  freightConsignments,
   handlingUnits,
   manifests,
   orderLines,
@@ -694,7 +701,95 @@ export class OutboundFacade {
     @Inject(ClientLabelCommand) private readonly clientLabels: ClientLabelCommand,
     @Inject(ShippingFilesCommand) private readonly shippingFiles: ShippingFilesCommand,
     @Inject(ShippingService) private readonly shipping: ShippingService,
+    // Story 4-9a — B2B freight dispatch.
+    @Inject(FreightService) private readonly freight: FreightService,
   ) {}
+
+  // ── story 4-9a: B2B freight dispatch ─────────────────────────────────────
+
+  async createFreightLoad(command: CreateFreightLoadCommand, key: string): Promise<FreightLoadSnapshot> {
+    return this.freight.createLoad(command, key);
+  }
+
+  async updateFreightLoad(command: UpdateFreightLoadCommand, key: string): Promise<FreightLoadSnapshot> {
+    return this.freight.updateLoad(command, key);
+  }
+
+  async addFreightOrders(command: FreightOrdersCommand, key: string): Promise<FreightLoadSnapshot> {
+    return this.freight.addOrders(command, key);
+  }
+
+  async removeFreightOrder(command: RemoveFreightOrderCommand, key: string): Promise<FreightLoadSnapshot> {
+    return this.freight.removeOrder(command, key);
+  }
+
+  async reorderFreightStops(command: FreightOrdersCommand, key: string): Promise<FreightLoadSnapshot> {
+    return this.freight.reorderStops(command, key);
+  }
+
+  async cancelFreightLoad(command: CancelFreightLoadCommand, key: string): Promise<FreightLoadSnapshot> {
+    return this.freight.cancelLoad(command, key);
+  }
+
+  async recordFreightScan(command: RecordFreightScanCommand, key: string): Promise<FreightScanSnapshot> {
+    return this.freight.recordScan(command, key);
+  }
+
+  async dispatchFreightLoad(command: DispatchFreightLoadCommand, key: string): Promise<FreightDispatchSnapshot> {
+    return this.freight.dispatchLoad(command, key);
+  }
+
+  async recordFreightLr(command: RecordFreightLrCommand, key: string): Promise<FreightConsignmentSnapshot> {
+    return this.freight.recordLr(command, key);
+  }
+
+  async recordFreightDelivery(command: RecordFreightDeliveryCommand, key: string): Promise<FreightConsignmentSnapshot> {
+    return this.freight.recordDelivery(command, key);
+  }
+
+  async uploadLoadingSheet(command: UploadLoadingSheetCommand, key: string): Promise<ShippingFileCommandSnapshot> {
+    return this.shippingFiles.uploadLoadingSheet(command, key);
+  }
+
+  async stageFreightPhoto(command: StageHandoverPhotoCommand, ref: string): Promise<StagedPhotoSnapshot> {
+    return this.shippingFiles.stageFreightPhoto(command, ref);
+  }
+
+  async freightLoadDetail(tenantId: string, loadId: string, actorUserId: string): Promise<FreightLoadView | null> {
+    return this.freight.loadDetail(tenantId, loadId, actorUserId);
+  }
+
+  async listFreightLoads(tenantId: string, warehouseId: string, query: FreightLoadListQuery): Promise<{ items: FreightLoadListRow[]; nextCursor: string | null }> {
+    return this.freight.listLoads(tenantId, warehouseId, query);
+  }
+
+  async freightCandidates(tenantId: string, warehouseId: string, query: FreightCandidatesQuery): Promise<{ items: FreightCandidate[]; nextCursor: string | null; truncated: boolean }> {
+    return this.freight.candidates(tenantId, warehouseId, query);
+  }
+
+  async renderLoadingSheet(tenantId: string, loadId: string): Promise<{ body: Buffer; fileName: string }> {
+    return this.freight.loadingSheet(tenantId, loadId);
+  }
+
+  async renderFreightNote(tenantId: string, consignmentId: string): Promise<{ body: Buffer; fileName: string }> {
+    return this.freight.freightNote(tenantId, consignmentId);
+  }
+
+  /** A22 — the client-audience freight note of the client's own dispatched order (two layers: the stamp and `client_id`). */
+  async portalFreightNote(tenantId: string, clientId: string, orderId: string): Promise<{ body: Buffer; fileName: string }> {
+    const model = await withTenantTransaction(this.db, tenantId, (tx) => this.freight.portalFreightNoteModelInTx(tx, tenantId, clientId, orderId), { clientId });
+    return this.freight.renderClientFreightNote(model);
+  }
+
+  /** A23 — the device snapshot's open loads, in their own transaction (the shell composes sequentially). */
+  async getFreightLoadsForDevice(tenantId: string, warehouseId: string): Promise<{ loads: DeviceFreightLoad[]; truncated: boolean }> {
+    return withTenantTransaction(this.db, tenantId, (tx) => this.freight.freightLoadsForDeviceInTx(tx, tenantId, warehouseId));
+  }
+
+  /** A23 — the device snapshot's open loads (in-tx ONLY — the `getPickTasksInTx` rule). */
+  async freightLoadsForDeviceInTx(tx: TenantTx, tenantId: string, warehouseId: string): Promise<{ loads: DeviceFreightLoad[]; truncated: boolean }> {
+    return this.freight.freightLoadsForDeviceInTx(tx, tenantId, warehouseId);
+  }
 
   // ── story 4-6a: client consignment compliance ────────────────────────────
 
@@ -1261,7 +1356,27 @@ export class OutboundFacade {
         ),
       )
       .orderBy(orders.id);
-    if (awb.length > 0) return awb.map((row) => ({ orderId: row.orderId, matchKind: 'awb' as const }));
+    // Story 4-9a (A61) — a dispatched freight consignment's LR joins the AWB
+    // arm: one distinct order set (an LR shared by two orders → two matches
+    // → no suggestion, the existing rule).
+    const lr = await tx
+      .selectDistinct({ orderId: orders.id })
+      .from(freightConsignments)
+      .innerJoin(orders, and(eq(orders.tenantId, freightConsignments.tenantId), eq(orders.id, freightConsignments.orderId)))
+      .where(
+        and(
+          eq(freightConsignments.tenantId, tenantId),
+          eq(freightConsignments.lrNumber, normalizeAwb(reference)),
+          eq(freightConsignments.status, 'dispatched'),
+          eq(freightConsignments.clientId, clientId),
+          eq(orders.clientId, clientId),
+          eq(orders.warehouseId, warehouseId),
+          eq(orders.status, 'dispatched'),
+        ),
+      )
+      .orderBy(orders.id);
+    const byAwb = [...new Set([...awb, ...lr].map((row) => row.orderId))].sort();
+    if (byAwb.length > 0) return byAwb.map((orderId) => ({ orderId, matchKind: 'awb' as const }));
     const candidates = await tx
       .select({
         orderId: orders.id,
@@ -1306,7 +1421,14 @@ export class OutboundFacade {
       .from(shipments)
       .where(and(eq(shipments.tenantId, tenantId), inArray(shipments.orderId, ids), sql`${shipments.status} <> 'voided'`))
       .orderBy(asc(shipments.createdAt), asc(shipments.id));
-    for (const row of rows) {
+    // Story 4-9a (A61) — a dispatched freight consignment's LR too.
+    const lrs = await tx
+      .select({ orderId: freightConsignments.orderId, trackingNumber: freightConsignments.lrNumber })
+      .from(freightConsignments)
+      .where(and(eq(freightConsignments.tenantId, tenantId), inArray(freightConsignments.orderId, ids), eq(freightConsignments.status, 'dispatched'), isNotNull(freightConsignments.lrNumber)))
+      .orderBy(asc(freightConsignments.createdAt));
+    for (const row of [...rows, ...lrs]) {
+      if (row.trackingNumber === null) continue;
       const list = out.get(row.orderId) ?? [];
       if (!list.includes(row.trackingNumber)) list.push(row.trackingNumber);
       out.set(row.orderId, list);

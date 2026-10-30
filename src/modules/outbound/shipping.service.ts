@@ -1,3 +1,4 @@
+import { orderFreightBlockInTx, portalFreightBlocksInTx, type OrderFreightBlock, type PortalFreightBlock } from './freight.service';
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { and, eq } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
@@ -105,6 +106,8 @@ export interface OrderShippingView {
   } | null;
   readonly parcelTagCode: string;
   readonly storageEnabled: boolean;
+  /** Story 4-9a (A20, A52) — the order's live freight consignment; null when none. Optional on read. */
+  readonly freight?: OrderFreightBlock | null;
 }
 
 export interface PortalOrderShippingView {
@@ -125,6 +128,8 @@ export interface PortalOrderShippingView {
   readonly cartons: readonly { readonly seq: number; readonly weightGrams: number | null; readonly totals: readonly { readonly uom: string; readonly qty: number }[] }[] | null;
   /** Story 4-5a (A19) — packed or dispatched: the slip downloads. */
   readonly packingSlipAvailable: boolean;
+  /** Story 4-9a (A22) — the truck block (an exact allowlist; only `status` while planned); null when none. Optional on read. */
+  readonly freight?: PortalFreightBlock | null;
 }
 
 export interface PortalShippingRead {
@@ -133,6 +138,8 @@ export interface PortalShippingRead {
   readonly dispatchRecord: { readonly carrierName: string | null; readonly trackingNumber: string | null } | null;
   /** Story 4-5a — the pack's cartons with their per-UoM totals (base units); null when never packed. */
   readonly cartons: PortalOrderShippingView['cartons'];
+  /** Story 4-9a (A22) — the client's freight block and the facts the status judges first. */
+  readonly freight: PortalFreightBlock | null;
 }
 
 export interface HandoverDetailView extends HandoverView {
@@ -226,8 +233,12 @@ export class ShippingService {
   // ── reads ─────────────────────────────────────────────────────────────────
 
   async orderShipping(tenantId: string, orderId: string): Promise<OrderShippingView | null> {
-    const read = await withTenantTransaction(this.db, tenantId, (tx) => orderShippingInTx(tx, tenantId, orderId));
-    if (read === null) return null;
+    const both = await withTenantTransaction(this.db, tenantId, async (tx) => {
+      const shipping = await orderShippingInTx(tx, tenantId, orderId);
+      return shipping === null ? null : { shipping, freight: await orderFreightBlockInTx(tx, tenantId, shipping.order.id) };
+    });
+    if (both === null) return null;
+    const read = both.shipping;
     const [label, documents, sheet] = await Promise.all([
       read.label === null ? Promise.resolve(null) : this.fileView(read.label),
       Promise.all(read.documents.map((file) => this.fileView(file))),
@@ -253,6 +264,7 @@ export class ShippingService {
             },
       parcelTagCode: parcelTagCode(read.order.id),
       storageEnabled: this.attachments.storageEnabled,
+      freight: both.freight,
     };
   }
 
@@ -281,9 +293,11 @@ export class ShippingService {
         totals: uomTotalsOf(carton.lines.map((line) => ({ uom: skus.get(line.skuId)?.uom ?? '', qty: fromMilli(line.qty) }))),
       }));
     }
+    const freight = (await portalFreightBlocksInTx(tx, tenantId, clientId, [shipping.order.id])).get(shipping.order.id) ?? null;
     return {
       shipping,
       cartons,
+      freight,
       // E2 — "the dispatch record names a carrier or a tracking number".
       hasDispatchRecord: dispatchRecord !== null && (dispatchRecord.carrierName !== null || dispatchRecord.trackingNumber !== null),
       dispatchRecord,
@@ -323,6 +337,7 @@ export class ShippingService {
         shipping.order.status,
         live === null ? null : { kind: live.kind, status: live.status, labelVerified: live.labelVerifiedAt !== null },
         read.hasDispatchRecord,
+        read.freight === null ? null : { status: read.freight.status === 'planned' ? 'planned' : 'dispatched', deliveryOutcome: read.freight.status === 'delivered' || read.freight.status === 'delivered-with-exceptions' || read.freight.status === 'refused' ? read.freight.status : null },
       ),
       // E2 — with no live shipment, the dispatch record's courier and AWB.
       courierName: live?.carrierName ?? read.dispatchRecord?.carrierName ?? null,
@@ -338,6 +353,7 @@ export class ShippingService {
       handoverSheet,
       cartons: read.cartons === null ? null : read.cartons.map((carton) => ({ seq: carton.seq, weightGrams: carton.weightGrams, totals: carton.totals.map((total) => ({ uom: total.uom, qty: total.qty })) })),
       packingSlipAvailable: read.cartons !== null && (shipping.order.status === 'ready_to_dispatch' || shipping.order.status === 'dispatched'),
+      freight: read.freight,
     };
   }
 

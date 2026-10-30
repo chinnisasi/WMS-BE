@@ -1,3 +1,4 @@
+import { assertNotOnFreightLoadInTx } from './freight.read';
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { and, eq, ne, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
@@ -259,6 +260,8 @@ export class ClientLabelCommand {
     const raced = await replayInTx(tx, tenantId, key, payloadHash);
     if (raced !== null) return { snapshot: raced as ShipmentCommandSnapshot, replayed: true };
     const live = await lockLiveShipmentInTx(tx, tenantId, order.id);
+    // Story 4-9a (A19) — an order planned on a truck takes no courier label.
+    await assertNotOnFreightLoadInTx(tx, tenantId, order);
     const transporter: TransporterSnapshotV1 | null =
       input.transporterId === null ? null : await assertTransporterInTx(tx, tenantId, input.transporterId, 'a client label');
     const label = orderLabelOf(order);

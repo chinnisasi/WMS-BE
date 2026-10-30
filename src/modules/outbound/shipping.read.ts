@@ -35,6 +35,12 @@ export const PORTAL_SHIPPING_STATUSES = [
   'handed-over',
   'shipped',
   'shipped-no-courier-record',
+  // Story 4-9a (A22, D18) — an order on a truck, judged first.
+  'freight-planned',
+  'freight-dispatched',
+  'delivered',
+  'delivered-with-exceptions',
+  'delivery-refused',
 ] as const;
 export type PortalShippingStatus = (typeof PORTAL_SHIPPING_STATUSES)[number];
 
@@ -47,8 +53,17 @@ export function portalShippingStatus(
   live: { readonly kind: string; readonly status: string; readonly labelVerified: boolean } | null,
   /** E2 — the order's dispatch record names a carrier or a tracking number (its first `dispatch.dispatched` reference doc). */
   hasDispatchRecord: boolean,
+  /** Story 4-9a (D18) — the order's live freight consignment, judged first; absent or null when none. */
+  freight: { readonly status: string; readonly deliveryOutcome: string | null } | null = null,
 ): PortalShippingStatus {
   if (orderStatus === 'cancelled') return 'cancelled';
+  if (freight !== null && freight.status === 'planned' && (orderStatus === 'accepted' || orderStatus === 'ready_to_dispatch')) return 'freight-planned';
+  if (freight !== null && freight.status === 'dispatched' && orderStatus === 'dispatched') {
+    if (freight.deliveryOutcome === 'delivered') return 'delivered';
+    if (freight.deliveryOutcome === 'delivered-with-exceptions') return 'delivered-with-exceptions';
+    if (freight.deliveryOutcome === 'refused') return 'delivery-refused';
+    return 'freight-dispatched';
+  }
   if (orderStatus === 'dispatched') {
     if (live === null) return hasDispatchRecord ? 'shipped' : 'shipped-no-courier-record';
     if (live.status === 'handed_over') return 'handed-over';
@@ -219,6 +234,8 @@ export async function handoverCandidateRowsInTx(
         eq(orders.warehouseId, warehouseId),
         eq(orders.status, 'ready_to_dispatch'),
         eq(orders.clientId, clientId),
+        // Story 4-9a (A19, A52) — an order on a truck leaves with it.
+        sql`not exists (select 1 from freight_consignments fc where fc.tenant_id = "orders"."tenant_id" and fc.order_id = "orders"."id" and fc.status = 'planned')`,
         after === null ? undefined : sql`(${orders.updatedAt}, ${orders.id}) > (${after.at}::timestamptz, ${after.id}::uuid)`,
       ),
     )
@@ -512,6 +529,8 @@ export async function dispatchParcelsInTx(tx: TenantTx, tenantId: string, wareho
         or (o.status = 'accepted' and s.id is not null and s.kind <> 'carrier' and s.status = 'labelled')
       )
       and (s.id is null or s.kind <> 'carrier')
+      -- Story 4-9a (A19, A52) — an order on a truck is loaded, not handed over.
+      and not exists (select 1 from freight_consignments fc where fc.tenant_id = o.tenant_id and fc.order_id = o.id and fc.status = 'planned')
     order by o.updated_at, o.id
     limit ${DISPATCH_PARCELS_MAX + 1}
   `)) as unknown as {

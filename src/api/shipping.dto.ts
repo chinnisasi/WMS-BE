@@ -1,3 +1,4 @@
+import { OrderFreightBlockDto, PortalFreightBlockDto } from './freight.dto';
 import { Type } from 'class-transformer';
 import { ArrayMaxSize, ArrayMinSize, IsArray, IsBoolean, IsIn, IsInt, IsOptional, IsString, IsUUID, MaxLength, ValidateNested } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
@@ -421,6 +422,8 @@ export class OrderShippingResponse {
   @ApiProperty({ type: OrderShippingHandoverDto, nullable: true }) handover!: OrderShippingHandoverDto | null;
   @ApiProperty({ description: 'The parcel tag’s code (`O` + the order id’s last 16 hex digits)' }) parcelTagCode!: string;
   @ApiProperty() storageEnabled!: boolean;
+  @ApiProperty({ required: false, type: () => OrderFreightBlockDto, nullable: true, description: 'Story 4-9a (A20) — the order’s live freight consignment (its truck, LR and delivery); null when none' })
+  freight?: OrderFreightBlockDto | null;
 }
 
 export class HandoverCandidateShipmentDto {
@@ -559,6 +562,8 @@ export class PortalOrderShippingResponse {
   @ApiProperty({ type: [PortalFileDto] }) handoverSheet!: PortalFileDto[];
   @ApiProperty({ type: [PortalCartonDto], nullable: true, description: 'Story 4-5a — the cartons of the pack, once packed (null before)' }) cartons!: PortalCartonDto[] | null;
   @ApiProperty({ description: 'Story 4-5a — the packing slip can be downloaded (packed or dispatched)' }) packingSlipAvailable!: boolean;
+  @ApiProperty({ required: false, type: () => PortalFreightBlockDto, nullable: true, description: 'Story 4-9a (A22) — the order’s truck: only its status while planned; null when none' })
+  freight?: PortalFreightBlockDto | null;
 }
 
 /** The portal's document kinds, for the upload form. */

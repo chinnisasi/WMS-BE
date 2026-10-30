@@ -443,7 +443,7 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'freight_load.package_unloaded', targetType: 'freight_load' },
   { action: 'freight_load.dispatched', targetType: 'freight_load' },
   { action: 'freight_load.cancelled', targetType: 'freight_load' },
-  { action: 'freight_load.sheet_attached', targetType: 'attachment' },
+  { action: 'freight_load.sheet_attached', targetType: 'freight_load' },
   { action: 'freight_photo.uploaded', targetType: 'attachment' },
   { action: 'freight_consignment.lr_recorded', targetType: 'order' },
   { action: 'freight_consignment.delivery_recorded', targetType: 'order' },

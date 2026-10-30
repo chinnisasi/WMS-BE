@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import { and, eq, inArray, sql } from 'drizzle-orm';
-import { freightConsignments, freightLoadScans, type FreightLoad } from '../../shared/db/schema';
+import { auditEvents, freightConsignments, freightLoadScans, type FreightLoad } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
-import { UUID_RE } from '../../shared/primitives/ids';
+import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { normalizeCourierInput, type NormalizedCourier } from '../../shared/primitives/courier';
 import { normalizePhone, PHONE_RE } from '../../shared/primitives/phone';
 import { normalizeVehicleNo, VEHICLE_NO_RE } from '../../shared/primitives/vehicle';
@@ -338,6 +338,46 @@ export async function removeConsignmentsInTx(
     .where(and(eq(freightLoadScans.tenantId, input.tenantId), inArray(freightLoadScans.consignmentId, ids), eq(freightLoadScans.status, 'loaded')))
     .returning({ id: freightLoadScans.id });
   return { removed: ids, unloaded: unloaded.length };
+}
+
+/**
+ * A19, A45, A64 — the cancels' freight arm: the order's planned consignment
+ * `FOR UPDATE` (after the order lock — the global order) → `removed` ("Order
+ * cancelled"), its loaded scans unloaded, one `freight_load.order_removed`
+ * audit row under the cancel's key. Asserts the transaction is unstamped (the
+ * scans are staff-only — a client stamp would silently skip them).
+ */
+export async function removeFromFreightOnCancelInTx(
+  tx: TenantTx,
+  input: { readonly tenantId: string; readonly orderId: string; readonly actorUserId: string; readonly at: string; readonly idempotencyKey: string },
+): Promise<void> {
+  const rows = await tx
+    .select()
+    .from(freightConsignments)
+    .where(and(eq(freightConsignments.tenantId, input.tenantId), eq(freightConsignments.orderId, input.orderId), eq(freightConsignments.status, 'planned')))
+    .limit(1)
+    .for('update');
+  const consignment = rows[0];
+  if (consignment === undefined) return;
+  await assertUnstampedInTx(tx);
+  const { unloaded } = await removeConsignmentsInTx(tx, {
+    tenantId: input.tenantId,
+    consignmentIds: [consignment.id],
+    actorUserId: input.actorUserId,
+    reason: 'Order cancelled',
+    at: input.at,
+  });
+  await tx.insert(auditEvents).values({
+    id: uuidv7(),
+    tenantId: input.tenantId,
+    actorUserId: input.actorUserId,
+    action: 'freight_load.order_removed',
+    targetType: 'freight_load',
+    targetId: consignment.loadId,
+    reference: input.idempotencyKey,
+    changes: { orderId: input.orderId, reason: 'Order cancelled', stopSeq: consignment.stopSeq, unloadedScans: unloaded },
+    occurredAt: input.at,
+  });
 }
 
 /** A64 — a freight write must run unstamped (the load and its scans are staff-only). */

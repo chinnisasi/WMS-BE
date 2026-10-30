@@ -17,6 +17,7 @@ import { UUID_RE } from '../../shared/primitives/ids';
 import { orderLabelOf } from '../../shared/primitives/order-label';
 import { maskPhone } from '../../shared/primitives/phone';
 import { canonicalInstant } from '../../shared/primitives/time';
+import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { consignmentRef } from '../../shared/primitives/freight';
 import type { PackMeasurement } from '../inventory/inventory.facade';
 import { getClientsInTx, type ClientPartySnapshotV1 } from '../clients/clients.facade';
@@ -105,6 +106,30 @@ export async function plannedConsignmentOfOrderInTx(
     .where(and(eq(freightConsignments.tenantId, tenantId), eq(freightConsignments.orderId, orderId), eq(freightConsignments.status, 'planned')))
     .limit(1);
   return rows[0] ?? null;
+}
+
+/**
+ * A19 — the guard the label commands run under the order lock: a planned
+ * consignment refuses 409 `order-on-freight-load`. It reads only
+ * `freight_consignments` (a client-stamped portal write sees its own row
+ * there); the load's code is added only on an unstamped (staff) read.
+ */
+export async function assertNotOnFreightLoadInTx(tx: TenantTx, tenantId: string, order: Pick<Order, 'id' | 'clientOrderRef' | 'externalEventId' | 'followOnSeq' | 'followOnRootOrderId'>): Promise<void> {
+  const rows = await tx
+    .select({ loadId: freightConsignments.loadId })
+    .from(freightConsignments)
+    .where(and(eq(freightConsignments.tenantId, tenantId), eq(freightConsignments.orderId, order.id), eq(freightConsignments.status, 'planned')))
+    .limit(1);
+  if (rows[0] === undefined) return;
+  const load = await tx.select({ code: freightLoads.code }).from(freightLoads).where(and(eq(freightLoads.tenantId, tenantId), eq(freightLoads.id, rows[0].loadId))).limit(1);
+  const code = load[0]?.code ?? null;
+  throw new ProblemException(
+    'order-on-freight-load',
+    409,
+    'Order is on a truck',
+    `Order ${orderLabelOf(order)} is booked on a truck${code === null ? '' : ` (${code})`} — it leaves with the truck; remove it from the load first.`,
+    code === null ? {} : { loadCode: code },
+  );
 }
 
 // ── package sets ───────────────────────────────────────────────────────────

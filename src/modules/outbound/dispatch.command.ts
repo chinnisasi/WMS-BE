@@ -32,6 +32,7 @@ import { istDateOf } from '../../shared/primitives/time';
 // guide §7h): outbound imports it, never the invoicing module.
 import { stampConsignmentDispatchedInTx } from '../invoicing/consignment-seam';
 import { consignmentFactsOfOrderRowsInTx, consignmentRefusal, judgeConsignment, NationalThresholds } from './consignment.read';
+import { plannedConsignmentOfOrderInTx } from './freight.read';
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
@@ -95,9 +96,10 @@ export interface DispatchOrderInTxInput {
   /**
    * Story 4-6a (A13, A32, D5) — the consignment gate's mode, REQUIRED of every
    * caller (no default, so 4-9a's departure cannot forget it): `enforce` (the
-   * per-order dispatch, freight) judges the gate here and refuses 409 with the
-   * blocking code; `pre-checked` (the courier handover) already judged it once
-   * per parcel in its classification and passes the verdict.
+   * per-order dispatch) judges the gate here and refuses 409 with the
+   * blocking code; `pre-checked` (the courier handover and the freight
+   * departure, on both surfaces — 4-9a D3) already judged it once per order
+   * in its classification and passes the verdict.
    */
   readonly consignment: 'enforce' | 'pre-checked';
   /** Story 4-6a (A14) — a pre-checked device parcel that left without its documents: the gate's code (else null). */
@@ -342,6 +344,21 @@ export class DispatchCommandService {
         throw dispatchConflict(
           'Order is not dispatchable',
           `Order "${order.id}" reads "${order.status}" — only a packed (ready_to_dispatch) order is dispatched.`,
+        );
+      }
+
+      // ── story 4-9a (A19, D4): an order planned on a freight load leaves
+      // with the truck — after the status guards, immediately before the
+      // handover guard. Read under the order lock (every consignment writer
+      // of this order holds it first).
+      const freight = await plannedConsignmentOfOrderInTx(tx, command.tenantId, order.id);
+      if (freight !== null) {
+        throw new ProblemException(
+          'dispatch-via-freight',
+          409,
+          'Order leaves with its truck',
+          `${orderLabelOf(order)} is on truck ${freight.loadCode} — it leaves with the truck, or remove it from the load first.`,
+          { loadId: freight.consignment.loadId, loadCode: freight.loadCode },
         );
       }
 

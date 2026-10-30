@@ -25,6 +25,10 @@ import { ClientLabelCommand } from './client-label.command';
 import { ShippingFilesCommand } from './shipping-files.command';
 import { HandoverCommand } from './handover.command';
 import { ShippingService } from './shipping.service';
+import { FreightLoadCommand } from './freight-load.command';
+import { FreightDispatchCommand } from './freight-dispatch.command';
+import { FreightConsignmentCommand } from './freight-consignment.command';
+import { FreightService } from './freight.service';
 
 /**
  * Outbound module (Story 4.1): the order aggregate and its state machine —
@@ -127,6 +131,12 @@ import { ShippingService } from './shipping.service';
     ShippingFilesCommand,
     HandoverCommand,
     ShippingService,
+    // Story 4-9a — B2B freight dispatch: the load commands, the departure,
+    // the LR and delivery, and the reads and prints.
+    FreightLoadCommand,
+    FreightDispatchCommand,
+    FreightConsignmentCommand,
+    FreightService,
     { provide: WAVE_CLOCK, useClass: SystemWaveClock },
     OutboundFacade,
   ],
