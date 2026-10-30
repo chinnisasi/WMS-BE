@@ -92,6 +92,7 @@ CREATE INDEX IF NOT EXISTS "order_carton_lines_tenant_order_idx" ON "order_carto
 CREATE UNIQUE INDEX IF NOT EXISTS "order_cartons_tenant_pack_seq_unique" ON "order_cartons" USING btree ("tenant_id","pack_id","seq");--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "order_cartons_tenant_order_pack_seq_idx" ON "order_cartons" USING btree ("tenant_id","order_id","pack_seq");--> statement-breakpoint
 CREATE UNIQUE INDEX IF NOT EXISTS "order_cartons_tenant_code_unique" ON "order_cartons" USING btree ("tenant_id","code");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "order_cartons_tenant_handover_idx" ON "order_cartons" USING btree ("tenant_id","handover_id") WHERE handover_id IS NOT NULL;--> statement-breakpoint
 CREATE UNIQUE INDEX IF NOT EXISTS "order_packs_tenant_order_seq_unique" ON "order_packs" USING btree ("tenant_id","order_id","seq");--> statement-breakpoint
 CREATE UNIQUE INDEX IF NOT EXISTS "order_packs_live_unique" ON "order_packs" USING btree ("tenant_id","order_id") WHERE "order_packs"."status" = 'live';--> statement-breakpoint
 -- ── hand-amended: RLS with the 0041 client clause (A1–A3) ───────────────
@@ -261,16 +262,20 @@ BEGIN
 	FOR probe IN SELECT * FROM (VALUES
 		('an unknown status', 'order_packs_status_check', '{"status":"open","ended_at":"2026-10-30T00:00:00Z","ended_by":"%U%"}'),
 		('seq 100', 'order_packs_seq_range', '{"seq":100}'),
+		('seq 0', 'order_packs_seq_range', '{"seq":0}'),
 		('zero cartons', 'order_packs_carton_count_range', '{"carton_count":0}'),
 		('201 cartons', 'order_packs_carton_count_range', '{"carton_count":201}'),
 		('a zero gross weight', 'order_packs_gross_weight_range', '{"gross_weight_grams":0}'),
+		('a gross weight of 200,000,001', 'order_packs_gross_weight_range', '{"gross_weight_grams":200000001}'),
 		('an unknown source', 'order_packs_source_check', '{"source":"fax"}'),
 		('a handheld pack without a device', 'order_packs_device_pairing', '{"source":"handheld"}'),
 		('a web pack with a device', 'order_packs_device_pairing', '{"device_id":"%R%"}'),
 		('a live pack with ended_at', 'order_packs_end_pairing', '{"ended_at":"2026-10-30T00:00:00Z"}'),
 		('a cancelled pack without its end', 'order_packs_end_pairing', '{"status":"cancelled"}'),
+		('a live pack with only ended_by', 'order_packs_end_pairing', '{"ended_by":"%U%"}'),
 		('a reason on a live pack', 'order_packs_end_reason', '{"end_reason":"x"}'),
 		('a superseded pack without a reason', 'order_packs_end_reason', '{"status":"superseded","ended_at":"2026-10-30T00:00:00Z","ended_by":"%U%"}'),
+		('an empty reason', 'order_packs_end_reason', '{"status":"superseded","ended_at":"2026-10-30T00:00:00Z","ended_by":"%U%","end_reason":""}'),
 		('a 201-character reason', 'order_packs_end_reason', '{"status":"superseded","ended_at":"2026-10-30T00:00:00Z","ended_by":"%U%","end_reason":"%LONG%"}'),
 		('parties v:2', 'order_packs_parties_shape', '{"document_parties":{"v":2,"client":{},"warehouse":{}}}'),
 		('parties without a warehouse', 'order_packs_parties_shape', '{"document_parties":{"v":1,"client":{}}}'),
@@ -361,12 +366,17 @@ BEGIN
 		('a code naming another order', 'order_cartons_code_derived', NULL, '{"code":"O0123456789ABCDEF.1.1"}'),
 		('a code naming another pack seq', 'order_cartons_code_derived', NULL, '{"code":"%T%.2.1"}'),
 		('carton 201', 'order_cartons_seq_range', NULL, '{"seq":201}'),
+		('carton 0', 'order_cartons_seq_range', 'order_cartons_code_shape', '{"seq":0}'),
 		('pack seq 100', 'order_cartons_pack_seq_range', 'order_cartons_code_shape', '{"pack_seq":100}'),
+		('pack seq 0', 'order_cartons_pack_seq_range', 'order_cartons_code_shape', '{"pack_seq":0}'),
 		('a zero weight', 'order_cartons_weight_range', NULL, '{"weight_grams":0}'),
+		('a weight of 1,000,001', 'order_cartons_weight_range', NULL, '{"weight_grams":1000001}'),
+		('a dim of 100,001', 'order_cartons_dims', NULL, '{"length_mm":100001,"width_mm":300,"height_mm":200}'),
 		('two dims of three', 'order_cartons_dims', NULL, '{"length_mm":400,"width_mm":300}'),
 		('a zero dim', 'order_cartons_dims', NULL, '{"length_mm":400,"width_mm":0,"height_mm":200}'),
 		('a zero-unit carton', 'order_cartons_units_positive', NULL, '{"unit_count":0}'),
 		('a carton of no lines', 'order_cartons_line_count_range', NULL, '{"line_count":0}'),
+		('a carton of 501 lines', 'order_cartons_line_count_range', NULL, '{"line_count":501}'),
 		('a handover without its instant', 'order_cartons_handover_pairing', NULL, '{"handover_id":"%R%"}')
 	) AS p(name, expected, shadow, override) LOOP
 		refused_by := NULL;
@@ -463,6 +473,22 @@ BEGIN
 	END;
 	IF refused_by IS DISTINCT FROM 'order_carton_lines_handling_units_shape' THEN
 		RAISE EXCEPTION 'migration 0117: handling-unit ids as an object were refused by % (expected order_carton_lines_handling_units_shape).', coalesce(refused_by, 'nothing');
+	END IF;
+	-- One line per SKU in a carton.
+	refused_by := NULL;
+	BEGIN
+		INSERT INTO "order_carton_lines" ("id","tenant_id","client_id","order_id","carton_id","sku_id","qty")
+		VALUES (gen_random_uuid(), t, c, c, t, c, 1000),
+		       (gen_random_uuid(), t, c, c, t, c, 2000);
+		RAISE EXCEPTION USING ERRCODE = 'P0117', MESSAGE = 'a refused probe landed';
+	EXCEPTION
+		WHEN unique_violation THEN
+			GET STACKED DIAGNOSTICS refused_by = CONSTRAINT_NAME;
+		WHEN SQLSTATE 'P0117' THEN
+			refused_by := NULL;
+	END;
+	IF refused_by IS DISTINCT FROM 'order_carton_lines_carton_sku_unique' THEN
+		RAISE EXCEPTION 'migration 0117: a duplicate (carton, SKU) line was refused by % (expected order_carton_lines_carton_sku_unique).', coalesce(refused_by, 'nothing');
 	END IF;
 	IF EXISTS (SELECT 1 FROM "order_carton_lines" WHERE "tenant_id" = t) THEN
 		RAISE EXCEPTION 'migration 0117: a carton line probe row survived.';

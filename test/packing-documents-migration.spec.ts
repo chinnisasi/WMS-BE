@@ -159,8 +159,8 @@ describe('migration 0117: packing documents', () => {
       { attachment_kind: 'stored-file' },
       { attachment_kind: null },
     ]);
-    const indexes = (await sql`select indexname from pg_indexes where indexname in ('order_packs_live_unique', 'order_packs_tenant_order_seq_unique', 'order_cartons_tenant_code_unique', 'order_cartons_tenant_pack_seq_unique', 'order_cartons_tenant_order_pack_seq_idx', 'order_carton_lines_carton_sku_unique', 'order_carton_lines_tenant_order_idx')`) as unknown as { indexname: string }[];
-    expect(indexes).toHaveLength(7);
+    const indexes = (await sql`select indexname from pg_indexes where indexname in ('order_packs_live_unique', 'order_packs_tenant_order_seq_unique', 'order_cartons_tenant_code_unique', 'order_cartons_tenant_pack_seq_unique', 'order_cartons_tenant_order_pack_seq_idx', 'order_carton_lines_carton_sku_unique', 'order_carton_lines_tenant_order_idx', 'order_cartons_tenant_handover_idx')`) as unknown as { indexname: string }[];
+    expect(indexes).toHaveLength(8);
     await expect(applyInOneTransaction()).rejects.toThrow(/already been applied/);
   });
 

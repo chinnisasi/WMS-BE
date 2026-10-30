@@ -86,10 +86,46 @@ describe('story 4-5a — aggregateCartons (A6, A32)', () => {
           t,
         ),
       ),
-    ).toMatch(/not in the scanned parcel/);
+    ).toMatch(/does not hold it under that SKU/);
     expect(
       refusal(() => aggregateCartons([{ scanned: [{ skuId: CW, qty: 2, handlingUnitIds: [U1] }] }], t)),
-    ).toMatch(/is in no carton/);
+    ).toMatch(/no carton holds it under that SKU/);
+  });
+
+  it('compares case ids per SKU: two catch-weight SKUs with their cases swapped are refused (review)', () => {
+    const CW2 = '01a18ba8-4743-79dd-8fe5-000000000004';
+    const t = target(
+      [
+        [CW, 1_000],
+        [CW2, 1_000],
+      ],
+      [
+        [CW, [U1]],
+        [CW2, [U2]],
+      ],
+    );
+    // Same global set {U1, U2}, but U2 filed under CW and U1 under CW2.
+    expect(
+      refusal(() =>
+        aggregateCartons(
+          [{ scanned: [{ skuId: CW, qty: 1, handlingUnitIds: [U2] }] }, { scanned: [{ skuId: CW2, qty: 1, handlingUnitIds: [U1] }] }],
+          t,
+        ),
+      ),
+    ).toMatch(/does not hold it under that SKU/);
+    // The right filing passes.
+    expect(
+      aggregateCartons(
+        [{ scanned: [{ skuId: CW, qty: 1, handlingUnitIds: [U1] }] }, { scanned: [{ skuId: CW2, qty: 1, handlingUnitIds: [U2] }] }],
+        t,
+      ),
+    ).toHaveLength(2);
+  });
+
+  it('refuses a line whose quantity rounds to zero milli-units, naming its carton (review — never a 500 at the insert)', () => {
+    expect(refusal(() => aggregateCartons([{ scanned: [{ skuId: A, qty: 1 }] }, { scanned: [{ skuId: A, qty: 0.0004 }] }]))).toMatch(
+      /^Carton 2: scanned quantity must be a positive quantity/,
+    );
   });
 
   it('type-checks a payload no DTO validated — always a 400, never a TypeError (A32)', () => {

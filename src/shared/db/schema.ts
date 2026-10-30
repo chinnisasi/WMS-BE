@@ -4702,6 +4702,10 @@ export const orderCartons = pgTable(
   (table) => [
     uniqueIndex('order_cartons_tenant_pack_seq_unique').on(table.tenantId, table.packId, table.seq),
     index('order_cartons_tenant_order_pack_seq_idx').on(table.tenantId, table.orderId, table.packSeq),
+    // The handover detail's read: one handover's scanned cartons (0116's shipments_handover_idx shape).
+    index('order_cartons_tenant_handover_idx')
+      .on(table.tenantId, table.handoverId)
+      .where(sql`handover_id IS NOT NULL`),
     uniqueIndex('order_cartons_tenant_code_unique').on(table.tenantId, table.code),
   ],
 );

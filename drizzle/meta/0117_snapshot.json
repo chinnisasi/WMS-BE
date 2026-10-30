@@ -12492,6 +12492,28 @@
           "method": "btree",
           "with": {}
         },
+        "order_cartons_tenant_handover_idx": {
+          "name": "order_cartons_tenant_handover_idx",
+          "columns": [
+            {
+              "expression": "tenant_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "handover_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "handover_id IS NOT NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "order_cartons_tenant_code_unique": {
           "name": "order_cartons_tenant_code_unique",
           "columns": [

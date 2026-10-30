@@ -169,7 +169,7 @@ export function aggregateCartons(raw: unknown, target?: CartonTotalsTarget): Agg
       if (typeof line.qty !== 'number' || !Number.isFinite(line.qty)) {
         throw cartonValidation(`Carton ${seq}: every scanned line carries a numeric qty.`);
       }
-      if (!(line.qty > 0) || line.qty > fromMilli(MAX_QUANTITY_MILLI)) {
+      if (!(line.qty > 0) || toMilli(line.qty) <= 0 || line.qty > fromMilli(MAX_QUANTITY_MILLI)) {
         throw cartonValidation(
           `Carton ${seq}: scanned quantity must be a positive quantity in base UoM, at most ${fromMilli(MAX_QUANTITY_MILLI)} (got ${String(line.qty)}).`,
         );
@@ -235,16 +235,29 @@ export function aggregateCartons(raw: unknown, target?: CartonTotalsTarget): Agg
         );
       }
     }
-    const targetIds = new Set<string>();
-    for (const ids of target.handlingUnitIdsBySku.values()) for (const id of ids) targetIds.add(id);
-    for (const id of seenUnits.keys()) {
-      if (!targetIds.has(id)) {
-        throw cartonValidation(`Handling unit "${id}" is in carton ${seenUnits.get(id)} but not in the scanned parcel.`);
+    // Per SKU: the cartons' case ids equal the scanned parcel's case ids for that SKU exactly, so a case
+    // filed under another SKU's line (two catch-weight SKUs swapped) is refused, not stored misfiled.
+    const cartonIdsBySku = new Map<string, Set<string>>();
+    for (const carton of cartons) {
+      for (const [skuId, ids] of carton.handlingUnitIdsBySku) {
+        const set = cartonIdsBySku.get(skuId) ?? new Set<string>();
+        for (const id of ids) set.add(id);
+        cartonIdsBySku.set(skuId, set);
       }
     }
-    for (const id of targetIds) {
-      if (!seenUnits.has(id)) {
-        throw cartonValidation(`Handling unit "${id}" was scanned but is in no carton — every case is in exactly one carton.`);
+    const idSkus = new Set([...target.handlingUnitIdsBySku.keys(), ...cartonIdsBySku.keys()]);
+    for (const skuId of [...idSkus].sort()) {
+      const targetIds = new Set(target.handlingUnitIdsBySku.get(skuId) ?? []);
+      const cartonIds = cartonIdsBySku.get(skuId) ?? new Set<string>();
+      for (const id of [...cartonIds].sort()) {
+        if (!targetIds.has(id)) {
+          throw cartonValidation(`Handling unit "${id}" is in carton ${seenUnits.get(id)} under SKU ${skuId}, but the scanned parcel does not hold it under that SKU.`);
+        }
+      }
+      for (const id of [...targetIds].sort()) {
+        if (!cartonIds.has(id)) {
+          throw cartonValidation(`Handling unit "${id}" was scanned under SKU ${skuId} but no carton holds it under that SKU — every case is in exactly one carton.`);
+        }
       }
     }
   }
