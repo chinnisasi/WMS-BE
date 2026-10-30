@@ -25,6 +25,7 @@ import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
 import { expectAuditRow } from './support/audit-guard';
 import { linkVendor } from './support/linked-vendor';
+import { parseZplLabels, readPdfLabels, zplTexts } from './support/labels';
 
 // Story 2-8b — the return to vendor: DAMAGED units (2-4a receipt damage,
 // 2-8a QC fails) created on the web as an RTV with the vendor and the brand
@@ -1120,6 +1121,74 @@ describe('story 2-8b: the return to vendor (e2e)', () => {
       await sql`delete from vendor_return_lines where tenant_id = ${foreign}`;
       await sql`delete from vendor_returns where tenant_id = ${foreign}`;
     }
+  });
+
+  it('story 4-5a (A22, A43, A45) — package labels: a picked RTV prints count=4 “PACKAGE 1/4…4/4” to the vendor’s address (ZPL first, PDF, A4); count required before dispatch; after it the dispatched count, a different one 409; slices; refusals', async () => {
+    await receiveDamagedBlind('RU', 0, 4);
+    const rtv = await createOk([line('RU', 4)]);
+    const labels = (query: string, token = opsToken) =>
+      http().get(`${API}/${tenantId}/vendor-returns/${rtv.id}/package-labels${query}`).set('Authorization', `Bearer ${token}`).buffer(true).parse((res, cb) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => cb(null, Buffer.concat(chunks)));
+      });
+    const problem = (res: request.Response) => JSON.parse((res.body as Buffer).toString('utf8')) as { code: string };
+    // A draft is not picked.
+    expect(problem(await labels('?count=4').expect(409)).code).toBe('rtv-not-picked');
+    await pick(rtv).expect(200);
+    expect(problem(await labels('?count=0').expect(400)).code).toBe('validation-failed');
+    expect(problem(await labels('').expect(400)).code).toBe('validation-failed');
+    expect(problem(await labels('?count=4&format=zpl&layout=a4').expect(400)).code).toBe('validation-failed');
+    expect(problem(await labels('?count=4&from=3&to=2').expect(400)).code).toBe('validation-failed');
+    const zpl = await labels('?count=4').expect(200);
+    expect(zpl.headers['content-type']).toBe('text/plain; charset=us-ascii');
+    expect(zpl.headers['content-disposition']).toBe(`attachment; filename="${rtv.code}-package-labels.zpl"`);
+    const parsed = parseZplLabels((zpl.body as Buffer).toString('ascii'));
+    expect(parsed).toHaveLength(4);
+    parsed.forEach((label, i) => {
+      expect(label.barcodes.map((bar) => bar.payload)).toEqual([`${rtv.code}.${i + 1}`]);
+    });
+    const words = zplTexts(parsed[3]!.raw).join(' | ');
+    expect(words).toContain(`RETURN TO VENDOR ${rtv.code}`);
+    expect(words).toContain('4/4');
+    expect(words).toContain('Gate 2, Vendor Yard');
+    expect(words).toContain('Thane');
+    expect(words).toContain('FROM Brand Co');
+    // A slice.
+    const slice = parseZplLabels((await labels('?count=4&from=2&to=3').expect(200)).body.toString('ascii'));
+    expect(slice.map((label) => label.barcodes[0]!.payload)).toEqual([`${rtv.code}.2`, `${rtv.code}.3`]);
+    // Over 1,000 labels in one print is 422, naming the range to ask for.
+    const tooMany = await labels('?count=1500').expect(422);
+    expect(problem(tooMany)).toMatchObject({ code: 'too-many-labels' });
+    await labels('?count=1500&from=1001&to=1500').expect(200);
+    // PDF: one 4×6 page per package, or two per A4 sheet.
+    const pdf = await labels('?count=4&format=pdf').expect(200);
+    expect(pdf.headers['content-type']).toBe('application/pdf');
+    const pages = await readPdfLabels(pdf.body as Buffer);
+    expect(pages.map((page) => page.payloads[0])).toEqual([1, 2, 3, 4].map((n) => `${rtv.code}.${n}`));
+    await labels('?count=4&format=pdf&layout=a4').expect(200);
+    // Dispatched with 3 packages: the count defaults to 3; count=4 is 409; the carrier and ref print.
+    await dispatch(rtv, captureBody({ packageCount: 3 })).expect(200);
+    const after = parseZplLabels((await labels('').expect(200)).body.toString('ascii'));
+    expect(after).toHaveLength(3);
+    expect(after[0]!.barcodes.map((bar) => bar.payload)).toEqual(['AWB1234', `${rtv.code}.1`]);
+    const mismatch = await labels('?count=4').expect(409);
+    expect(problem(mismatch).code).toBe('package-count-mismatch');
+    await labels('?count=3').expect(200);
+    // A45 — a vendor snapshot with no address of the consignee kind: print by hand.
+    await sql`update vendor_returns set vendor_snapshot = jsonb_set(vendor_snapshot, '{dispatchAddress}', 'null'::jsonb) where id = ${rtv.id}`;
+    expect(problem(await labels('').expect(409)).code).toBe('consignee-address-missing');
+    // Unknown is 404; a role without labels.execute is 403 whatever it sent.
+    expect(problem(await http().get(`${API}/${tenantId}/vendor-returns/${uuidv7()}/package-labels?count=1`).set('Authorization', `Bearer ${opsToken}`).buffer(true).parse((res, cb) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => cb(null, Buffer.concat(chunks)));
+    }).expect(404)).code).toBe('not-found');
+    const accountantEmail = `accountant-${ulid().toLowerCase()}@example.com`;
+    const invited = await asOwner('post', '/users').send({ email: accountantEmail, role: 'accountant' }).expect(201);
+    await http().post(`${API}/${tenantId}/accept-invite`).set(KEY_HEADER, ulid()).send({ token: invited.body.inviteToken as string, password: 'correct-horse-battery' }).expect(200);
+    const accountant = (await mintSignIn(app, { email: accountantEmail, password: 'correct-horse-battery' })).body.accessToken as string;
+    expect(problem(await labels('?format=nope', accountant).expect(403)).code).toBe('role-denied');
   });
 
   it('the OpenAPI document carries the six routes and the snapshot arm', () => {
