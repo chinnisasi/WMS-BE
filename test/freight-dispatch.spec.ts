@@ -334,7 +334,9 @@ describe('B2B freight dispatch (e2e, story 4-9a)', () => {
     );
     // A second device scanning the same package: one row, the no-op stores the key.
     const twice = noOpIdempotencyKey(tenantId, ulid(), 'freight.scan:already-loaded');
-    const again = await scan(load.id, cartonCode(so3, 1, 1), twice).expect(201);
+    const again = await scan(load.id, cartonCode(so3, 1, 1), twice).expect(200);
+    // Its replay answers 200 too.
+    await scan(load.id, cartonCode(so3, 1, 1), twice).expect(200);
     expect(again.body.alreadyLoaded).toBe(true);
     expect(await sql`select count(*)::int as n from freight_load_scans where consignment_id = ${load.consignments[0].id as string} and status = 'loaded'`).toEqual([{ n: 1 }]);
 

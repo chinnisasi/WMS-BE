@@ -301,6 +301,7 @@ export class FreightController {
   @ApiBody({ type: FreightScanDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiResponse({ status: HttpStatus.CREATED, type: FreightScanResponse })
+  @ApiOkResponse({ type: FreightScanResponse, description: 'The package was already loaded on this load (alreadyLoaded: true) — a no-op that stores the key; its replay answers 200 too' })
   @ApiResponse({ status: 400, ...problemJsonResponse('A blank code, an unknown action, no unload reason, occurredAt on the web (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token, or a device token without a badge-in (unauthenticated)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('role-denied') })
@@ -315,6 +316,8 @@ export class FreightController {
     @IdempotencyKey() idempotencyKey: string | undefined,
     @CurrentAnySession() session: AnySession,
     @Body() dto: FreightScanDto,
+    // The I/O matrix: a package already on the truck answers 200 (the no-op), a new load 201.
+    @Res({ passthrough: true }) res: Response,
   ): Promise<FreightScanResponse> {
     assertOwnTenant(session.session.tenantId, tenantId);
     assertUuid(loadId, 'loadId');
@@ -323,12 +326,12 @@ export class FreightController {
       session.family === 'device'
         ? { kind: 'device' as const, deviceId: session.session.deviceId, operatorUserId: badgedIn(session.session) }
         : { kind: 'web' as const, actorUserId: session.session.userId };
-    return plain(
-      await this.outbound.recordFreightScan(
-        { tenantId, surface, loadId, packageCode: dto.packageCode, action: dto.action, occurredAt: dto.occurredAt, reason: dto.reason, warehouseId: dto.warehouseId },
-        key,
-      ),
+    const result = await this.outbound.recordFreightScan(
+      { tenantId, surface, loadId, packageCode: dto.packageCode, action: dto.action, occurredAt: dto.occurredAt, reason: dto.reason, warehouseId: dto.warehouseId },
+      key,
     );
+    if (result.alreadyLoaded) res.status(HttpStatus.OK);
+    return plain(result);
   }
 
   @Post(':tenantId/outbound/freight-loads/:loadId/dispatch')

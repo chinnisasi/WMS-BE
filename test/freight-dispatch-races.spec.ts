@@ -321,8 +321,8 @@ describe('B2B freight dispatch — races, lock order, plans and the 100-order bo
     const keys = [ulid(), ulid()];
     const at = new Date().toISOString();
     const [a, b] = await raceOn('freight_loads', load.id, keys.map((key) => () => scan(load.id, cartonCode(order, 1, 1), key, { occurredAt: at, warehouseId }, operatorToken)));
-    expect([a!.status, b!.status]).toEqual([201, 201]);
-    expect([a!.body.alreadyLoaded, b!.body.alreadyLoaded].sort()).toEqual([false, true]);
+    // The I/O matrix: the scan that loads answers 201, the no-op 200.
+    expect([a!, b!].map((r) => [r.body.alreadyLoaded, r.status]).sort()).toEqual([[false, 201], [true, 200]]);
     noOpIdempotencyKey(tenantId, a!.body.alreadyLoaded ? keys[0]! : keys[1]!, 'freight.scan:already-loaded');
     expect(await sql`select count(*)::int as n from freight_load_scans where order_id = ${order} and status = 'loaded'`).toEqual([{ n: 1 }]);
   });

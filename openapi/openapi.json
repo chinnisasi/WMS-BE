@@ -17098,6 +17098,16 @@
           }
         },
         "responses": {
+          "200": {
+            "description": "The package was already loaded on this load (alreadyLoaded: true) — a no-op that stores the key; its replay answers 200 too",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FreightScanResponse"
+                }
+              }
+            }
+          },
           "201": {
             "description": "",
             "content": {
