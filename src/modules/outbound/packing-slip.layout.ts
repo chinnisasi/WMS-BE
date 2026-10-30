@@ -225,14 +225,32 @@ export function paymentLine(doc: Pick<PackDocument, 'payment'>): string {
   return doc.payment.kind === 'cod' ? `COD ${indianRupees(doc.payment.amountPaise)}` : 'Prepaid';
 }
 
-/** "Carton 2 of 3 — 4.20 kg — 40 × 30 × 20 cm" (+ " — {code}" for staff). */
+/**
+ * Story 4-9a (A24) — the packages count: "Cartons 3" (4-5a's words, a pack of
+ * cartons only), or "Packages 3 (2 pallets, 1 carton)" when any is a pallet.
+ */
+export function packagesSummary(doc: Pick<PackDocument, 'cartonCount' | 'cartons'>): string {
+  const pallets = doc.cartons.filter((carton) => carton.packageType === 'pallet').length;
+  if (pallets === 0) return `Cartons ${doc.cartonCount}`;
+  const cartons = doc.cartonCount - pallets;
+  const parts = [`${pallets} pallet${pallets === 1 ? '' : 's'}`, ...(cartons === 0 ? [] : [`${cartons} carton${cartons === 1 ? '' : 's'}`])];
+  return `Packages ${doc.cartonCount} (${parts.join(', ')})`;
+}
+
+/**
+ * "Carton 2 of 3 — 4.20 kg — 40 × 30 × 20 cm" (+ " — {code}" for staff).
+ * Story 4-9a (A24) — a pallet reads "Pallet 2 of 3 — STC 40 cartons — …"; a
+ * carton (no package type) prints byte-identically to 4-5a's.
+ */
 export function cartonHeading(
-  carton: Pick<PackDocument['cartons'][number], 'seq' | 'code' | 'weightGrams' | 'dimensionsMm'>,
+  carton: Pick<PackDocument['cartons'][number], 'seq' | 'code' | 'weightGrams' | 'dimensionsMm' | 'packageType' | 'innerCount'>,
   count: number,
   audience: PackingSlipAudience,
 ): string {
+  const pallet = carton.packageType === 'pallet';
   return [
-    `Carton ${carton.seq} of ${count}`,
+    `${pallet ? 'Pallet' : 'Carton'} ${carton.seq} of ${count}`,
+    pallet && carton.innerCount !== undefined ? `STC ${carton.innerCount} cartons` : null,
     carton.weightGrams === null ? null : kgText(carton.weightGrams),
     carton.dimensionsMm === null ? null : cmText(carton.dimensionsMm).replace(/x/g, ' x '),
     audience === 'staff' ? carton.code : null,
@@ -381,7 +399,7 @@ export function layoutPackingSlip(doc: PackDocument, options: { readonly audienc
   flow.paragraph(facts.join(' · '), BODY, 'regular', 3);
   if (doc.shipment !== null) flow.paragraph(`Courier ${doc.shipment.courierName} · AWB ${doc.shipment.awb}`, BODY, 'regular', 2);
   flow.paragraph(
-    `Cartons ${doc.cartonCount}${doc.grossWeightGrams === null ? '' : ` · Gross weight ${kgText(doc.grossWeightGrams)}`} · Packed ${doc.totals}`,
+    `${packagesSummary(doc)}${doc.grossWeightGrams === null ? '' : ` · Gross weight ${kgText(doc.grossWeightGrams)}`} · Packed ${doc.totals}`,
     BODY,
     'regular',
     2,
