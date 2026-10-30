@@ -683,3 +683,33 @@ export class ReturnableDamagedResponse {
   @ApiProperty({ type: [ReturnableArmDto] })
   arms!: ReturnableArmDto[];
 }
+
+// ── story 4-5a: the package labels of a return shipment ────────────────────
+
+/** Story 4-5a (A22, A43) — `?format=&layout=&count=&from=&to=` on the RTV and RTC package-label routes (the vocabularies are judged after labels.execute). */
+export class PackageLabelQueryDto {
+  @ApiProperty({ required: false, enum: ['zpl', 'pdf'], description: 'zpl (default; 4×6 at 203 dpi) or pdf' })
+  @IsOptional()
+  @IsString()
+  format?: string;
+
+  @ApiProperty({ required: false, enum: ['label', 'a4'], description: 'label (default; one 4×6 per package) or a4 (two per landscape sheet — PDF only)' })
+  @IsOptional()
+  @IsString()
+  layout?: string;
+
+  @ApiProperty({ required: false, description: 'Packages, 1–9,999: required before dispatch; after it defaults to the dispatched count, and a different one is 409 package-count-mismatch' })
+  @IsOptional()
+  @IsString()
+  count?: string;
+
+  @ApiProperty({ required: false, description: 'The first package to print (default 1)' })
+  @IsOptional()
+  @IsString()
+  from?: string;
+
+  @ApiProperty({ required: false, description: 'The last package to print (default count); one print is at most 1,000 labels' })
+  @IsOptional()
+  @IsString()
+  to?: string;
+}

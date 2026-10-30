@@ -48,7 +48,10 @@ import {
 } from './disposition-reads';
 import { PORTAL_PAGE_DEFAULT_LIMIT } from '../../shared/primitives/portal-page';
 import { fromMilli } from '../../shared/primitives/quantity';
-import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
+import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
+import { assertPermission } from '../tenancy/permissions';
+import type { PackageLabelQuery, PackageLabelsFile } from '../../shared/labels/shipping/package-labels-file';
+import { clientReturnPackageLabelsInTx } from './client-return-labels';
 import { findDamagedBinInTx } from '../tenancy/receiving-bin';
 import { openVendorReturnClaimsByArmInTx } from '../inbound/vendor-return-claims';
 import { ClientReturnCommand, rtcSkuUnsupported } from './client-return.command';
@@ -338,6 +341,18 @@ export class ReturnsFacade {
   /** Story 4-7c — cancel a draft or picked return to client; its claims are released. */
   cancelClientReturn(command: CancelClientReturnCommand, idempotencyKey: string): Promise<ClientReturnView> {
     return this.clientReturns.cancel(command, idempotencyKey);
+  }
+
+  /** Story 4-5a (A22) — `labels.execute`, alone in its own transaction (the 2-10b shape: 403 whatever was sent). */
+  async assertCanPrintPackageLabels(tenantId: string, actorUserId: string): Promise<void> {
+    await withTenantTransaction(this.db, tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, tenantId, actorUserId), 'labels.execute');
+    });
+  }
+
+  /** Story 4-5a (A22, A43) — the RTC's 4×6 package labels (a file read; no key, no audit). */
+  clientReturnPackageLabels(tenantId: string, id: string, query: PackageLabelQuery): Promise<PackageLabelsFile> {
+    return withTenantTransaction(this.db, tenantId, (tx) => clientReturnPackageLabelsInTx(tx, tenantId, canonicalUuid(id), query));
   }
 
   /** Story 4-7c — one return to client (404 `not-found` when absent). */

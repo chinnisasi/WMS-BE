@@ -1,5 +1,7 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, UseGuards } from '@nestjs/common';
-import { ApiBearerAuth, ApiBody, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, Res, UseGuards } from '@nestjs/common';
+import type { Response } from 'express';
+import { parsePackageLabelQuery } from '../shared/labels/shipping/package-labels-file';
+import { ApiBearerAuth, ApiBody, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiProduces, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
 import { ProblemException } from '../shared/problem-details/problem.exception';
@@ -23,6 +25,8 @@ import {
   ReturnableToClientQuery,
   ReturnableToClientResponse,
 } from './client-returns.dto';
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { PackageLabelQueryDto } from '../modules/inbound/vendor-return.dto';
 
 const IDEMPOTENCY_HEADER = [
   {
@@ -156,6 +160,49 @@ export class ClientReturnsController {
     assertOwnTenantToken(session.tenantId, tenantId);
     assertUuidParam(clientReturnId);
     return toDto(await this.returns.getClientReturn(tenantId, clientReturnId));
+  }
+
+  @Get(':tenantId/client-returns/:clientReturnId/package-labels')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Story 4-5a — labels.execute: the 4×6 package labels of a picked or dispatched return to client, “PACKAGE n/N” — FROM the brand c/o the warehouse, TO the RTC’s frozen consignee address, RETURN TO CLIENT {code}, the carrier and tracking ref once dispatched, and the barcode {code}.{n}. ZPL (203 dpi) first; PDF one 4×6 page per package, or two per landscape A4 sheet',
+    description:
+      '`format=zpl|pdf` (default zpl), `layout=label|a4` (default label; a4 is PDF only), `count` (required before dispatch; after it, defaults to the dispatched package count), `from`/`to` (a slice, default every package; at most 1,000 labels per print). `Content-Disposition: attachment` — `{code}-package-labels.{zpl|pdf}`.',
+  })
+  @ApiProduces('text/plain', 'application/pdf')
+  @ApiResponse({
+    status: 200,
+    description: 'The labels: ZPL as `text/plain; charset=us-ascii`, or a PDF',
+    content: { 'text/plain': { schema: { type: 'string', format: 'binary' } }, 'application/pdf': { schema: { type: 'string', format: 'binary' } } },
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed id, format, layout, count, from or to; zpl with the a4 layout; no count before dispatch (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks labels.execute (role-denied) — checked before anything it sent') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No such return to client in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Not picked or dispatched (rtc-not-picked); a count other than the dispatched one (package-count-mismatch)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('More than 1,000 labels in one print (too-many-labels — ask for a from/to range)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'clientReturnId', format: 'uuid' })
+  async packageLabels(
+    @Param('tenantId') tenantId: string,
+    @Param('clientReturnId') clientReturnId: string,
+    @Query() labelQuery: PackageLabelQueryDto,
+    @CurrentSession() session: TenantSession,
+    @Res() res: Response,
+  ): Promise<void> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    // Authority before every path and query 400 (the 2-10b shape).
+    await this.returns.assertCanPrintPackageLabels(tenantId, session.userId);
+    assertUuidParam(clientReturnId);
+    const file = await this.returns.clientReturnPackageLabels(tenantId, clientReturnId, parsePackageLabelQuery(labelQuery));
+    res.status(200);
+    res.setHeader('Content-Type', file.contentType);
+    res.setHeader('Content-Length', String(file.body.length));
+    res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(file.body);
   }
 
   /** `rtc.pick` — the handheld op (badge-in session; the `Idempotency-Key` is the op's ULID). */

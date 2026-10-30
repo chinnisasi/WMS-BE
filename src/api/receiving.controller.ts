@@ -355,6 +355,8 @@ export class ReceivingController {
       // Story 4-4a — copied key by key (a mutable DTO array).
       dispatchParcels: dispatchArm.parcels.map((parcel) => ({ ...parcel, shipment: parcel.shipment === null ? null : { ...parcel.shipment } })),
       dispatchParcelsTruncated: dispatchArm.truncated,
+      // Story 4-5a (A32, D6) — this api records cartons on a pack.
+      packCartons: true,
       // Story 2-3a — the open gate-ins, copied key by key (a mutable DTO array).
       openGateIns: snapshot.openGateIns.map((gateIn) => ({
         ...gateIn,

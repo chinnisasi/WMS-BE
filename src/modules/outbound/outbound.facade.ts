@@ -172,7 +172,7 @@ export type {
 } from './shipping-files.command';
 export type { FileView, HandoverDetailView, OrderShippingView, PortalFile, PortalOrderShippingView } from './shipping.service';
 export type { HandOverCommand, HandoverParcelInput, HandoverRefusedParcel, HandoverSnapshot, HandoverView } from './handover.command';
-export { HANDOVER_PARCEL_REFUSALS, MAX_HANDOVER_PARCELS, handoverHashInput } from './handover.command';
+export { HANDOVER_PARCEL_REFUSALS, MAX_HANDOVER_CARTON_CODES, MAX_HANDOVER_PARCELS, handoverHashInput } from './handover.command';
 export type { DispatchParcel, HandoverCandidate, HandoverListItem, PortalShippingStatus } from './shipping.read';
 export { PORTAL_SHIPPING_STATUSES, portalShippingStatus, DISPATCH_PARCELS_MAX } from './shipping.read';
 export type { ShipmentDocumentEmailFacts, ShipmentDocumentFactInput } from './shipping-mail';

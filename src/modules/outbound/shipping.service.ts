@@ -20,7 +20,7 @@ import { ClientLabelCommand } from './client-label.command';
 import { ShippingFilesCommand } from './shipping-files.command';
 import { HandoverCommand, handoverViewOf, type HandOverCommand, type HandoverSnapshot, type HandoverView } from './handover.command';
 import { DispatchCommandService } from './dispatch.command';
-import { packRecordOfOrderInTx, skuFactsByIdInTx, uomTotalsOf } from './cartons.read';
+import { livePackFactsOfOrdersInTx, packRecordOfOrderInTx, skuFactsByIdInTx, uomTotalsOf } from './cartons.read';
 import { fromMilli } from '../../shared/primitives/quantity';
 import { AllocationCommandService } from './allocation.command';
 import { clientShipmentViewOf, type ClientShipmentView } from './shipping-views';
@@ -42,6 +42,7 @@ import {
   shippingFileNames,
   type DispatchParcel,
   type HandoverCandidate,
+  type HandoverCartonsRead,
   type HandoverListItem,
   type PortalShippingStatus,
   type UnsignedFile,
@@ -149,6 +150,7 @@ export interface HandoverDetailView extends HandoverView {
     readonly weightGrams: number | null;
     readonly codAmountPaise: number | null;
     readonly destinationCity: string | null;
+    readonly cartons: HandoverCartonsRead;
   }[];
   readonly sheet: readonly FileView[];
 }
@@ -318,9 +320,21 @@ export class ShippingService {
       const { rows } = await handoverCandidateRowsInTx(tx, tenantId, warehouseId, clientId, after, limit);
       const page = rows.slice(0, limit);
       const packs = await this.inventory.packMeasurementsOfOrdersInTx(tx, tenantId, page.map((row) => row.order.id));
+      // Story 4-5a (A21, A33, A39, D4) — the stored live pack's facts merge over the ledger's.
+      const live = await livePackFactsOfOrdersInTx(tx, tenantId, page.map((row) => row.order.id));
       const last = page.at(-1);
       return {
-        items: page.map((row) => candidateOf(row.order, row.shipment, packs.get(row.order.id)?.packedAt ?? null)),
+        items: page.map((row) => {
+          const ledger = packs.get(row.order.id) ?? null;
+          const facts = live.get(row.order.id) ?? null;
+          return candidateOf(
+            row.order,
+            row.shipment,
+            ledger?.packedAt ?? null,
+            facts === null ? null : { packSeq: facts.packSeq, cartonCount: facts.cartonCount },
+            facts !== null ? facts.weightGrams : (ledger?.weightGrams ?? null),
+          );
+        }),
         nextCursor: rows.length > limit && last !== undefined ? encodeKeyset(last.cursorAt, last.order.id) : null,
       };
     });
@@ -372,6 +386,7 @@ export class ShippingService {
         weightGrams: shipment.weightGrams,
         codAmountPaise: order.codAmountPaise,
         destinationCity: order.destinationCity,
+        cartons: detail.cartons.get(order.id) ?? { cartonCount: 1, scanned: 0, legacy: true, codCartonScanned: null, staleCartonLabels: false },
       })),
       sheet,
     };

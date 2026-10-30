@@ -4,6 +4,7 @@ import { ApiProperty } from '@nestjs/swagger';
 import {
   HANDOVER_PARCEL_REFUSALS,
   LABEL_VERIFY_METHODS,
+  MAX_HANDOVER_CARTON_CODES,
   MAX_HANDOVER_PARCELS,
   PORTAL_DOC_KINDS,
   PORTAL_SHIPPING_STATUSES,
@@ -173,10 +174,22 @@ export class HandoverParcelDto {
   @IsInt()
   packageCount?: number | null;
 
-  @ApiProperty({ required: false, type: Number, nullable: true, description: 'Weight in grams, 1–1,000,000 (default: the last pack measurement)' })
+  @ApiProperty({ required: false, type: Number, nullable: true, description: 'Weight in grams, 1–1,000,000 (default: the live pack’s gross when ≤ 1,000,000 g, else the last pack measurement)' })
   @IsOptional()
   @IsInt()
   weightGrams?: number | null;
+
+  @ApiProperty({
+    required: false,
+    type: [String],
+    description:
+      'Story 4-5a (A21) — the carton labels scanned onto the pickup (≤ 200; trimmed and upper-cased; an empty list is absent; unique by carton). A code that is not one of this order’s live cartons refuses the parcel (carton-not-current)',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(MAX_HANDOVER_CARTON_CODES + 1)
+  @IsString({ each: true })
+  cartonCodes?: string[];
 }
 
 /** A12 — `POST …/outbound/handovers`. */
@@ -420,6 +433,9 @@ export class HandoverCandidateDto {
   @ApiProperty({ type: Number, nullable: true }) codAmountPaise!: number | null;
   @ApiProperty({ type: String, nullable: true }) packedAt!: string | null;
   @ApiProperty({ type: HandoverCandidateShipmentDto, nullable: true }) shipment!: HandoverCandidateShipmentDto | null;
+  @ApiProperty({ required: false, description: 'Story 4-5a (A21) — the live pack’s number; absent for an order packed before cartons were recorded (one carton, pack 1)' }) packSeq?: number;
+  @ApiProperty({ required: false, description: 'Story 4-5a (A21) — the live pack’s carton count; absent as packSeq' }) cartonCount?: number;
+  @ApiProperty({ required: false, type: Number, nullable: true, description: 'Story 4-5a (A33) — the handover’s weight default: the live pack’s gross when ≤ 1,000,000 g (null above it), else the last pack measurement' }) defaultWeightGrams?: number | null;
 }
 
 export class HandoverCandidatesResponse {
@@ -445,6 +461,14 @@ export class HandoversResponse {
   @ApiProperty({ type: String, nullable: true }) nextCursor!: string | null;
 }
 
+export class HandoverDetailCartonsDto {
+  @ApiProperty({ description: 'The live pack’s cartons (1 for an order packed before cartons were recorded)' }) cartonCount!: number;
+  @ApiProperty({ description: 'Cartons scanned onto this pickup (recorded on the carton)' }) scanned!: number;
+  @ApiProperty({ description: 'Packed before cartons were recorded: "1 carton (packed before cartons were recorded)"' }) legacy!: boolean;
+  @ApiProperty({ type: Boolean, nullable: true, description: 'A44 — a COD order whose cartons were scanned: false when carton 1 (the COD label) was not; null when not judged' }) codCartonScanned!: boolean | null;
+  @ApiProperty({ description: 'A37 — the handheld scanned a superseded pack’s label (accepted, not recorded): reprint the labels' }) staleCartonLabels!: boolean;
+}
+
 export class HandoverDetailParcelDto {
   @ApiProperty({ format: 'uuid' }) orderId!: string;
   @ApiProperty() orderLabel!: string;
@@ -455,6 +479,7 @@ export class HandoverDetailParcelDto {
   @ApiProperty({ type: Number, nullable: true }) weightGrams!: number | null;
   @ApiProperty({ type: Number, nullable: true }) codAmountPaise!: number | null;
   @ApiProperty({ type: String, nullable: true }) destinationCity!: string | null;
+  @ApiProperty({ type: HandoverDetailCartonsDto, description: 'Story 4-5a (A21, A34, A37, A44) — the order’s cartons at this handover' }) cartons!: HandoverDetailCartonsDto;
 }
 
 export class HandoverDetailDto extends HandoverViewDto {

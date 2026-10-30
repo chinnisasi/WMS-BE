@@ -1836,6 +1836,9 @@ export class CatalogDispatchParcelDto {
   @ApiProperty() orderLabel!: string;
   @ApiProperty({ description: 'The parcel tag code (`O` + the order id’s last 16 hex digits)' }) parcelTagCode!: string;
   @ApiProperty({ enum: ['accepted', 'ready_to_dispatch'] }) status!: string;
+  @ApiProperty({ required: false, description: 'Story 4-5a (D6, additive): the live pack’s number — a carton label of a lower pack is stale. Absent for an order packed before cartons were recorded (pack 1, one carton) and from an older server' }) packSeq?: number;
+  @ApiProperty({ required: false, description: 'Story 4-5a (D6, additive): the live pack’s carton count; absent as packSeq' }) cartonCount?: number;
+  @ApiProperty({ required: false, description: 'Story 4-5a (A44, additive): the COD amount in paise (carton 1 carries the COD label); absent when prepaid' }) codAmountPaise?: number;
   @ApiProperty({ type: CatalogDispatchParcelShipmentDto, nullable: true }) shipment!: CatalogDispatchParcelShipmentDto | null;
 }
 
@@ -1978,6 +1981,13 @@ export class CatalogSnapshotResponse {
 
   @ApiProperty({ description: 'Story 4-4a (additive): true when dispatchParcels was capped at 2000 — hand over newer parcels on the web, or refresh later' })
   dispatchParcelsTruncated!: boolean;
+
+  @ApiProperty({
+    required: false,
+    description:
+      'Story 4-5a (A32, additive): true when this server records cartons on a pack — the handheld offers New carton only then. Absent from an older server (which would drop `cartons` from a synced pack): one carton only',
+  })
+  packCartons?: boolean;
 }
 
 // ── story 2-9a: the GRN document ────────────────────────────────────────────
