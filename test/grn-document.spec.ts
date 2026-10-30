@@ -38,6 +38,12 @@ class MemoryFileStore implements FileStore {
   async delete(key: string): Promise<void> {
     this.objects.delete(key);
   }
+  // Story 4-4a — the port's read (the shipping-document mail renderer).
+  async get(key: string): Promise<Uint8Array> {
+    const bytes = this.objects.get(key);
+    if (bytes === undefined) throw new Error(`no object ${key}`);
+    return bytes;
+  }
 }
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';

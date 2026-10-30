@@ -106,7 +106,7 @@ import type { PackOrderCommand, PackSnapshot } from './pack.command';
 import { DispatchCommandService } from './dispatch.command';
 import type { DispatchOrderCommand, DispatchSnapshot } from './dispatch.command';
 import { ShipmentCommandService } from './shipment.command';
-import type { CreateShipmentLabelCommand, ShipmentSnapshot, ShipmentStatus } from './shipment.command';
+import type { CreateShipmentLabelCommand, ShipmentKind, ShipmentSnapshot, ShipmentStatus } from './shipment.command';
 import { ManifestCommandService } from './manifest.command';
 import type { CreateManifestCommand, ManifestSnapshot } from './manifest.command';
 import { RateService } from './rate.service';
@@ -523,6 +523,12 @@ function toShipmentView(
     // Story 4-2b — the void stamps (null unless voided).
     voidedAt: row.voidedAt === null ? null : canonicalInstant(row.voidedAt),
     voidedBy: row.voidedBy,
+    // Story 4-4a (A38) — the kind and the client-arranged arms.
+    kind: row.kind as ShipmentKind,
+    packageCount: row.packageCount,
+    labelVerifiedAt: row.labelVerifiedAt === null ? null : canonicalInstant(row.labelVerifiedAt),
+    handoverId: row.handoverId,
+    handedOverAt: row.handedOverAt === null ? null : canonicalInstant(row.handedOverAt),
   };
 }
 
@@ -671,6 +677,9 @@ export class OutboundFacade {
         .from(shipments)
         .leftJoin(orders, and(eq(orders.id, shipments.orderId), eq(orders.tenantId, shipments.tenantId)))
         .where(and(eq(shipments.tenantId, tenantId), eq(shipments.orderId, orderId)))
+        // Story 4-4a (A16, folded defect) — the LIVE shipment, else the newest
+        // voided one (a void then a new label left two rows, read in any order).
+        .orderBy(sql`(${shipments.status} = 'voided')`, desc(shipments.createdAt), desc(shipments.id))
         .limit(1);
       const row = rows[0];
       if (row === undefined) {

@@ -1,0 +1,8 @@
+{
+  "comment": "Story 4-4a — shared parcel-tag vectors. Copied byte for byte into wms-fe and wms-mobile src/lib/parcel-tag.vectors.json.",
+  "cases": [
+    { "orderId": "01a18ba8-4743-79dd-8fe5-145b99902272", "code": "O8FE5145B99902272" },
+    { "orderId": "00000000-0000-7000-8000-000000000000", "code": "O8000000000000000" },
+    { "orderId": "ffffffff-ffff-7fff-bfff-ffffffffffff", "code": "OBFFFFFFFFFFFFFFF" }
+  ]
+}

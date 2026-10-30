@@ -62,7 +62,16 @@ export interface FileStore {
   presignGet(input: PresignGet): Promise<PresignedUrl>;
   /** Deletes `key`; deleting a key that does not exist succeeds (S3 semantics). A transport or S3 error THROWS. */
   delete(key: string): Promise<void>;
+  /**
+   * Story 4-4a (A23, D8) — the stored bytes of `key` (the mail renderer's
+   * read of a shipping document). A missing key, a transport error or a
+   * timeout THROWS (the sender's transient `attachment-failed`).
+   */
+  get(key: string): Promise<Uint8Array>;
 }
+
+/** Story 4-4a (D8) — one `get` waits at most this long (the 15 s statement timeout does not bound a network read). */
+export const FILE_STORE_GET_TIMEOUT_MS = 15_000;
 
 /** The object key: `tenants/<tenantId>/attachments/<attachmentId>` — no names, codes or client data. */
 export function attachmentObjectKey(tenantId: string, attachmentId: string): string {
@@ -82,6 +91,10 @@ export class NoneFileStore implements FileStore {
   }
 
   async delete(): Promise<void> {
+    throw new Error('FILE_STORE=none — no file store is configured');
+  }
+
+  async get(): Promise<Uint8Array> {
     throw new Error('FILE_STORE=none — no file store is configured');
   }
 }
@@ -130,8 +143,9 @@ export class S3FileStore implements FileStore {
         Body: input.bytes,
         ContentType: input.contentType,
         ContentLength: input.bytes.byteLength,
-        // Every stored type is one of the three sanitized rasters (decision 3);
-        // S3 serves `inline` only because of that.
+        // Every stored type is one of the three sanitized rasters (decision 3)
+        // or, since story 4-4a, a re-serialised PDF (active content dropped
+        // by `sanitizePdf`); S3 serves `inline` only because of that.
         ContentDisposition: 'inline',
         CacheControl: 'private, max-age=300',
         ChecksumAlgorithm: 'SHA256',
@@ -164,6 +178,14 @@ export class S3FileStore implements FileStore {
 
   async delete(key: string): Promise<void> {
     await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: key }));
+  }
+
+  async get(key: string): Promise<Uint8Array> {
+    const out = await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: key }), {
+      abortSignal: AbortSignal.timeout(FILE_STORE_GET_TIMEOUT_MS),
+    });
+    if (out.Body === undefined) throw new Error(`file store: object ${key} has no body`);
+    return out.Body.transformToByteArray();
   }
 }
 

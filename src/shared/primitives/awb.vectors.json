@@ -1,0 +1,23 @@
+{
+  "comment": "Story 4-4a — shared AWB vectors. Copied byte for byte into wms-fe src/lib/awb.vectors.json and wms-mobile src/lib/awb.vectors.json; each repo's spec runs normalizeAwb then awbProblem over every case.",
+  "cases": [
+    { "raw": "1234 5678 9012", "normalized": "123456789012", "valid": true },
+    { "raw": "  1234-5678-9012  ", "normalized": "123456789012", "valid": true },
+    { "raw": "abc12345", "normalized": "ABC12345", "valid": true },
+    { "raw": "lr/2026/0004", "normalized": "LR/2026/0004", "valid": true },
+    { "raw": "77001", "normalized": "77001", "valid": true },
+    { "raw": "SBX-0001-AB", "normalized": "SBX0001AB", "valid": true },
+    { "raw": "\t12 34\n", "normalized": "1234", "valid": true },
+    { "raw": "123", "normalized": "123", "valid": false },
+    { "raw": "", "normalized": "", "valid": false },
+    { "raw": "   ", "normalized": "", "valid": false },
+    { "raw": "/12345", "normalized": "/12345", "valid": false },
+    { "raw": "1234_5678", "normalized": "1234_5678", "valid": false },
+    { "raw": "AWB#12345", "normalized": "AWB#12345", "valid": false },
+    { "raw": "O0123456789ABCDEF", "normalized": "O0123456789ABCDEF", "valid": false },
+    { "raw": "o0123456789abcdef", "normalized": "O0123456789ABCDEF", "valid": false },
+    { "raw": "O0123456789ABCDE", "normalized": "O0123456789ABCDE", "valid": true },
+    { "raw": "12345678901234567890123456789012345678901234567890", "normalized": "12345678901234567890123456789012345678901234567890", "valid": true },
+    { "raw": "123456789012345678901234567890123456789012345678901", "normalized": "123456789012345678901234567890123456789012345678901", "valid": false }
+  ]
+}

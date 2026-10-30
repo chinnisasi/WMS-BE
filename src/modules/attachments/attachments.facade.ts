@@ -227,10 +227,14 @@ export class AttachmentsFacade {
   private async discardStagedInTx(tx: TenantTx, tenantId: string, cutoff: string, nowText: string): Promise<{ discarded: number; kept: number }> {
     // The referenced rows are excluded BEFORE the limit, so a backlog of
     // kept photos can never starve the newer unbound ones.
+    // Story 4-4a (A29) — a device handover's sheet photos ride its payload at
+    // the top level (`$.photoRefs`), so a `handover.create` review row keeps
+    // them too.
     const referenced = sql`exists (
         select 1 from rejected_ops r
         where r.tenant_id = a.tenant_id and r.status = 'open'
-          and jsonb_path_exists(r.payload, '$.lines[*].photoRefs[*] ? (@ == $ref)', jsonb_build_object('ref', a.client_ref))
+          and (jsonb_path_exists(r.payload, '$.lines[*].photoRefs[*] ? (@ == $ref)', jsonb_build_object('ref', a.client_ref))
+            or jsonb_path_exists(r.payload, '$.photoRefs[*] ? (@ == $ref)', jsonb_build_object('ref', a.client_ref)))
       )`;
     const candidates = (await tx.execute(sql`
       select a.id

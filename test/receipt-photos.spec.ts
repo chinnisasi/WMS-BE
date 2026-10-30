@@ -66,6 +66,13 @@ class FakeFileStore implements FileStore {
     this.objects.set(input.key, { bytes: Buffer.from(input.bytes), contentType: input.contentType });
   }
 
+  // Story 4-4a — the port's read (the shipping-document mail renderer).
+  async get(key: string): Promise<Uint8Array> {
+    const object = this.objects.get(key);
+    if (object === undefined) throw new Error(`no object ${key}`);
+    return object.bytes;
+  }
+
   async presignGet(input: PresignGet): Promise<PresignedUrl> {
     return {
       url: `https://attachments.example/${input.key}?ct=${encodeURIComponent(input.contentType)}&fn=${encodeURIComponent(input.filename)}`,

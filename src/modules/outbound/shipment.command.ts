@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, ne } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { auditEvents, idempotencyKeys, orders, shipments } from '../../shared/db/schema';
@@ -43,8 +43,24 @@ const LABEL_COMMAND_KIND = 'outbound.label';
  * locally (`voided_at` / `voided_by`), terminal. Pinned to the DB CHECK
  * `shipments_status_check` (0102) by the label.spec drift guard.
  */
-export const SHIPMENT_STATUSES = ['labelled', 'manifested', 'voided'] as const;
+export const SHIPMENT_STATUSES = ['labelled', 'manifested', 'voided', 'handed_over'] as const;
 export type ShipmentStatus = (typeof SHIPMENT_STATUSES)[number];
+
+/**
+ * Story 4-4a — the three shipment kinds (`shipments_kind_check`, 0116):
+ * `carrier` (4.6c, an adapter label — the only kind a manifest closes),
+ * `client-label` (the client supplied the label PDF and its AWB) and
+ * `courier-label` (the courier brings the label). The two client-arranged
+ * kinds are closed by a courier handover (`handed_over`, never `manifested`).
+ */
+export const SHIPMENT_KINDS = ['carrier', 'client-label', 'courier-label'] as const;
+export type ShipmentKind = (typeof SHIPMENT_KINDS)[number];
+
+/** Story 4-4a — the client-arranged kinds. */
+export const CLIENT_ARRANGED_KINDS = ['client-label', 'courier-label'] as const satisfies readonly ShipmentKind[];
+export function isClientArrangedKind(kind: string): kind is (typeof CLIENT_ARRANGED_KINDS)[number] {
+  return (CLIENT_ARRANGED_KINDS as readonly string[]).includes(kind);
+}
 
 // ── command inputs ───────────────────────────────────────────────────────────
 
@@ -76,14 +92,15 @@ export interface ShipmentSnapshot {
     readonly warehouseId: string;
     /** `labelled` — the arm this command is the only writer of. */
     readonly status: ShipmentStatus;
-    readonly carrierConnectionId: string;
-    readonly carrierCode: string;
+    /** Null on a client-arranged shipment (story 4-4a). */
+    readonly carrierConnectionId: string | null;
+    readonly carrierCode: string | null;
     /** The registry display name resolved at label time (point-in-time, the 11-1 precedent). */
     readonly carrierName: string;
     /** The adapter-issued tracking number — what dispatch auto-stamps. */
     readonly trackingNumber: string;
-    /** The adapter's opaque handle for the label document — never the bytes. */
-    readonly labelDocumentRef: string;
+    /** The adapter's opaque handle for the label document — never the bytes. Null on a client-arranged shipment. */
+    readonly labelDocumentRef: string | null;
     readonly weightGrams: number | null;
     readonly dimensionsMm: PackDimensionsInput | null;
     readonly labelledBy: string;
@@ -99,6 +116,15 @@ export interface ShipmentSnapshot {
     /** Story 4-2b — set on a voided label; absent on a label snapshot (read absent as null). */
     readonly voidedAt?: string | null;
     readonly voidedBy?: string | null;
+    /**
+     * Story 4-4a — optional on read, omitted from a 4.6c label snapshot (a
+     * key stored before 4-4a replays without them).
+     */
+    readonly kind?: ShipmentKind;
+    readonly packageCount?: number | null;
+    readonly labelVerifiedAt?: string | null;
+    readonly handoverId?: string | null;
+    readonly handedOverAt?: string | null;
   };
 }
 
@@ -216,10 +242,12 @@ export class ShipmentCommandService {
       // and `manifested` (the arc is closed) alike. Under the order lock this
       // read sees a concurrent label's committed row; the partial unique
       // index is the backstop for anything the lock cannot serialize.
+      // Story 4-4a (A28) — a VOIDED row (a client label voided or replaced, a
+      // cancelled order's label) no longer blocks: only a live row refuses.
       const existing = await tx
         .select({ id: shipments.id, status: shipments.status })
         .from(shipments)
-        .where(and(eq(shipments.tenantId, command.tenantId), eq(shipments.orderId, order.id)))
+        .where(and(eq(shipments.tenantId, command.tenantId), eq(shipments.orderId, order.id), ne(shipments.status, 'voided')))
         .limit(1);
       if (existing[0] !== undefined) {
         throw labelConflict(
@@ -283,6 +311,8 @@ export class ShipmentCommandService {
           tenantId: command.tenantId,
           warehouseId: order.warehouseId,
           orderId: order.id,
+          // Story 4-4a (A1) — the order's client, set by every writer.
+          clientId: order.clientId,
           status: 'labelled',
           carrierConnectionId: connection.id,
           carrierCode: connection.carrierCode,
@@ -300,7 +330,11 @@ export class ShipmentCommandService {
           labelledAt,
         });
       } catch (err) {
-        if (isUniqueViolationOn(err, 'shipments_tenant_order_labelled_unique')) {
+        if (
+          isUniqueViolationOn(err, 'shipments_tenant_order_labelled_unique') ||
+          // Story 4-4a (A28) — the live-row backstop (any kind).
+          isUniqueViolationOn(err, 'shipments_tenant_order_live_unique')
+        ) {
           // The race backstop beneath the order lock — a same-order label
           // that slipped past the existence read.
           throw labelConflict(

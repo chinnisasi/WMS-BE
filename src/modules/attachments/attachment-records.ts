@@ -24,8 +24,21 @@ import { ProblemException } from '../../shared/problem-details/problem.exception
  *    precedent) — Postgres infers a partial index only from its predicate.
  */
 
-export const ATTACHMENT_PURPOSES = ['receipt-damage'] as const;
+/**
+ * Story 4-4a (A3) widened: `shipping-label` (a client's label PDF, owner the
+ * order), `shipping-document` (an order's invoice, challan, e-way bill, POD or
+ * other scan, with a `doc_kind`) and `handover-sheet` (a signed handover
+ * sheet page, owner the courier handover). Mirrored by 0116's CHECKs.
+ */
+export const ATTACHMENT_PURPOSES = ['receipt-damage', 'shipping-label', 'shipping-document', 'handover-sheet'] as const;
 export type AttachmentPurpose = (typeof ATTACHMENT_PURPOSES)[number];
+
+/** Story 4-4a — a shipping document's kind (`attachments_doc_kind_check`). */
+export const SHIPPING_DOC_KINDS = ['invoice', 'challan', 'eway-bill', 'pod', 'other'] as const;
+export type ShippingDocKind = (typeof SHIPPING_DOC_KINDS)[number];
+
+/** Story 4-4a — the stored content types (`attachments_content_type_check`): the three sanitized rasters and a re-serialised PDF. */
+export const ATTACHMENT_CONTENT_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'] as const;
 
 export const ATTACHMENT_STATUSES = [
   'uploading',
@@ -38,10 +51,13 @@ export const ATTACHMENT_STATUSES = [
 ] as const;
 export type AttachmentStatus = (typeof ATTACHMENT_STATUSES)[number];
 
-export const ATTACHMENT_SOURCES = ['handheld', 'web'] as const;
+/** Story 4-4a — `portal`: a client's own upload. */
+export const ATTACHMENT_SOURCES = ['handheld', 'web', 'portal'] as const;
 export type AttachmentSource = (typeof ATTACHMENT_SOURCES)[number];
 
-export const ATTACHMENT_OWNER_TYPES = ['goods_receipt_line'] as const;
+/** Story 4-4a — `order` (owner = parent = the order) and `courier_handover` (owner = parent = the handover). */
+export const ATTACHMENT_OWNER_TYPES = ['goods_receipt_line', 'order', 'courier_handover'] as const;
+export type AttachmentOwnerType = (typeof ATTACHMENT_OWNER_TYPES)[number];
 
 /** The statuses that count toward a line's and a receipt's photo cap (K21: a staged row has no line yet). */
 export const LIVE_ATTACHMENT_STATUSES = ['attached', 'awaited'] as const satisfies readonly AttachmentStatus[];
@@ -63,6 +79,8 @@ export interface StoredObject {
   readonly sha256: string;
   readonly width: number;
   readonly height: number;
+  /** Story 4-4a — a PDF's page count; null (or absent) for an image. */
+  readonly pageCount?: number | null;
 }
 
 /** A1 — the per-ref advisory lock, in the caller's transaction (released at commit/rollback). */
@@ -96,6 +114,16 @@ export interface ReserveUploadInput {
   /** Builds the object key from the reservation's id. */
   readonly objectKeyOf: (attachmentId: string) => string;
   readonly object: Omit<StoredObject, 'objectKey'>;
+  /**
+   * Story 4-4a (A3, D9) — set at reservation for every 4-4a upload: a portal
+   * reservation must carry its client from the start (the RLS WITH CHECK
+   * refuses a NULL `client_id` under a client stamp). Absent (the 2-5a
+   * callers): null, unchanged.
+   */
+  readonly clientId?: string | null;
+  readonly warehouseId?: string | null;
+  /** Story 4-4a — a shipping document's kind (required by `attachments_doc_kind_check` on that purpose). */
+  readonly docKind?: ShippingDocKind | null;
 }
 
 /**
@@ -127,6 +155,10 @@ export async function reserveUploadInTx(tx: TenantTx, input: ReserveUploadInput)
       sha256: input.object.sha256,
       width: input.object.width,
       height: input.object.height,
+      pageCount: input.object.pageCount ?? null,
+      docKind: input.docKind ?? null,
+      clientId: input.clientId ?? null,
+      warehouseId: input.warehouseId ?? null,
       capturedAt: input.capturedAt,
       deviceId: input.deviceId,
       createdBy: input.createdBy,
@@ -232,6 +264,16 @@ export async function finalizeDeviceUploadInTx(
       .returning();
     return { arm: 'staged', row: row! };
   }
+  if (existing.purpose !== reservation.purpose) {
+    // Story 4-4a — a ref is one photo of one purpose: a receipt photo's ref
+    // can never fill a handover sheet's placeholder, or the reverse.
+    throw new ProblemException(
+      'attachment-ref-conflict',
+      409,
+      'Photo reference already used',
+      `Photo ${ref} is already recorded for another purpose — the device sent two photos under one reference.`,
+    );
+  }
   if (existing.status === 'awaited' || existing.status === 'expired') {
     // A9's unique live object key: the reservation goes first, then its object moves.
     await tx.delete(attachments).where(and(eq(attachments.id, reservation.id), eq(attachments.status, 'uploading')));
@@ -245,6 +287,7 @@ export async function finalizeDeviceUploadInTx(
         sha256: reservation.sha256,
         width: reservation.width,
         height: reservation.height,
+        pageCount: reservation.pageCount,
         rawSha256: reservation.rawSha256,
         uploadKey: reservation.uploadKey,
         uploadHash: reservation.uploadHash,
@@ -299,6 +342,8 @@ export async function finalizeOwnedUploadInTx(
   tx: TenantTx,
   input: {
     readonly reservation: AttachmentRow;
+    /** Story 4-4a — the owner spec; absent = a GRN line (2-5a, unchanged). */
+    readonly ownerType?: AttachmentOwnerType;
     readonly ownerId: string;
     readonly ownerParentId: string;
     readonly clientId: string | null;
@@ -310,7 +355,7 @@ export async function finalizeOwnedUploadInTx(
     .update(attachments)
     .set({
       status: 'attached',
-      ownerType: 'goods_receipt_line',
+      ownerType: input.ownerType ?? 'goods_receipt_line',
       ownerId: input.ownerId,
       ownerParentId: input.ownerParentId,
       clientId: input.clientId,
@@ -434,7 +479,9 @@ export async function claimRefsInTx(
       continue;
     }
     const row = await lockRefRowInTx(tx, input.tenantId, ref);
-    if (row !== null && row.status === 'staged' && row.deviceId === input.deviceId) {
+    // Story 4-4a — only a receipt photo binds to a receipt line (a staged
+    // handover-sheet photo under the same ref is skipped, never re-purposed).
+    if (row !== null && row.status === 'staged' && row.deviceId === input.deviceId && row.purpose === 'receipt-damage') {
       await tx
         .update(attachments)
         .set({
@@ -595,4 +642,196 @@ export async function markRemovedInTx(
 
 function concurrentRequest(): ProblemException {
   return new ProblemException('conflict', 409, 'Concurrent idempotent request', 'A request with this Idempotency-Key is in progress — retry it.');
+}
+
+// ── story 4-4a: files owned by an order or a courier handover ─────────────
+
+export interface OwnedClaimResult {
+  /** Refs that now await their upload (a placeholder was written). */
+  readonly awaited: readonly string[];
+  /** Refs whose staged row was attached now — with the row ids (each is shared with the client). */
+  readonly attached: readonly { readonly ref: string; readonly attachmentId: string }[];
+  /** Refs not bound: another device's, another purpose's, or already bound. */
+  readonly skipped: readonly string[];
+}
+
+/**
+ * Story 4-4a (A12 step 4) — `claimRefsInTx` generalised to an owner spec: a
+ * device handover's sheet photos bind to the handover (owner = parent = the
+ * handover, purpose `handover-sheet`). The same A1 discipline: every ref's
+ * advisory lock first, sorted, so they are the LAST locks the command takes;
+ * a ref is never a refusal. A staged row binds only when it is THIS device's
+ * and of the same purpose.
+ */
+export async function claimOwnedRefsInTx(
+  tx: TenantTx,
+  input: {
+    readonly tenantId: string;
+    readonly deviceId: string;
+    readonly ownerType: AttachmentOwnerType;
+    readonly ownerId: string;
+    readonly purpose: AttachmentPurpose;
+    readonly clientId: string | null;
+    readonly warehouseId: string;
+    readonly actorUserId: string;
+    readonly refs: readonly string[];
+  },
+): Promise<OwnedClaimResult> {
+  const refs = [...new Set(input.refs)].sort();
+  const awaited: string[] = [];
+  const attached: { ref: string; attachmentId: string }[] = [];
+  const skipped: string[] = [];
+  if (refs.length === 0) return { awaited, attached, skipped };
+  for (const ref of refs) {
+    await lockAttachmentRefInTx(tx, input.tenantId, ref);
+  }
+  const now = nowIso();
+  for (const ref of refs) {
+    const inserted = await tx
+      .insert(attachments)
+      .values({
+        id: uuidv7(),
+        tenantId: input.tenantId,
+        clientId: input.clientId,
+        warehouseId: input.warehouseId,
+        purpose: input.purpose,
+        status: 'awaited',
+        source: 'handheld',
+        ownerType: input.ownerType,
+        ownerId: input.ownerId,
+        ownerParentId: input.ownerId,
+        clientRef: ref,
+        deviceId: input.deviceId,
+        createdBy: input.actorUserId,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .onConflictDoNothing({
+        target: [attachments.tenantId, attachments.clientRef],
+        where: sql`client_ref is not null and status <> 'discarded'`,
+      })
+      .returning({ id: attachments.id });
+    if (inserted[0]) {
+      awaited.push(ref);
+      continue;
+    }
+    const row = await lockRefRowInTx(tx, input.tenantId, ref);
+    if (row !== null && row.status === 'staged' && row.deviceId === input.deviceId && row.purpose === input.purpose) {
+      await tx
+        .update(attachments)
+        .set({
+          status: 'attached',
+          ownerType: input.ownerType,
+          ownerId: input.ownerId,
+          ownerParentId: input.ownerId,
+          clientId: input.clientId,
+          warehouseId: input.warehouseId,
+          updatedAt: now,
+        })
+        .where(and(eq(attachments.id, row.id), eq(attachments.status, 'staged')));
+      attached.push({ ref, attachmentId: row.id });
+      continue;
+    }
+    skipped.push(ref);
+  }
+  return { awaited, attached, skipped };
+}
+
+/**
+ * Story 4-4a — one owner's files of the given purposes: every live row
+ * (`attached` / `awaited`) in creation order, plus at most the 50 newest
+ * `removed` / `expired`. With `clientId` (the portal and the mail renderer),
+ * an explicit `client_id = $client` predicate besides the caller's stamp
+ * (guide §7e — two layers). On `attachments_tenant_owner_purpose_idx`.
+ */
+export async function listByOwnerInTx(
+  tx: TenantTx,
+  input: {
+    readonly tenantId: string;
+    readonly ownerType: AttachmentOwnerType;
+    readonly ownerIds: readonly string[];
+    readonly purposes: readonly AttachmentPurpose[];
+    readonly clientId?: string;
+    readonly includeHistory?: boolean;
+  },
+): Promise<AttachmentRow[]> {
+  if (input.ownerIds.length === 0) return [];
+  const scope = and(
+    eq(attachments.tenantId, input.tenantId),
+    eq(attachments.ownerType, input.ownerType),
+    inArray(attachments.ownerId, [...input.ownerIds]),
+    inArray(attachments.purpose, [...input.purposes]),
+    ...(input.clientId === undefined ? [] : [eq(attachments.clientId, input.clientId)]),
+  );
+  const live = await tx
+    .select()
+    .from(attachments)
+    .where(and(scope, inArray(attachments.status, [...LIVE_ATTACHMENT_STATUSES])))
+    .orderBy(asc(attachments.createdAt), asc(attachments.id));
+  if (input.includeHistory !== true) return live;
+  const history = await tx
+    .select()
+    .from(attachments)
+    .where(and(scope, inArray(attachments.status, ['removed', 'expired'])))
+    .orderBy(desc(attachments.updatedAt), desc(attachments.id))
+    .limit(ATTACHMENT_HISTORY_LIMIT);
+  return [...live, ...history.reverse()];
+}
+
+/** Story 4-4a — the live count (`attached` + `awaited`) of one owner's files of a purpose, optionally of one source set. */
+export async function countLiveByOwnerInTx(
+  tx: TenantTx,
+  input: {
+    readonly tenantId: string;
+    readonly ownerType: AttachmentOwnerType;
+    readonly ownerId: string;
+    readonly purpose: AttachmentPurpose;
+    readonly sources?: readonly AttachmentSource[];
+  },
+): Promise<number> {
+  const rows = await tx
+    .select({ n: sql<number>`count(*)::int` })
+    .from(attachments)
+    .where(
+      and(
+        eq(attachments.tenantId, input.tenantId),
+        eq(attachments.ownerType, input.ownerType),
+        eq(attachments.ownerId, input.ownerId),
+        eq(attachments.purpose, input.purpose),
+        inArray(attachments.status, [...LIVE_ATTACHMENT_STATUSES]),
+        ...(input.sources === undefined ? [] : [inArray(attachments.source, [...input.sources])]),
+      ),
+    );
+  return Number(rows[0]?.n ?? 0);
+}
+
+/** Story 4-4a — one attachment by id, locked (null when absent or not yet owned). LOCK ONLY (guide §1). */
+export async function lockAttachmentByIdInTx(tx: TenantTx, tenantId: string, attachmentId: string): Promise<AttachmentRow | null> {
+  const rows = await tx
+    .select()
+    .from(attachments)
+    .where(
+      and(
+        eq(attachments.tenantId, tenantId),
+        eq(attachments.id, attachmentId),
+        notInArray(attachments.status, ['uploading', 'staged', 'discarded']),
+      ),
+    )
+    .for('update')
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+/**
+ * Story 4-4a (A8, A10, A27, D10) — a voided shipment's label file is
+ * `removed` with the void's reason and actor, in the void's transaction.
+ * A no-op when the row is already gone or removed.
+ */
+export async function removeAttachmentIfLiveInTx(
+  tx: TenantTx,
+  input: { readonly tenantId: string; readonly attachmentId: string; readonly removedBy: string; readonly reason: string },
+): Promise<AttachmentRow | null> {
+  const row = await lockAttachmentByIdInTx(tx, input.tenantId, input.attachmentId);
+  if (row === null || (row.status !== 'attached' && row.status !== 'awaited')) return null;
+  return markRemovedInTx(tx, { row, removedBy: input.removedBy, reason: input.reason });
 }

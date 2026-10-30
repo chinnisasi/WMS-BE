@@ -813,6 +813,13 @@
       "when": 1793338402066,
       "tag": "0115_grn_document",
       "breakpoints": true
+    },
+    {
+      "idx": 116,
+      "version": "7",
+      "when": 1793344482553,
+      "tag": "0116_client_arranged_shipping",
+      "breakpoints": true
     }
   ]
 }

@@ -35,6 +35,8 @@ import { ORDER_OWNER_TYPE, OrderCommandService } from './order.command';
 import type { OrderSnapshot, OrderStatus } from './order.command';
 import type { ShipmentStatus } from './shipment.command';
 import { orderLabelOf } from './follow-on';
+import { CANCELLED_VOID_REASON, shipmentVoidedPayload } from './client-arranged';
+import { removeAttachmentIfLiveInTx } from '../attachments/attachment-records';
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
@@ -348,7 +350,10 @@ export class CancelRestockCommandService {
       // while it was produced by a carrier with no AWB at a real courier.
       // A transport story that gives a DIRECT carrier a real label arm must
       // add its AWB cancel here before its labels can be voided.
-      if (labelled !== null && !LOCALLY_VOIDABLE_CARRIERS.has(labelled.carrierCode)) {
+      // Story 4-4a (A27, D1) — the refusal is about a CARRIER label only: a
+      // client-arranged label (the client's own courier booked it) is voided
+      // locally below, its label file removed.
+      if (labelled !== null && labelled.kind === 'carrier' && !LOCALLY_VOIDABLE_CARRIERS.has(labelled.carrierCode ?? '')) {
         throw new ProblemException(
           'shipment-void-unsupported',
           409,
@@ -581,11 +586,28 @@ export class CancelRestockCommandService {
       let voidedShipment: { id: string; carrierName: string; trackingNumber: string } | null = null;
       let voidedRow: Shipment | null = null;
       if (labelled !== null) {
+        const clientArranged = labelled.kind !== 'carrier';
         const voided = await tx
           .update(shipments)
-          .set({ status: 'voided', voidedAt: restockedAt, voidedBy: command.actorUserId, updatedAt: restockedAt })
+          .set({
+            status: 'voided',
+            voidedAt: restockedAt,
+            voidedBy: command.actorUserId,
+            // Story 4-4a (A27) — a client-arranged void names its reason.
+            ...(clientArranged ? { voidReason: CANCELLED_VOID_REASON } : {}),
+            updatedAt: restockedAt,
+          })
           .where(and(eq(shipments.id, labelled.id), eq(shipments.tenantId, command.tenantId), eq(shipments.status, 'labelled')))
           .returning();
+        if (clientArranged && labelled.labelAttachmentId !== null) {
+          // A27 / D10 — its label file is removed with the void's reason and actor.
+          await removeAttachmentIfLiveInTx(tx, {
+            tenantId: command.tenantId,
+            attachmentId: labelled.labelAttachmentId,
+            removedBy: command.actorUserId,
+            reason: CANCELLED_VOID_REASON,
+          });
+        }
         if (voided[0] === undefined) {
           // Unreachable beneath the row lock; the backstop rolls back.
           throw shipmentManifested(order, labelled);
@@ -644,20 +666,7 @@ export class CancelRestockCommandService {
           tenantId: command.tenantId,
           type: 'shipment.voided',
           occurredAt: restockedAt,
-          payload: {
-            shipment: {
-              id: voidedRow.id,
-              orderId: voidedRow.orderId,
-              warehouseId: voidedRow.warehouseId,
-              status: 'voided',
-              carrierConnectionId: voidedRow.carrierConnectionId,
-              carrierCode: voidedRow.carrierCode,
-              carrierName: voidedRow.carrierName,
-              trackingNumber: voidedRow.trackingNumber,
-              voidedAt: canonicalInstant(restockedAt),
-              voidedBy: command.actorUserId,
-            },
-          },
+          payload: shipmentVoidedPayload(voidedRow, restockedAt, command.actorUserId),
         });
       }
       await tx.insert(auditEvents).values({
