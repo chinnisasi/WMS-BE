@@ -11900,7 +11900,7 @@
             }
           },
           "403": {
-            "description": "Session belongs to another tenant (permission-denied), or the caller lacks labels.execute (role-denied) — checked before anything it sent",
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks labels.execute (role-denied) — checked before every path and query value the handler judges (an unknown query key is 400 first, at the ValidationPipe)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -45931,7 +45931,7 @@
             }
           },
           "403": {
-            "description": "Session belongs to another tenant (permission-denied), or the caller lacks labels.execute (role-denied) — checked before anything it sent",
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks labels.execute (role-denied) — checked before every path and query value the handler judges (an unknown query key is 400 first, at the ValidationPipe)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -46918,7 +46918,7 @@
             }
           },
           "403": {
-            "description": "Session belongs to another tenant (permission-denied), or the caller lacks labels.execute (role-denied) — checked before anything it sent",
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks labels.execute (role-denied) — checked before every path and query value the handler judges (an unknown query key is 400 first, at the ValidationPipe)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -56513,6 +56513,29 @@
           "qty"
         ]
       },
+      "CartonCaseViewDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "description": "The case label’s barcode text (a case label encodes its handling-unit id)"
+          },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true,
+            "description": "Grams captured at receipt; null when the case is no longer on record"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "weightGrams"
+        ]
+      },
       "PackCartonLineViewDto": {
         "type": "object",
         "properties": {
@@ -56540,6 +56563,13 @@
             "type": "array",
             "items": {
               "type": "string"
+            }
+          },
+          "handlingUnits": {
+            "description": "Catch weight — each case as a person finds it (beside handlingUnitIds, same order): its label’s barcode text and its receipt weight",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CartonCaseViewDto"
             }
           }
         },
