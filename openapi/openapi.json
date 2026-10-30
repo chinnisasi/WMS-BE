@@ -15353,7 +15353,8 @@
                       "challan",
                       "eway-bill",
                       "pod",
-                      "other"
+                      "other",
+                      "lr"
                     ]
                   }
                 },
@@ -15442,7 +15443,7 @@
             "bearer": []
           }
         ],
-        "summary": "Story 4-4a — dispatch.execute: attaches a shipping document to an order (an image or a PDF; invoice, challan, eway-bill, pod or other). Shared with the client by email at once when the order is dispatched, else at its dispatch",
+        "summary": "Story 4-4a — dispatch.execute: attaches a shipping document to an order (an image or a PDF; invoice, challan, eway-bill, pod, other or a scanned LR). Shared with the client by email at once when the order is dispatched, else at its dispatch",
         "tags": [
           "shipping"
         ]
@@ -62382,7 +62383,8 @@
             "enum": [
               "shipping-label",
               "shipping-document",
-              "handover-sheet"
+              "handover-sheet",
+              "loading-sheet"
             ]
           },
           "docKind": {
@@ -62720,7 +62722,8 @@
             "enum": [
               "shipping-label",
               "shipping-document",
-              "handover-sheet"
+              "handover-sheet",
+              "loading-sheet"
             ]
           },
           "docKind": {
@@ -64451,13 +64454,9 @@
           "load"
         ]
       },
-      "FreightProgressDto": {
+      "FreightLoadedTotalDto": {
         "type": "object",
         "properties": {
-          "consignmentId": {
-            "type": "string",
-            "format": "uuid"
-          },
           "loaded": {
             "type": "number"
           },
@@ -64466,7 +64465,6 @@
           }
         },
         "required": [
-          "consignmentId",
           "loaded",
           "total"
         ]
@@ -64521,7 +64519,7 @@
             "type": "number"
           },
           "packages": {
-            "$ref": "#/components/schemas/FreightProgressDto"
+            "$ref": "#/components/schemas/FreightLoadedTotalDto"
           },
           "palletCount": {
             "type": "number"
@@ -64761,6 +64759,26 @@
           "packageCode",
           "orderId",
           "status"
+        ]
+      },
+      "FreightProgressDto": {
+        "type": "object",
+        "properties": {
+          "consignmentId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "loaded": {
+            "type": "number"
+          },
+          "total": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "consignmentId",
+          "loaded",
+          "total"
         ]
       },
       "FreightScanResponse": {
@@ -81804,7 +81822,7 @@
           "subjectId": {
             "type": "string",
             "format": "uuid",
-            "description": "The receipt (GRN) id, the order id, or (order.delivered) the id of the recorded delivery version"
+            "description": "The receipt (GRN) id, the order id, or (order.delivered) an id derived from the consignment id and its deliverySeq — stable per recorded version, stored on no row (the body’s orderId names the order)"
           },
           "status": {
             "type": "string",
@@ -81962,7 +81980,7 @@
           "subjectId": {
             "type": "string",
             "format": "uuid",
-            "description": "The receipt (GRN) id, the order id, or (order.delivered) the id of the recorded delivery version"
+            "description": "The receipt (GRN) id, the order id, or (order.delivered) an id derived from the consignment id and its deliverySeq — stable per recorded version, stored on no row (the body’s orderId names the order)"
           },
           "status": {
             "type": "string",

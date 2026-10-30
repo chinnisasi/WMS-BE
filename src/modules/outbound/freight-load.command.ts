@@ -680,7 +680,8 @@ export class FreightLoadCommand {
       if (load === null) throw loadNotFound(loadId);
       if (warehouseId !== null && load.warehouseId !== warehouseId) throw warehouseMismatch(load);
       const now = nowIso();
-      const scannedAt = occurredAt === null ? now : new Date(Math.min(Date.parse(occurredAt), Date.parse(now))).toISOString();
+      // The device's time, never in the future and never before the load existed.
+      const scannedAt = occurredAt === null ? now : new Date(Math.max(Math.min(Date.parse(occurredAt), Date.parse(now)), Date.parse(load.createdAt))).toISOString();
       if (load.status === 'cancelled') throw loadStateRefusal(load)!;
       const lateScan = load.status === 'dispatched';
       if (lateScan && (action !== 'load' || occurredAt === null || Date.parse(scannedAt) > Date.parse(load.dispatchedAt!))) throw loadStateRefusal(load)!;

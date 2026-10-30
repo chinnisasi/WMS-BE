@@ -236,7 +236,8 @@ export function normalizeLrInput(raw: { lrNumber?: unknown; lrDate?: unknown; fr
   }
   let lrDate: string | null = null;
   if (raw.lrDate !== undefined && raw.lrDate !== null && raw.lrDate !== '') {
-    if (typeof raw.lrDate !== 'string' || !ISO_DATE_RE.test(raw.lrDate) || Number.isNaN(Date.parse(`${raw.lrDate}T00:00:00Z`))) {
+    // A real calendar date: `2026-02-30` parses (Date rolls it to March 2) but is no date — the round trip refuses it.
+    if (typeof raw.lrDate !== 'string' || !ISO_DATE_RE.test(raw.lrDate) || Number.isNaN(Date.parse(`${raw.lrDate}T00:00:00Z`)) || new Date(`${raw.lrDate}T00:00:00Z`).toISOString().slice(0, 10) !== raw.lrDate) {
       throw validation(`${field}.lrDate must be an ISO date (YYYY-MM-DD).`);
     }
     lrDate = raw.lrDate;

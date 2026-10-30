@@ -33,8 +33,11 @@ export const FREIGHT_ADD_REFUSALS = [
 export type FreightAddRefusal = (typeof FREIGHT_ADD_REFUSALS)[number];
 
 /**
- * A14 — an order refused at departure (one code each, in classification order):
- * 4-6a's three gate codes LAST, so a consignment code never masks a recall.
+ * A14 — an order refused at departure (one code each). The tuple's order is
+ * the vocabulary's, not quite the classification's: the command judges
+ * `order-already-dispatched` BEFORE `order-not-ready` (a dispatched order is
+ * not "not ready"). 4-6a's three gate codes are judged LAST, so a consignment
+ * code never masks a recall.
  */
 export const FREIGHT_DISPATCH_REFUSALS = [
   'consignment-removed',

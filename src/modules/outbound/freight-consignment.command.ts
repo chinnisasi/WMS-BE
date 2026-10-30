@@ -323,6 +323,7 @@ export class FreightConsignmentCommand {
           vehicleNumber: carriage.vehicleNumber,
           dispatchedAt: canonicalInstant(row.dispatchedAt!),
           consignmentRef: carriage.consignmentRef,
+          consigneeCity: order.destinationCity,
           amended,
           recordedAt: now,
         },

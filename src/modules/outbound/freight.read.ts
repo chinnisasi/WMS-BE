@@ -559,12 +559,23 @@ export async function freightLoadViewInTx(
   return { view, sheet };
 }
 
-/** The scan count of a load's live consignments (no row lock — evidence for the counts). */
+/**
+ * The scan count of a load's live consignments (no row lock — evidence for the
+ * counts). Filtered by the consignments' ids so `(tenant_id, consignment_id,
+ * status)` serves it (`freight_load_scans` has no load index).
+ */
 export async function liveScanCountsInTx(tx: TenantTx, tenantId: string, loadId: string): Promise<Map<string, number>> {
+  const ids = (
+    await tx
+      .select({ id: freightConsignments.id })
+      .from(freightConsignments)
+      .where(and(eq(freightConsignments.tenantId, tenantId), eq(freightConsignments.loadId, loadId), ne(freightConsignments.status, 'removed')))
+  ).map((row) => row.id);
+  if (ids.length === 0) return new Map();
   const rows = await tx
     .select({ consignmentId: freightLoadScans.consignmentId, n: sql<number>`count(*)::int` })
     .from(freightLoadScans)
-    .where(and(eq(freightLoadScans.tenantId, tenantId), eq(freightLoadScans.loadId, loadId), eq(freightLoadScans.status, 'loaded')))
+    .where(and(eq(freightLoadScans.tenantId, tenantId), inArray(freightLoadScans.consignmentId, ids), eq(freightLoadScans.status, 'loaded')))
     .groupBy(freightLoadScans.consignmentId);
   return new Map(rows.map((row) => [row.consignmentId, Number(row.n)]));
 }

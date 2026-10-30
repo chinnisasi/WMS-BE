@@ -381,7 +381,9 @@ export class FreightDispatchCommand {
         if (departed < floor) throw validation('departedAt is before the load was created, the truck reported or the last package was scanned — the truck left after its loading.');
         dispatchedAt = new Date(departed).toISOString();
       } else {
-        dispatchedAt = new Date(Math.max(Math.min(Date.parse(input.occurredAt!), nowMs), latestScanMs)).toISOString();
+        // The floor's record, but never before the load existed, the truck reported or the last scan (A54).
+        const floor = Math.max(latestScanMs, Date.parse(load.createdAt), load.vehicleReportedAt === null ? 0 : Date.parse(load.vehicleReportedAt));
+        dispatchedAt = new Date(Math.min(Math.max(Math.min(Date.parse(input.occurredAt!), nowMs), floor), nowMs)).toISOString();
       }
       const departureIst = istDateOf(dispatchedAt);
       const packs = await this.inventory.packMeasurementsOfOrdersInTx(tx, tenantId, dispatchingOrderIds);
@@ -464,21 +466,34 @@ export class FreightDispatchCommand {
       }
 
       // A48 / A49 — the LRs: dates and terms only with a number; one LR, one client; the date window.
+      // The web refuses a breach (400, nothing written); on the DEVICE the truck has
+      // left, so the offending consignment is dispatched WITHOUT its LR (recorded
+      // in the audit as `lrDropped`) — never a whole-op refusal after departure.
       const lrOf = (entry: (typeof passing)[number]) => entry.member.input?.lrNumber ?? entry.member.consignment.lrNumber;
-      const clientsByLr = new Map<string, Set<string>>();
+      const lrDateOf = (entry: (typeof passing)[number]) => (entry.member.input?.lrNumber != null ? entry.member.input.lrDate : entry.member.consignment.lrDate);
+      const lrDropped = new Map<string, { lrNumber: string; reason: string }>();
+      const breach = (entry: (typeof passing)[number], detail: string, reason: string): void => {
+        if (surface === 'web') throw validation(detail);
+        lrDropped.set(entry.order.id, { lrNumber: lrOf(entry)!, reason });
+      };
+      const firstClientOfLr = new Map<string, string>();
       for (const entry of passing) {
         const lr = lrOf(entry);
         const sent = entry.member.input;
         if (lr === null && sent !== null && (sent.lrDate !== null || sent.freightTerms !== null)) {
           throw validation(`Order ${orderLabelOf(entry.order)}: an LR date or freight terms need the LR number.`);
         }
-        if (sent?.lrDate != null && (sent.lrDate > departureIst || sent.lrDate < addIsoDays(departureIst, -30))) {
-          throw validation(`Order ${orderLabelOf(entry.order)}: the LR date must be within 30 days before the departure (${departureIst}).`);
+        if (lr === null) continue;
+        const date = lrDateOf(entry);
+        if (date !== null && (date > departureIst || date < addIsoDays(departureIst, -30))) {
+          breach(entry, `Order ${orderLabelOf(entry.order)}: the LR date must be within 30 days before the departure (${departureIst}).`, 'lr-date-outside-window');
+          continue;
         }
-        if (lr !== null) clientsByLr.set(lr, new Set([...(clientsByLr.get(lr) ?? []), entry.member.consignment.clientId]));
-      }
-      for (const [lr, clients] of clientsByLr) {
-        if (clients.size > 1) throw validation(`LR ${lr} is given to orders of ${clients.size} clients — an LR covers one client's goods.`);
+        const holder = firstClientOfLr.get(lr);
+        if (holder === undefined) firstClientOfLr.set(lr, entry.member.consignment.clientId);
+        else if (holder !== entry.member.consignment.clientId) {
+          breach(entry, `LR ${lr} is given to orders of more than one client — an LR covers one client's goods.`, 'lr-of-another-client');
+        }
       }
 
       // Part B: any dispatching order's live record holds a recorded e-way bill.
@@ -496,7 +511,8 @@ export class FreightDispatchCommand {
           { orders: ewayOrders, vehicleNumber: input.vehicleNumber },
         );
       }
-      const partBConfirmed = input.ewayPartBConfirmed;
+      // Stamped only when some dispatching order holds a recorded e-way bill.
+      const partBConfirmed = input.ewayPartBConfirmed && ewayOrders.length > 0;
 
       // A66 — capacity.
       const weights = passing.map((entry) => entry.set?.grossWeightGrams ?? null);
@@ -519,6 +535,7 @@ export class FreightDispatchCommand {
       const leaveIds = members.filter((m) => m.input?.decision === 'leave' && m.consignment.id !== '').map((m) => m.consignment);
       const absentIds = members.filter((m) => m.input === null && !m.notOnDeviceList).map((m) => m.consignment);
       const removedOrderIds: string[] = [];
+      const removedReasons = new Map<string, string>();
       for (const [rows, reason] of [
         [leaveIds, FREIGHT_REASONS.leftAtDeparture],
         [absentIds, FREIGHT_REASONS.notOnDeviceList],
@@ -533,8 +550,30 @@ export class FreightDispatchCommand {
       for (const entry of refused) {
         const member = members.find((m) => m.consignment.orderId === entry.orderId && m.consignment.id !== '');
         if (member === undefined) continue;
-        await removeConsignmentsInTx(tx, { tenantId, consignmentIds: [member.consignment.id], actorUserId, reason: `Not dispatched at departure: ${entry.code}`, at: now });
+        const reason = `Not dispatched at departure: ${entry.code}`;
+        const { removed } = await removeConsignmentsInTx(tx, { tenantId, consignmentIds: [member.consignment.id], actorUserId, reason, at: now });
+        if (removed.length === 0) continue;
+        // A41 — not in `left` (the answer's `refused` names it), but audited as a removal like the others.
+        removedReasons.set(entry.orderId, reason);
+        removedOrderIds.push(entry.orderId);
       }
+
+      // One `freight_load.order_removed` row per consignment the departure removed (left, absent, refused).
+      const auditRemovals = async (): Promise<void> => {
+        for (const orderId of removedOrderIds) {
+          await tx.insert(auditEvents).values({
+            id: uuidv7(),
+            tenantId,
+            actorUserId,
+            action: 'freight_load.order_removed',
+            targetType: 'freight_load',
+            targetId: load.id,
+            reference: key,
+            changes: { orderId, reason: removedReasons.get(orderId) ?? left.find((l) => l.orderId === orderId)?.reason ?? null, atDeparture: true },
+            occurredAt: now,
+          });
+        }
+      };
 
       let rejectedOpId: string | null = null;
       if (refused.length > 0 && deviceId !== null) {
@@ -597,6 +636,7 @@ export class FreightDispatchCommand {
           changes: { status: { before: 'open', after: 'cancelled' }, reason, departure: true, refused: refused.map((r) => ({ orderId: r.orderId, code: r.code })), left },
           occurredAt: now,
         });
+        await auditRemovals();
         await this.assertNoPlanned(tx, tenantId, load.id);
         if (deviceId !== null) await touchDeviceInTx(tx, deviceId);
         const snapshot: FreightDispatchSnapshot = { load: (await freightLoadViewInTx(tx, tenantId, closed!, { unmask: true, todayIst, measurements: this.measurements })).view, dispatched: [], left, refused, rejectedOpId };
@@ -631,7 +671,8 @@ export class FreightDispatchCommand {
           clientParties.set(order.clientId, client);
         }
         const sent = entry.member.input;
-        const lrNumber = sent?.lrNumber ?? consignment.lrNumber;
+        const dropped = lrDropped.has(order.id);
+        const lrNumber = dropped ? null : (sent?.lrNumber ?? consignment.lrNumber);
         const carriage: CarriageSnapshotV1 = {
           v: 1,
           loadCode: load.code,
@@ -652,9 +693,11 @@ export class FreightDispatchCommand {
         await tx
           .update(freightConsignments)
           .set({
-            ...(sent?.lrNumber != null
-              ? { lrNumber: sent.lrNumber, lrDate: sent.lrDate, freightTerms: sent.freightTerms, lrRecordedAt: now, lrRecordedBy: actorUserId }
-              : {}),
+            ...(dropped
+              ? { lrNumber: null, lrDate: null, freightTerms: null, lrRecordedAt: null, lrRecordedBy: null }
+              : sent?.lrNumber != null
+                ? { lrNumber: sent.lrNumber, lrDate: sent.lrDate, freightTerms: sent.freightTerms, lrRecordedAt: now, lrRecordedBy: actorUserId }
+                : {}),
             status: 'dispatched',
             dispatchedAt: occurredAt,
             packageCount: set?.packageCount ?? 1,
@@ -752,23 +795,12 @@ export class FreightDispatchCommand {
           ...(refused.length === 0 ? {} : { refused: refused.map((r) => ({ orderId: r.orderId, code: r.code })) }),
           partBConfirmed,
           capacityExceeded,
+          ...(lrDropped.size === 0 ? {} : { lrDropped: [...lrDropped].map(([orderId, drop]) => ({ orderId, ...drop })) }),
           ...(load.transporterPartnerId !== null && !transporterAsserted ? { transporterSnapshotKept: true } : {}),
         },
         occurredAt: now,
       });
-      for (const orderId of removedOrderIds) {
-        await tx.insert(auditEvents).values({
-          id: uuidv7(),
-          tenantId,
-          actorUserId,
-          action: 'freight_load.order_removed',
-          targetType: 'freight_load',
-          targetId: load.id,
-          reference: key,
-          changes: { orderId, reason: left.find((l) => l.orderId === orderId)?.reason ?? null, atDeparture: true },
-          occurredAt: now,
-        });
-      }
+      await auditRemovals();
       // A41 — no planned consignment survives a departure.
       await this.assertNoPlanned(tx, tenantId, load.id);
       if (deviceId !== null) await touchDeviceInTx(tx, deviceId);

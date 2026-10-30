@@ -20,6 +20,7 @@ import { mintSignIn } from './support/sign-in';
 import { testAddress } from './support/shipment-address';
 import { dispatchedOrderFixtures, type Picklist } from './support/dispatched-order';
 import { pdfText } from './support/pdf-text';
+import { decodeDelivery, deliverySubjectUuid } from '../src/modules/client-webhooks/webhook-payloads';
 import { withTenantTransaction } from '../src/shared/db/tenant-scope';
 import { removeFromFreightOnCancelInTx } from '../src/modules/outbound/freight-support';
 
@@ -352,6 +353,17 @@ describe('B2B freight dispatch (e2e, story 4-9a)', () => {
     expect(planText).toContain('PLAN');
     expect(planText).toContain(load.code);
 
+    // A22 — before departure the portal reads only that the order is booked on a truck; no note yet.
+    const planned = await http().get(`${API}/${tenantId}/portal/orders/${so1}/shipping`).set('Authorization', `Bearer ${acmePortal}`).expect(200);
+    expect(planned.body.status).toBe('freight-planned');
+    expect(planned.body.freight).toEqual({ status: 'planned' });
+    await http().get(`${API}/${tenantId}/portal/orders/${so1}/freight-note`).set('Authorization', `Bearer ${acmePortal}`).expect(404);
+    // The brand's contact (deliveries and documents) and webhook endpoint (order.delivered).
+    await http().post(`${API}/${tenantId}/clients/${acme}/contacts`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid())
+      .send({ name: 'Asha', email: 'asha@acme.example', emailEvents: ['delivery.recorded', 'shipment.documents'] }).expect(201);
+    await sql`insert into webhook_endpoints (id, tenant_id, client_id, url, event_types, status, secret_sealed, secret_hint, consecutive_failures, rate_window_count, created_by)
+      values (${uuidv7()}, ${tenantId}, ${acme}, 'https://hooks.acme.example/wms', ARRAY['order.delivered'], 'active', 'v1:x', 'abcd', 0, 0, ${opsId})`;
+
     // The web departure.
     const departKey = ulid();
     const departed = await depart(
@@ -478,6 +490,13 @@ describe('B2B freight dispatch (e2e, story 4-9a)', () => {
     const outbox = (await sql`select payload from outbox_messages where tenant_id = ${tenantId} and type = 'freight_consignment.delivered'`) as unknown as { payload: Record<string, unknown> }[];
     expect(outbox).toHaveLength(1);
     expect(outbox[0]!.payload).toMatchObject({ orderId: so1, clientId: acme, deliverySeq: 1, outcome: 'delivered-with-exceptions', lrNumber: '4410', transporterName: 'VRL Logistics', amended: false });
+    expect(decodeDelivery(outbox[0]!.payload)).not.toBeNull();
+    await drain();
+    const deliveryMail = (await sql`select to_email, dedupe_key from email_messages where tenant_id = ${tenantId} and template = 'client-delivery-update'`) as unknown as { to_email: string; dedupe_key: string }[];
+    expect(deliveryMail).toEqual([{ to_email: 'asha@acme.example', dedupe_key: `client-delivery-update:${c1.id as string}:1:asha@acme.example` }]);
+    expect(await sql`select event_type, subject_id from webhook_events where tenant_id = ${tenantId} and event_type = 'order.delivered'`).toEqual([
+      { event_type: 'order.delivered', subject_id: deliverySubjectUuid(c1.id as string, 1) },
+    ]);
     const portalAfter = await http().get(`${API}/${tenantId}/portal/orders/${so1}/shipping`).set('Authorization', `Bearer ${acmePortal}`).expect(200);
     expect(portalAfter.body.status).toBe('delivered-with-exceptions');
     // An unchanged resend is the 200 no-op (any role); an amendment needs orders.manage and a reason.
@@ -489,6 +508,16 @@ describe('B2B freight dispatch (e2e, story 4-9a)', () => {
     await post(`freight-consignments/${c1.id as string}/delivery`, { outcome: 'delivered', deliveredAt }).expect(400);
     const amended = await post(`freight-consignments/${c1.id as string}/delivery`, { outcome: 'delivered', deliveredAt, reason: 'The damage was cosmetic' }).expect(200);
     expect(amended.body.consignment.delivery).toMatchObject({ outcome: 'delivered', deliverySeq: 2 });
+    await post(`freight-consignments/${c1.id as string}/delivery`, { outcome: 'refused', deliveredAt, note: 'wrong item', reason: 'The consignee refused it after all' }).expect(200);
+    expect((await http().get(`${API}/${tenantId}/portal/orders/${so1}/shipping`).set('Authorization', `Bearer ${acmePortal}`).expect(200)).body.status).toBe('delivery-refused');
+
+    // A scanned LR uploaded on the dispatched order is shared by the document email ("Lorry receipt").
+    await http().post(`${API}/${tenantId}/outbound/orders/${so1}/documents`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).field('kind', 'lr')
+      .attach('file', JPEG, { filename: 'lr.jpg', contentType: 'image/jpeg' }).expect(201);
+    await drain();
+    const documentMail = (await sql`select params from email_messages where tenant_id = ${tenantId} and template = 'client-shipment-document'`) as unknown as { params: Record<string, unknown> }[];
+    expect(documentMail).toHaveLength(1);
+    expect(JSON.stringify(documentMail[0]!.params)).toContain('lr');
 
     // ── A16: the LR after departure needs a reason ──
     await post(`freight-consignments/${c1.id as string}/lr`, { lrNumber: '4411' }).expect(400);
@@ -544,7 +573,7 @@ describe('B2B freight dispatch (e2e, story 4-9a)', () => {
 
   // ── AC7: the guards on a planned order's other exits; the cancels ─────────
 
-  it('AC7 — a planned order is refused by the per-order dispatch, the handover and a courier label, and by a second load; cancelling it removes it; remove, reorder, update and cancel the load', async () => {
+  it('AC7 — a planned order is refused by the per-order dispatch, the handover, an AWB pre-advice and a carrier label, and by a second load; cancelling it removes it; remove, reorder, update and cancel the load', async () => {
     const so6 = await packedOrder('A-TEE', 1);
     const so7 = await acceptedOrder('A-TEE');
     const so8 = await packedOrder('A-TEE', 1);
@@ -557,6 +586,14 @@ describe('B2B freight dispatch (e2e, story 4-9a)', () => {
     const awb = await http().post(`${API}/${tenantId}/outbound/orders/${so6}/shipment/awb`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
       .send({ awb: 'AWB9002', courierName: 'Delhivery' }).expect(409);
     expect(awb.body.code).toBe('order-on-freight-load');
+    const connection = (
+      await http().post(`${API}/${tenantId}/carriers/connections`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid())
+        .send({ carrierCode: 'sandbox', accountLabel: 'Sandbox', credential: { accountToken: 'e2e-sandbox-token' } }).expect(201)
+    ).body.id as string;
+    const carrier = await http().post(`${API}/${tenantId}/outbound/orders/${so6}/label`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid())
+      .send({ carrierConnectionId: connection }).expect(409);
+    expect(carrier.body.code).toBe('order-on-freight-load');
+    expect(await sql`select count(*)::int as n from shipments where order_id = ${so6}`).toEqual([{ n: 0 }]);
     const other = await createLoad({ orderIds: [so6] }).expect(409);
     expect(other.body).toMatchObject({ code: 'freight-orders-refused', orders: [{ orderId: so6, code: 'order-on-freight-load', loadCode: load.code }] });
     // A web handover candidate list no longer offers it.
@@ -745,6 +782,8 @@ describe('B2B freight dispatch (e2e, story 4-9a)', () => {
       expect(entry.consignments[0]).toMatchObject({ orderId: p, packageCount: 3, palletCount: 3, parcelTagCode: parcelTagCode(p) });
       expect(entry.loadedCodes).toEqual([cartonCode(p, 1, 2)]);
       expect(snapshot.body.freightLoadsTruncated).toBe(false);
+      // A19 — a planned order is loaded, never offered to a courier handover.
+      expect((snapshot.body.dispatchParcels as { orderId: string }[]).some((parcel) => parcel.orderId === p)).toBe(false);
     }
     // 100 live consignments seeded on a load; one more is load-full.
     const full = (await createLoad({}).expect(201)).body.load;
@@ -798,5 +837,150 @@ describe('B2B freight dispatch (e2e, story 4-9a)', () => {
     } finally {
       await sql`update clients set consignment_document_rule = 'b2b' where id = ${beta}`;
     }
+  });
+
+  // ── review fixes: clocks, LRs on the handheld, Part B, removals, the sync report, the candidates ──
+
+  it('device clocks — a scan and a departure dated before the load existed are clamped up to it; Part B is not stamped with no e-way bill; a refused order’s removal is audited', async () => {
+    const order = await packedOrder('A-TEE', 1);
+    const unpacked = await acceptedOrder('A-TEE');
+    const load = (await createLoad({ orderIds: [order, unpacked] }).expect(201)).body.load;
+    const created = Date.parse((await sql`select created_at::text as at from freight_loads where id = ${load.id}`)[0]!.at as string);
+    const longAgo = new Date(created - 86_400_000).toISOString();
+    await deviceScan(load.id, cartonCode(order, 1, 1), longAgo).expect(201);
+    const scanned = (await sql`select scanned_at from freight_load_scans where order_id = ${order}`)[0]!.scanned_at as Date;
+    expect(scanned.getTime()).toBeGreaterThanOrEqual(created);
+    const key = ulid();
+    const res = await depart(
+      load.id,
+      [
+        { orderId: order, decision: 'dispatch' },
+        { orderId: unpacked, decision: 'dispatch' },
+      ],
+      { occurredAt: longAgo, warehouseId, ewayPartBConfirmed: true },
+      key,
+      operatorToken,
+    ).expect(201);
+    expect(res.body.refused).toEqual([expect.objectContaining({ orderId: unpacked, code: 'order-not-ready' })]);
+    const dispatchedAt = (await sql`select dispatched_at, eway_part_b_confirmed_at from freight_loads where id = ${load.id}`)[0]!;
+    expect((dispatchedAt.dispatched_at as Date).getTime()).toBeGreaterThanOrEqual(scanned.getTime());
+    expect(dispatchedAt.eway_part_b_confirmed_at).toBeNull();
+    expect(res.body.load.partB).toMatchObject({ required: false, confirmedAt: null });
+    expect(await consignmentOf(unpacked)).toMatchObject({ status: 'removed', remove_reason: 'Not dispatched at departure: order-not-ready' });
+    const removals = (await sql`select changes from audit_events where tenant_id = ${tenantId} and reference = ${key} and action = 'freight_load.order_removed'`) as unknown as { changes: { orderId: string; reason: string } }[];
+    expect(removals.map((row) => row.changes)).toEqual([expect.objectContaining({ orderId: unpacked, reason: 'Not dispatched at departure: order-not-ready' })]);
+  });
+
+  it('LRs at departure — the web refuses a cross-client LR and a kept LR dated after the departure (400); the handheld dispatches those consignments without their LR (lrDropped); 2026-02-30 is no date', async () => {
+    const a = await packedOrder('A-TEE', 1);
+    const b = await packedOrder('B-TEE', 1);
+    const c = await packedOrder('A-TEE', 1);
+    const load = (await createLoad({ orderIds: [a, b, c] }).expect(201)).body.load;
+    await scan(load.id, cartonCode(a, 1, 1)).expect(201);
+    await scan(load.id, cartonCode(b, 1, 1)).expect(201);
+    await scan(load.id, cartonCode(c, 1, 1)).expect(201);
+    const cross = [
+      { orderId: a, decision: 'dispatch', lrNumber: 'SHARED1' },
+      { orderId: b, decision: 'dispatch', lrNumber: 'SHARED1' },
+      { orderId: c, decision: 'dispatch' },
+    ];
+    expect((await depart(load.id, cross).expect(400)).body.detail).toMatch(/one client's goods/);
+    const consignmentA = (await consignmentOf(a)).id as string;
+    expect((await post(`freight-consignments/${consignmentA}/lr`, { lrNumber: 'KEPT1', lrDate: '2026-02-30' }).expect(400)).body.detail).toMatch(/ISO date/);
+    // A kept LR dated today, and a departure two days back (the load backdated so the departure is after it).
+    const today = new Date(Date.now() + 5.5 * 3_600_000).toISOString().slice(0, 10);
+    await post(`freight-consignments/${consignmentA}/lr`, { lrNumber: 'KEPT1', lrDate: today }).expect(200);
+    await sql`update freight_loads set created_at = now() - interval '3 days' where id = ${load.id}`;
+    await sql`update freight_load_scans set scanned_at = now() - interval '3 days' where load_id = ${load.id}`;
+    const twoDaysBack = new Date(Date.now() - 2 * 86_400_000).toISOString();
+    const kept = [
+      { orderId: a, decision: 'dispatch' },
+      { orderId: b, decision: 'dispatch', lrNumber: 'BETA-LR1' },
+      { orderId: c, decision: 'dispatch' },
+    ];
+    expect((await depart(load.id, kept, { departedAt: twoDaysBack }).expect(400)).body.detail).toMatch(/LR date/);
+    // The handheld: the truck has left — a dispatches without its kept LR (dated after the departure),
+    // b keeps SHARED2, and c (another client's order on the same LR) dispatches without it.
+    const key = ulid();
+    const res = await depart(
+      load.id,
+      [
+        { orderId: a, decision: 'dispatch' },
+        { orderId: b, decision: 'dispatch', lrNumber: 'SHARED2' },
+        { orderId: c, decision: 'dispatch', lrNumber: 'SHARED2' },
+      ],
+      { occurredAt: twoDaysBack, warehouseId },
+      key,
+      operatorToken,
+    ).expect(201);
+    expect(res.body.dispatched.map((d: { orderId: string; lrNumber: string | null }) => [d.orderId, d.lrNumber]).sort()).toEqual(
+      [
+        [a, null],
+        [b, 'SHARED2'],
+        [c, null],
+      ].sort(),
+    );
+    expect(await consignmentOf(a)).toMatchObject({ status: 'dispatched', lr_number: null, lr_date: null });
+    const changes = (await sql`select changes from audit_events where tenant_id = ${tenantId} and reference = ${key} and action = 'freight_load.dispatched'`)[0]!.changes as { lrDropped: { orderId: string; reason: string }[] };
+    expect(changes.lrDropped.map((d) => [d.orderId, d.reason]).sort()).toEqual(
+      [
+        [a, 'lr-date-outside-window'],
+        [c, 'lr-of-another-client'],
+      ].sort(),
+    );
+  });
+
+  it('V12 twin — a device upload of each freight op type is accepted and makes a Discard-only review row', async () => {
+    const row = (opType: string, payload: Record<string, unknown>) => ({
+      opId: ulid(),
+      opType,
+      classification: 'rejected',
+      problemCode: 'package-not-on-load',
+      problemDetail: 'refused',
+      payload,
+      attribution: { deviceLabel: 'Dock scanner', operatorEmail: 'op@example.com' },
+      opEnqueuedAt: new Date(Date.now() - 60_000).toISOString(),
+      opOccurredAt: null,
+    });
+    const rows = [
+      row('freight.load-scan', { loadId: uuidv7(), packageCode: 'O0123456789ABCDEF.1.1', action: 'load', occurredAt: new Date().toISOString(), warehouseId }),
+      row('freight.dispatch', { loadId: uuidv7(), vehicleNumber: 'KA01AB1234', driverName: 'Ravi', seals: [], consignments: [{ orderId: uuidv7(), decision: 'dispatch' }], photoRefs: [] }),
+      row('freight-photo.stage', { ref: ulid(), capturedAt: new Date().toISOString(), dispatchOpId: ulid() }),
+    ];
+    await http().post(`${API}/${tenantId}/devices/sync-reports`).set('Authorization', `Bearer ${operatorToken}`).set(KEY_HEADER, ulid()).send({ rows }).expect(201);
+    const listed = (await http().get(`${API}/${tenantId}/rejected-ops?status=open&limit=100`).set('Authorization', `Bearer ${ownerToken}`).expect(200)).body.items as { opId: string; opType: string; decisions: string[] }[];
+    for (const uploaded of rows) {
+      expect(listed.find((item) => item.opId === uploaded.opId)).toMatchObject({ opType: uploaded.opType, decisions: ['discard'] });
+    }
+  });
+
+  it('A20 — the candidates: packed and accepted orders listed (packed first); a planned order absent and present again once removed; the client filter; the second page continues the first', async () => {
+    const packed = await packedOrder('A-TEE', 1);
+    const accepted = await acceptedOrder('A-TEE');
+    const betaPacked = await packedOrder('B-TEE', 1);
+    const read = async (query: string) =>
+      (await http().get(`${API}/${tenantId}/warehouses/${warehouseId}/outbound/freight-candidates${query}`).set('Authorization', `Bearer ${opsToken}`).expect(200)).body as {
+        items: { orderId: string; status: string; clientId: string }[];
+        nextCursor: string | null;
+        truncated: boolean;
+      };
+    const all = await read('?limit=500');
+    const ids = all.items.map((item) => item.orderId);
+    expect(ids).toEqual(expect.arrayContaining([packed, accepted, betaPacked]));
+    expect(ids.indexOf(packed)).toBeLessThan(ids.indexOf(accepted));
+    expect(all.truncated).toBe(false);
+    const load = (await createLoad({ orderIds: [packed] }).expect(201)).body.load;
+    expect((await read('?limit=500')).items.map((item) => item.orderId)).not.toContain(packed);
+    await post(`freight-loads/${load.id}/orders/${packed}/remove`, { reason: 'Next truck' }).expect(200);
+    expect((await read('?limit=500')).items.map((item) => item.orderId)).toContain(packed);
+    const betaOnly = await read(`?clientId=${beta}&limit=500`);
+    expect(betaOnly.items.length).toBeGreaterThan(0);
+    expect(betaOnly.items.every((item) => item.clientId === beta)).toBe(true);
+    expect(betaOnly.items.map((item) => item.orderId)).toContain(betaPacked);
+    const first = await read('?limit=2');
+    expect(first.items).toHaveLength(2);
+    expect(first.nextCursor).not.toBeNull();
+    const second = await read(`?limit=2&cursor=${first.nextCursor!}`);
+    expect(second.items.map((item) => item.orderId)).toEqual(all.items.slice(2, 4).map((item) => item.orderId));
   });
 });

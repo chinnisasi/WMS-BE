@@ -634,8 +634,9 @@ describe('client webhooks (e2e, story 5-2a)', () => {
         lrNumber: '4410',
         vehicleNumber: 'KA01AB1234',
         receiverName: 'A. Kumar',
-        shortPackages: 0,
-        damagedPackages: 0,
+        // A clean delivery recorded no counts: null, never a made-up 0.
+        shortPackages: null,
+        damagedPackages: null,
         note: null,
         amended: false,
         deliverySeq: 1,
