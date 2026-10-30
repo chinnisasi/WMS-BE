@@ -43,6 +43,8 @@ export interface ThermalSlipInput {
   readonly rows: readonly ThermalSlipRow[];
   /** The carton's per-UoM totals as the document prints them (exact, from milli-units); else summed here. */
   readonly totalsText?: string;
+  /** Story 4-9a (A24) — `pallet` prints `PALLET n/N`; absent or `carton` prints `CARTON n/N` (byte-identical). */
+  readonly packageType?: 'carton' | 'pallet';
 }
 
 /** `12 EA, 2.5 KG` — one total per UoM, in first-seen (sorted-row) order. */
@@ -76,7 +78,7 @@ export function thermalSlipLabels(input: ThermalSlipInput): ShippingLabel[] {
         FIELD_GAP_DOTS,
       ).fields,
     );
-    fields.push(reverseField('head', X, 124, 400, 56, 40, `CARTON ${input.cartonNo}/${input.cartonCount}`));
+    fields.push(reverseField('head', X, 124, 400, 56, 40, `${input.packageType === 'pallet' ? 'PALLET' : 'CARTON'} ${input.cartonNo}/${input.cartonCount}`));
     if (pages > 1) {
       const cont = singleText('head', 450, 138, 28, W - 420, `Slip ${k + 1}/${pages}`, true);
       if (cont !== null) fields.push(cont);

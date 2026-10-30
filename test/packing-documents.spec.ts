@@ -1133,6 +1133,25 @@ describe('packing documents: labels, slips, portal and email (e2e, story 4-5a)',
     expect(problem(await file(`/outbound/orders/${uuidv7()}/packing-slip`).expect(404)).code).toBe('not-found');
   });
 
+  it('story 4-9a (A24) — a pallet row prints PALLET n/N and STC {n} CARTONS on its 4×6 label and PALLET n/N on its thermal slip; its carton sibling is unchanged', async () => {
+    const { orderId } = await pickedOrder([['A-TEE', 2]], { codAmountPaise: 125_000 });
+    await pack(orderId, {
+      scanned: [{ skuId: sku.get('A-TEE')!, qty: 2 }],
+      cartons: [1, 2].map(() => ({ scanned: [{ skuId: sku.get('A-TEE')!, qty: 1 }], weightGrams: 500 })),
+    }).expect(201);
+    // The pack command's package type is its own arm; the read is proved on the row.
+    await sql`update order_cartons set package_type = 'pallet', inner_count = 40 where order_id = ${orderId} and seq = 1`;
+    const labels = parseZplLabels((((await file(`/outbound/orders/${orderId}/carton-labels`).expect(200)).body) as Buffer).toString('ascii'));
+    const texts = labels.map((one) => zplTexts(one.raw));
+    expect(texts[0]).toContain('PALLET');
+    expect(texts[0]).toContain('1/2');
+    expect(texts[0]!.some((t) => t.includes('STC 40 CARTONS'))).toBe(true);
+    expect(texts[1]).toContain('CARTON');
+    expect(texts[1]!.some((t) => t.includes('STC'))).toBe(false);
+    const slips = (((await file(`/outbound/orders/${orderId}/packing-slip?format=zpl&layout=label`).expect(200)).body) as Buffer).toString('ascii');
+    expect(zplTexts(slips)).toEqual(expect.arrayContaining(['PALLET 1/2', 'CARTON 2/2']));
+  });
+
   it('AC3 — the A4 slip: frozen brand and warehouse (a later legal-name edit leaves it), batches, both cartons with contents, the carton codes for staff, not a tax invoice; zpl+a4 400', async () => {
     const { orderId, label, scanned } = await pickedOrder([['A-LOT', 4], ['A-TEE', 2]]);
     await pack(orderId, {

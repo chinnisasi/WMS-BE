@@ -19,7 +19,7 @@
 
 import { and, asc, desc, eq, ne } from 'drizzle-orm';
 import type { TenantTx } from '../../shared/db/tenant-scope';
-import { orderLines, orders, picks, shipments } from '../../shared/db/schema';
+import { orderCartons, orderLines, orders, picks, shipments } from '../../shared/db/schema';
 import type { LedgerEvent, Order } from '../../shared/db/schema';
 import { formatQuantity } from '../../shared/primitives/client-event-facts';
 import { orderLabelOf } from '../../shared/primitives/order-label';
@@ -114,6 +114,10 @@ export interface PackDocumentCarton {
   readonly lines: readonly PackDocumentCartonLine[];
   /** Per UoM, e.g. `12 EA, 2.5 KG` (never a cross-UoM unit total — A36). */
   readonly totals: string;
+  /** Story 4-9a (A24) — set only on a pallet (a carton and a virtual pack's carton omit it). */
+  readonly packageType?: 'pallet';
+  /** Story 4-9a (A24) — a pallet's "said to contain" count, when set. */
+  readonly innerCount?: number;
 }
 
 /**
@@ -358,7 +362,17 @@ export async function packDocumentInTx(
   }
 
   // ── the cartons ──────────────────────────────────────────────────────────
+  // Story 4-9a (A24) — the package type and inner count of a stored pack's rows.
+  const packageTypes = new Map<number, { packageType: string; innerCount: number | null }>();
+  if (record.id !== null) {
+    const typeRows = await tx
+      .select({ seq: orderCartons.seq, packageType: orderCartons.packageType, innerCount: orderCartons.innerCount })
+      .from(orderCartons)
+      .where(and(eq(orderCartons.tenantId, tenantId), eq(orderCartons.packId, record.id)));
+    for (const row of typeRows) packageTypes.set(row.seq, { packageType: row.packageType, innerCount: row.innerCount });
+  }
   const cartons: PackDocumentCarton[] = record.cartons.map((carton) => {
+    const typed = packageTypes.get(carton.seq);
     const cartonLines = carton.lines
       .map((line) => {
         const sku = skuOf(line.skuId);
@@ -380,6 +394,8 @@ export async function packDocumentInTx(
         handlingUnitIds: line.handlingUnitIds,
       })),
       totals: milliTotalsPerUom(cartonLines),
+      ...(typed?.packageType === 'pallet' ? { packageType: 'pallet' as const } : {}),
+      ...(typed?.innerCount === null || typed?.innerCount === undefined ? {} : { innerCount: typed.innerCount }),
     };
   });
 

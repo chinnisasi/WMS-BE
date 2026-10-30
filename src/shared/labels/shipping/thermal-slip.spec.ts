@@ -52,6 +52,11 @@ describe('story 4-5a — the thermal slip (A18, A36)', () => {
     expect(texts(labels[2]!).filter((x) => x.startsWith('SKU-'))).toHaveLength(6);
   });
 
+  it('story 4-9a (A24): a pallet prints PALLET n/N; a carton and an absent type are byte-identical', () => {
+    expect(texts(thermalSlipLabels(input(1, { packageType: 'pallet' }))[0]!)).toContain('PALLET 1/2');
+    expect(thermalSlipLabels(input(1, { packageType: 'carton' }))).toEqual(thermalSlipLabels(input(1)));
+  });
+
   it('renders as ZPL text only (no barcode) — the slip carries no carton code', () => {
     const zpl = renderShippingLabelsZpl(thermalSlipLabels(input(1)));
     expect(zpl).not.toContain('^BC');

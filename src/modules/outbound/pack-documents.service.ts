@@ -141,6 +141,9 @@ export function cartonLabelsOf(doc: PackDocument, cartons: PackDocument['cartons
       cartonCode: carton.code,
       // Story 4-6a (A19) — line 1 of the seam band (line 2 stays 4-10a's marks).
       ...(doc.consignmentLine === undefined || doc.consignmentLine === null ? {} : { extraLines: [doc.consignmentLine] }),
+      // Story 4-9a (A24) — a pallet's word and inner count (absent on a carton: byte-identical).
+      ...(carton.packageType === undefined ? {} : { packageType: carton.packageType }),
+      ...(carton.innerCount === undefined ? {} : { innerCount: carton.innerCount }),
     }),
   );
 }
@@ -157,6 +160,7 @@ export function thermalSlipsOf(doc: PackDocument, cartons: PackDocument['cartons
       pincode: doc.consignee.pincode,
       rows: carton.lines.map((line) => ({ skuCode: line.skuCode, skuName: line.skuName, qty: line.qty, qtyText: line.qtyText, uom: line.uom })),
       totalsText: carton.totals,
+      ...(carton.packageType === undefined ? {} : { packageType: carton.packageType }),
     }),
   );
 }
