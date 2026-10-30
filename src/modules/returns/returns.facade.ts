@@ -51,7 +51,7 @@ import { fromMilli } from '../../shared/primitives/quantity';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
 import { findDamagedBinInTx } from '../tenancy/receiving-bin';
 import { openVendorReturnClaimsByArmInTx } from '../inbound/vendor-return-claims';
-import { ClientReturnCommand } from './client-return.command';
+import { ClientReturnCommand, rtcSkuUnsupported } from './client-return.command';
 import type { CancelClientReturnCommand, CreateClientReturnCommand, DispatchClientReturnCommand, PickClientReturnCommand } from './client-return.command';
 import { clientReturnArmKey, openClientReturnClaimsByArmInTx } from './client-return-claims';
 import {
@@ -372,17 +372,21 @@ export class ReturnsFacade {
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       await assertWarehouseInTenant(tx, tenantId, wh);
       const queue = await awaitingDispositionsInTx(tx, this.catalog, tenantId, { warehouseId: wh, clientId: client, after: null, limit: RTC_RETURNABLE_MAX_ROWS });
-      // Decision 12 — a returned case (catch-weight) cannot go on an RTC.
-      const awaiting = queue.items.filter((row) => row.weightGrams === null);
       const bin = await findDamagedBinInTx(tx, tenantId, wh);
       const allArms = bin === null ? [] : await this.inventory.damagedArmsInTx(tx, tenantId, wh, bin.binId, { clientId: client });
-      const allSkuIds = [...new Set(allArms.map((arm) => arm.skuId))];
+      const allSkuIds = [...new Set([...allArms.map((arm) => arm.skuId), ...queue.items.map((row) => row.skuId)])];
       const facts = await this.catalog.skuFactsInTx(tx, tenantId, allSkuIds);
       const kits = new Set(await this.catalog.getKitSkuIdsInTx(tx, tenantId, allSkuIds));
+      // Decision 12 — exactly what the create accepts (one predicate): a
+      // returned case reads as a line with a captured weight.
+      const awaiting = queue.items.filter((row) => {
+        const sku = facts.get(row.skuId);
+        return sku !== undefined && rtcSkuUnsupported(sku, kits.has(row.skuId), 'returns', row.weightGrams !== null) === null;
+      });
       const batches = await this.catalog.batchViewsByIdsInTx(tx, tenantId, allArms.flatMap((arm) => (arm.batchId === null ? [] : [arm.batchId])));
       const supported = allArms.filter((arm) => {
         const sku = facts.get(arm.skuId);
-        return sku !== undefined && !sku.serialTracked && !sku.catchWeightTracked && !kits.has(arm.skuId);
+        return sku !== undefined && rtcSkuUnsupported(sku, kits.has(arm.skuId), 'damaged', false) === null;
       });
       const text = (x: string, y: string): number => (x < y ? -1 : x > y ? 1 : 0);
       const codeOf = (arm: (typeof allArms)[number]): string => facts.get(arm.skuId)!.code;

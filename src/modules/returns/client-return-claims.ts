@@ -11,7 +11,8 @@ import type { TenantTx } from '../../shared/db/tenant-scope';
  *
  * A claim is an OPEN RTC's `damaged` line on a DAMAGED arm `(sku, batch |
  * null)` of one warehouse: a `draft` line claims its `qty`, a `picked` line
- * its `picked_qty`. Dispatched and cancelled RTCs claim nothing (the units
+ * its `picked_qty` (an RTC whose line claims 0 — picked 0 — is never named
+ * in `codes`). Dispatched and cancelled RTCs claim nothing (the units
  * left, or were released). A `returns` line claims RETURNS, never DAMAGED —
  * its claim lives in the receipt line's `open_qty`. Milli-units.
  */
@@ -42,7 +43,7 @@ export async function openClientReturnClaimsInTx(
 ): Promise<ClientReturnArmClaims> {
   const rows = (await tx.execute(sql`
     select coalesce(sum(case when r.status = 'draft' then l.qty else l.picked_qty end), 0)::bigint as "claimed",
-           coalesce(array_agg(distinct r.code order by r.code), '{}') as "codes"
+           coalesce(array_agg(distinct r.code order by r.code) filter (where (case when r.status = 'draft' then l.qty else l.picked_qty end) > 0), '{}') as "codes"
     from client_return_lines l
     join client_returns r on r.tenant_id = l.tenant_id and r.id = l.client_return_id
     where r.tenant_id = ${tenantId}::uuid and r.warehouse_id = ${warehouseId}::uuid
@@ -69,7 +70,7 @@ export async function openClientReturnClaimsByArmInTx(
   const rows = (await tx.execute(sql`
     select l.sku_id::text as "skuId", l.batch_id::text as "batchId",
            sum(case when r.status = 'draft' then l.qty else l.picked_qty end)::bigint as "claimed",
-           array_agg(distinct r.code order by r.code) as "codes"
+           coalesce(array_agg(distinct r.code order by r.code) filter (where (case when r.status = 'draft' then l.qty else l.picked_qty end) > 0), '{}') as "codes"
     from client_return_lines l
     join client_returns r on r.tenant_id = l.tenant_id and r.id = l.client_return_id
     where r.tenant_id = ${tenantId}::uuid and r.warehouse_id = ${warehouseId}::uuid

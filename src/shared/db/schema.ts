@@ -7316,6 +7316,10 @@ export const clientReturnLines = pgTable(
     index('client_return_lines_tenant_receipt_line_idx')
       .on(table.tenantId, table.returnReceiptLineId)
       .where(sql`return_receipt_line_id IS NOT NULL`),
+    // The portal's per-RMA reads (the awaiting predicate, the RMA line totals).
+    index('client_return_lines_tenant_rma_idx')
+      .on(table.tenantId, table.rmaId)
+      .where(sql`rma_id IS NOT NULL`),
     // The DAMAGED pool claims.
     index('client_return_lines_tenant_damaged_arm_idx')
       .on(table.tenantId, table.skuId, table.batchId)

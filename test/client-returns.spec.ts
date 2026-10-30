@@ -10,6 +10,7 @@ import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { getLedgerEventType } from '../src/modules/inventory/ledger-registry';
 import { signedQuantity } from '../src/shared/primitives/quantity';
 import { RTV_BRAND_DOCUMENT_TYPES } from '../src/shared/primitives/consignment-capture';
+import { damagedPoolLockKey } from '../src/shared/primitives/damaged-pool';
 import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
 import { REJECTED_OP_DECISIONS_BY_TYPE } from '../src/modules/tenancy/sync-report.command';
 import { damagedArmKey } from '../src/modules/inbound/vendor-return-claims';
@@ -181,7 +182,13 @@ describe('story 4-7c: the return to client (e2e)', () => {
       'CS,Serial S,pcs,,1800,,false,true,false,,,',
       'CK,Bulk K,kg,,1800,,false,false,false,,,',
       'CW,Case W,pcs,,1800,,false,false,true,,,',
+      'CJ,Both J,pcs,,1800,,false,false,false,,,',
+      'CM,Short M,pcs,,1800,,false,false,false,,,',
+      'CN,Race N,pcs,,1800,,false,false,false,,,',
+      'CQ,Quarantine Q,pcs,,1800,,false,false,false,,,',
+      'CX,Kit X,pcs,,1800,,false,false,false,,,',
     ]);
+    await asOwner('post', `/catalog/skus/${sku('CX')}/kit`).send({ components: [{ skuId: sku('CA'), quantity: 1 }] }).expect(201);
     await importSkus(other, ['OU,Other U,pcs,,1800,,false,false,false,,,']);
     await asOwner('patch', `/clients/${other}/addresses`).send({ return: testAddress() }).expect(200);
     await importSkus(bare, ['BU,Bare U,pcs,,1800,,false,false,false,,,']);
@@ -303,6 +310,7 @@ describe('story 4-7c: the return to client (e2e)', () => {
     condition?: string;
     serialNumber?: string | null;
     batchCode?: string | null;
+    weightGrams?: number | null;
   }
 
   /** A blind return booked into RETURNS and (unless `accept: false`) accepted with no order — its receipt lines. */
@@ -324,7 +332,7 @@ describe('story 4-7c: the return to client (e2e)', () => {
           note: null,
           batchCode: entry.batchCode ?? null,
           serialNumber: entry.serialNumber ?? null,
-          weightGrams: null,
+          weightGrams: entry.weightGrams ?? null,
         })),
       })
       .expect(201);
@@ -574,6 +582,12 @@ describe('story 4-7c: the return to client (e2e)', () => {
     const list = await http().get(`${API}/${tenantId}/client-returns?clientId=${brand}&status=dispatched`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
     expect((list.body.items as { id: string; clientCode: string }[]).find((item) => item.id === created.id)).toMatchObject({ clientCode: 'BRD', lineCount: 3, totalQuantity: 7, totalPickedQuantity: 7, trackingRef: 'AWB777' });
     expect((await http().get(`${API}/${tenantId}/client-returns/${created.id}`).set('Authorization', `Bearer ${ownerToken}`).expect(200)).body).toEqual(shipped);
+    // The ledger register's reference cell names the RTC by its code.
+    const register = await http()
+      .get(`${API}/${tenantId}/warehouses/${wh}/reports/ledger?format=csv&from=${istToday(-1)}&to=${istToday()}`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .expect(200);
+    expect(register.text.split('\n').filter((row) => row.includes('rtc.dispatched') && row.includes(`return to client ${created.code}`))).toHaveLength(3);
   });
 
   it('AC2 — the detail keeps the address frozen at create after the client edits its return address', async () => {
@@ -616,6 +630,8 @@ describe('story 4-7c: the return to client (e2e)', () => {
     expect(picked.lines[0]!.pickedQuantity).toBe(2);
     expect(await openQtyOf(line.id)).toBe(2);
     expect(await receiptLine(rma.rmaId, line.id)).toMatchObject({ openQty: 2, returningToClientQty: 2, returnedToClientQty: 0 });
+    const portalDetail = await http().get(`${API}/${tenantId}/portal/returns/${rma.rmaId}`).set('Authorization', `Bearer ${portalBrand}`).expect(200);
+    expect(portalDetail.body.lines[0]).toMatchObject({ returningToClientQty: 2, returnedToClientQty: 0 });
     // Cancel a picked RTC: its picked claim goes back.
     const cancelKey = ulid();
     const cancelled = (await cancel(picked, 'brand withdrew', cancelKey).expect(200)).body as Rtc;
@@ -659,6 +675,10 @@ describe('story 4-7c: the return to client (e2e)', () => {
     expect((await create({ lines: [damagedLine('BU', 1)], consigneeAddress: 'registered' }).expect(409)).body.addressKind).toBe('registered');
     expect((await create({ lines: [damagedLine('CW', 1)] }).expect(409)).body).toMatchObject({ code: 'rtc-sku-unsupported', skuCode: 'CW' });
     expect((await create({ lines: [damagedLine('CS', 1)] }).expect(409)).body.code).toBe('rtc-sku-unsupported');
+    // The kit arm (a kit never holds stock — refused before the pool is read).
+    const kit = await create({ lines: [damagedLine('CX', 1)] }).expect(409);
+    expect(kit.body).toMatchObject({ code: 'rtc-sku-unsupported', skuCode: 'CX' });
+    expect(kit.body.detail).toMatch(/a kit/);
     expect((await create({ lines: [] }).expect(400)).body.code).toBe('validation-failed');
     expect((await create({ lines: [{ source: 'returns', quantity: 1 }] }).expect(400)).body.detail).toMatch(/returnReceiptLineId/);
     expect((await create({ lines: [{ source: 'damaged', quantity: 1 }] }).expect(400)).body.detail).toMatch(/skuId/);
@@ -696,8 +716,17 @@ describe('story 4-7c: the return to client (e2e)', () => {
     const returnable = await http().get(`${API}/${tenantId}/warehouses/${wh}/vendor-returns/returnable?clientId=${brand}&skuId=${sku('CD')}`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
     expect(returnable.body.arms[0]).toMatchObject({ onHand: 10, claimed: 10, available: 0 });
     expect(returnable.body.arms[0].claimedBy).toEqual([rtc.code, rtv.code].sort());
-    // The RTC's own returnable read: the arm with both claims.
+    // The RTC's own returnable read: the arm with both claims; the brand's
+    // awaiting lines only — never another client's, never a returned case.
+    const own = await returned([{ skuCode: 'CD', qty: 1 }]);
+    const theirs = await returned([{ skuCode: 'OU', qty: 1 }], { clientId: other });
+    const caseLine = await returned([{ skuCode: 'CW', qty: 1, weightGrams: 1200 }]);
     const mine = await http().get(`${API}/${tenantId}/warehouses/${wh}/client-returns/returnable?clientId=${brand}`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
+    const awaitingIds = (mine.body.awaiting as { receiptLineId: string }[]).map((row) => row.receiptLineId);
+    expect(awaitingIds).toContain(own.lines[0]!.id);
+    expect(awaitingIds).not.toContain(theirs.lines[0]!.id);
+    expect(awaitingIds).not.toContain(caseLine.lines[0]!.id);
+    expect(mine.body.truncated).toBe(false);
     expect((mine.body.damaged as { skuCode: string }[]).find((arm) => arm.skuCode === 'CD')).toMatchObject({ onHand: 10, claimedRtv: 4, claimedRtc: 6, available: 0 });
     expect((mine.body.damaged as { skuCode: string }[]).some((arm) => arm.skuCode === 'CW' || arm.skuCode === 'CS')).toBe(false);
     // The two seams key arms identically.
@@ -741,6 +770,50 @@ describe('story 4-7c: the return to client (e2e)', () => {
     );
     expect(stage1.body).not.toHaveProperty('clientReturnCodes');
     await http().post(`${API}/${tenantId}/vendor-returns/${rtv.id}/cancel`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({ reason: 'test over' }).expect(200);
+  });
+
+  it('the write-off stage 2 with BOTH claims open: DAMAGED 6, RTV 2, RTC 2, write off 3 → damaged-claimed-by-rtc naming both', async () => {
+    await receiveDamaged('CJ', 6);
+    const rtv = (
+      await http()
+        .post(`${API}/${tenantId}/vendor-returns`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ warehouseId: wh, vendorId: vendor, consigneeAddress: 'dispatch', lines: [{ skuId: sku('CJ'), quantity: 2, reasonCode: 'damaged' }] })
+        .expect(201)
+    ).body as { id: string; code: string };
+    const rtc = await createOk([damagedLine('CJ', 2)]);
+    const refused = await writeOff('CJ', 3, 409);
+    expect(refused.body).toMatchObject({ code: 'damaged-claimed-by-rtc', clientReturnCodes: [rtc.code], vendorReturnCodes: [rtv.code], claimedQty: 4, onHandQty: 6 });
+    await cancel(rtc).expect(200);
+    await http().post(`${API}/${tenantId}/vendor-returns/${rtv.id}/cancel`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({ reason: 'test over' }).expect(200);
+  });
+
+  it('a short pick on a DAMAGED line (2 of 4, on-hand 6): the returnable shows claimedRtc 2 and a write-off of 4 passes', async () => {
+    await receiveDamaged('CM', 6);
+    const rtc = await createOk([damagedLine('CM', 4)]);
+    await pick(rtc, { [rtc.lines[0]!.id]: 2 }).expect(200);
+    const read = await http().get(`${API}/${tenantId}/warehouses/${wh}/client-returns/returnable?clientId=${brand}`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
+    expect((read.body.damaged as { skuCode: string }[]).find((arm) => arm.skuCode === 'CM')).toMatchObject({ onHand: 6, claimedRtc: 2, available: 4, claimedBy: [rtc.code] });
+    await writeOff('CM', 4, 201);
+    await cancel(rtc).expect(200);
+  });
+
+  it('a reconcile quarantine on DAMAGED stops the dispatch (409 disposition-scope-quarantined); nothing is written', async () => {
+    await receiveDamaged('CQ', 1);
+    const rtc = await createOk([damagedLine('CQ', 1)]);
+    await pick(rtc).expect(200);
+    const q = uuidv7();
+    await sql`insert into inventory_quarantines (id, tenant_id, warehouse_id, sku_id, bin_id, from_seq, to_seq, reason)
+      values (${q}, ${tenantId}, ${wh}, ${sku('CQ')}, ${await systemBin('DAMAGED')}, 1, 1, 'client-returns probe')`;
+    try {
+      expect((await dispatch(rtc).expect(409)).body.code).toBe('disposition-scope-quarantined');
+      expect(await rtcEvents(rtc.id)).toEqual([]);
+      expect(((await sql`select status from client_returns where id = ${rtc.id}`) as unknown as { status: string }[])[0]!.status).toBe('picked');
+    } finally {
+      await sql`update inventory_quarantines set status = 'resolved' where id = ${q}`;
+    }
+    await cancel(rtc).expect(200);
   });
 
   // ── the pick (decision 13) ─────────────────────────────────────────────────
@@ -1147,6 +1220,35 @@ describe('story 4-7c: the return to client (e2e)', () => {
         if (rtcRes.status === 201) await cancel(rtcRes.body as Rtc).expect(200);
       } finally {
         await Promise.allSettled([rtcReq, disposeReq]);
+        await holder.end();
+      }
+    });
+
+    it('the DAMAGED pool: an RTC create and an RTV create on one arm whose sum exceeds on-hand, parked behind the pool advisory — exactly one wins', async () => {
+      await receiveDamaged('CN', 5);
+      const holder = handle();
+      let rtcReq: Promise<request.Response> | undefined;
+      let rtvReq: Promise<request.Response> | undefined;
+      try {
+        await holder.begin(async (tx) => {
+          const locked = (await tx`select pg_backend_pid() as pid, pg_advisory_xact_lock(hashtextextended(${damagedPoolLockKey(tenantId, wh)}, 0))`) as unknown as { pid: number }[];
+          rtcReq = (async () => create({ lines: [damagedLine('CN', 3)] }))();
+          rtvReq = (async () =>
+            http()
+              .post(`${API}/${tenantId}/vendor-returns`)
+              .set('Authorization', `Bearer ${opsToken}`)
+              .set(KEY_HEADER, ulid())
+              .send({ warehouseId: wh, vendorId: vendor, consigneeAddress: 'dispatch', lines: [{ skuId: sku('CN'), quantity: 3, reasonCode: 'damaged' }] }))();
+          await waitParked(locked[0]!.pid, 2);
+        });
+        const [rtcRes, rtvRes] = await Promise.all([rtcReq!, rtvReq!]);
+        expect([rtcRes.status, rtvRes.status].sort()).toEqual([201, 409]);
+        if (rtcRes.status === 409) expect(rtcRes.body.code).toBe('rtc-exceeds-damaged');
+        else expect(rtvRes.body.code).toBe('rtv-exceeds-damaged');
+        if (rtcRes.status === 201) await cancel(rtcRes.body as Rtc).expect(200);
+        else await http().post(`${API}/${tenantId}/vendor-returns/${rtvRes.body.id as string}/cancel`).set('Authorization', `Bearer ${opsToken}`).set(KEY_HEADER, ulid()).send({ reason: 'race over' }).expect(200);
+      } finally {
+        await Promise.allSettled([rtcReq, rtvReq]);
         await holder.end();
       }
     });

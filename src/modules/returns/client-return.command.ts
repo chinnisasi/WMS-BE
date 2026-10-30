@@ -253,9 +253,10 @@ export function normalizeCreate(command: Omit<CreateClientReturnCommand, 'tenant
       if (skuId === null) throw invalid(`${at} is a damaged line — name its skuId (and batchId for a batch-tracked SKU).`);
       if (returnReceiptLineId !== null) throw invalid(`${at} is a damaged line — it names no returnReceiptLineId.`);
     }
-    if (typeof line.quantity !== 'number' || !Number.isFinite(line.quantity) || line.quantity <= 0 || line.quantity > MAX_QUANTITY_BASE) {
+    if (typeof line.quantity !== 'number' || !Number.isFinite(line.quantity) || line.quantity <= 0) {
       throw invalid(`${at}.quantity must be above 0.`);
     }
+    if (line.quantity > MAX_QUANTITY_BASE) throw invalid(`${at}.quantity is at most ${MAX_QUANTITY_BASE}.`);
     // A9 — the reason is optional and defaults (before hashing) to `client-instruction`.
     const reasonCode = line.reasonCode ?? DEFAULT_RTC_REASON;
     if (!(RETURN_DISPOSITION_REASONS as readonly string[]).includes(reasonCode)) {
@@ -391,6 +392,21 @@ export function consigneeAddressOf(client: ClientSnapshot, kind: RtcAddressKind)
   };
 }
 
+/**
+ * Decision 12 — THE rule of what a return to client cannot carry, shared by
+ * the create and both returnable lists (so the dialog offers exactly what the
+ * create accepts): a catch-weight SKU, a kit (by the catalog flag or the kit
+ * table), a returned case (a handling-unit receipt line), and from DAMAGED a
+ * serial-tracked SKU. Returns why, or null when supported.
+ */
+export function rtcSkuUnsupported(sku: SkuFacts, isKitFromTable: boolean, source: RtcLineSource, handlingUnit: boolean): string | null {
+  if (sku.catchWeightTracked) return 'catch-weight (a returned or damaged case has no shipped-back state)';
+  if (isKitFromTable || sku.isKit) return 'a kit';
+  if (handlingUnit) return 'a returned case';
+  if (source === 'damaged' && sku.serialTracked) return 'serial-tracked (DAMAGED holds no serials)';
+  return null;
+}
+
 /** One returns line's locked receipt line. */
 interface LockedReceiptLine {
   readonly id: string;
@@ -512,13 +528,8 @@ export class ClientReturnCommand {
       for (const line of normalized.lines) {
         const skuId = line.source === 'returns' ? receiptLines.get(line.returnReceiptLineId!)!.skuId : line.skuId!;
         const sku = facts.get(skuId)!;
-        if (sku.catchWeightTracked || kits.has(skuId) || sku.isKit) {
-          throw skuUnsupported(sku.code, sku.catchWeightTracked ? 'catch-weight (a returned or damaged case has no shipped-back state)' : 'a kit');
-        }
-        if (line.source === 'returns' && receiptLines.get(line.returnReceiptLineId!)!.handlingUnitId !== null) {
-          throw skuUnsupported(sku.code, 'a returned case');
-        }
-        if (line.source === 'damaged' && sku.serialTracked) throw skuUnsupported(sku.code, 'serial-tracked (DAMAGED holds no serials)');
+        const why = rtcSkuUnsupported(sku, kits.has(skuId), line.source, line.source === 'returns' && receiptLines.get(line.returnReceiptLineId!)!.handlingUnitId !== null);
+        if (why !== null) throw skuUnsupported(sku.code, why);
       }
       for (const line of damagedLines) {
         const sku = facts.get(line.skuId!)!;
@@ -860,7 +871,9 @@ export class ClientReturnCommand {
       }
 
       // ── the time rule, behind the replay lookup (D8) ────────────────────
-      assertBrandDocumentDateWindow(valid.brandDocumentDate, istDateOf(row.createdAt), istDateOf(new Date(clientReturnClock.now()).toISOString()));
+      // §7m — ONE clock reading: the date window, `dispatched_at` and the ledger's business time.
+      const at = new Date(clientReturnClock.now()).toISOString();
+      assertBrandDocumentDateWindow(valid.brandDocumentDate, istDateOf(row.createdAt), istDateOf(at));
       // ── the transporter, frozen (when one is named) ─────────────────────
       const transporter: TransporterSnapshotV1 | null =
         valid.transporterId === null ? null : await assertTransporterInTx(tx, tenantId, valid.transporterId, 'a return-to-client dispatch');
@@ -935,7 +948,6 @@ export class ClientReturnCommand {
       }
 
       // ── the ledger: one rtc.dispatched draw per picked line (per serial unit) ─
-      const at = nowIso();
       for (const line of shipping) {
         const fromBinId = line.source === 'returns' ? returnsBin!.binId : damagedBin!.binId;
         await this.inventory.appendLedgerEventInTx(tx, {
@@ -1163,6 +1175,3 @@ export class ClientReturnCommand {
     }
   }
 }
-
-/** The `SkuFacts` the create judged — re-exported for the facade's returnable read. */
-export type { SkuFacts };

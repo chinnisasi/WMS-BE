@@ -790,9 +790,15 @@ describe('story 1-2a: the client master record', () => {
       // Story 2-8b — an open (draft) return to vendor of its goods.
       await sql`insert into vendor_returns (id, tenant_id, warehouse_id, client_id, vendor_id, code, status, consignee_address_kind, vendor_snapshot, client_snapshot, created_by)
         values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${windId}, ${uuidv7()}, 'RTV-9001', 'draft', 'registered', ${sql.json({})}, ${sql.json({})}, ${ownerUserId})`;
-      // Story 4-7c — an open (picked) return to client of its goods, and a dispatched one that never blocks.
+      // Story 4-7c — an open (picked) return to client of its goods; a dispatched and a cancelled one never block.
       await sql`insert into client_returns (id, tenant_id, client_id, warehouse_id, code, status, client_snapshot, consignee_address_kind, consignee_address, created_by, picked_by, picked_at, picked_device_id)
         values (${uuidv7()}, ${tenantId}, ${windId}, ${warehouseId}, 'RTC-9001', 'picked', ${sql.json({})}, 'return', ${sql.json({})}, ${ownerUserId}, ${ownerUserId}, now(), ${uuidv7()})`;
+      await sql`insert into client_returns (id, tenant_id, client_id, warehouse_id, code, status, client_snapshot, consignee_address_kind, consignee_address, created_by, picked_by, picked_at, picked_device_id,
+          dispatched_by, dispatched_at, brand_document_type, brand_document_number, brand_document_date, carrier_name, package_count)
+        values (${uuidv7()}, ${tenantId}, ${windId}, ${warehouseId}, 'RTC-9002', 'dispatched', ${sql.json({})}, 'return', ${sql.json({})}, ${ownerUserId}, ${ownerUserId}, now(), ${uuidv7()},
+          ${ownerUserId}, now(), 'challan', 'CH-1', current_date, 'Hand delivery', 1)`;
+      await sql`insert into client_returns (id, tenant_id, client_id, warehouse_id, code, status, client_snapshot, consignee_address_kind, consignee_address, created_by, cancelled_by, cancelled_at, cancel_reason)
+        values (${uuidv7()}, ${tenantId}, ${windId}, ${warehouseId}, 'RTC-9003', 'cancelled', ${sql.json({})}, 'return', ${sql.json({})}, ${ownerUserId}, ${ownerUserId}, now(), 'probe')`;
 
       const res = await setStatus(windId, 'departed');
       expectProblem(res, 409, 'client-not-wound-down');

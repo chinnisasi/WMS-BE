@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS "client_returns" (
 CREATE UNIQUE INDEX IF NOT EXISTS "client_return_lines_line_no_unique" ON "client_return_lines" USING btree ("client_return_id","line_no");--> statement-breakpoint
 CREATE UNIQUE INDEX IF NOT EXISTS "client_return_lines_receipt_line_unique" ON "client_return_lines" USING btree ("client_return_id","return_receipt_line_id") WHERE return_receipt_line_id IS NOT NULL;--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "client_return_lines_tenant_receipt_line_idx" ON "client_return_lines" USING btree ("tenant_id","return_receipt_line_id") WHERE return_receipt_line_id IS NOT NULL;--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "client_return_lines_tenant_rma_idx" ON "client_return_lines" USING btree ("tenant_id","rma_id") WHERE rma_id IS NOT NULL;--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "client_return_lines_tenant_damaged_arm_idx" ON "client_return_lines" USING btree ("tenant_id","sku_id","batch_id") WHERE source = 'damaged';--> statement-breakpoint
 CREATE UNIQUE INDEX IF NOT EXISTS "client_returns_tenant_code_unique" ON "client_returns" USING btree ("tenant_id","code");--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "client_returns_tenant_created_at_id_idx" ON "client_returns" USING btree ("tenant_id","created_at","id");--> statement-breakpoint
@@ -268,6 +269,7 @@ BEGIN
 	END IF;
 	-- (1) accepted shapes: a draft, a picked, a dispatched (with an e-way
 	-- bill, a transporter, a vehicle, both GSTINs and a declared value), a
+	-- dispatched naming only a transporter and one naming only a vehicle, a
 	-- draft cancelled, a picked RTC cancelled, and lines — a returns line, a
 	-- serial line picked whole and picked 0, a damaged line with and without
 	-- a batch, picked short.
@@ -293,6 +295,15 @@ BEGIN
 		VALUES (gen_random_uuid(), t, r, 1, 'returns', c, NULL, u, l, v, 1000, 1000, 'client-instruction', '{}'),
 		       (gen_random_uuid(), t, r, 2, 'returns', c, NULL, d, gen_random_uuid(), v, 1000, 0, 'client-instruction', '{}'),
 		       (gen_random_uuid(), t, r, 200, 'damaged', c, NULL, NULL, NULL, NULL, 2000, 500, 'damaged', '{}');
+		-- The carrier identity: a transporter alone, and a vehicle alone, each suffice.
+		INSERT INTO "client_returns" ("id","tenant_id","client_id","warehouse_id","code","status","client_snapshot","consignee_address_kind","consignee_address","created_by","picked_by","picked_at","picked_device_id",
+			"dispatched_by","dispatched_at","brand_document_type","brand_document_number","brand_document_date","transporter_id","transporter_snapshot","package_count","warehouse_snapshot")
+		VALUES (gen_random_uuid(), t, c, w, 'RTC-P006', 'dispatched', '{}', 'return', '{}', u, u, now(), d,
+			u, now(), 'challan', 'CH-6', current_date, v, '{}', 1, '{}');
+		INSERT INTO "client_returns" ("id","tenant_id","client_id","warehouse_id","code","status","client_snapshot","consignee_address_kind","consignee_address","created_by","picked_by","picked_at","picked_device_id",
+			"dispatched_by","dispatched_at","brand_document_type","brand_document_number","brand_document_date","vehicle_number","package_count","warehouse_snapshot")
+		VALUES (gen_random_uuid(), t, c, w, 'RTC-P007', 'dispatched', '{}', 'return', '{}', u, u, now(), d,
+			u, now(), 'challan', 'CH-7', current_date, 'KA01AB1234', 1, '{}');
 		INSERT INTO "client_returns" ("id","tenant_id","client_id","warehouse_id","code","status","client_snapshot","consignee_address_kind","consignee_address","created_by","cancelled_by","cancelled_at","cancel_reason")
 		VALUES (gen_random_uuid(), t, c, w, 'RTC-P004', 'cancelled', '{}', 'return', '{}', u, u, now(), 'cancel a draft');
 		INSERT INTO "client_returns" ("id","tenant_id","client_id","warehouse_id","code","status","client_snapshot","consignee_address_kind","consignee_address","created_by","picked_by","picked_at","picked_device_id","cancelled_by","cancelled_at","cancel_reason")
