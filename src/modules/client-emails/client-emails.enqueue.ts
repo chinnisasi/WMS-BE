@@ -23,6 +23,7 @@ import {
   clientEmailCountsTodayInTx,
   queueClientEmailInTx,
   type ClientDispatchEmailParams,
+  type ClientDocumentsNeededEmailParams,
   type ClientReceiptEmailParams,
   type ClientShipmentDocumentEmailParams,
 } from '../mail/mail.facade';
@@ -36,12 +37,16 @@ import {
 } from './client-email-rules';
 import {
   buildDispatchEmailParams,
+  buildDocumentsNeededEmailParams,
   buildReceiptEmailParams,
   buildShipmentDocumentEmailParams,
   clientEmailDedupeKey,
   decodeDocumentShared,
+  decodePackedOrderId,
   qcHeldLinesOf,
 } from './client-email-params';
+// Story 4-6a (A12, A20) — the record's seam (guide §7h): never the invoicing module.
+import { dispatchedConsignmentRecordsOfOrdersInTx } from '../invoicing/consignment-seam';
 
 /** Why an event queued nothing (never a row — decision 4's skip table). */
 export type ClientEmailSkipReason =
@@ -54,7 +59,13 @@ export type ClientEmailSkipReason =
   | 'no-subscriber'
   | 'over-cap'
   // Story 4-4a — the shared file (or its order or handover) is gone, or not the event's client's.
-  | 'document-gone';
+  | 'document-gone'
+  // Story 4-6a (A20, A36, A47) — the documents-needed reminder: the order is no
+  // longer open at delivery, its gate is not blocking any more (a record
+  // arrived), or the gate could not be read (a data fault — acked, never rethrown).
+  | 'not-open'
+  | 'not-blocking'
+  | 'gate-unreadable';
 
 /** What one delivery did (the suites read it). */
 export type ClientEmailOutcome =
@@ -162,19 +173,22 @@ export class ClientEmailsEnqueueHandler implements OnModuleInit {
     const dispatch = publicEvent === 'order.dispatched' ? decodeDispatch(event.payload) : null;
     // Story 4-4a (D6) — a shared shipping document: the payload names its client.
     const document = publicEvent === 'shipment.documents' ? decodeDocumentShared(event.payload) : null;
-    if (receipt === null && dispatch === null && document === null) {
+    // Story 4-6a (A20) — a packed order: the reminder is judged at delivery.
+    const packedOrderId = publicEvent === 'consignment.documents-needed' ? decodePackedOrderId(event.payload) : null;
+    if (receipt === null && dispatch === null && document === null && packedOrderId === null) {
       this.logger.error(`client-email.malformed type=${event.type} tenant=${tenantId} event=${event.eventId} — no mail, acking`);
       return { kind: 'malformed' };
     }
 
     // 1. The client: on the receipt; through the order for a dispatch.
-    const subjectId = receipt !== null ? receipt.grnId : document !== null ? document.attachmentId : dispatch!.orderId;
+    const orderSubject = packedOrderId ?? dispatch?.orderId ?? null;
+    const subjectId = receipt !== null ? receipt.grnId : document !== null ? document.attachmentId : orderSubject!;
     const clientId =
       receipt !== null
         ? receipt.clientId
         : document !== null
           ? document.clientId
-          : ((await this.outbound.orderClientIdsInTx(tx, tenantId, [dispatch!.orderId])).get(dispatch!.orderId) ?? null);
+          : ((await this.outbound.orderClientIdsInTx(tx, tenantId, [orderSubject!])).get(orderSubject!) ?? null);
     if (clientId === null) return skip('no-client', null);
 
     // 2. Missing, the tenant's own `self`, or departed: no mail. Existence is
@@ -202,8 +216,43 @@ export class ClientEmailsEnqueueHandler implements OnModuleInit {
       clientName: client.name,
       replyTo: client.emailReplyTo ?? null,
     };
-    let params: ClientReceiptEmailParams | ClientDispatchEmailParams | ClientShipmentDocumentEmailParams;
-    if (document !== null) {
+    let params: ClientReceiptEmailParams | ClientDispatchEmailParams | ClientShipmentDocumentEmailParams | ClientDocumentsNeededEmailParams;
+    if (packedOrderId !== null) {
+      // Story 4-6a (A20, A36, A47) — the gate read AT DELIVERY (a reminder
+      // about something already recorded would be wrong — the deliberate
+      // exception to "facts frozen at the event"). Contained: any
+      // non-transient fault acks without a row.
+      let read: Awaited<ReturnType<OutboundFacade['consignmentGateOfOrderInTx']>>;
+      try {
+        // In a SAVEPOINT: a non-transient database error rolls back to it, so
+        // the outer transaction stays usable and the skip commits cleanly.
+        read = await tx.transaction((sp) =>
+          this.outbound.consignmentGateOfOrderInTx(sp as unknown as TenantTx, tenantId, packedOrderId, istDateOf(new Date(clientEmailClock.now()).toISOString())),
+        );
+      } catch (err) {
+        if (isTransientDbError(err)) throw err;
+        return skip('gate-unreadable', clientId);
+      }
+      // The order is gone (it cannot reach here with a client and no row, but never mail it).
+      if (read === null) return skip('not-open', clientId);
+      const status = read.facts.order.status;
+      if (status !== 'accepted' && status !== 'ready_to_dispatch') return skip('not-open', clientId);
+      const gate = read.gate;
+      if (!gate.blocking) return skip('not-blocking', clientId);
+      const warehouseName = await getWarehouseNameInTx(tx, tenantId, read.facts.order.warehouseId);
+      params = buildDocumentsNeededEmailParams(
+        {
+          orderId: packedOrderId,
+          orderRef: read.facts.label,
+          state: gate.state as 'missing' | 'eway-required' | 'eway-expired',
+          requiredBecause: gate.requiredBecause,
+          nationalThresholdPaise: read.nationalThresholdPaise,
+          recordThresholdPaise: read.facts.live?.thresholdPaise === undefined || read.facts.live?.thresholdPaise === null ? null : Number(read.facts.live.thresholdPaise),
+          ewayValidUntil: read.facts.live?.ewayValidUntil ?? null,
+        },
+        { ...names, warehouseName },
+      );
+    } else if (document !== null) {
       const facts = await this.outbound.shipmentDocumentEmailFactsInTx(tx, tenantId, document);
       if (facts === null) return skip('document-gone', clientId);
       params = buildShipmentDocumentEmailParams(document, facts, names);
@@ -223,7 +272,9 @@ export class ClientEmailsEnqueueHandler implements OnModuleInit {
       const warehouseName = await getWarehouseNameInTx(tx, tenantId, fact.warehouseId);
       const skus = await this.catalog.skuLabelsInTx(tx, tenantId, fact.lines.map((line) => line.skuId));
       const kitParentLineIds = await this.outbound.kitParentLineIdsInTx(tx, tenantId, fact.lines.map((line) => line.orderLineId));
-      params = buildDispatchEmailParams(fact, { ...names, warehouseName, skus, kitParentLineIds });
+      // Story 4-6a (A20) — the version the goods left under (stamped, immutable).
+      const stamped = (await dispatchedConsignmentRecordsOfOrdersInTx(tx, tenantId, [fact.orderId], new Map([[fact.orderId, fact.dispatchedAt]]))).get(fact.orderId) ?? null;
+      params = buildDispatchEmailParams(fact, { ...names, warehouseName, skus, kitParentLineIds }, stamped);
     }
 
     // 6. One row per recipient; a re-delivered event finds every key taken.
@@ -255,7 +306,16 @@ export class ClientEmailsEnqueueHandler implements OnModuleInit {
                 // Story 4-4a (D3) — the stored file, read and attached at send time.
                 attachment: { kind: 'stored-file', ref: subjectId },
               })
-            : await queueClientEmailInTx(tx, {
+            : template === 'client-documents-needed'
+              ? await queueClientEmailInTx(tx, {
+                  tenantId,
+                  clientId,
+                  template,
+                  to: recipient.email,
+                  dedupeKey,
+                  params: params as ClientDocumentsNeededEmailParams,
+                })
+              : await queueClientEmailInTx(tx, {
                 tenantId,
                 clientId,
                 template,

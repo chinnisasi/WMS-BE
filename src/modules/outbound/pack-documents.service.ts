@@ -139,6 +139,8 @@ export function cartonLabelsOf(doc: PackDocument, cartons: PackDocument['cartons
       courierName: doc.shipment?.courierName ?? null,
       awb: doc.shipment?.awb ?? null,
       cartonCode: carton.code,
+      // Story 4-6a (A19) — line 1 of the seam band (line 2 stays 4-10a's marks).
+      ...(doc.consignmentLine === undefined || doc.consignmentLine === null ? {} : { extraLines: [doc.consignmentLine] }),
     }),
   );
 }

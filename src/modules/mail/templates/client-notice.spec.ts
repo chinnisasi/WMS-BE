@@ -48,9 +48,17 @@ const dispatch: ClientDispatchEmailParams = {
 const context = { tenantId: 't', to: 'a@acme.example', webBaseUrl: 'https://app.wms.test', secret: null };
 
 describe('client notices (story 5-2b)', () => {
-  it('the vocabulary: six templates (story 4-4a added the shipping document), the three client ones at priority 1, account mail at 0', () => {
-    expect([...EMAIL_TEMPLATES]).toEqual(['user-invite', 'password-reset', 'password-changed', 'client-receipt', 'client-dispatch', 'client-shipment-document']);
-    expect([...CLIENT_EMAIL_TEMPLATES]).toEqual(['client-receipt', 'client-dispatch', 'client-shipment-document']);
+  it('the vocabulary: seven templates (story 4-4a added the shipping document, 4-6a the documents-needed reminder), the four client ones at priority 1, account mail at 0', () => {
+    expect([...EMAIL_TEMPLATES]).toEqual([
+      'user-invite',
+      'password-reset',
+      'password-changed',
+      'client-receipt',
+      'client-dispatch',
+      'client-shipment-document',
+      'client-documents-needed',
+    ]);
+    expect([...CLIENT_EMAIL_TEMPLATES]).toEqual(['client-receipt', 'client-dispatch', 'client-shipment-document', 'client-documents-needed']);
     expect(EMAIL_TEMPLATE_PRIORITY).toEqual({
       'user-invite': 0,
       'password-reset': 0,
@@ -58,6 +66,7 @@ describe('client notices (story 5-2b)', () => {
       'client-receipt': 1,
       'client-dispatch': 1,
       'client-shipment-document': 1,
+      'client-documents-needed': 1,
     });
   });
 
@@ -183,5 +192,22 @@ describe('client notices (story 5-2b)', () => {
       expect(sheet.text).toContain('- SO-0: AWB AWB0');
       expect(sheet.text).toContain('…and 3 more');
     });
+  });
+
+  it('story 4-6a (A20) — the documents-needed reminder: the subject by what is needed, each reason sentence, the action by what is needed, the deep link', () => {
+    const base = { tenantName: 'Acme 3PL', clientName: 'ACME Brand', warehouseName: 'Main', orderId: 'o-1', orderRef: 'SO-1', threshold: null, ewayValidUntil: null, replyTo: null };
+    const render = (over: Record<string, unknown>) => renderEmail('client-documents-needed', { ...base, ...over }, context);
+    const invoice = render({ needs: 'invoice', reason: 'policy-b2b' });
+    expect(invoice.subject).toBe('ACME Brand: order SO-1 is packed — your invoice is needed before it can leave');
+    expect(invoice.text).toContain('every B2B order before it leaves');
+    expect(invoice.text).toContain('and the e-way bill when one is needed');
+    expect(invoice.text).toContain('https://app.wms.test/portal/orders?order=o-1&tab=documents');
+    expect(render({ needs: 'invoice', reason: 'policy-all' }).text).toContain('every order before it leaves');
+    expect(render({ needs: 'invoice', reason: 'value', threshold: '₹50,000' }).text).toContain("The order's own value is above ₹50,000 — the e-way threshold");
+    const owed = render({ needs: 'eway-bill', reason: 'eway-pending', threshold: '₹1,00,000' });
+    expect(owed.subject).toBe('ACME Brand: order SO-1 is packed — your e-way bill is needed before it can leave');
+    expect(owed.text).toContain('above ₹1,00,000 — the e-way threshold — and no e-way bill number is recorded yet');
+    expect(owed.text).toContain('Record the e-way bill number, its date and its validity');
+    expect(render({ needs: 'eway-bill', reason: 'eway-expired', ewayValidUntil: '2026-11-01' }).text).toContain('expired on 1 Nov 2026');
   });
 });

@@ -1,3 +1,5 @@
+// Story 4-6a (A12) — the record's seam (guide §7h): never the invoicing module.
+import { withdrawConsignmentOnCancelInTx } from '../invoicing/consignment-seam';
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { and, eq, inArray, isNull, ne } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
@@ -1958,6 +1960,17 @@ export class OrderCommandService {
       const snapshot = await this.snapshotOf(tx, target);
 
       if (winner !== undefined) {
+        // Story 4-6a (A21, A38) — the order's live consignment version is
+        // withdrawn ("Order cancelled") so its e-way number is free for the
+        // brand's re-issue: in THIS (phase-3) transaction, only on the winning
+        // flip, under the flip's row lock (order → record). A cancel refused
+        // in its pre-check, or a lost flip, withdraws nothing.
+        await withdrawConsignmentOnCancelInTx(tx, this.outbox, {
+          tenantId: command.tenantId,
+          orderId: order.id,
+          actorUserId: command.actorUserId,
+          at: nowIso(),
+        });
         // In-transaction outbox append (AD-7) — before the idempotency key.
         await this.outbox.append(tx, {
           messageId: uuidv7(),

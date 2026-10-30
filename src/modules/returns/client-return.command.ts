@@ -11,12 +11,16 @@ import { ProblemException, isUniqueViolationOn } from '../../shared/problem-deta
 import {
   assertBrandDocumentDateWindow,
   assertConsignmentCaptureShape,
+  CONSIGNMENT_CAPTURE_LIMITS,
+  gstinStateCode,
   normalizeConsignmentCapture,
   type ConsignmentCaptureInput,
   type NormalizedConsignmentCapture,
 } from '../../shared/primitives/consignment-capture';
 import { GSTIN_RE, gstinPrefixProblem, normalizeGstinInput } from '../../shared/primitives/gstin';
 import { damagedPoolLockKey } from '../../shared/primitives/damaged-pool';
+import { assertEwayExemptionShape, normalizeEwayExemption } from '../../shared/primitives/consignment-record';
+import { assertReturnEwayRuleInTx, stateCodeOfNameInTx } from '../../shared/eway/return-eway-rule';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -65,8 +69,8 @@ export type { ClientReturnStatus, RtcAddressKind, RtcLineSource } from './client
 export const MAX_RTC_LINES = 200;
 /** The header note and the cancel reason, in code points (0113's CHECK). */
 export const MAX_RTC_NOTE = 500;
-/** A9 — the declared value's ceiling (paise; 0113's CHECK). */
-export const MAX_DECLARED_VALUE_PAISE = 1_000_000_000_000;
+/** A9 — the declared value's ceiling (paise; 0113's CHECK). Story 4-6a (A8): the shared capture limit, re-exported. */
+export const MAX_DECLARED_VALUE_PAISE = CONSIGNMENT_CAPTURE_LIMITS.declaredValueMaxPaise;
 /** A9 — a line's reason when none is given. */
 export const DEFAULT_RTC_REASON: ReturnDispositionReason = 'client-instruction';
 
@@ -127,6 +131,8 @@ export interface DispatchClientReturnCommand extends Omit<ConsignmentCaptureInpu
   readonly clientReturnId: string;
   readonly consigneeGstin?: string | null | undefined;
   readonly declaredValuePaise?: number | null | undefined;
+  /** Story 4-6a (A41) — instead of an e-way bill above the threshold; hashed only when sent. */
+  readonly ewayExemption?: { readonly reason?: string | null; readonly note?: string | null } | null | undefined;
 }
 
 export interface CancelClientReturnCommand {
@@ -306,13 +312,20 @@ export interface NormalizedRtcDispatch {
   /** Normalised (trimmed, upper-cased), as SENT — absent is null, never the defaulted value (A1). */
   readonly consigneeGstin: string | null;
   readonly declaredValuePaise: number | null;
+  /** Story 4-6a (A41) — the exemption, trimmed (both null when none was sent). */
+  readonly ewayExemption?: { readonly reason: string | null; readonly note: string | null };
 }
 
 /** The lenient normalize (hashed; never throws). D8 — the RTC carries no debit note. */
 export function normalizeRtcDispatch(command: Omit<DispatchClientReturnCommand, 'tenantId' | 'actorUserId' | 'clientReturnId'>): NormalizedRtcDispatch {
   const capture = normalizeConsignmentCapture({ ...command, debitNoteNumber: null });
   const consigneeGstin = typeof command.consigneeGstin === 'string' ? normalizeGstinInput(command.consigneeGstin) : (command.consigneeGstin ?? null);
-  return { capture, consigneeGstin, declaredValuePaise: (command.declaredValuePaise ?? null) as number | null };
+  return {
+    capture,
+    consigneeGstin,
+    declaredValuePaise: (command.declaredValuePaise ?? null) as number | null,
+    ewayExemption: normalizeEwayExemption(command.ewayExemption),
+  };
 }
 
 /**
@@ -340,6 +353,10 @@ export function dispatchPayloadHash(tenantId: string, clientReturnId: string, no
     packageCount: c.packageCount,
     consigneeGstin: normalized.consigneeGstin,
     declaredValuePaise: normalized.declaredValuePaise,
+    // Story 4-6a (A41) — only when sent, so every pre-4-6a body hashes as before (the golden).
+    ...(normalized.ewayExemption === undefined || normalized.ewayExemption.reason === null
+      ? {}
+      : { ewayExemption: { reason: normalized.ewayExemption.reason, note: normalized.ewayExemption.note } }),
   });
 }
 
@@ -355,6 +372,11 @@ function assertRtcDispatchExtras(normalized: NormalizedRtcDispatch): void {
   if (value !== null && (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > MAX_DECLARED_VALUE_PAISE)) {
     throw invalid(`declaredValuePaise is a whole number of paise, 0–${MAX_DECLARED_VALUE_PAISE}.`);
   }
+  const exemption = normalized.ewayExemption ?? { reason: null, note: null };
+  if ((exemption.reason !== null || exemption.note !== null) && normalized.declaredValuePaise === null) {
+    throw invalid('ewayExemption goes with a declaredValuePaise — an exemption answers a value above the e-way threshold.');
+  }
+  assertEwayExemptionShape(exemption.reason, exemption.note, normalized.capture.ewayBillNumber !== null);
 }
 
 /** A2 — the frozen consignee address of the chosen kind, or null when the client has none. */
@@ -874,6 +896,24 @@ export class ClientReturnCommand {
       // §7m — ONE clock reading: the date window, `dispatched_at` and the ledger's business time.
       const at = new Date(clientReturnClock.now()).toISOString();
       assertBrandDocumentDateWindow(valid.brandDocumentDate, istDateOf(row.createdAt), istDateOf(at));
+      // ── story 4-6a (A22, A41): the declared value is judged against the
+      // e-way threshold for the movement — from the warehouse's state (else
+      // the consignor's, else the frozen brand's) to the consignee's (its
+      // frozen address's state, else the consignee GSTIN's prefix).
+      const exemption = normalized.ewayExemption ?? { reason: null, note: null };
+      const warehouseNow = await liveClientReturnWarehouseInTx(tx, tenantId, row.warehouseId);
+      const frozenClient = row.clientSnapshot as { gstin?: string | null };
+      const consignee = row.consigneeAddress as ConsigneeAddressV1;
+      await assertReturnEwayRuleInTx(tx, tenantId, {
+        declaredValuePaise: normalized.declaredValuePaise,
+        fromState: gstinStateCode(warehouseNow.gstin) ?? gstinStateCode(valid.consignorGstin) ?? gstinStateCode(frozenClient.gstin ?? null),
+        toState: consignee.stateCode ?? (await stateCodeOfNameInTx(tx, consignee.state)) ?? gstinStateCode(normalized.consigneeGstin ?? frozenClient.gstin ?? null),
+        documentDate: valid.brandDocumentDate,
+        todayIst: istDateOf(at),
+        ewayBillNumber: valid.ewayBillNumber,
+        ewayValidUntil: valid.ewayValidUntil,
+        exempt: exemption.reason !== null,
+      });
       // ── the transporter, frozen (when one is named) ─────────────────────
       const transporter: TransporterSnapshotV1 | null =
         valid.transporterId === null ? null : await assertTransporterInTx(tx, tenantId, valid.transporterId, 'a return-to-client dispatch');
@@ -1010,7 +1050,11 @@ export class ClientReturnCommand {
 
       const view = await clientReturnViewInTx(tx, tenantId, row.id);
       await this.emit(tx, tenantId, CLIENT_RETURN_EVENTS.dispatched, view, at);
-      await this.audit(tx, tenantId, command.actorUserId, CLIENT_RETURN_EVENTS.dispatched, row.id, idempotencyKey);
+      // Story 4-6a (A41) — the audit row says when the threshold was not judged, and names an exemption.
+      await this.audit(tx, tenantId, command.actorUserId, CLIENT_RETURN_EVENTS.dispatched, row.id, idempotencyKey, {
+        ...(normalized.declaredValuePaise === null ? { ewayUnjudged: true } : { declaredValuePaise: normalized.declaredValuePaise }),
+        ...(exemption.reason === null ? {} : { ewayExemption: { reason: exemption.reason, note: exemption.note } }),
+      });
       await this.writeIdempotencyKey(tx, tenantId, idempotencyKey, payloadHash, view);
       return view;
     });
@@ -1134,7 +1178,15 @@ export class ClientReturnCommand {
     await this.outbox.append(tx, { messageId: uuidv7(), tenantId, type, occurredAt: at, payload: { ...payload } });
   }
 
-  private async audit(tx: TenantTx, tenantId: string, actorUserId: string, action: string, targetId: string, idempotencyKey: string): Promise<void> {
+  private async audit(
+    tx: TenantTx,
+    tenantId: string,
+    actorUserId: string,
+    action: string,
+    targetId: string,
+    idempotencyKey: string,
+    changes?: Record<string, unknown>,
+  ): Promise<void> {
     await tx.insert(auditEvents).values({
       id: uuidv7(),
       tenantId,
@@ -1143,6 +1195,7 @@ export class ClientReturnCommand {
       targetType: 'client_return',
       targetId,
       reference: idempotencyKey,
+      ...(changes === undefined ? {} : { changes }),
       occurredAt: nowIso(),
     });
   }

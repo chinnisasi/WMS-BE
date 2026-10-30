@@ -11,11 +11,15 @@ import { ProblemException, isUniqueViolationOn } from '../../shared/problem-deta
 import {
   assertBrandDocumentDateWindow,
   assertConsignmentCaptureShape,
+  CONSIGNMENT_CAPTURE_LIMITS,
+  gstinStateCode,
   normalizeConsignmentCapture,
   type ConsignmentCaptureInput,
   type NormalizedConsignmentCapture,
 } from '../../shared/primitives/consignment-capture';
 import { damagedPoolLockKey } from '../../shared/primitives/damaged-pool';
+import { assertEwayExemptionShape, normalizeEwayExemption } from '../../shared/primitives/consignment-record';
+import { assertReturnEwayRuleInTx } from '../../shared/eway/return-eway-rule';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -31,7 +35,7 @@ import {
   clientPartySnapshotOf,
   getClientInTx,
 } from '../clients/clients.facade';
-import { assertTransporterInTx, assertVendorLinkedInTx, type TransporterSnapshotV1 } from '../partners/partners.facade';
+import { assertTransporterInTx, assertVendorLinkedInTx, type TransporterSnapshotV1, type VendorSnapshotV1 } from '../partners/partners.facade';
 import { CatalogFacade } from '../catalog/catalog.facade';
 import { uomPrecision } from '../catalog/uom';
 import { InventoryFacade } from '../inventory/inventory.facade';
@@ -134,6 +138,10 @@ export interface DispatchVendorReturnCommand extends ConsignmentCaptureInput {
   readonly tenantId: string;
   readonly actorUserId: string;
   readonly vendorReturnId: string;
+  /** Story 4-6a (A22) — the consignment value the brand declares (paise); judged against the e-way threshold. */
+  readonly declaredValuePaise?: number | null | undefined;
+  /** Story 4-6a (A41) — instead of an e-way bill above the threshold. */
+  readonly ewayExemption?: { readonly reason?: string | null; readonly note?: string | null } | null | undefined;
 }
 
 export interface CancelVendorReturnCommand {
@@ -617,9 +625,29 @@ export class VendorReturnCommand {
     if (!UUID_RE.test(command.vendorReturnId)) throw invalid('The return id must be a uuid.');
     const capture = normalizeConsignmentCapture(command);
     const valid = assertConsignmentCaptureShape(capture);
+    // Story 4-6a (A22, A41) — the declared value and the exemption, checked above the transaction.
+    const declaredValuePaise = (command.declaredValuePaise ?? null) as number | null;
+    if (declaredValuePaise !== null && (typeof declaredValuePaise !== 'number' || !Number.isInteger(declaredValuePaise) || declaredValuePaise < 0 || declaredValuePaise > CONSIGNMENT_CAPTURE_LIMITS.declaredValueMaxPaise)) {
+      throw invalid(`declaredValuePaise is a whole number of paise, 0–${CONSIGNMENT_CAPTURE_LIMITS.declaredValueMaxPaise}.`);
+    }
+    const exemption = normalizeEwayExemption(command.ewayExemption);
+    if ((exemption.reason !== null || exemption.note !== null) && declaredValuePaise === null) {
+      throw invalid('ewayExemption goes with a declaredValuePaise — an exemption answers a value above the e-way threshold.');
+    }
+    assertEwayExemptionShape(exemption.reason, exemption.note, valid.ewayBillNumber !== null);
     const vendorReturnId = command.vendorReturnId.toLowerCase();
     // A9 — the dispatch's fingerprint: every capture field after normalisation.
-    const payloadHash = hashCommandPayload({ tenantId: command.tenantId, arm: 'dispatch', vendorReturnId, ...captureHashFields(capture) });
+    // Story 4-6a (A22, D12) — the value and the exemption join ONLY when sent,
+    // after the capture fields, so every pre-4-6a body hashes byte for byte
+    // as before (pinned by the golden in test/vendor-returns.spec.ts).
+    const payloadHash = hashCommandPayload({
+      tenantId: command.tenantId,
+      arm: 'dispatch',
+      vendorReturnId,
+      ...captureHashFields(capture),
+      ...(declaredValuePaise === null ? {} : { declaredValuePaise }),
+      ...(exemption.reason === null ? {} : { ewayExemption: { reason: exemption.reason, note: exemption.note } }),
+    });
     const tenantId = command.tenantId;
 
     return withTenantTransaction(this.db, tenantId, async (tx) => {
@@ -643,7 +671,24 @@ export class VendorReturnCommand {
       }
 
       // ── the time rule, behind the replay lookup (A8) ────────────────────
-      assertBrandDocumentDateWindow(valid.brandDocumentDate, istDateOf(row.createdAt), istDateOf(new Date(vendorReturnClock.now()).toISOString()));
+      const todayIst = istDateOf(new Date(vendorReturnClock.now()).toISOString());
+      assertBrandDocumentDateWindow(valid.brandDocumentDate, istDateOf(row.createdAt), todayIst);
+      // ── story 4-6a (A22, A41): a sent value is judged against the e-way
+      // threshold for the movement — from the warehouse's state (else the
+      // consignor's, else the frozen brand's), to the vendor's state.
+      const warehouseParty = await liveWarehouseSnapshotInTx(tx, tenantId, row.warehouseId);
+      const vendor = row.vendorSnapshot as VendorSnapshotV1;
+      const frozenClient = row.clientSnapshot as { gstin?: string | null };
+      await assertReturnEwayRuleInTx(tx, tenantId, {
+        declaredValuePaise,
+        fromState: gstinStateCode(warehouseParty.gstin) ?? gstinStateCode(valid.consignorGstin) ?? gstinStateCode(frozenClient.gstin ?? null),
+        toState: vendor.stateCode ?? gstinStateCode(vendor.gstin),
+        documentDate: valid.brandDocumentDate,
+        todayIst,
+        ewayBillNumber: valid.ewayBillNumber,
+        ewayValidUntil: valid.ewayValidUntil,
+        exempt: exemption.reason !== null,
+      });
       // ── the transporter, frozen (when one is named) ─────────────────────
       const transporter: TransporterSnapshotV1 | null =
         valid.transporterId === null ? null : await assertTransporterInTx(tx, tenantId, valid.transporterId, 'a return-to-vendor dispatch');
@@ -746,6 +791,7 @@ export class VendorReturnCommand {
           vehicleNumber: valid.vehicleNumber,
           packageCount: valid.packageCount,
           warehouseSnapshot: warehouse,
+          declaredValuePaise,
           updatedAt: at,
         })
         .where(and(eq(vendorReturns.id, row.id), eq(vendorReturns.status, 'picked')))
@@ -757,7 +803,11 @@ export class VendorReturnCommand {
 
       const view = await vendorReturnViewInTx(tx, tenantId, row.id);
       await this.emit(tx, tenantId, VENDOR_RETURN_EVENTS.dispatched, view, at);
-      await this.audit(tx, tenantId, command.actorUserId, VENDOR_RETURN_EVENTS.dispatched, row.id, idempotencyKey);
+      // Story 4-6a (A41) — the audit row says when the threshold was not judged, and names an exemption.
+      await this.audit(tx, tenantId, command.actorUserId, VENDOR_RETURN_EVENTS.dispatched, row.id, idempotencyKey, {
+        ...(declaredValuePaise === null ? { ewayUnjudged: true } : { declaredValuePaise }),
+        ...(exemption.reason === null ? {} : { ewayExemption: { reason: exemption.reason, note: exemption.note } }),
+      });
       await this.writeIdempotencyKey(tx, tenantId, idempotencyKey, payloadHash, view);
       return view;
     });
@@ -854,7 +904,15 @@ export class VendorReturnCommand {
     });
   }
 
-  private async audit(tx: TenantTx, tenantId: string, actorUserId: string, action: string, targetId: string, idempotencyKey: string): Promise<void> {
+  private async audit(
+    tx: TenantTx,
+    tenantId: string,
+    actorUserId: string,
+    action: string,
+    targetId: string,
+    idempotencyKey: string,
+    changes?: Record<string, unknown>,
+  ): Promise<void> {
     await tx.insert(auditEvents).values({
       id: uuidv7(),
       tenantId,
@@ -863,6 +921,7 @@ export class VendorReturnCommand {
       targetType: 'vendor_return',
       targetId,
       reference: idempotencyKey,
+      ...(changes === undefined ? {} : { changes }),
       occurredAt: nowIso(),
     });
   }

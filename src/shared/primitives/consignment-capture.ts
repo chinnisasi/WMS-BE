@@ -20,9 +20,12 @@
  * separate check the command runs behind its replay lookup
  * (`assertBrandDocumentDateWindow`).
  *
- * The WMS never generates an e-way bill and never judges its threshold: it
- * does not know the consignment value (D4; generation for client goods is
- * roadmap 4.6). It records the brand's numbers.
+ * The WMS never generates an e-way bill (D4): it records the brand's
+ * numbers. Story 4-6a extracted the brand-document, consignor and e-way rules
+ * (`assertBrandDocumentShape`, `assertConsignorGstinShape`, `assertEwayShape`)
+ * so the order consignment record (`consignment-record.ts`) reuses them with
+ * the same messages; a sent declared value is judged against the e-way
+ * threshold by the RTV and RTC dispatches.
  */
 import { ProblemException } from '../problem-details/problem.exception';
 import { GSTIN_RE, gstinPrefixProblem, normalizeGstinInput } from './gstin';
@@ -45,6 +48,8 @@ export const CONSIGNMENT_CAPTURE_LIMITS = {
   packageCountMax: 9999,
   /** A8 — the brand document may be dated at most this many days before the document's creation day. */
   documentDateLookbackDays: 30,
+  /** Story 4-6a (A8) — a declared consignment value's ceiling, paise (4-7c's `MAX_DECLARED_VALUE_PAISE`). */
+  declaredValueMaxPaise: 1_000_000_000_000,
 } as const;
 
 /** The capture as a caller sends it (every field optional on the wire). */
@@ -98,20 +103,58 @@ function trimmed(value: unknown): string | null {
   return out === '' ? null : out;
 }
 
-/** The lenient normalize (hashed; never throws). A non-string is passed through for the shape check to refuse. */
-export function normalizeConsignmentCapture(input: ConsignmentCaptureInput): NormalizedConsignmentCapture {
-  const doc = input.brandDocument ?? null;
-  const vehicle = typeof input.vehicleNumber === 'string' ? normalizeVehicleNo(input.vehicleNumber) : (input.vehicleNumber ?? null);
-  const gstin = typeof input.consignorGstin === 'string' ? normalizeGstinInput(input.consignorGstin) : (input.consignorGstin ?? null);
+/** The brand document as normalized (story 4-6a — extracted, shared with the order record). */
+export interface NormalizedBrandDocument {
+  readonly brandDocumentType: string | null;
+  readonly brandDocumentNumber: string | null;
+  readonly brandDocumentDate: string | null;
+}
+
+/** The e-way bill as normalized (story 4-6a — extracted, shared with the order record). */
+export interface NormalizedEway {
+  readonly ewayBillNumber: string | null;
+  readonly ewayBillDate: string | null;
+  readonly ewayValidUntil: string | null;
+}
+
+/** Story 4-6a (A8) — the brand document's lenient normalize: trimmed, blank as null. */
+export function normalizeBrandDocument(
+  doc: { readonly type?: string | null | undefined; readonly number?: string | null | undefined; readonly date?: string | null | undefined } | null | undefined,
+): NormalizedBrandDocument {
+  const d = doc ?? null;
   return {
-    brandDocumentType: doc === null ? null : trimmed(doc.type),
-    brandDocumentNumber: doc === null ? null : trimmed(doc.number),
-    brandDocumentDate: doc === null ? null : trimmed(doc.date),
-    consignorGstin: gstin,
-    debitNoteNumber: trimmed(input.debitNoteNumber),
+    brandDocumentType: d === null ? null : trimmed(d.type),
+    brandDocumentNumber: d === null ? null : trimmed(d.number),
+    brandDocumentDate: d === null ? null : trimmed(d.date),
+  };
+}
+
+/** Story 4-6a (A8) — the e-way bill's lenient normalize: trimmed, blank as null. */
+export function normalizeEway(input: {
+  readonly ewayBillNumber?: string | null | undefined;
+  readonly ewayBillDate?: string | null | undefined;
+  readonly ewayValidUntil?: string | null | undefined;
+}): NormalizedEway {
+  return {
     ewayBillNumber: trimmed(input.ewayBillNumber),
     ewayBillDate: trimmed(input.ewayBillDate),
     ewayValidUntil: trimmed(input.ewayValidUntil),
+  };
+}
+
+/** Story 4-6a (A8) — the consignor GSTIN's lenient normalize (upper-cased, blank as null). */
+export function normalizeConsignorGstin(value: string | null | undefined): string | null {
+  return typeof value === 'string' ? normalizeGstinInput(value) : (value ?? null);
+}
+
+/** The lenient normalize (hashed; never throws). A non-string is passed through for the shape check to refuse. */
+export function normalizeConsignmentCapture(input: ConsignmentCaptureInput): NormalizedConsignmentCapture {
+  const vehicle = typeof input.vehicleNumber === 'string' ? normalizeVehicleNo(input.vehicleNumber) : (input.vehicleNumber ?? null);
+  return {
+    ...normalizeBrandDocument(input.brandDocument),
+    consignorGstin: normalizeConsignorGstin(input.consignorGstin),
+    debitNoteNumber: trimmed(input.debitNoteNumber),
+    ...normalizeEway(input),
     transporterId: trimmed(input.transporterId),
     carrierName: trimmed(input.carrierName),
     vehicleNumber: vehicle,
@@ -129,17 +172,17 @@ function codePoints(value: string): number {
 }
 
 /**
- * The shape rules, in field order, each a 400 `validation-failed` naming the
- * field. Returns the capture typed as valid.
+ * Story 4-6a (A8) — the brand document's shape rules, extracted from
+ * `assertConsignmentCaptureShape` with the same messages and order: required,
+ * a type from `allowedTypes`, a 1–40 character number, a calendar date.
  */
-export function assertConsignmentCaptureShape(capture: NormalizedConsignmentCapture): ValidConsignmentCapture {
+export function assertBrandDocumentShape(capture: NormalizedBrandDocument, allowedTypes: readonly string[]): void {
   const L = CONSIGNMENT_CAPTURE_LIMITS;
-  // The brand's movement document — required: goods cannot legally travel without one.
   if (capture.brandDocumentType === null || capture.brandDocumentNumber === null || capture.brandDocumentDate === null) {
     throw invalid("brandDocument is required — the brand's challan or invoice the goods travel under (type, number and date).");
   }
-  if (!(RTV_BRAND_DOCUMENT_TYPES as readonly string[]).includes(capture.brandDocumentType)) {
-    throw invalid(`brandDocument.type must be one of ${JSON.stringify(RTV_BRAND_DOCUMENT_TYPES)} (got ${JSON.stringify(capture.brandDocumentType)}).`);
+  if (!allowedTypes.includes(capture.brandDocumentType)) {
+    throw invalid(`brandDocument.type must be one of ${JSON.stringify(allowedTypes)} (got ${JSON.stringify(capture.brandDocumentType)}).`);
   }
   if (typeof capture.brandDocumentNumber !== 'string' || codePoints(capture.brandDocumentNumber) > L.documentNumber) {
     throw invalid(`brandDocument.number is 1–${L.documentNumber} characters.`);
@@ -147,38 +190,73 @@ export function assertConsignmentCaptureShape(capture: NormalizedConsignmentCapt
   if (typeof capture.brandDocumentDate !== 'string' || !isIsoDate(capture.brandDocumentDate)) {
     throw invalid('brandDocument.date must be a calendar date (YYYY-MM-DD).');
   }
-  if (capture.consignorGstin !== null) {
-    if (typeof capture.consignorGstin !== 'string' || !GSTIN_RE.test(capture.consignorGstin)) {
+}
+
+/** Story 4-6a (A8) — the consignor GSTIN's shape (optional), extracted with its messages. */
+export function assertConsignorGstinShape(consignorGstin: string | null): void {
+  if (consignorGstin !== null) {
+    if (typeof consignorGstin !== 'string' || !GSTIN_RE.test(consignorGstin)) {
       throw invalid('consignorGstin must be a GSTIN — 2 digits and 13 letters or digits.');
     }
-    const prefix = gstinPrefixProblem(capture.consignorGstin);
+    const prefix = gstinPrefixProblem(consignorGstin);
     if (prefix !== null) throw invalid(`consignorGstin: ${prefix}.`);
   }
+}
+
+/** Story 4-6a (D7) — the names the e-way messages call the three fields. */
+export interface EwayFieldLabels {
+  readonly number: string;
+  readonly date: string;
+  readonly validUntil: string;
+}
+
+/** The RTV / RTC capture's flat field names — its messages stay byte-identical. */
+export const FLAT_EWAY_LABELS: EwayFieldLabels = { number: 'ewayBillNumber', date: 'ewayBillDate', validUntil: 'ewayValidUntil' };
+
+/**
+ * Story 4-6a (A8, D7) — the e-way bill's shape rules, extracted from
+ * `assertConsignmentCaptureShape` with the same order; the messages name the
+ * fields through `labels` (the capture's flat names, or the order record's
+ * `ewayBill.number` …). Optional; a number carries its date.
+ */
+export function assertEwayShape(capture: NormalizedEway, labels: EwayFieldLabels): void {
+  if (capture.ewayBillNumber !== null) {
+    if (typeof capture.ewayBillNumber !== 'string' || !EWB_NO_RE.test(capture.ewayBillNumber)) {
+      throw invalid(`${labels.number} must be 12 digits.`);
+    }
+    if (capture.ewayBillDate === null) {
+      throw invalid(`${labels.date} is required with an ${labels.number}.`);
+    }
+  } else if (capture.ewayBillDate !== null || capture.ewayValidUntil !== null) {
+    throw invalid(`${labels.date} and ${labels.validUntil} go with an ${labels.number} — send the number too, or neither.`);
+  }
+  if (capture.ewayBillDate !== null && (typeof capture.ewayBillDate !== 'string' || !isIsoDate(capture.ewayBillDate))) {
+    throw invalid(`${labels.date} must be a calendar date (YYYY-MM-DD).`);
+  }
+  if (capture.ewayValidUntil !== null) {
+    if (typeof capture.ewayValidUntil !== 'string' || !isIsoDate(capture.ewayValidUntil)) {
+      throw invalid(`${labels.validUntil} must be a calendar date (YYYY-MM-DD).`);
+    }
+    if (capture.ewayBillDate !== null && capture.ewayValidUntil < capture.ewayBillDate) {
+      throw invalid(`${labels.validUntil} (${capture.ewayValidUntil}) is before ${labels.date} (${capture.ewayBillDate}).`);
+    }
+  }
+}
+
+/**
+ * The shape rules, in field order, each a 400 `validation-failed` naming the
+ * field. Returns the capture typed as valid.
+ */
+export function assertConsignmentCaptureShape(capture: NormalizedConsignmentCapture): ValidConsignmentCapture {
+  const L = CONSIGNMENT_CAPTURE_LIMITS;
+  // The brand's movement document — required: goods cannot legally travel without one.
+  assertBrandDocumentShape(capture, RTV_BRAND_DOCUMENT_TYPES);
+  assertConsignorGstinShape(capture.consignorGstin);
   if (capture.debitNoteNumber !== null && (typeof capture.debitNoteNumber !== 'string' || codePoints(capture.debitNoteNumber) > L.debitNoteNumber)) {
     throw invalid(`debitNoteNumber is 1–${L.debitNoteNumber} characters.`);
   }
   // The e-way bill — optional, recorded only; a number carries its date.
-  if (capture.ewayBillNumber !== null) {
-    if (typeof capture.ewayBillNumber !== 'string' || !EWB_NO_RE.test(capture.ewayBillNumber)) {
-      throw invalid('ewayBillNumber must be 12 digits.');
-    }
-    if (capture.ewayBillDate === null) {
-      throw invalid('ewayBillDate is required with an ewayBillNumber.');
-    }
-  } else if (capture.ewayBillDate !== null || capture.ewayValidUntil !== null) {
-    throw invalid('ewayBillDate and ewayValidUntil go with an ewayBillNumber — send the number too, or neither.');
-  }
-  if (capture.ewayBillDate !== null && (typeof capture.ewayBillDate !== 'string' || !isIsoDate(capture.ewayBillDate))) {
-    throw invalid('ewayBillDate must be a calendar date (YYYY-MM-DD).');
-  }
-  if (capture.ewayValidUntil !== null) {
-    if (typeof capture.ewayValidUntil !== 'string' || !isIsoDate(capture.ewayValidUntil)) {
-      throw invalid('ewayValidUntil must be a calendar date (YYYY-MM-DD).');
-    }
-    if (capture.ewayBillDate !== null && capture.ewayValidUntil < capture.ewayBillDate) {
-      throw invalid(`ewayValidUntil (${capture.ewayValidUntil}) is before ewayBillDate (${capture.ewayBillDate}).`);
-    }
-  }
+  assertEwayShape(capture, FLAT_EWAY_LABELS);
   // Who carries the goods — at least one of a transporter, a carrier name or a vehicle.
   if (capture.transporterId !== null && (typeof capture.transporterId !== 'string' || !UUID_RE.test(capture.transporterId))) {
     throw invalid('transporterId must be a uuid.');

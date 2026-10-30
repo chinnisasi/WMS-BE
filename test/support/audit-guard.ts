@@ -167,6 +167,19 @@ export const AUDIT_NO_OP_ARMS = {
     sameKeys(snapshot, ['clientLabelReverify', 'pack', 'unchanged']) &&
     snapshot.unchanged === true &&
     isRecord(snapshot.pack),
+  /**
+   * Story 4-6a (A9 step 9, A45) — `ConsignmentCommand.recordConsignment` /
+   * `recordPortalConsignment` whose ten compared columns equal the live
+   * version's: the key stored with `{consignment, unchanged: true}` (the 200), nothing written or audited.
+   */
+  'consignment.record:unchanged': (snapshot: unknown) =>
+    isRecord(snapshot) &&
+    sameKeys(snapshot, ['consignment', 'unchanged']) &&
+    snapshot.unchanged === true &&
+    isRecord(snapshot.consignment) &&
+    snapshot.consignment.status === 'live',
+  /** Story 4-6a (A11) — `ClientsCommand.updateConsignmentPolicy` with the rule already in place. */
+  'clients.consignmentPolicy:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'client'),
   /** Story 6-1b — `SecondFactorCommand.reset` of a user with no two-factor sign-in and no enrolment code. */
   'users.resetSecondFactor:not-enrolled': (snapshot: unknown) =>
     isRecord(snapshot) &&

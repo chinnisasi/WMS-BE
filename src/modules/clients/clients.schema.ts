@@ -65,6 +65,17 @@ export {
 } from '../../shared/primitives/batch-allocation';
 
 /**
+ * Story 4-6a (A2, decision 4) — when a client's orders need the brand's tax
+ * document and e-way bill recorded before they leave: `b2b` (B2B orders — the
+ * default), `all` (every order) or `high-value` (only the order's own value
+ * floor above the e-way threshold, which applies under every rule). Mirrored
+ * by `clients_consignment_document_rule_check` (0118), the DTO's `@IsIn` and
+ * the web; pinned by test/consignment-compliance-migration.spec.ts.
+ */
+export const CONSIGNMENT_DOCUMENT_RULES = ['b2b', 'all', 'high-value'] as const;
+export type ConsignmentDocumentRuleValue = (typeof CONSIGNMENT_DOCUMENT_RULES)[number];
+
+/**
  * Story 5-2b (D10) — the client emails a contact may opt into, mirrored by
  * the `client_contacts_email_events_check` CHECK (0114; 0116 re-added it —
  * no NULL, no duplicate), the DTO's `@IsIn` and the web. Owned here (not in
@@ -76,7 +87,13 @@ export {
  * public webhook event names (the webhook vocabulary is its own):
  * `shipment.documents` is the shipping documents and signed handover sheets.
  */
-export const CLIENT_EMAIL_EVENTS = ['receipt.recorded', 'order.dispatched', 'shipment.documents'] as const;
+export const CLIENT_EMAIL_EVENTS = [
+  'receipt.recorded',
+  'order.dispatched',
+  'shipment.documents',
+  // Story 4-6a (A20, A47) — a packed order waiting for the brand's invoice or e-way bill.
+  'consignment.documents-needed',
+] as const;
 export type ClientEmailEvent = (typeof CLIENT_EMAIL_EVENTS)[number];
 
 /** Story 5-2b — the email template each event is sent with (`mail-rules.ts` `EMAIL_TEMPLATES`). */
@@ -85,4 +102,6 @@ export const CLIENT_EMAIL_EVENT_TEMPLATE = {
   'order.dispatched': 'client-dispatch',
   // Story 4-4a — a shipping document or a signed handover-sheet page.
   'shipment.documents': 'client-shipment-document',
+  // Story 4-6a — the documents-needed reminder.
+  'consignment.documents-needed': 'client-documents-needed',
 } as const satisfies Record<ClientEmailEvent, ClientEmailTemplate>;

@@ -20,6 +20,7 @@ import {
   vendorReturnClock,
 } from '../src/modules/inbound/vendor-return.command';
 import { REJECTED_OP_DECISIONS_BY_TYPE } from '../src/modules/tenancy/sync-report.command';
+import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
@@ -737,6 +738,67 @@ describe('story 2-8b: the return to vendor (e2e)', () => {
       } finally {
         vendorReturnClock.now = () => Date.now();
       }
+      // Story 4-6a (A22, D12) — the dispatch golden, written green on 4-5a's
+      // code before the value joined the hash: a body without
+      // declaredValuePaise must keep hashing byte for byte as below.
+      const stored = (await sql`select payload_hash from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`) as unknown as { payload_hash: string }[];
+      expect(stored[0]!.payload_hash).toBe(
+        hashCommandPayload({
+          tenantId,
+          arm: 'dispatch',
+          vendorReturnId: rtv.id,
+          brandDocumentType: 'challan',
+          brandDocumentNumber: 'CH-77',
+          brandDocumentDate: (body.brandDocument as { date: string }).date,
+          consignorGstin: null,
+          debitNoteNumber: null,
+          ewayBillNumber: null,
+          ewayBillDate: null,
+          ewayValidUntil: null,
+          transporterId: transporter,
+          carrierName: null,
+          vehicleNumber: null,
+          trackingRef: 'AWB1234',
+          packageCount: 1,
+        }),
+      );
+    });
+
+    it('story 4-6a (A22, A41) — a declared ₹75,000 above the threshold with no e-way bill is 409 eway-bill-required (the figures named); an exemption satisfies it; the value is stored; no value sent is unjudged', async () => {
+      await receiveDamagedBlind('RU', 0, 3);
+      const rtv = await createOk([line('RU', 1)]);
+      await pick(rtv).expect(200);
+      const refused = await dispatch(rtv, captureBody({ declaredValuePaise: 7_500_000 })).expect(409);
+      expect(refused.body).toMatchObject({ code: 'eway-bill-required', declaredValuePaise: 7_500_000, thresholdPaise: 5_000_000, thresholdRule: 'national' });
+      expect((await dispatch(rtv, captureBody({ declaredValuePaise: 7_500_000, ewayExemption: { reason: 'other' } })).expect(400)).body.detail).toMatch(/note is required/);
+      const key = ulid();
+      const shipped = (await dispatch(rtv, captureBody({ declaredValuePaise: 7_500_000, ewayExemption: { reason: 'exempt-goods' } }), key).expect(200)).body as Rtv;
+      expect(shipped.dispatch).toMatchObject({ declaredValuePaise: 7_500_000, ewayUnjudged: false });
+      const audit = (await sql`select changes from audit_events where tenant_id = ${tenantId} and reference = ${key}`)[0]!.changes as Record<string, unknown>;
+      expect(audit).toEqual({ declaredValuePaise: 7_500_000, ewayExemption: { reason: 'exempt-goods', note: null } });
+      const old = await createOk([line('RU', 1)]);
+      await pick(old).expect(200);
+      expect(((await dispatch(old).expect(200)).body as Rtv).dispatch).toMatchObject({ declaredValuePaise: null, ewayUnjudged: true });
+      const below = await createOk([line('RU', 1)]);
+      await pick(below).expect(200);
+      await dispatch(below, captureBody({ declaredValuePaise: 1_000_000 })).expect(200);
+    });
+
+    it('story 4-6a (A41) — a Karnataka vendor under a Karnataka intra-state override (₹1,00,000): ₹80,000 dispatches with no bill; an exemption without a value is 400', async () => {
+      await asOwner('post', '/eway/state-thresholds').send({ stateCode: '29', thresholdPaise: 10_000_000, effectiveFrom: new Date(Date.now() + 5.5 * 3_600_000 - 86_400_000).toISOString().slice(0, 10) }).expect(201);
+      const local = await newPartner({
+        code: 'V-KA',
+        name: 'Vendor Karnataka',
+        roles: ['vendor'],
+        gstin: '29VENDR1234Q1Z9',
+        registeredAddress: { line1: '3 Peenya Road', city: 'Bengaluru', stateCode: '29', pincode: '560058' },
+      });
+      await linkVendor(app, tenantId, ownerToken, local, brand);
+      await receiveDamagedBlind('RU', 0, 1);
+      const rtv = await createOk([line('RU', 1)], { vendorId: local, consigneeAddress: 'registered' });
+      await pick(rtv).expect(200);
+      expect((await dispatch(rtv, captureBody({ ewayExemption: { reason: 'customs' } })).expect(400)).body.detail).toMatch(/goes with a declaredValuePaise/);
+      expect(((await dispatch(rtv, captureBody({ declaredValuePaise: 8_000_000 })).expect(200)).body as Rtv).dispatch).toMatchObject({ declaredValuePaise: 8_000_000, ewayBill: null });
     });
 
     it('A7 — the vendor is not re-checked at dispatch: a picked RTV of a vendor deactivated meanwhile dispatches and prints the frozen vendor', async () => {

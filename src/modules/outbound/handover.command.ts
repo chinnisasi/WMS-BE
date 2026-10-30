@@ -35,6 +35,9 @@ import { replayInTx, validation, writeKeyInTx } from './shipping-support';
 import { MAX_WEIGHT_GRAMS } from './pack.command';
 import { shareLockLivePacksInTx } from './order-packs';
 import { livePackFactsOfOrdersInTx } from './cartons.read';
+import type { ConsignmentGateCode } from '../../shared/primitives/consignment-gate';
+import { istDateOf } from '../../shared/primitives/time';
+import { consignmentFactsOfOrderRowsInTx, consignmentRefusal, judgeConsignment, NationalThresholds } from './consignment.read';
 
 /**
  * Story 4-4a (A12, A32, A33, A36, A37, A40) — the courier handover: one
@@ -70,6 +73,12 @@ export const HANDOVER_PARCEL_REFUSALS = [
   // judged on its cartons only once every 4-4a check passes.
   'package-count-mismatch',
   'carton-not-current',
+  // Story 4-6a (A14, A31, D4) — appended at the VERY END and judged last, so a
+  // consignment code never masks a recall, AWB or carton refusal. The web
+  // refuses them; a device parcel is handed over and flagged instead.
+  'consignment-documents-missing',
+  'eway-bill-required',
+  'eway-bill-expired',
 ] as const;
 export type HandoverParcelRefusal = (typeof HANDOVER_PARCEL_REFUSALS)[number];
 
@@ -132,6 +141,12 @@ export interface HandoverParcelResult {
   readonly awb: string;
   readonly dispatched: true;
   readonly followOnOrderId: string | null;
+  /**
+   * Story 4-6a (A14) — a device parcel that left without the brand's
+   * documents (a stale snapshot): the gate's code, also on its shipment row.
+   * Present only when set, so a 4-4a snapshot's bytes stand.
+   */
+  readonly complianceException?: ConsignmentGateCode;
 }
 
 export interface HandoverRefusedParcel {
@@ -325,8 +340,28 @@ export class HandoverCommand {
         input.courier.transporterId === null ? null : await assertTransporterInTx(tx, tenantId, input.courier.transporterId, 'a courier handover');
       const courierName = transporter?.name ?? input.courier.courierName!;
 
+      // Story 4-6a (A14, A32) — the consignment facts of every member order in
+      // one batch (under the order locks), and the pack times each order's
+      // dispatch is dated by (A40: never before its pack) — read here so the
+      // classification judges the gate on the SAME date the dispatch takes.
+      const consignmentFacts = await consignmentFactsOfOrderRowsInTx(tx, tenantId, orderRows);
+      const packs = await this.inventory.packMeasurementsOfOrdersInTx(tx, tenantId, orderRows.map((order) => order.id));
+      const occurredAtOf = (orderId: string): string => {
+        const pack = packs.get(orderId) ?? null;
+        return pack !== null && Date.parse(pack.packedAt) > Date.parse(handedOverAt) ? new Date(Date.parse(pack.packedAt)).toISOString() : handedOverAt;
+      };
+      const thresholds = new NationalThresholds(tx);
+      const todayIst = istDateOf(now);
+
       // ── the per-parcel classification, in body order ─────────────────────
-      const passing: { parcel: (typeof input.parcels)[number]; order: Order; shipment: Shipment | null; livePack: OrderPack | null; cartons: CartonJudgement }[] = [];
+      const passing: {
+        parcel: (typeof input.parcels)[number];
+        order: Order;
+        shipment: Shipment | null;
+        livePack: OrderPack | null;
+        cartons: CartonJudgement;
+        complianceException: ConsignmentGateCode | null;
+      }[] = [];
       const refused: HandoverRefusedParcel[] = [];
       const refuse = (orderId: string, code: HandoverParcelRefusal, detail: string) => {
         const status = orderById.get(orderId)?.status;
@@ -390,8 +425,31 @@ export class HandoverCommand {
           refuse(order.id, cartons.refusal.code, cartons.refusal.detail);
           continue;
         }
+        // Story 4-6a (A14, A31, A32) — the consignment gate, judged LAST and
+        // once per parcel on the dispatch's own date. The web also judges
+        // today (a backdated pickup cannot pass an expired bill); the device
+        // judges only the dispatch date — the parcel left then — and flags
+        // instead of refusing (decision 6: the parcel is gone; the office
+        // records the documents afterwards).
+        let complianceException: ConsignmentGateCode | null = null;
+        const facts = consignmentFacts.get(order.id)!;
+        const dispatchDay = istDateOf(occurredAtOf(order.id));
+        let threshold = await thresholds.on(dispatchDay);
+        let gate = judgeConsignment(facts, threshold, dispatchDay);
+        if (!gate.blocking && surface === 'web' && todayIst !== dispatchDay) {
+          // The refusal names the figure of the judgement that blocks.
+          threshold = await thresholds.on(todayIst);
+          gate = judgeConsignment(facts, threshold, todayIst);
+        }
+        if (gate.blocking) {
+          if (surface === 'web') {
+            refuse(order.id, gate.code!, consignmentRefusal(facts, gate, threshold).message);
+            continue;
+          }
+          complianceException = gate.code;
+        }
         awbsTaken.add(parcel.awb ?? shipment!.trackingNumber);
-        passing.push({ parcel, order, shipment, livePack, cartons });
+        passing.push({ parcel, order, shipment, livePack, cartons, complianceException });
       }
 
       if (surface === 'web' && refused.length > 0) {
@@ -521,8 +579,7 @@ export class HandoverCommand {
         })
         .returning();
 
-      // The pack measurements and times (A12 step 2, A40).
-      const packs = await this.inventory.packMeasurementsOfOrdersInTx(tx, tenantId, memberOrders.map((order) => order.id));
+      // The pack measurements and times (A12 step 2, A40) — read above, with the classification.
       // Story 4-5a (A33, A39, D4) — a stored live pack is the measurement
       // source (the gross only within the shipment bound; dimensions only for
       // one carton); the ledger's pack docs serve a virtual pack only.
@@ -583,6 +640,8 @@ export class HandoverCommand {
               handedOverAt,
               packageCount: count,
               weightGrams: weightGrams ?? entry.shipment.weightGrams,
+              // Story 4-6a (A14) — set only on a flagged device parcel.
+              complianceException: entry.complianceException,
               ...(dims === null ? {} : { lengthMm: dims.lengthMm, widthMm: dims.widthMm, heightMm: dims.heightMm }),
               ...(verifyNow
                 ? { labelVerifiedAt: handedOverAt, labelVerifiedBy: actorUserId, labelVerifiedDeviceId: deviceId, labelVerifyMethod: 'handover-scan' }
@@ -595,6 +654,15 @@ export class HandoverCommand {
             throw new ProblemException('conflict', 409, 'Shipment moved', `Order ${label}'s shipment changed during the handover — retry it.`);
           }
           shipment = updated;
+        }
+        if (entry.shipment === null && entry.complianceException !== null) {
+          // Story 4-6a (A14) — the courier-label row created handed over above carries the flag too.
+          const [flagged] = await tx
+            .update(shipments)
+            .set({ complianceException: entry.complianceException, updatedAt: now })
+            .where(and(eq(shipments.tenantId, tenantId), eq(shipments.id, shipment.id)))
+            .returning();
+          shipment = flagged!;
         }
         shipmentIds.push(shipment.id);
         // Story 4-5a (A21) — the scanned cartons of the live pack carry this handover.
@@ -611,8 +679,8 @@ export class HandoverCommand {
               ),
             );
         }
-        // A40 — a dispatch is never dated before its pack.
-        const occurredAt = pack !== null && Date.parse(pack.packedAt) > Date.parse(handedOverAt) ? new Date(Date.parse(pack.packedAt)).toISOString() : handedOverAt;
+        // A40 — a dispatch is never dated before its pack (the date the gate judged).
+        const occurredAt = occurredAtOf(order.id);
         const dispatched = await this.dispatch.dispatchOrderInTx(tx, {
           tenantId,
           order,
@@ -624,8 +692,18 @@ export class HandoverCommand {
           batchesLocked: true,
           idempotencyKey: key,
           handoverId,
+          // Story 4-6a (A32) — judged once, above.
+          consignment: 'pre-checked',
+          complianceException: entry.complianceException,
         });
-        results.push({ orderId: order.id, shipmentId: shipment.id, awb: shipment.trackingNumber, dispatched: true, followOnOrderId: dispatched.followOnOrderId });
+        results.push({
+          orderId: order.id,
+          shipmentId: shipment.id,
+          awb: shipment.trackingNumber,
+          dispatched: true,
+          followOnOrderId: dispatched.followOnOrderId,
+          ...(entry.complianceException === null ? {} : { complianceException: entry.complianceException }),
+        });
         after.push({ orderId: order.id, warehouseId: order.warehouseId, restores: dispatched.counterRestores, followOnOrderId: dispatched.followOnOrderId });
       }
 
@@ -663,6 +741,9 @@ export class HandoverCommand {
           ...(entry.cartons.codCartonScanned === null ? {} : { codCartonScanned: entry.cartons.codCartonScanned }),
           ...(entry.cartons.stale ? { staleCartonLabels: true } : {}),
         }));
+      const complianceExceptions = passing
+        .filter((entry) => entry.complianceException !== null)
+        .map((entry) => ({ orderId: entry.order.id, code: entry.complianceException! }));
       await this.outbox.append(tx, {
         messageId: uuidv7(),
         tenantId,
@@ -679,7 +760,15 @@ export class HandoverCommand {
         targetType: 'courier_handover',
         targetId: handoverId,
         reference: key,
-        changes: { code, parcels: results.length, refused: refused.length, source: view.source, ...(cartonChanges.length === 0 ? {} : { cartons: cartonChanges }) },
+        changes: {
+          code,
+          parcels: results.length,
+          refused: refused.length,
+          source: view.source,
+          ...(cartonChanges.length === 0 ? {} : { cartons: cartonChanges }),
+          // Story 4-6a (A14) — the device parcels that left without their documents.
+          ...(complianceExceptions.length === 0 ? {} : { complianceExceptions }),
+        },
         occurredAt: now,
       });
       if (deviceId !== null) await touchDeviceInTx(tx, deviceId);

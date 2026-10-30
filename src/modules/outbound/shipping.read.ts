@@ -1,3 +1,6 @@
+// Story 4-6a (A12) — the record's seam (guide §7h): never the invoicing module.
+import { consignmentTodayIst, parcelConsignmentsInTx, type ParcelConsignment } from './consignment.read';
+import { dispatchedConsignmentRecordsOfOrdersInTx, liveConsignmentRecordsOfOrdersInTx, type ConsignmentRecordRow } from '../invoicing/consignment-seam';
 import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import type { AttachmentRow, CourierHandover, Order, Shipment } from '../../shared/db/schema';
 import { auditEvents, courierHandovers, orderCartons, orderPacks, orders, shipments } from '../../shared/db/schema';
@@ -191,6 +194,8 @@ export interface HandoverCandidate {
   readonly cartonCount?: number;
   /** Story 4-5a (A33, A39) — what the handover defaults the weight to. */
   readonly defaultWeightGrams?: number | null;
+  /** Story 4-6a (A16) — the consignment gate today; a blocking parcel cannot be ticked on the web. */
+  readonly consignment?: ParcelConsignment;
 }
 
 export const HANDOVER_CANDIDATES_DEFAULT_LIMIT = 100;
@@ -368,6 +373,10 @@ export interface HandoverDetailRead {
   readonly sheet: readonly UnsignedFile[];
   /** Story 4-5a — by order id. */
   readonly cartons: ReadonlyMap<string, HandoverCartonsRead>;
+  /** Story 4-6a (A19, A39) — the consignment version each order LEFT under (stamped; immutable), by order id. */
+  readonly stamped: ReadonlyMap<string, ConsignmentRecordRow>;
+  /** Story 4-6a (A39) — the live version, by order id (a late record after the dispatch). */
+  readonly live: ReadonlyMap<string, ConsignmentRecordRow>;
 }
 
 /**
@@ -441,7 +450,13 @@ export async function handoverDetailInTx(tx: TenantTx, tenantId: string, handove
   ).filter((row) => row.status === 'attached');
   const names = shippingFileNames(handover.code, pages, await fileOrdinalsInTx(tx, { tenantId, ownerType: 'courier_handover', ownerIds: [handover.id], purposes: ['handover-sheet'] }));
   const cartons = await handoverCartonsInTx(tx, tenantId, handover.id, parcels.map((parcel) => parcel.order.id));
-  return { handover, parcels, sheet: pages.map((row) => ({ row, fileName: names.get(row.id)! })), cartons };
+  // Story 4-6a (A19, A39, A45 D16) — the stamped version (the sheet reprints
+  // it identically), falling back for an unstamped rollout dispatch to the
+  // version live at the handover's commit; and the live one (a late record).
+  const orderIds = parcels.map((parcel) => parcel.order.id);
+  const stamped = await dispatchedConsignmentRecordsOfOrdersInTx(tx, tenantId, orderIds, new Map(orderIds.map((id) => [id, handover.createdAt])));
+  const live = await liveConsignmentRecordsOfOrdersInTx(tx, tenantId, orderIds);
+  return { handover, parcels, sheet: pages.map((row) => ({ row, fileName: names.get(row.id)! })), cartons, stamped, live };
 }
 
 export function maskedPhoneOf(handover: CourierHandover, unmasked: boolean): string | null {
@@ -470,6 +485,8 @@ export interface DispatchParcel {
     readonly courierName: string;
     readonly labelVerified: boolean;
   } | null;
+  /** Story 4-6a (A23, D15) — the consignment gate today; the handheld refuses a blocking parcel locally. */
+  readonly consignment?: ParcelConsignment;
 }
 
 /**
@@ -515,6 +532,8 @@ export async function dispatchParcelsInTx(tx: TenantTx, tenantId: string, wareho
     cartonCount: number | null;
   }[];
   const truncated = rows.length > DISPATCH_PARCELS_MAX;
+  // Story 4-6a (D15) — each parcel's consignment, in batches (one threshold read).
+  const consignments = await parcelConsignmentsInTx(tx, tenantId, rows.slice(0, DISPATCH_PARCELS_MAX).map((row) => row.orderId), consignmentTodayIst());
   return {
     truncated,
     parcels: rows.slice(0, DISPATCH_PARCELS_MAX).map((row) => ({
@@ -535,6 +554,7 @@ export async function dispatchParcelsInTx(tx: TenantTx, tenantId: string, wareho
         row.shipmentId === null
           ? null
           : { shipmentId: row.shipmentId, kind: row.kind as ShipmentKind, awb: row.awb!, courierName: row.courierName!, labelVerified: row.labelVerified === true },
+      ...(consignments.has(row.orderId) ? { consignment: consignments.get(row.orderId)! } : {}),
     })),
   };
 }

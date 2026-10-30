@@ -33,6 +33,26 @@ import { uomPrecision } from '../catalog/uom';
 import { memberDisplayNamesInTx } from '../tenancy/tenancy.service';
 import { packRecordOfOrderInTx, skuFactsByIdInTx, type OrderLedgerEventsReader, type PackRecord } from './cartons.read';
 import { documentPartiesInTx } from './order-packs';
+import { cartonLabelConsignmentLine, packingSlipConsignmentLines, type ConsignmentPrintFacts } from '../../shared/primitives/consignment-record';
+// Story 4-6a (A12, A19) — the record's seam (guide §7h): never the invoicing module.
+import { liveConsignmentRecordsOfOrdersInTx, type ConsignmentRecordRow } from '../invoicing/consignment-seam';
+
+/** Story 4-6a — a version's print facts (the consignor's frozen legal name, else its name). */
+export function consignmentPrintFactsOf(row: ConsignmentRecordRow): ConsignmentPrintFacts {
+  const snapshot = (row.consignorSnapshot ?? {}) as { name?: unknown; legalName?: unknown };
+  return {
+    brandDocumentType: row.brandDocumentType,
+    brandDocumentNumber: row.brandDocumentNumber,
+    brandDocumentDate: row.brandDocumentDate,
+    consignorGstin: row.consignorGstin,
+    consignorName: typeof snapshot.legalName === 'string' ? snapshot.legalName : typeof snapshot.name === 'string' ? snapshot.name : null,
+    ewayStatus: row.ewayStatus,
+    ewayBillNumber: row.ewayBillNumber,
+    ewayBillDate: row.ewayBillDate,
+    ewayValidUntil: row.ewayValidUntil,
+    ewayExemptionReason: row.ewayExemptionReason,
+  };
+}
 import type { CartonDimensions } from './cartons';
 
 /** A48 — at most this many batch sub-rows under one line, then "+N more batches". */
@@ -140,8 +160,10 @@ export interface PackDocument {
   /** Packed per UoM over every packed line. */
   readonly totals: string;
   readonly shortfall: PackDocumentShortfall;
-  /** The 4-6a / 4-10a seam (the brand's invoice, the e-way bill, hazard notes) — empty in 4-5a. */
+  /** The 4-6a / 4-10a seam (the brand's invoice, the e-way bill, hazard notes). Story 4-6a: the live record's lines. */
   readonly annotations: readonly string[];
+  /** Story 4-6a (A19) — the carton label's seam line from the LIVE consignment version, or null when none is live. */
+  readonly consignmentLine?: string | null;
 }
 
 /** `12 EA, 2.5 KG` over milli quantities, each UoM at its own precision, in first-seen order. */
@@ -364,6 +386,8 @@ export async function packDocumentInTx(
   const packerName =
     options.clientId === undefined ? ((await memberDisplayNamesInTx(tx, tenantId, [record.packedBy])).get(record.packedBy) ?? null) : null;
   const partiesFrozenAt = record.partiesFrozenAt;
+  const liveRecord = (await liveConsignmentRecordsOfOrdersInTx(tx, tenantId, [order.id])).get(order.id) ?? null;
+  const consignment = liveRecord === null ? null : consignmentPrintFactsOf(liveRecord);
   const doc: PackDocument = {
     orderId: order.id,
     orderLabel: orderLabelOf(order),
@@ -392,7 +416,10 @@ export async function packDocumentInTx(
     lines,
     totals: packedTotals,
     shortfall,
-    annotations: [],
+    // Story 4-6a (A19) — printed before the goods leave: the LIVE version, so
+    // a reprint after an amendment carries the new numbers.
+    annotations: consignment === null ? [] : packingSlipConsignmentLines(consignment),
+    consignmentLine: consignment === null ? null : cartonLabelConsignmentLine(consignment),
   };
   return { doc, record, order };
 }

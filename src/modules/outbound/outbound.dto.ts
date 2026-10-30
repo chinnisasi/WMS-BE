@@ -21,6 +21,7 @@ import {
   IsBoolean,
 } from 'class-validator';
 import { ApiProperty, OmitType } from '@nestjs/swagger';
+import { CONSIGNMENT_GATE_STATES } from '../../shared/primitives/consignment-gate';
 import { BooleanFlag, IsInstant } from '../../shared/primitives/instant-range';
 import { PACK_FAILURE_ENTRIES } from '../../shared/db/schema';
 import {
@@ -679,6 +680,13 @@ export class OrderEntryDto {
 
   @ApiProperty({ description: 'ISO-8601 UTC last update' })
   updatedAt!: string;
+
+  @ApiProperty({
+    required: false,
+    enum: [...CONSIGNMENT_GATE_STATES],
+    description: "Story 4-6a — the consignment gate today (the brand's tax document and e-way bill): the Docs cell. Optional",
+  })
+  consignmentState?: string;
 }
 
 export class OrderListResponse {

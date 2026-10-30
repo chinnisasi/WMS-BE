@@ -6,6 +6,7 @@ import { decodePasswordChangedParams, renderPasswordChangedEmail } from './passw
 import { decodeClientReceiptParams, renderClientReceiptEmail, type ClientAttachmentState } from './client-receipt';
 import { decodeClientShipmentDocumentParams, renderClientShipmentDocumentEmail } from './client-shipment-document';
 import { decodeClientDispatchParams, renderClientDispatchEmail } from './client-dispatch';
+import { decodeClientDocumentsNeededParams, renderClientDocumentsNeededEmail } from './client-documents-needed';
 
 export type { RenderedEmail } from './invite';
 export type { InviteEmailParams } from './invite';
@@ -15,6 +16,8 @@ export type { ClientAttachmentState, ClientReceiptAttachmentState, ClientReceipt
 export type { ClientShipmentDocumentEmailParams, ClientShipmentDocumentParcelParams, ShipmentDocumentKind } from './client-shipment-document';
 export { SHIPMENT_DOCUMENT_KINDS, SHEET_PARCELS_SHOWN } from './client-shipment-document';
 export type { ClientDispatchEmailParams, ClientDispatchLineParams } from './client-dispatch';
+export type { ClientDocumentsNeededEmailParams, DocumentsNeededKind, DocumentsNeededReason } from './client-documents-needed';
+export { DOCUMENTS_NEEDED_KINDS, DOCUMENTS_NEEDED_REASONS } from './client-documents-needed';
 export { CLIENT_EMAIL_MAX_LINES } from './client-notice';
 
 /** What a template may use besides its stored parameters: the row's tenant, its recipient, the base URL and the opened secret. */
@@ -92,6 +95,15 @@ export function renderEmail(template: EmailTemplate, params: unknown, context: R
         context.fallbackReplyTo ?? null,
         context.attachment ?? 'none',
       );
+    // Story 4-6a (A20) — the documents-needed reminder; the link opens the order's Tax documents tab.
+    case 'client-documents-needed': {
+      const needed = decodeClientDocumentsNeededParams(params);
+      return renderClientDocumentsNeededEmail(
+        needed,
+        webLinkFrom(context.webBaseUrl, '/portal/orders', { order: needed.orderId, tab: 'documents' }),
+        context.fallbackReplyTo ?? null,
+      );
+    }
     default: {
       const unreachable: never = template;
       throw new Error(`unknown email template ${String(unreachable)}`);

@@ -284,7 +284,7 @@ export class ClientReturnsController {
   @ApiResponse({
     status: 409,
     ...problemJsonResponse(
-      'The return to client is not picked — member rtcStatus (rtc-not-picked); the partner is not a transporter or is inactive (partner-not-transporter, transporter-inactive); a reconcile quarantine on RETURNS or DAMAGED (disposition-scope-quarantined); DAMAGED no longer holds the picked units — members onHandQty, pickedQty (rtc-damaged-short); a user location occupies the RETURNS or DAMAGED code (returns-bin-conflict, damaged-bin-conflict); or a concurrent idempotent request (conflict)',
+      'The return to client is not picked — member rtcStatus (rtc-not-picked); the partner is not a transporter or is inactive (partner-not-transporter, transporter-inactive); a reconcile quarantine on RETURNS or DAMAGED (disposition-scope-quarantined); DAMAGED no longer holds the picked units — members onHandQty, pickedQty (rtc-damaged-short); a user location occupies the RETURNS or DAMAGED code (returns-bin-conflict, damaged-bin-conflict); story 4-6a — a declared value above the e-way threshold without an e-way bill or exemption (eway-bill-required, extensions declaredValuePaise/thresholdPaise/thresholdRule), an expired bill (eway-bill-expired), no threshold in force (eway-threshold-missing); or a concurrent idempotent request (conflict)',
     ),
   })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
@@ -309,6 +309,8 @@ export class ClientReturnsController {
         consignorGstin: dto.consignorGstin ?? null,
         consigneeGstin: dto.consigneeGstin ?? null,
         declaredValuePaise: dto.declaredValuePaise ?? null,
+        // Story 4-6a (A41).
+        ewayExemption: dto.ewayExemption === undefined || dto.ewayExemption === null ? null : { reason: dto.ewayExemption.reason ?? null, note: dto.ewayExemption.note ?? null },
         ewayBillNumber: dto.ewayBillNumber ?? null,
         ewayBillDate: dto.ewayBillDate ?? null,
         ewayValidUntil: dto.ewayValidUntil ?? null,

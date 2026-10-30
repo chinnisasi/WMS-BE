@@ -24,6 +24,8 @@ import { assertPermission } from '../tenancy/permissions';
 import { getMemberRoleIn } from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
+// Story 4-6a (A12) — the record's seam (guide §7h): never the invoicing module.
+import { withdrawConsignmentOnCancelInTx } from '../invoicing/consignment-seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import type { LedgerReferenceDoc, ReservationSnapshot } from '../inventory/inventory.facade';
@@ -338,6 +340,16 @@ export class CancelRestockCommandService {
       // ── story 4-5a (A10): the live pack, locked after the order and before
       // the shipments (the re-carton's order → pack → shipment) ───────────
       const livePack = await lockLivePackInTx(tx, command.tenantId, order.id);
+
+      // ── story 4-6a (A21, A38): the live consignment version is withdrawn
+      // ("Order cancelled"), after the order lock and before the shipments
+      // lock; a later refusal in this transaction rolls it back with the rest.
+      await withdrawConsignmentOnCancelInTx(tx, this.outbox, {
+        tenantId: command.tenantId,
+        orderId: order.id,
+        actorUserId: command.actorUserId,
+        at: nowIso(),
+      });
 
       // ── the shipment row, locked (A1): labelled → void, manifested → 409 ─
       const shipmentRows = await tx

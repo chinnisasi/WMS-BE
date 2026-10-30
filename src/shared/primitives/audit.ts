@@ -455,4 +455,9 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'dock_appointment.cancelled', targetType: 'dock_appointment' },
   { action: 'dock_appointment.arrived', targetType: 'dock_appointment' },
   { action: 'dock_appointment.released', targetType: 'dock_appointment' },
+  // Story 4-6a — the order consignment record (`ConsignmentCommand`, staff and
+  // portal; target the order) and the client's documents rule.
+  { action: 'consignment.recorded', targetType: 'order' },
+  { action: 'consignment.withdrawn', targetType: 'order' },
+  { action: 'client.consignment_policy_updated', targetType: 'client' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

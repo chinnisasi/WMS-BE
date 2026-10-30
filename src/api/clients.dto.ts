@@ -1,3 +1,4 @@
+import { CONSIGNMENT_DOCUMENT_RULES } from '../modules/clients/clients.schema';
 import { ApiProperty } from '@nestjs/swagger';
 import { Transform, Type } from 'class-transformer';
 import {
@@ -643,6 +644,12 @@ export class ClientAllocationPolicyResponse extends ClientAllocationPolicyDto {
   undatedBatchesOnHand!: number;
 }
 
+/** Story 4-6a (A11) — when the client's orders need the brand's documents recorded. */
+export class ClientConsignmentPolicyDto {
+  @ApiProperty({ enum: [...CONSIGNMENT_DOCUMENT_RULES] })
+  documentRule!: string;
+}
+
 export class ClientDto {
   @ApiProperty({ format: 'uuid' })
   id!: string;
@@ -701,6 +708,14 @@ export class ClientDto {
       'Story 4-3a — the outbound allocation policy. Optional: a mutation answer stored before 4-3a replays without it; every fresh read carries it',
   })
   allocationPolicy?: ClientAllocationPolicyDto;
+
+  @ApiProperty({
+    type: ClientConsignmentPolicyDto,
+    required: false,
+    description:
+      'Story 4-6a — the consignment documents rule. Optional: a mutation answer stored before 4-6a replays without it; every fresh read carries it',
+  })
+  consignmentPolicy?: ClientConsignmentPolicyDto;
 
   @ApiProperty({
     type: String,

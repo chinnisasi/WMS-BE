@@ -467,6 +467,8 @@ describe('client portal (e2e, story 21-7)', () => {
     // Story 4-4a — the client's label, its AWB and its own documents.
     'POST api/v1/tenants/:tenantId/portal/orders/:orderId/shipment/client-label',
     'POST api/v1/tenants/:tenantId/portal/orders/:orderId/shipment/awb',
+    // Story 4-6a (A51) — the brand records its consignment documents.
+    'POST api/v1/tenants/:tenantId/portal/orders/:orderId/consignment',
     'POST api/v1/tenants/:tenantId/portal/orders/:orderId/documents',
   ]);
 
@@ -740,8 +742,8 @@ describe('client portal (e2e, story 21-7)', () => {
       // plus 3-7a's three recall reads (the list, one recall, its report),
       // plus 4-1c's order import, plus 4-7c's two return-to-client reads,
       // plus 2-9a's GRN document file, plus 4-4a's Shipping read and its three uploads,
-      // plus 4-5a's packing slip.
-      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(33);
+      // plus 4-5a's packing slip, plus 4-6a's Tax documents (read, record) and needed list.
+      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(36);
     });
 
     it('a portal token is refused on EVERY operator route — reads and writes — with the exact fence detail', async () => {
@@ -1212,6 +1214,8 @@ describe('client portal (e2e, story 21-7)', () => {
         [
           '/tenants/{tenantId}/portal/client-returns',
           '/tenants/{tenantId}/portal/client-returns/{clientReturnId}',
+          // Story 4-6a (A18) — the orders waiting for the brand's documents.
+          '/tenants/{tenantId}/portal/consignments/needed',
           '/tenants/{tenantId}/portal/inbound/asns',
           '/tenants/{tenantId}/portal/inbound/asns/{asnId}',
           // Story 2-5a — the client's goods receipts.
@@ -1230,6 +1234,8 @@ describe('client portal (e2e, story 21-7)', () => {
           '/tenants/{tenantId}/portal/order-imports',
           '/tenants/{tenantId}/portal/orders',
           '/tenants/{tenantId}/portal/orders/{orderId}',
+          // Story 4-6a (A18) — the order's Tax documents (read and record).
+          '/tenants/{tenantId}/portal/orders/{orderId}/consignment',
           // Story 4-4a — the Shipping section and the client's uploads.
           '/tenants/{tenantId}/portal/orders/{orderId}/documents',
           // Story 4-5a — the order's packing slip.

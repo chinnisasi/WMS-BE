@@ -827,6 +827,13 @@
       "when": 1793354212273,
       "tag": "0117_packing_documents",
       "breakpoints": true
+    },
+    {
+      "idx": 118,
+      "version": "7",
+      "when": 1793363055141,
+      "tag": "0118_consignment_compliance",
+      "breakpoints": true
     }
   ]
 }

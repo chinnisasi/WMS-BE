@@ -27,6 +27,7 @@ import {
   MaxLength,
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
+import { CONSIGNMENT_GATE_STATES } from '../../shared/primitives/consignment-gate';
 import { BooleanFlag, IsInstant } from '../../shared/primitives/instant-range';
 import { PurchaseOrderLineDto } from './inbound.dto';
 import {
@@ -1829,6 +1830,14 @@ export class CatalogDispatchParcelShipmentDto {
   @ApiProperty() labelVerified!: boolean;
 }
 
+/** Story 4-6a (A23) — a parcel's consignment gate as the device reads it. */
+export class CatalogDispatchParcelConsignmentDto {
+  @ApiProperty({ enum: [...CONSIGNMENT_GATE_STATES] }) state!: string;
+  @ApiProperty() blocking!: boolean;
+  @ApiProperty({ type: String, nullable: true }) ewayBillNumber!: string | null;
+  @ApiProperty({ type: String, nullable: true, description: 'YYYY-MM-DD — the last valid day' }) ewayValidUntil!: string | null;
+}
+
 /** Story 4-4a — one parcel awaiting a courier. */
 export class CatalogDispatchParcelDto {
   @ApiProperty({ format: 'uuid' }) orderId!: string;
@@ -1840,6 +1849,12 @@ export class CatalogDispatchParcelDto {
   @ApiProperty({ required: false, description: 'Story 4-5a (D6, additive): the live pack’s carton count; absent as packSeq' }) cartonCount?: number;
   @ApiProperty({ required: false, description: 'Story 4-5a (A44, additive): the COD amount in paise (carton 1 carries the COD label); absent when prepaid' }) codAmountPaise?: number;
   @ApiProperty({ type: CatalogDispatchParcelShipmentDto, nullable: true }) shipment!: CatalogDispatchParcelShipmentDto | null;
+  @ApiProperty({
+    type: CatalogDispatchParcelConsignmentDto,
+    required: false,
+    description: "Story 4-6a (A23, additive): the brand's documents gate today — a blocking parcel is refused at the handover scan; the device recomputes expiry from ewayValidUntil. Absent from an older server (read as unknown)",
+  })
+  consignment?: CatalogDispatchParcelConsignmentDto;
 }
 
 export class CatalogSnapshotResponse {

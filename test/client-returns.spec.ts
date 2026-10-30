@@ -942,6 +942,49 @@ describe('story 4-7c: the return to client (e2e)', () => {
     expect((await cancel(rtc).expect(409)).body).toMatchObject({ code: 'rtc-closed', rtcStatus: 'dispatched' });
   });
 
+  it('story 4-6a (A22, A41) — the declared value is judged: above the threshold with no e-way bill is 409 eway-bill-required, an expired bill 409 eway-bill-expired, ₹10,000 dispatches; no value sent is unjudged', async () => {
+    await receiveDamaged('CG', 4);
+    const above = await createOk([damagedLine('CG', 1)]);
+    await pick(above).expect(200);
+    expect((await dispatch(above, captureBody({ declaredValuePaise: 20_000_000 })).expect(409)).body).toMatchObject({ code: 'eway-bill-required', thresholdPaise: 5_000_000 });
+    const expiredBody = captureBody({
+      declaredValuePaise: 20_000_000,
+      brandDocument: { type: 'challan', number: 'CH-E', date: istToday(-3) },
+      ewayBillNumber: '123456789012',
+      ewayBillDate: istToday(-3),
+      ewayValidUntil: istToday(-1),
+    });
+    expect((await dispatch(above, expiredBody).expect(409)).body.code).toBe('eway-bill-expired');
+    expect((await dispatch(above, captureBody({ declaredValuePaise: 20_000_000, ewayBillNumber: '123456789012', ewayBillDate: istToday(), ewayValidUntil: istToday(1) })).expect(200)).body.dispatch).toMatchObject({ declaredValuePaise: 20_000_000, ewayUnjudged: false });
+    const below = await createOk([damagedLine('CG', 1)]);
+    await pick(below).expect(200);
+    await dispatch(below, captureBody({ declaredValuePaise: 1_000_000 })).expect(200);
+    const unvalued = await createOk([damagedLine('CG', 1)]);
+    await pick(unvalued).expect(200);
+    expect((await dispatch(unvalued).expect(200)).body.dispatch).toMatchObject({ declaredValuePaise: null, ewayUnjudged: true });
+  });
+
+  it('story 4-6a (A41) — an exemption above the threshold dispatches (audited with the value and the exemption); "other" without a note is 400; an exemption without a value is 400; the same key with another exemption is 422', async () => {
+    await receiveDamaged('CG', 2);
+    const rtc = await createOk([damagedLine('CG', 1)]);
+    await pick(rtc).expect(200);
+    expect((await dispatch(rtc, captureBody({ declaredValuePaise: 20_000_000, ewayExemption: { reason: 'other' } })).expect(400)).body.detail).toMatch(/note is required/);
+    expect((await dispatch(rtc, captureBody({ ewayExemption: { reason: 'customs' } })).expect(400)).body.detail).toMatch(/goes with a declaredValuePaise/);
+    const key = ulid();
+    await dispatch(rtc, captureBody({ declaredValuePaise: 20_000_000, ewayExemption: { reason: 'customs' } }), key).expect(200);
+    const audit = (await sql`select changes from audit_events where tenant_id = ${tenantId} and reference = ${key}`)[0]!.changes as Record<string, unknown>;
+    expect(audit).toEqual({ declaredValuePaise: 20_000_000, ewayExemption: { reason: 'customs', note: null } });
+    expect((await dispatch(rtc, captureBody({ declaredValuePaise: 20_000_000, ewayExemption: { reason: 'exempt-goods' } }), key).expect(422)).body.code).toBe('idempotency-key-reuse');
+  });
+
+  it('story 4-6a (A41) — a Karnataka intra-state override (₹1,00,000) and the Karnataka return address (resolved by its state name): ₹80,000 dispatches with no bill', async () => {
+    await asOwner('post', '/eway/state-thresholds').set(KEY_HEADER, ulid()).send({ stateCode: '29', thresholdPaise: 10_000_000, effectiveFrom: istToday(-1) }).expect(201);
+    await receiveDamaged('CG', 1);
+    const rtc = await createOk([damagedLine('CG', 1)]);
+    await pick(rtc).expect(200);
+    expect((await dispatch(rtc, captureBody({ declaredValuePaise: 8_000_000 })).expect(200)).body.dispatch).toMatchObject({ declaredValuePaise: 8_000_000, ewayBill: null });
+  });
+
   // ── a serial line and a fractional line, end to end ────────────────────────
 
   it('a serial line from RETURNS: create 1, pick it, dispatch writes one draw with its serial arm; a serial picked 0 returns to awaiting', async () => {

@@ -21,6 +21,7 @@ import { VendorSnapshotDto } from '../modules/partners/partners.dto';
 import {
   BrandDocumentDto,
   ClientPartySnapshotDto,
+  EwayExemptionDto,
   RtvActorStampDto,
   RtvBrandDocumentDto,
   RtvCancelDto,
@@ -175,12 +176,19 @@ export class DispatchClientReturnDto {
   @IsString()
   consigneeGstin?: string | null;
 
-  @ApiProperty({ type: Number, nullable: true, required: false, minimum: 0, maximum: MAX_DECLARED_VALUE_PAISE, description: "A9 — the consignor's declared value in paise, printed \"declared by the consignor\" and never judged" })
+  @ApiProperty({ type: Number, nullable: true, required: false, minimum: 0, maximum: MAX_DECLARED_VALUE_PAISE, description: "A9 — the consignor's declared value in paise, printed \"declared by the consignor\" and judged against the e-way threshold (4-6a): above it an e-way bill number or an exemption is required. Optional on the API for older callers; the web always sends it" })
   @IsOptional()
   @ValidateIf((_, value) => value !== null)
   @Type(() => Number)
   @IsInt()
   declaredValuePaise?: number | null;
+
+  @ApiProperty({ type: () => EwayExemptionDto, nullable: true, required: false, description: 'Story 4-6a — instead of an e-way bill above the threshold' })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @ValidateNested()
+  @Type(() => EwayExemptionDto)
+  ewayExemption?: EwayExemptionDto | null;
 
   @ApiProperty({ type: String, nullable: true, required: false, description: 'The e-way bill number (12 digits) — recorded, never generated; its date is required with it' })
   @IsOptional()
@@ -318,6 +326,9 @@ export class ClientReturnDispatchDto extends RtvActorStampDto {
 
   @ApiProperty({ type: Number, nullable: true, description: 'The declared value in paise, as entered' })
   declaredValuePaise!: number | null;
+
+  @ApiProperty({ required: false, description: 'Story 4-6a — true when no value was sent, so the e-way threshold was not judged (an older caller)' })
+  ewayUnjudged?: boolean;
 
   @ApiProperty({ type: RtvEwayBillDto, nullable: true })
   ewayBill!: RtvEwayBillDto | null;

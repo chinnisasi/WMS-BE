@@ -430,7 +430,7 @@ export class ShippingController {
   @ApiBearerAuth('device')
   @ApiOperation({
     summary:
-      'Story 4-4a — dispatch.execute: hands parcels of ONE client to its courier and DISPATCHES every order handed over, in one transaction. Web: all-or-nothing (409 handover-parcels-refused naming each parcel). Handheld (badge-in; occurredAt required): the passing parcels settle and the refused ones go into one Discard-only review row',
+      'Story 4-4a — dispatch.execute: hands parcels of ONE client to its courier and DISPATCHES every order handed over, in one transaction. Web: all-or-nothing (409 handover-parcels-refused naming each parcel). Handheld (badge-in; occurredAt required): the passing parcels settle and the refused ones go into one Discard-only review row. Story 4-6a: a parcel without the brand’s documents is refused on the web (consignment-documents-missing, eway-bill-required, eway-bill-expired — judged last, after recall and cartons; expiry also against today); on the handheld it is handed over and flagged (parcels[].complianceException)',
   })
   @ApiBody({ type: CreateHandoverDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)

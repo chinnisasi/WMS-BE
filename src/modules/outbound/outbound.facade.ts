@@ -116,6 +116,57 @@ export type { LiveCartonFacts, LivePackFacts, PackCartonView, PackHistoryRecord,
 export type { PackCartonInput } from './cartons';
 import { DispatchCommandService } from './dispatch.command';
 import type { DispatchOrderCommand, DispatchSnapshot } from './dispatch.command';
+// Story 4-6a — the consignment reads (outbound) and the record's seam (invoicing, guide §7h).
+import {
+  consignmentExceptionsInTx,
+  consignmentFactsOfOrdersInTx as consignmentFactsOfOrdersInTxImpl,
+  consignmentNeededInTx,
+  consignmentStatesOfOrdersInTx,
+  consignmentTodayIst,
+  judgeConsignment,
+  lockOrderForConsignmentInTx as lockOrderForConsignmentInTxImpl,
+  lockOrderStatusInTx as lockOrderStatusInTxImpl,
+  NationalThresholds,
+  orderConsignmentReadInTx,
+  portalConsignmentsNeededInTx,
+  type ConsignmentExceptionRow,
+  type ConsignmentGateView,
+  type ConsignmentOrderLock,
+  type ConsignmentWorklistRow,
+  type OrderConsignmentFacts,
+  type PortalConsignmentNeededRow,
+} from './consignment.read';
+export type {
+  ConsignmentExceptionRow,
+  ConsignmentGateView,
+  ConsignmentOrderLock,
+  ConsignmentWorklistRow,
+  OrderConsignmentFacts,
+  PortalConsignmentNeededRow,
+} from './consignment.read';
+import { toConsignmentView, toPortalConsignmentView, type ConsignmentView, type PortalConsignmentView } from '../invoicing/consignment-seam';
+import type { ConsignmentGateResult } from '../../shared/primitives/consignment-gate';
+import type { FileView as ConsignmentScanFile } from './shipping.service';
+
+/** Story 4-6a (A16) — one order's consignment, staff. */
+export interface OrderConsignmentView {
+  readonly gate: ConsignmentGateView;
+  readonly live: ConsignmentView | null;
+  readonly history: ConsignmentView[];
+  readonly dispatchedRecordId: string | null;
+  readonly duplicates: { readonly orderId: string; readonly orderLabel: string }[];
+  readonly consignorStateMismatch: boolean;
+  readonly ewayUsedByOtherClient: { readonly clientCode: string; readonly orderLabel: string } | null;
+  readonly scans: ConsignmentScanFile[];
+  readonly complianceException: string | null;
+}
+
+/** Story 4-6a (A18) — one order's consignment, portal (an exact key allowlist). */
+export interface PortalOrderConsignmentView {
+  readonly gate: ConsignmentGateView;
+  readonly live: PortalConsignmentView | null;
+  readonly history: PortalConsignmentView[];
+}
 import { ShipmentCommandService } from './shipment.command';
 import type { CreateShipmentLabelCommand, ShipmentKind, ShipmentSnapshot, ShipmentStatus } from './shipment.command';
 import { ManifestCommandService } from './manifest.command';
@@ -240,6 +291,8 @@ export interface OrderEntry {
   readonly followOnOrderId: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /** Story 4-6a (A16) — the consignment gate's state today (the list rows only; optional). */
+  readonly consignmentState?: string;
 }
 
 /** Story 4-2c — one order line as the channel writeback reads it: what SHIPPED (Σ picks), base units. */
@@ -642,6 +695,99 @@ export class OutboundFacade {
     @Inject(ShippingFilesCommand) private readonly shippingFiles: ShippingFilesCommand,
     @Inject(ShippingService) private readonly shipping: ShippingService,
   ) {}
+
+  // ── story 4-6a: client consignment compliance ────────────────────────────
+
+  /** A9 step 3 — the order `FOR UPDATE` for the record command (lock + 404 only; portal: its client's). */
+  async lockOrderForConsignmentInTx(tx: TenantTx, tenantId: string, orderId: string, opts: { readonly clientId?: string } = {}): Promise<ConsignmentOrderLock> {
+    return lockOrderForConsignmentInTxImpl(tx, tenantId, orderId, opts);
+  }
+
+  /** A45 (D30) — another order locked to see whether it is cancelled (the e-way self-heal). */
+  async lockOrderStatusInTx(tx: TenantTx, tenantId: string, orderId: string): Promise<{ readonly status: string; readonly label: string } | null> {
+    return lockOrderStatusInTxImpl(tx, tenantId, orderId);
+  }
+
+  /** A14 — the gate's facts of a set of orders (one query per kind). */
+  async consignmentFactsOfOrdersInTx(tx: TenantTx, tenantId: string, orderIds: readonly string[]): Promise<Map<string, OrderConsignmentFacts>> {
+    return consignmentFactsOfOrdersInTxImpl(tx, tenantId, orderIds);
+  }
+
+  /**
+   * A20, A47 — the gate of one order judged on `istDate` (client-emails' read at
+   * delivery), or null for an unknown order. Throws `eway-threshold-missing`
+   * when no national threshold is in force (the caller contains it).
+   */
+  async consignmentGateOfOrderInTx(
+    tx: TenantTx,
+    tenantId: string,
+    orderId: string,
+    istDate: string,
+  ): Promise<{ readonly facts: OrderConsignmentFacts; readonly gate: ConsignmentGateResult; readonly nationalThresholdPaise: number } | null> {
+    const facts = (await consignmentFactsOfOrdersInTxImpl(tx, tenantId, [orderId])).get(orderId);
+    if (facts === undefined) return null;
+    const national = await new NationalThresholds(tx).on(istDate);
+    return { facts, gate: judgeConsignment(facts, national, istDate), nationalThresholdPaise: national };
+  }
+
+  /** A16 — one order's consignment (staff, ungated); null for an unknown order. */
+  async orderConsignment(tenantId: string, orderId: string): Promise<OrderConsignmentView | null> {
+    const read = await withTenantTransaction(this.db, tenantId, (tx) => orderConsignmentReadInTx(tx, tenantId, orderId, consignmentTodayIst()));
+    if (read === null) return null;
+    const shipping = await this.shipping.orderShipping(tenantId, read.facts.order.id);
+    const rated = read.facts.ratedValuePaise;
+    return {
+      gate: read.gate,
+      live: read.facts.live === null ? null : toConsignmentView(read.facts.live, { ratedValuePaise: rated }),
+      history: read.history.filter((row) => row.status !== 'live').map((row) => toConsignmentView(row)),
+      dispatchedRecordId: read.dispatchedRecordId,
+      duplicates: [...read.duplicates],
+      consignorStateMismatch: read.consignorStateMismatch,
+      ewayUsedByOtherClient: read.ewayUsedByOtherClient,
+      scans: (shipping?.documents ?? []).filter((file) => file.docKind === 'invoice' || file.docKind === 'challan' || file.docKind === 'eway-bill'),
+      complianceException: read.complianceException,
+    };
+  }
+
+  /** A16, A43 — the warehouse's documents worklist: `needed` (packed first) or the device `exceptions`. */
+  async consignmentWorklist(
+    tenantId: string,
+    warehouseId: string,
+    query: { readonly clientId: string | null; readonly view: 'needed' | 'exceptions' },
+  ): Promise<{ readonly view: 'needed' | 'exceptions'; readonly needed: ConsignmentWorklistRow[]; readonly exceptions: ConsignmentExceptionRow[]; readonly truncated: boolean }> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      await assertWarehouseInTenant(tx, tenantId, warehouseId);
+      if (query.view === 'exceptions') {
+        const exceptions = await consignmentExceptionsInTx(tx, tenantId, warehouseId, query.clientId);
+        return { view: 'exceptions' as const, needed: [], exceptions: exceptions.rows, truncated: exceptions.truncated };
+      }
+      const needed = await consignmentNeededInTx(tx, tenantId, warehouseId, query.clientId, consignmentTodayIst());
+      return { view: 'needed' as const, needed: needed.rows, exceptions: [], truncated: needed.truncated };
+    });
+  }
+
+  /** A18 — the portal order's consignment (stamped, `orders.client_id = $client`); null for an unknown or foreign order. */
+  async portalOrderConsignment(tenantId: string, clientId: string, orderId: string, viewerUserId: string): Promise<PortalOrderConsignmentView | null> {
+    return withTenantTransaction(
+      this.db,
+      tenantId,
+      async (tx) => {
+        const read = await orderConsignmentReadInTx(tx, tenantId, orderId, consignmentTodayIst(), clientId);
+        if (read === null) return null;
+        return {
+          gate: read.gate,
+          live: read.facts.live === null ? null : toPortalConsignmentView(read.facts.live, viewerUserId),
+          history: read.history.filter((row) => row.status !== 'live').map((row) => toPortalConsignmentView(row, viewerUserId)),
+        };
+      },
+      { clientId },
+    );
+  }
+
+  /** A18 — the client's open orders waiting for its documents (stamped; at most 500). */
+  async portalConsignmentsNeeded(tenantId: string, clientId: string): Promise<{ readonly items: PortalConsignmentNeededRow[] }> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => ({ items: await portalConsignmentsNeededInTx(tx, tenantId, clientId, consignmentTodayIst()) }), { clientId });
+  }
 
   // ── story 4-4a: client-arranged shipping ──────────────────────────────────
 
@@ -1459,6 +1605,13 @@ export class OutboundFacade {
         createdAt: canonicalInstant(row.createdAt),
         updatedAt: canonicalInstant(row.updatedAt),
       }));
+      // Story 4-6a (A16) — each row's consignment gate today (one batch of
+      // facts per page; the Orders tab and Pack & Dispatch show a Docs cell).
+      const consignmentStates = await consignmentStatesOfOrdersInTx(tx, tenantId, rows.map((row) => row.id));
+      for (let i = 0; i < items.length; i += 1) {
+        const state = consignmentStates.get(items[i]!.id);
+        if (state !== undefined) (items[i] as { consignmentState?: string }).consignmentState = state;
+      }
       const page = buildPage(
         rows.map((row, index) => ({
           createdAt: fullPrecisionInstant(row.createdAtText),
