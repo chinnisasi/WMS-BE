@@ -21,6 +21,7 @@ import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { KeysetWindow, Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
+import { normalizeAwb } from '../../shared/primitives/awb';
 import { addressFromColumns } from '../../shared/primitives/address';
 import type { AddressSnapshot } from '../../shared/primitives/address';
 import { fromMilli } from '../../shared/primitives/quantity';
@@ -1085,7 +1086,10 @@ export class OutboundFacade {
       .where(
         and(
           eq(shipments.tenantId, tenantId),
-          eq(shipments.trackingNumber, reference),
+          // Story 4-4a (A41) — a client-arranged AWB is stored normalised
+          // (no spaces or hyphens, upper case): the scanned or typed
+          // reference matches either as given or normalised.
+          inArray(shipments.trackingNumber, [...new Set([reference, normalizeAwb(reference)])]),
           sql`${shipments.status} <> 'voided'`,
           eq(orders.clientId, clientId),
           eq(orders.warehouseId, warehouseId),

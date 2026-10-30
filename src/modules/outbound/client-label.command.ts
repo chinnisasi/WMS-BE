@@ -259,7 +259,13 @@ export class ClientLabelCommand {
       input.transporterId === null ? null : await assertTransporterInTx(tx, tenantId, input.transporterId, 'a client label');
     const label = orderLabelOf(order);
 
-    // 1. the order is open.
+    // 1. the order is open — except that a parcel already handed over answers
+    // the more specific 409 `shipment-handed-over` (the matrix row "Replace …
+    // after handover"): its order reads `dispatched`, so the open check alone
+    // would make that answer unreachable.
+    if (live !== null && live.status === 'handed_over') {
+      throw new ProblemException('shipment-handed-over', 409, 'Shipment already handed over', `Order ${label}'s parcel was already handed to ${live.carrierName} (AWB ${live.trackingNumber}).`);
+    }
     if (!(LABEL_OPEN_STATUSES as readonly string[]).includes(order.status)) {
       throw orderNotOpen(order, label);
     }

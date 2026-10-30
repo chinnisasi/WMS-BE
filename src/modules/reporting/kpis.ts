@@ -930,7 +930,10 @@ const dispatchPipeline: TileDefinition<'dispatchPipeline'> = {
           from shipments
           where tenant_id = ${scope.tenantId}::uuid
             and warehouse_id = ${scope.warehouseId}::uuid
-            and status = 'labelled'`,
+            and status = 'labelled'
+            -- Story 4-4a (A24) — "labelled, not yet on a manifest" means a
+            -- CARRIER label: a client label uploaded before the pick is not one.
+            and kind = 'carrier'`,
     );
     return pipelineShape(ctx, {
       accepted: n(statuses[0]?.accepted),
