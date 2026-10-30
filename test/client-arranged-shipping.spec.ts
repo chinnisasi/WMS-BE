@@ -768,6 +768,19 @@ describe('client-arranged shipping capture (e2e, story 4-4a)', () => {
     expect(snapshot.body.clients.map((c: { id: string }) => c.id)).toContain(acme);
   });
 
+  it('A41 — a blind return finds a client-arranged AWB typed spaced or in lower case', async () => {
+    const orderId = await packedOrder();
+    await awbAdvice(orderId, { awb: 'ab12-3456-7890', courierName: 'VRL' }).expect(201);
+    await handOver({ parcels: [{ orderId, awb: 'AB1234567890' }] }).expect(201);
+    const { withTenantTransaction } = await import('../src/shared/db/tenant-scope');
+    const { OutboundFacade } = await import('../src/modules/outbound/outbound.facade');
+    const outbound = app.get(OutboundFacade);
+    for (const typed of ['ab12 3456 7890', 'AB1234567890']) {
+      const found = await withTenantTransaction(app.get(DATABASE), tenantId, (tx) => outbound.ordersByParcelReferenceInTx(tx, tenantId, acme, warehouseId, typed));
+      expect(found).toEqual([{ orderId, matchKind: 'awb' }]);
+    }
+  });
+
   it('A44 — the portal status derivation', () => {
     expect(portalShippingStatus('cancelled', null, false)).toBe('cancelled');
     expect(portalShippingStatus('accepted', null, false)).toBe('no-label-yet');
