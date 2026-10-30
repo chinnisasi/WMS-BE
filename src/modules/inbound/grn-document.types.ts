@@ -1,6 +1,7 @@
 import type { ClientPartySnapshotV1 } from '../clients/clients.facade';
 import type { VendorSnapshotV1 } from '../partners/partners.facade';
 import type { RtvWarehouseSnapshotV1 } from './vendor-return.read';
+import { documentWarehousePartyOf } from '../../shared/documents/parties';
 
 /**
  * Story 2-9a — the GRN document: the shapes the freeze writes and the one
@@ -42,19 +43,14 @@ export interface GrnPartiesSnapshotV1 {
   readonly vendor: VendorSnapshotV1 | null;
 }
 
-/** A3 — the GRN's warehouse party from the RTV's live warehouse read, key by key (no contact name, no phone). */
+/**
+ * A3 — the GRN's warehouse party from the RTV's live warehouse read, key by
+ * key (no contact name, no phone). Story 4-5a (D13): the mapping is the one
+ * shared `documentWarehousePartyOf`, plus the operator — same values, so the
+ * GRN goldens are unchanged.
+ */
 export function grnWarehousePartyOf(live: RtvWarehouseSnapshotV1): GrnWarehousePartyV1 {
-  const origin = live.originAddress;
-  return {
-    code: live.code,
-    name: live.name,
-    gstin: live.gstin,
-    address:
-      origin === null
-        ? null
-        : { line1: origin.line1, line2: origin.line2 ?? null, city: origin.city, state: origin.state, pincode: origin.pincode },
-    operatorName: live.operatorName,
-  };
+  return { ...documentWarehousePartyOf(live), operatorName: live.operatorName };
 }
 
 export type GrnDocumentKind = 'po' | 'asn' | 'blind';
