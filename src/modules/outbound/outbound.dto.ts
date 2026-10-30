@@ -563,6 +563,13 @@ export class OrdersListQuery extends OrderListQuery {
   followOn?: boolean;
 }
 
+/** Story 4-9a — the truck an order is planned on (declared before OrderEntryDto: its design:type metadata reads the class at definition). */
+export class OrderEntryFreightDto {
+  @ApiProperty({ format: 'uuid' }) loadId!: string;
+  @ApiProperty() loadCode!: string;
+  @ApiProperty() stopSeq!: number;
+}
+
 /** One header row of the order list (no lines — the detail read carries them). */
 export class OrderEntryDto {
   @ApiProperty({ format: 'uuid' })
@@ -696,12 +703,6 @@ export class OrderEntryDto {
     description: 'Story 4-9a (A30) — the truck the order is planned on (its load and stop), null when none: the Shipping cell reads "On truck LD-0007 (stop 3)". The list rows only; optional',
   })
   freight?: OrderEntryFreightDto | null;
-}
-
-export class OrderEntryFreightDto {
-  @ApiProperty({ format: 'uuid' }) loadId!: string;
-  @ApiProperty() loadCode!: string;
-  @ApiProperty() stopSeq!: number;
 }
 
 export class OrderListResponse {

@@ -60583,6 +60583,26 @@
           "orderShelfLife"
         ]
       },
+      "OrderEntryFreightDto": {
+        "type": "object",
+        "properties": {
+          "loadId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "loadCode": {
+            "type": "string"
+          },
+          "stopSeq": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "loadId",
+          "loadCode",
+          "stopSeq"
+        ]
+      },
       "OrderEntryDto": {
         "type": "object",
         "properties": {
@@ -60718,6 +60738,16 @@
               "not-required"
             ],
             "description": "Story 4-6a — the consignment gate today (the brand's tax document and e-way bill): the Docs cell. Optional"
+          },
+          "freight": {
+            "nullable": true,
+            "description": "Story 4-9a (A30) — the truck the order is planned on (its load and stop), null when none: the Shipping cell reads \"On truck LD-0007 (stop 3)\". The list rows only; optional",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OrderEntryFreightDto"
+              }
+            ]
           }
         },
         "required": [
@@ -64173,6 +64203,13 @@
           },
           "packages": {
             "$ref": "#/components/schemas/FreightPackagesDto"
+          },
+          "loadedCodes": {
+            "description": "The live loaded package codes, sorted (≤ 200; empty once dispatched) — the expanded row’s per-package Load tick",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           },
           "weightGrams": {
             "type": "number",
